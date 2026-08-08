@@ -1400,71 +1400,68 @@ async function runCLI(options: CLIOptions): Promise<void> {
     if (!options.bare && runtimeResourceOwner) {
       runtimeResourceOwner.startBackgroundStartup({
         resolveAuthAndVersion: async () => {
-          const versionCheckPromise = config.ui?.checkForUpdates !== false
-            ? checkForUpdates(runtimeVersion, {
-                checkIntervalHours: config.ui?.updateCheckInterval ?? 24,
-              })
-            : Promise.resolve(null);
+          let authUser: Awaited<ReturnType<typeof validateAuthOnStartup>> | null = null;
+          let versionResult: VersionCheckResult | null = null;
 
-        const [authUser, versionResult] = await Promise.all([
-          validateAuthOnStartup(config),
-          versionCheckPromise,
-        ]);
+          try {
+            const versionCheckPromise = config.ui?.checkForUpdates !== false
+              ? checkForUpdates(runtimeVersion, {
+                  checkIntervalHours: config.ui?.updateCheckInterval ?? 24,
+                })
+              : Promise.resolve(null);
 
-        // Pass version check result to agent for status bar display
-        if (versionResult && agentHolder.current) {
-          agentHolder.current.setVersionCheckResult(versionResult);
-        }
+            [authUser, versionResult] = await Promise.all([
+              validateAuthOnStartup(config).then((user) => user ?? null),
+              versionCheckPromise,
+            ]);
 
-        // Start settings sync service for logged-in users
-        if (authUser && config.auth?.token) {
-          const syncEnabled = options.syncSettings !== false &&
-            config.sync?.enabled !== false;
-
-          if (syncEnabled) {
-            try {
-              const { createSyncService, DEFAULT_SYNC_CONFIG } = await import('./sync/index.js');
-              const { setSyncService } = await import('./commands/sync.js');
-              const syncService = createSyncService({
-                authToken: config.auth.token,
-                userId: authUser.id,
-                config: {
-                  ...DEFAULT_SYNC_CONFIG,
-                  ...config.sync,
-                  enabled: true,
-                },
-                onAuthFailure: async () => {
-                  // Notify the user but do NOT wipe local credentials automatically.
-                  // The startup auth gate already trusts locally-valid tokens;
-                  // destroying them here would force re-login on transient sync issues.
-                  const message = 'Session sync failed.';
-                  if (agentHolder.current) {
-                    agentHolder.current.notifyUser(message);
-                  } else {
-                    const { promptNotify } = await import('./ui/inputPrompt.js');
-                    promptNotify(chalk.yellow(message));
-                  }
-                },
-              });
-              syncService.start();
-              setSyncService(syncService);
-
-              const stopSync = () => {
-                syncService?.stop();
-                setSyncService(null);
-              };
-              process.on('exit', stopSync);
-              process.on('SIGINT', stopSync);
-              process.on('SIGTERM', stopSync);
-            } catch {
-              // Sync service failed to start, continue without it
+            // Pass version check result to agent for status bar display
+            if (versionResult && agentHolder.current) {
+              agentHolder.current.setVersionCheckResult(versionResult);
             }
+          } catch {
+            // Non-critical startup tasks - don't crash on failure
           }
-        }
-        } catch {
-          // Non-critical startup tasks - don't crash on failure
-        }
-      })();
+
+          return {
+            authUser,
+            versionResult,
+          };
+        },
+        onVersionResult: (versionResult) => {
+          if (agentHolder.current) {
+            agentHolder.current.setVersionCheckResult(versionResult);
+          }
+        },
+        shouldStartSync: (authUser) => Boolean(authUser && config.auth?.token && options.syncSettings !== false && config.sync?.enabled !== false),
+        createSyncService: async (authUser) => {
+          const { createSyncService, DEFAULT_SYNC_CONFIG } = await import('./sync/index.js');
+          const { setSyncService } = await import('./commands/sync.js');
+          const syncService = createSyncService({
+            authToken: config.auth.token,
+            userId: authUser.id,
+            config: {
+              ...DEFAULT_SYNC_CONFIG,
+              ...config.sync,
+              enabled: true,
+            },
+            onAuthFailure: async () => {
+              // Notify the user but do NOT wipe local credentials automatically.
+              // The startup auth gate already trusts locally-valid tokens;
+              // destroying them here would force re-login on transient sync issues.
+              const message = 'Session sync failed.';
+              if (agentHolder.current) {
+                agentHolder.current.notifyUser(message);
+              } else {
+                const { promptNotify } = await import('./ui/inputPrompt.js');
+                promptNotify(chalk.yellow(message));
+              }
+            },
+          });
+          setSyncService(syncService);
+          return syncService;
+        },
+      });
     }
 
     // Note: Git repo check is passed to the agent via runtime.

@@ -15,7 +15,6 @@ export * as resume from './resume.js';
 export * as sessions from './sessions.js';
 export * as agents from './agents.js';
 export * as agentsNew from './agents-new.js';
-export * as feedback from './feedback.js';
 export * as session from './session.js';
 export * as undo from './undo.js';
 export * as memory from './memory.js';
@@ -53,7 +52,6 @@ export function getAllCommands(): Array<{ command: string; description: string; 
         modules.sessions,
         modules.agents,
         modules.agentsNew,
-        modules.feedback,
         modules.session,
         modules.undo,
         modules.memory,
