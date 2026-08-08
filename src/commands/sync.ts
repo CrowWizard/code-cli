@@ -50,7 +50,7 @@ export async function sync(ctx: SlashCommandContext): Promise<string | null> {
   if (!isLoggedIn) {
     const theme = createCommandTheme();
     console.log(theme.warning('\nSettings sync requires authentication.'));
-    console.log(theme.muted('Run /login to sign in and enable cloud sync.\n'));
+    console.log(theme.muted('This feature is no longer available in this build.\n'));
     return null;
   }
 

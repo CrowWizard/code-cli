@@ -85,7 +85,6 @@ export async function about(ctx: { config?: LoadedConfig; terminalColumns?: numb
 
   // Contribution section
   lines.push(theme.text(`💡 ${t('commands.about.contribute')}`));
-  lines.push(theme.text(`   • ${t('commands.about.feedback')}:     ${theme.accent('/feedback')}`));
   lines.push(theme.text(`   • ${t('commands.about.submitPR')}:         ${theme.accent('gh pr create')}`));
 
   const issuesUrl = 'https://github.com/autohandai/code-cli/issues';

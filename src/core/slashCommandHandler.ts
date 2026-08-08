@@ -105,7 +105,7 @@ export class SlashCommandHandler {
 
     // Guard: interactive-only commands are not available in RPC/ACP mode
     const INTERACTIVE_ONLY = new Set([
-      '/model', '/cc', '/search', '/theme', '/language', '/feedback', '/skills new', '/skills-new',
+      '/model', '/cc', '/search', '/theme', '/language', '/skills new', '/skills-new',
       '/squad', '/statusline',
       '/publish-research', '/ps', '/stop',
       '/whatsnew',
@@ -188,15 +188,6 @@ export class SlashCommandHandler {
           await this.ctx.onBeforeModal?.();
           try {
             return await createAgent(this.ctx);
-          } finally {
-            await this.ctx.onAfterModal?.();
-          }
-        }
-        case '/feedback': {
-          const { feedback } = await import('../commands/feedback.js');
-          await this.ctx.onBeforeModal?.();
-          try {
-            return await feedback(this.ctx);
           } finally {
             await this.ctx.onAfterModal?.();
           }
@@ -421,24 +412,6 @@ export class SlashCommandHandler {
         case '/usage': {
           const { usage } = await import('../commands/usage.js');
           return usage(this.ctx, args);
-        }
-        case '/login': {
-          const { login } = await import('../commands/login.js');
-          await this.ctx.onBeforeModal?.();
-          try {
-            return await login({ config: this.ctx.config });
-          } finally {
-            await this.ctx.onAfterModal?.();
-          }
-        }
-        case '/logout': {
-          const { logout } = await import('../commands/logout.js');
-          await this.ctx.onBeforeModal?.();
-          try {
-            return await logout({ config: this.ctx.config, currentSession: this.ctx.currentSession });
-          } finally {
-            await this.ctx.onAfterModal?.();
-          }
         }
         case '/permissions': {
           const { permissions } = await import('../commands/permissions.js');

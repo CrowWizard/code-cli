@@ -241,10 +241,6 @@ program
   .option('-c, --auto-commit', 'Auto-commit with LLM-generated message (runs lint & test first)', false)
   .option('--unrestricted', 'Run without any approval prompts (use with caution)', false)
   .option('--restricted', 'Deny all dangerous operations automatically', false)
-  .option('--answer-only', 'Run the classified, tool-free Blueprint answer RPC profile', false)
-  .option('--setup-only', 'Run only the scoped Autohand device-authorization RPC profile', false)
-  .option('--client-context <context>', 'RPC client context: cli, vscode, browser, slack, api, restricted, or blueprint (default: cli)')
-  .option('--no-idle-logout', 'Disable authenticated idle logout for long-running agent sessions')
   .option('--goal [input]', 'Run /goal non-interactively (status when omitted, otherwise same arguments as /goal)')
   .option('--auto-skill', 'Auto-generate skills based on project analysis', false)
   .option('--learn', 'Run /learn skill advisor non-interactively (analyze and install recommended skills)', false)
@@ -252,10 +248,6 @@ program
   .option('--skill-install [skill-name]', 'Install a community skill (opens browser if no name)')
   .option('--project', 'Install skill to project level (with --skill-install)', false)
   .option('--permissions', 'Display current permission settings and exit', false)
-  .option('--settings', 'Configure Autohand settings (same as /settings in interactive mode)', false)
-  .option('--login', 'Sign in to your Autohand account', false)
-  .option('--logout', 'Sign out of your Autohand account', false)
-  .option('--sync-settings [bool]', 'Enable/disable settings sync (default: true for logged users)')
   .option('--patch', 'Generate git patch without applying changes (requires --prompt)', false)
   .option('--output <file>', 'Output file for patch (default: stdout, used with --patch)')
   .option('--mode <mode>', 'Run mode: interactive (default), rpc, or acp', 'interactive')
@@ -274,7 +266,6 @@ program
   .option('--interactive-on-complete', 'After auto-mode ends, hand off directly to interactive mode (TTY only)', false)
   .option('--setup', 'Run the setup wizard to configure or reconfigure Autohand', false)
   .option('--about', 'Show information about Autohand', false)
-  .option('--feedback', 'Submit feedback', false)
   .option('--add-dir <path...>', 'Add additional directories to workspace scope (can be used multiple times)')
   .option('--display-language <locale>', 'Set display language (e.g., en, id, zh-cn, fr, de, ja)')
   .option('--cc, --context-compact', 'Enable context compaction (default: on)')
@@ -315,25 +306,28 @@ program
       console.error(chalk.red(commandOutputResolution.error));
       process.exit(1);
     }
-    opts.commandOutputFormat = commandOutputResolution.format;
-    normalizePromptAndProtocolOptions(positionalPrompt, opts);
-
-    const restrictedProtocolMode = resolveProtocolLaunchMode(opts);
-    if (opts.answerOnly || opts.setupOnly || (
-      restrictedProtocolMode === 'rpc' && opts.clientContext === 'blueprint'
-    )) {
-      if (restrictedProtocolMode !== 'rpc') {
-        console.error(
-          chalk.red(
-            'Error: --answer-only and --setup-only require --mode rpc --restricted --client-context blueprint.',
-          ),
-        );
-        process.exitCode = 1;
-        return;
-      }
-      const { runRpcMode } = await import('./modes/rpc/index.js');
-      process.exitCode = await runRpcMode(opts);
-      return;
+    if ((opts as Record<string, unknown>).autoMode === true) {
+      opts.autoMode = undefined;
+    }
+    if ((opts as Record<string, unknown>).goal === true) {
+      opts.goal = '';
+    }
+    if ((opts as Record<string, unknown>).systemPrompt) {
+      opts.sysPrompt = String((opts as Record<string, unknown>).systemPrompt);
+    }
+    if (opts.systemPromptFile) {
+      opts.sysPrompt = opts.systemPromptFile;
+    }
+    if ((opts as Record<string, unknown>).appendSystemPrompt) {
+      opts.appendSysPrompt = String((opts as Record<string, unknown>).appendSystemPrompt);
+    }
+    if (opts.appendSystemPromptFile) {
+      opts.appendSysPrompt = opts.appendSystemPromptFile;
+    }
+    if (opts.bare) {
+      process.env.AUTOHAND_CODE_SIMPLE = '1';
+      opts.contextCompact = false;
+      opts.noChrome = true;
     }
 
     const { extensionRuntimeHost } = await import('./extensions/ExtensionRuntimeHost.js');
@@ -409,22 +403,6 @@ program
       process.exit(0);
     }
 
-    // Handle --login flag
-    if (opts.login) {
-      const { login } = await import('./commands/login.js');
-      const config = await loadConfig(opts.config);
-      await login({ config });
-      process.exit(0);
-    }
-
-    // Handle --logout flag
-    if (opts.logout) {
-      const { logout } = await import('./commands/logout.js');
-      const config = await loadConfig(opts.config);
-      await logout({ config });
-      process.exit(0);
-    }
-
     // Handle --about flag
     if (opts.about) {
       const { initI18n, detectLocale } = await import('./i18n/index.js');
@@ -433,17 +411,6 @@ program
       await initI18n(locale);
       const config = await loadConfig(opts.config);
       await about({ config });
-      process.exit(0);
-    }
-
-    // Handle --feedback flag
-    if (opts.feedback) {
-      const { initI18n, detectLocale } = await import('./i18n/index.js');
-      const { feedback } = await import('./commands/feedback.js');
-      const { locale } = detectLocale();
-      await initI18n(locale);
-      const config = await loadConfig(opts.config);
-      await feedback({ config });
       process.exit(0);
     }
 
@@ -521,17 +488,6 @@ program
         printDangerousWorkspaceWarning(workspaceRoot, safetyCheck);
         process.exit(1);
       }
-    }
-
-    // ── Mandatory authentication gate ──
-    // Everything below requires a valid login. --login, --logout, --setup,
-    // --about, --permissions, --skill-install, and --learn* are exempt above.
-    {
-      let authConfig = await loadConfig(opts.config, process.cwd());
-      authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
-      // Propagate refreshed auth into the options so downstream code sees
-      // the updated token (e.g. runCLI, runRpcMode, runAutoMode).
-      (opts as any)._authConfig = authConfig;
     }
 
     // Handle --patch flag
@@ -615,36 +571,8 @@ program
   .description('Resume a previous session')
   .option('--path <path>', 'Workspace path to operate in')
   .option('--model <model>', 'Override the configured LLM model')
-  .option('--offline', 'Disable the model catalog refresh for this resumed session', false)
-  .action(async (sessionId: string, opts: CLIOptions & { offline?: boolean }) => {
-    await refreshModelCatalogBeforeAgentStart(opts);
-
-    // Mandatory auth gate for resume
-    let authConfig = await loadConfig(opts.config, process.cwd());
-    authConfig = await ensureAuthenticated(authConfig);
-    (opts as any)._authConfig = authConfig;
-
+  .action(async (sessionId: string, opts: CLIOptions) => {
     await runCLI({ ...opts, resumeSessionId: sessionId });
-  });
-
-program
-  .command('login')
-  .description('Sign in to your Autohand account')
-  .action(async () => {
-    const { login } = await import('./commands/login.js');
-    const config = await loadConfig();
-    await login({ config });
-    process.exit(0);
-  });
-
-program
-  .command('logout')
-  .description('Sign out of your Autohand account')
-  .action(async () => {
-    const { logout } = await import('./commands/logout.js');
-    const config = await loadConfig();
-    await logout({ config });
-    process.exit(0);
   });
 
 program
@@ -1478,42 +1406,65 @@ async function runCLI(options: CLIOptions): Promise<void> {
               })
             : Promise.resolve(null);
 
-          const [authUser, versionResult] = await Promise.all([
-            validateAuthOnStartup(config),
-            versionCheckPromise,
-          ]);
-          return { authUser: authUser ?? null, versionResult };
-        },
-        onVersionResult: (versionResult) => {
-          agentHolder.current?.setVersionCheckResult(versionResult);
-        },
-        shouldStartSync: () => Boolean(
-          config.auth?.token
-          && options.syncSettings !== false
-          && config.sync?.enabled !== false
-        ),
-        createSyncService: async (authUser) => {
-          const { createSyncService, DEFAULT_SYNC_CONFIG } = await import('./sync/index.js');
-          return createSyncService({
-            authToken: config.auth?.token ?? '',
-            userId: authUser.id,
-            config: {
-              ...DEFAULT_SYNC_CONFIG,
-              ...config.sync,
-              enabled: true,
-            },
-            onAuthFailure: async () => {
-              const message = 'Session sync failed. Run /logout and /login if you continue to see this message.';
-              if (agentHolder.current) {
-                agentHolder.current.notifyUser(message);
-              } else {
-                const { promptNotify } = await import('./ui/inputPrompt.js');
-                promptNotify(chalk.yellow(message));
-              }
-            },
-          });
-        },
-      });
+        const [authUser, versionResult] = await Promise.all([
+          validateAuthOnStartup(config),
+          versionCheckPromise,
+        ]);
+
+        // Pass version check result to agent for status bar display
+        if (versionResult && agentHolder.current) {
+          agentHolder.current.setVersionCheckResult(versionResult);
+        }
+
+        // Start settings sync service for logged-in users
+        if (authUser && config.auth?.token) {
+          const syncEnabled = options.syncSettings !== false &&
+            config.sync?.enabled !== false;
+
+          if (syncEnabled) {
+            try {
+              const { createSyncService, DEFAULT_SYNC_CONFIG } = await import('./sync/index.js');
+              const { setSyncService } = await import('./commands/sync.js');
+              const syncService = createSyncService({
+                authToken: config.auth.token,
+                userId: authUser.id,
+                config: {
+                  ...DEFAULT_SYNC_CONFIG,
+                  ...config.sync,
+                  enabled: true,
+                },
+                onAuthFailure: async () => {
+                  // Notify the user but do NOT wipe local credentials automatically.
+                  // The startup auth gate already trusts locally-valid tokens;
+                  // destroying them here would force re-login on transient sync issues.
+                  const message = 'Session sync failed.';
+                  if (agentHolder.current) {
+                    agentHolder.current.notifyUser(message);
+                  } else {
+                    const { promptNotify } = await import('./ui/inputPrompt.js');
+                    promptNotify(chalk.yellow(message));
+                  }
+                },
+              });
+              syncService.start();
+              setSyncService(syncService);
+
+              const stopSync = () => {
+                syncService?.stop();
+                setSyncService(null);
+              };
+              process.on('exit', stopSync);
+              process.on('SIGINT', stopSync);
+              process.on('SIGTERM', stopSync);
+            } catch {
+              // Sync service failed to start, continue without it
+            }
+          }
+        }
+        } catch {
+          // Non-critical startup tasks - don't crash on failure
+        }
+      })();
     }
 
     // Note: Git repo check is passed to the agent via runtime.
@@ -1776,11 +1727,6 @@ function buildWelcomeSuggestions(isLoggedIn: boolean, workspaceRoot: string): We
 
   // Always suggest /help — it's the universal discovery command
   suggestions.push({ command: '/help', description: 'see all available commands and tips' });
-
-  if (!isLoggedIn) {
-    // Not logged in — prioritize getting them signed in
-    suggestions.push({ command: '/login', description: 'sign in to your Autohand account' });
-  }
 
   // Check if AGENTS.md exists — suggest /init only when it doesn't
   const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
