@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { readDeepResearchRun } from '../../deepResearch/session.js';
+import { buildGoalContinuationInstruction, GoalManager } from '../../goals/GoalManager.js';
 import type { MobileComposerCommandExecutionOutcome } from '../../mobile/MobileHandoffClient.js';
 import type { MobileComposerExecutableCommand } from '../../mobile/MobileCommandPolicy.js';
 import type { MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
@@ -70,6 +71,16 @@ export interface PostTurnActionHost {
   requestResearchPublication(reportPath: string): Promise<string>;
 }
 
+export interface ActiveGoalContinuationHost {
+  runtime: {
+    workspaceRoot: string;
+  };
+  sessionId?: string;
+  shouldExit: boolean;
+  interactiveAutomodeEnabled: boolean;
+  runtimeResourceShutdownController?: AbortController;
+}
+
 export function unpackQueuedAgentInstruction(
   value: PendingAgentInstruction,
 ): SequencedQueuedAgentInstruction {
@@ -94,8 +105,6 @@ export async function executePendingPostTurnAction(
     || host.runtime.isCommandMode
     || host.runtime.isRpcMode
     || Boolean(host.runtime.options.prompt)
-    || host.interactiveAutomodeEnabled
-    || host.automodeManager?.isActive()
     || !environment.stdinIsTTY
     || !environment.stdoutIsTTY
     || environment.isCI
@@ -114,7 +123,42 @@ export async function executePendingPostTurnAction(
     return null;
   }
 
+  if (host.interactiveAutomodeEnabled || host.automodeManager?.isActive()) {
+    // Automode means "don't interrupt with a blocking prompt" — but the user
+    // still deserves to know publishing is available and how to trigger it.
+    return [
+      'Research saved. Skipping the interactive publish prompt while auto mode is active.',
+      `Publish later with: /publish-research ${action.reportPath}`,
+    ].join('\n');
+  }
+
   return host.requestResearchPublication(action.reportPath);
+}
+
+export async function resolveActiveGoalContinuation(
+  host: ActiveGoalContinuationHost,
+  turnSucceeded: boolean,
+): Promise<string | null> {
+  if (
+    !turnSucceeded
+    || !host.interactiveAutomodeEnabled
+    || host.shouldExit
+    || host.runtimeResourceShutdownController?.signal.aborted
+  ) {
+    return null;
+  }
+
+  try {
+    const goal = await new GoalManager(host.runtime.workspaceRoot, {
+      sessionId: host.sessionId,
+    }).getActiveGoalForSession();
+    if (!goal) {
+      return null;
+    }
+    return buildGoalContinuationInstruction(goal.objective);
+  } catch {
+    return null;
+  }
 }
 
 function currentPostTurnEnvironment(): PostTurnEnvironment {

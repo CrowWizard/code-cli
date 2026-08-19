@@ -33,6 +33,7 @@ describe('feature registry', () => {
     expect(ids).toContain('usage_v2');
     expect(ids).toContain('cli_usage_v2');
     expect(ids).toContain('slash_goal');
+    expect(ids).toContain('automatic_specialists');
     expect(ids).toContain('experimental_fork');
     expect(ids).toContain('experimental_clone');
     expect(ids).toContain('experimental_handoff');
@@ -46,9 +47,18 @@ describe('feature registry', () => {
     expect(getFeatureState(config, 'chrome_integration')?.enabled).toBe(false);
     expect(getFeatureState(config, 'cli_usage_v2')?.enabled).toBe(true);
     expect(getFeatureState(config, 'slash_goal')?.enabled).toBe(false);
+    expect(getFeatureState(config, 'automatic_specialists')?.enabled).toBe(true);
     expect(getFeatureState(config, 'experimental_fork')?.enabled).toBe(false);
     expect(getFeatureState(config, 'experimental_clone')?.enabled).toBe(false);
     expect(getFeatureState(config, 'experimental_handoff')?.enabled).toBe(false);
+  });
+
+  it('allows users to disable automatic specialists explicitly', () => {
+    const config = makeConfig({
+      features: { automaticSpecialists: false },
+    });
+
+    expect(getFeatureState(config, 'automatic_specialists')?.enabled).toBe(false);
   });
 
   it('keeps prompt caching experimental and disabled until explicitly enabled', () => {
@@ -62,6 +72,36 @@ describe('feature registry', () => {
 
     (config.features as unknown as Record<string, unknown>).promptCaching = true;
     expect(getFeatureState(config, 'prompt_caching')?.enabled).toBe(true);
+  });
+
+  it('registers the ordered stateful-read experiments as restart-required and default-off', () => {
+    expect(FEATURE_REGISTRY.filter(feature => [
+      'read_state_ledger',
+      'read_state_dedup',
+      'read_before_write',
+    ].includes(feature.id))).toEqual([
+      expect.objectContaining({
+        id: 'read_state_ledger',
+        stage: 'experimental',
+        configPath: 'features.readStateLedger',
+        defaultEnabled: false,
+        requiresRestart: true,
+      }),
+      expect.objectContaining({
+        id: 'read_state_dedup',
+        stage: 'experimental',
+        configPath: 'features.readStateDedup',
+        defaultEnabled: false,
+        requiresRestart: true,
+      }),
+      expect.objectContaining({
+        id: 'read_before_write',
+        stage: 'experimental',
+        configPath: 'features.readBeforeWrite',
+        defaultEnabled: false,
+        requiresRestart: true,
+      }),
+    ]);
   });
 
   it('updates nested config paths without disturbing adjacent settings', () => {
@@ -240,6 +280,20 @@ describe('feature registry', () => {
     expect(result.ok).toBe(true);
     expect(config.features?.slashGoal).toBe(true);
     expect(getFeatureState(config, 'slash_goal')?.enabled).toBe(true);
+  });
+
+  it('keeps automatic specialist orchestration default-on and locally opt-out', () => {
+    const config = makeConfig();
+
+    const result = setFeatureState(config, 'automatic_specialists', false);
+
+    expect(result.ok).toBe(true);
+    expect(config.features?.automaticSpecialists).toBe(false);
+    expect(getFeatureState(config, 'automatic_specialists')).toEqual(expect.objectContaining({
+      enabled: false,
+      stage: 'experimental',
+      requiresRestart: true,
+    }));
   });
 
   it('enables experimental fork and clone through local feature config paths', () => {

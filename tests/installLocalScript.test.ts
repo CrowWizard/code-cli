@@ -35,10 +35,12 @@ describe('local install scripts', () => {
     };
     const proofScript = packageJson.scripts?.proof ?? '';
     const unitProofScript = packageJson.scripts?.['proof:unit'] ?? '';
+    const typecheckScript = packageJson.scripts?.typecheck ?? '';
 
     expect(proofScript).toBe('bun run proof:unit && bun run proof:build-tuistory');
-    expect(unitProofScript).toBe('eslint . && tsc --noEmit && node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run');
-    expect(unitProofScript).not.toContain('bun run');
+    expect(typecheckScript).toBe('node ./node_modules/@typescript/native/bin/tsc --noEmit');
+    expect(unitProofScript).toBe('eslint . && bun run typecheck && node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run');
+    expect(unitProofScript).not.toContain('tsc --noEmit');
   });
 
   it('runs dev through a portable minimal bun environment', () => {
@@ -47,7 +49,7 @@ describe('local install scripts', () => {
     };
     const devScript = packageJson.scripts?.dev ?? '';
 
-    expect(devScript).toBe('env -i PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME" AUTOHAND_VERSION_SOURCE=git AUTOHAND_DEBUG="$AUTOHAND_DEBUG" ${AUTOHAND_HOME:+AUTOHAND_HOME="$AUTOHAND_HOME"} ${AUTOHAND_CONFIG:+AUTOHAND_CONFIG="$AUTOHAND_CONFIG"} ${AUTOHAND_API_URL:+AUTOHAND_API_URL="$AUTOHAND_API_URL"} ${AUTOHAND_AUTH_URL:+AUTOHAND_AUTH_URL="$AUTOHAND_AUTH_URL"} bun src/index.ts');
+    expect(devScript).toBe('env -i PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME" AUTOHAND_VERSION_SOURCE=git AUTOHAND_DEBUG="$AUTOHAND_DEBUG" ${AUTOHAND_HOME:+AUTOHAND_HOME="$AUTOHAND_HOME"} ${AUTOHAND_CONFIG:+AUTOHAND_CONFIG="$AUTOHAND_CONFIG"} ${AUTOHAND_API_URL:+AUTOHAND_API_URL="$AUTOHAND_API_URL"} ${AUTOHAND_AUTH_URL:+AUTOHAND_AUTH_URL="$AUTOHAND_AUTH_URL"} ${AUTOHAND_DISABLE_STATEFUL_READ:+AUTOHAND_DISABLE_STATEFUL_READ="$AUTOHAND_DISABLE_STATEFUL_READ"} bun src/index.ts');
   });
 
   it('preserves AUTOHAND_DEBUG through the sanitized dev environment', () => {
@@ -58,6 +60,15 @@ describe('local install scripts', () => {
 
     expect(devScript).toContain('env -i ');
     expect(devScript).toContain('AUTOHAND_DEBUG="$AUTOHAND_DEBUG"');
+  });
+
+  it('preserves the stateful-read emergency switch through the sanitized dev environment', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
+      scripts?: Record<string, string>;
+    };
+    const devScript = packageJson.scripts?.dev ?? '';
+
+    expect(devScript).toContain('${AUTOHAND_DISABLE_STATEFUL_READ:+AUTOHAND_DISABLE_STATEFUL_READ="$AUTOHAND_DISABLE_STATEFUL_READ"}');
   });
 
   unixInstallScriptTest('preserves explicit Autohand config locations through the sanitized dev environment', () => {

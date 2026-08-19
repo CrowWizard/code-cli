@@ -19,6 +19,7 @@ import {
   handleInkTextBufferInput,
   isBareComposerTrigger,
   matchesExtensionKeybinding,
+  isTeamViewShortcut,
   resolveInkHiddenPastes,
   storeInkHiddenPaste,
 } from '../../../src/ui/ink/AgentUI.js';
@@ -79,6 +80,12 @@ afterEach(() => {
 });
 
 describe('AgentUI TextBuffer integration helpers', () => {
+  it('recognizes Cmd+T and Ctrl+T as team view shortcuts', () => {
+    expect(isTeamViewShortcut('t', createInkKey({ meta: true }))).toBe(true);
+    expect(isTeamViewShortcut('t', createInkKey({ ctrl: true }))).toBe(true);
+    expect(isTeamViewShortcut('t', createInkKey())).toBe(false);
+  });
+
   it('matches extension keybindings without claiming reserved composer controls', () => {
     expect(matchesExtensionKeybinding('k', createInkKey({ ctrl: true }), {
       key: 'ctrl+k',
@@ -108,6 +115,38 @@ describe('AgentUI TextBuffer integration helpers', () => {
     expect(getTextBufferCursorOffset(buffer)).toBe(5);
   });
 
+  it('inserts text at the cursor position selected with a composer click', async () => {
+    const instance = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state: { ...createInitialUIState(), currentInput: 'hello' },
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            mouseComposerCursor: true,
+          }),
+        ),
+      ),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    const contentRow = frame.split('\n').findIndex((line) => line.includes('❯ hello')) + 1;
+    expect(contentRow).toBeGreaterThan(0);
+
+    instance.stdin.write(`\x1b[<0;5;${contentRow}M`);
+    instance.stdin.write(`\x1b[${contentRow};8R`);
+    instance.stdin.write('X');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('❯ heXllo');
+  });
+
   it('supports multiline cursor offsets', () => {
     const buffer = new TextBuffer(20, 10, 'hello\nworld');
 
@@ -115,6 +154,13 @@ describe('AgentUI TextBuffer integration helpers', () => {
     handleInkTextBufferInput(buffer, '', createInkKey({ leftArrow: true }));
 
     expect(getTextBufferCursorOffset(buffer)).toBe('hello\nwor'.length);
+  });
+
+  it('converts code-point cursor columns to string offsets after emoji', () => {
+    const buffer = new TextBuffer(20, 10, 'a🙂b');
+    buffer.setCursor(0, 2);
+
+    expect(getTextBufferCursorOffset(buffer)).toBe('a🙂'.length);
   });
 
   it('treats residual Shift+Enter fragments as newline insertion', () => {
@@ -269,6 +315,94 @@ describe('AgentUI interaction mode shortcut', () => {
     expect(defaultFrame).not.toContain('[AUTO]');
     expect(onCycleInteractionMode).toHaveBeenCalledTimes(4);
   });
+
+  it('colors the mode glyph per mode, labels it, and hides it in default mode', async () => {
+    const modes = ['plan', 'yolo', 'automode', 'default'] as const;
+    let currentMode: typeof modes[number] = 'default';
+    let cursor = -1;
+    const onCycleInteractionMode = vi.fn(() => {
+      cursor += 1;
+      currentMode = modes[cursor] ?? 'default';
+      return currentMode;
+    });
+    const { lastFrame, stdin } = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state: createInitialUIState(),
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            getInteractionMode: () => currentMode,
+            onCycleInteractionMode,
+          })
+        )
+      )
+    );
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // "● PLAN"/"● YOLO"/"● AUTO" (glyph + label together) uniquely identifies
+    // this new help-line indicator, distinct from the pre-existing bracketed
+    // "[PLAN]"/"[YOLO]"/"[AUTO]" indicator rendered above the scrollback.
+    const expectations: Record<'plan' | 'yolo' | 'automode', { glyphAndLabel: string; rgb: string }> = {
+      plan: { glyphAndLabel: '● PLAN', rgb: '255;157;63' },
+      yolo: { glyphAndLabel: '● YOLO', rgb: '198;120;221' },
+      automode: { glyphAndLabel: '● AUTO', rgb: '255;107;107' },
+    };
+
+    for (const mode of ['plan', 'yolo', 'automode'] as const) {
+      stdin.write('\x1b[Z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const rawFrame = lastFrame() ?? '';
+      expect(stripAnsi(rawFrame)).toContain(expectations[mode].glyphAndLabel);
+      expect(rawFrame).toContain(expectations[mode].rgb);
+    }
+
+    stdin.write('\x1b[Z');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const defaultFrame = stripAnsi(lastFrame() ?? '');
+    expect(defaultFrame).not.toContain('●');
+  });
+
+  it('hides the mode label but keeps the glyph when showModeLabel is false', async () => {
+    let currentMode: 'default' | 'plan' = 'default';
+    const onCycleInteractionMode = vi.fn(() => {
+      currentMode = 'plan';
+      return currentMode;
+    });
+    const { lastFrame, stdin } = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state: { ...createInitialUIState(), showModeLabel: false },
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            getInteractionMode: () => currentMode,
+            onCycleInteractionMode,
+          })
+        )
+      )
+    );
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    stdin.write('\x1b[Z');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const rawFrame = lastFrame() ?? '';
+    expect(rawFrame).toContain('255;157;63');
+    expect(stripAnsi(rawFrame)).toContain('●');
+    expect(stripAnsi(rawFrame)).not.toContain('● PLAN');
+  });
 });
 
 describe('AgentUI live command shortcut', () => {
@@ -308,6 +442,50 @@ describe('AgentUI live command shortcut', () => {
 
     expect(onToggleLiveCommandExpanded).toHaveBeenCalledOnce();
     expect(stripAnsi(lastFrame() ?? '')).toContain('next instruction');
+  });
+});
+
+describe('AgentUI team activity view', () => {
+  it('renders the live team panel when the view is open', () => {
+    const state = {
+      ...createInitialUIState(),
+      teamPanelVisible: true,
+      teamActivity: {
+        team: {
+          name: 'prompt-shrink',
+          createdAt: '2026-08-17T00:00:00.000Z',
+          leadSessionId: 'lead-1',
+          status: 'active' as const,
+          members: [
+            { name: 'planner', agentName: 'planner', pid: 101, status: 'working' as const },
+          ],
+        },
+        tasks: [
+          { id: 'task-1', subject: 'Plan compression', description: '', status: 'in_progress' as const, blockedBy: [], createdAt: '' },
+        ],
+      },
+    };
+    const { lastFrame } = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state,
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+          })
+        )
+      )
+    );
+
+    const frame = stripAnsi(lastFrame() ?? '');
+    expect(frame).toContain('Team: prompt-shrink');
+    expect(frame).toContain('Plan compression');
+    expect(frame).toContain('planner');
   });
 });
 

@@ -10,8 +10,16 @@ import type { AutohandConfig } from '../types.js';
 import { cleanupModalRender, prepareModalRender } from '../ui/ink/components/Modal.js';
 import { formatSessionActualTokens } from '../core/agent/AgentFormatter.js';
 import { createCommandTheme } from './commandTheme.js';
-import { formatUsageDashboard, gatherUsageDashboardData } from './usage.js';
+import {
+    formatAccountPlanAllowance,
+    formatAccountPlanName,
+    formatAccountPlanThroughput,
+    formatUsageDashboard,
+    gatherUsageDashboardData,
+    resolveAccountEntitlement,
+} from './usage.js';
 import { formatAccount } from './accountDisplay.js';
+import type { AccountEntitlement } from '../auth/AuthClient.js';
 import packageJson from '../../package.json' with { type: 'json' };
 
 export const metadata = {
@@ -29,6 +37,7 @@ interface StatusData {
     provider: string;
     model: string;
     account: string;
+    accountEntitlement: AccountEntitlement | null;
     apiConnected: boolean;
     sessionsCount: number;
     contextPercentLeft: number;
@@ -61,6 +70,8 @@ async function gatherStatusData(ctx: SlashCommandContext): Promise<StatusData> {
         apiConnected = false;
     }
 
+    const accountEntitlement = await resolveAccountEntitlement(ctx);
+
     return {
         version: packageJson.version,
         sessionId: currentSession?.metadata.sessionId ?? null,
@@ -68,13 +79,14 @@ async function gatherStatusData(ctx: SlashCommandContext): Promise<StatusData> {
         provider: ctx.provider ?? 'openrouter',
         model: ctx.model,
         account: formatAccount(ctx.config),
+        accountEntitlement,
         apiConnected,
         sessionsCount: allSessions.length,
         contextPercentLeft: ctx.getContextPercentLeft?.() ?? 100,
         totalTokensUsed: ctx.getTotalTokensUsed?.() ?? 0,
         tokenUsageStatus: ctx.getTokenUsageStatus?.() ?? 'actual',
         usageV2Dashboard: ctx.isFeatureEnabled?.('usage_v2', ctx.config?.features?.usageV2 === true)
-            ? formatUsageDashboard(gatherUsageDashboardData(ctx))
+            ? formatUsageDashboard(gatherUsageDashboardData(ctx), accountEntitlement)
             : null,
         config: ctx.config,
         contextCompactionEnabled: ctx.isContextCompactionEnabled?.() ?? true,
@@ -287,6 +299,17 @@ function renderStatusTab(data: StatusData): void {
     console.log(theme.bold(`${t('commands.status.provider')}:`), data.provider);
     console.log(theme.bold(`${t('commands.status.model')}:`), data.model);
     console.log(theme.bold('Account:'), data.account);
+    if (data.accountEntitlement) {
+        console.log(theme.bold('Plan:'), formatAccountPlanName(data.accountEntitlement));
+        const allowance = formatAccountPlanAllowance(data.accountEntitlement);
+        if (allowance) {
+            console.log(theme.bold('Allowance:'), allowance);
+        }
+        const throughput = formatAccountPlanThroughput(data.accountEntitlement);
+        if (throughput) {
+            console.log(theme.bold('Throughput:'), throughput);
+        }
+    }
     console.log(
         theme.bold('Context Compaction:'),
         data.contextCompactionEnabled ? theme.success('ON') : theme.warning('OFF')

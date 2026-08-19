@@ -213,6 +213,97 @@ describe('/status command screen isolation', () => {
     }
   });
 
+  it('shows the signed-in Autohand plan on the status screen', async () => {
+    const { EventEmitter } = await import('node:events');
+    const originalStdin = process.stdin;
+    const originalStdout = process.stdout;
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const input = new EventEmitter() as NodeJS.ReadStream & {
+      isTTY: boolean;
+      isRaw: boolean;
+      setRawMode: (mode: boolean) => void;
+      setEncoding: (encoding: BufferEncoding) => void;
+      resume: () => void;
+      pause: () => void;
+      isPaused: () => boolean;
+    };
+    input.isTTY = true;
+    input.isRaw = false;
+    input.setRawMode = vi.fn((mode: boolean) => { input.isRaw = mode; });
+    input.setEncoding = vi.fn();
+    input.resume = vi.fn();
+    input.pause = vi.fn();
+    input.isPaused = vi.fn(() => false);
+    const output = new EventEmitter() as NodeJS.WriteStream & {
+      isTTY: boolean;
+      write: (chunk: string | Uint8Array) => boolean;
+    };
+    output.isTTY = false;
+    output.write = vi.fn(() => true);
+    Object.defineProperty(process, 'stdin', { value: input, writable: true, configurable: true });
+    Object.defineProperty(process, 'stdout', { value: output, writable: true, configurable: true });
+
+    const ctx = {
+      sessionManager: {
+        getCurrentSession: () => ({ metadata: { sessionId: 'session-plan' } }),
+        listSessions: vi.fn(async () => []),
+      },
+      llm: { isAvailable: vi.fn(async () => true) },
+      workspaceRoot: '/tmp/workspace',
+      provider: 'autohandai',
+      model: 'fantail',
+      getContextPercentLeft: () => 100,
+      getTotalTokensUsed: () => 0,
+      config: {
+        provider: 'autohandai',
+        autohandai: { plan: 'cloud', authMode: 'account', accountToken: 'account-token', model: 'fantail' },
+        auth: { token: 'account-token', user: { id: 'u1', email: 'user@example.com', name: 'User' } },
+      },
+      getAccountEntitlement: vi.fn(async () => ({
+        tier: 'pro',
+        freeRemaining: null,
+        limits: {
+          displayName: 'Autohand Code Pro',
+          messagesPer5h: 250,
+          messagesPer24h: 1000,
+          messagesPerWeek: 7000,
+          rpm: 1000,
+          inputTokensPerMinute: 500_000,
+          outputTokensPerMinute: 80_000,
+          requiresEligibility: false,
+          perSeat: false,
+          models: ['fantail', 'moa'],
+        },
+      })),
+      isContextCompactionEnabled: () => true,
+    };
+
+    try {
+      const { status } = await import('../../src/commands/status.js');
+      const statusPromise = status(ctx as any);
+      while (input.listenerCount('data') === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      input.emit('data', '\u0003');
+      await statusPromise;
+
+      const rendered = consoleSpy.mock.calls.map((args) => args.join(' ')).join('\n');
+      expect(rendered).toContain('Plan:');
+      expect(rendered).toContain('Autohand Code Pro');
+      expect(rendered).toContain('250 requests / 5 hours');
+      expect(rendered).toContain('1K requests / 24 hours');
+      expect(rendered).toContain('7K requests / week');
+      expect(rendered).toContain('1K requests / minute');
+      expect(rendered).toContain('500K uncached input tokens / minute');
+      expect(rendered).toContain('80K output tokens / minute');
+    } finally {
+      Object.defineProperty(process, 'stdin', { value: originalStdin, writable: true, configurable: true });
+      Object.defineProperty(process, 'stdout', { value: originalStdout, writable: true, configurable: true });
+      consoleSpy.mockRestore();
+      vi.restoreAllMocks();
+    }
+  });
+
   it('labels context as estimated and shows unavailable actual token usage', async () => {
     const { EventEmitter } = await import('node:events');
     const originalStdin = process.stdin;
@@ -329,20 +420,55 @@ describe('/status command screen isolation', () => {
         isAvailable: vi.fn(async () => true),
       },
       workspaceRoot: '/tmp/workspace',
-      provider: 'openai',
-      model: 'gpt-5.5',
+      provider: 'autohandai',
+      model: 'moa',
       getContextPercentLeft: () => 90,
       getContextWindow: () => 258000,
       getTotalTokensUsed: () => 37500,
       getTokenUsageStatus: () => 'actual',
       config: {
-        provider: 'openai',
+        provider: 'autohandai',
         features: { usageV2: true },
-        openai: { apiKey: 'test', model: 'gpt-5.5', reasoningEffort: 'high', contextWindow: 258000 },
+        autohandai: { authMode: 'account', accountToken: 'test-token', model: 'moa', reasoningEffort: 'xhigh', contextWindow: 1_000_000 },
         permissions: { mode: 'interactive' },
         auth: { token: 'test-token', user: { id: 'u1', email: 'user@example.com', name: 'User' } },
       },
       isFeatureEnabled: () => true,
+      getAccountEntitlement: vi.fn(async () => ({
+        tier: 'pro',
+        freeRemaining: null,
+        limits: {
+          displayName: 'Autohand Code Pro',
+          messagesPer5h: 250,
+          messagesPer24h: 1000,
+          messagesPerWeek: 7000,
+          rpm: 200,
+          requiresEligibility: false,
+          perSeat: false,
+          models: ['fantail', 'moa'],
+        },
+        quota: {
+          available: true,
+          window5h: {
+            used: 12,
+            remaining: 238,
+            limit: 250,
+            resetAt: '2026-08-10T06:00:00.000Z',
+          },
+          window24h: {
+            used: 120,
+            remaining: 880,
+            limit: 1000,
+            resetAt: '2026-08-11T01:00:00.000Z',
+          },
+          week: {
+            used: 120,
+            remaining: 6880,
+            limit: 7000,
+            resetAt: '2026-08-17T01:00:00.000Z',
+          },
+        },
+      })),
       isContextCompactionEnabled: () => true,
     };
 
@@ -353,6 +479,7 @@ describe('/status command screen isolation', () => {
       while (input.listenerCount('data') === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
+      consoleSpy.mockClear();
       input.emit('data', '\t');
       input.emit('data', '\t');
       input.emit('data', '\u0003');
@@ -364,7 +491,19 @@ describe('/status command screen isolation', () => {
       expect(rendered).toContain('Context window:');
       expect(rendered).toContain('90% left');
       expect(rendered).toContain('37.5K used / 258K');
-      expect(rendered).toContain('Provider limits:');
+      expect(rendered).toContain('Autohand plan:');
+      expect(rendered).toContain('Autohand Code Pro');
+      expect(rendered).toContain('250 requests / 5 hours');
+      expect(rendered).toContain('1K requests / 24 hours');
+      expect(rendered).toContain('7K requests / week');
+      expect(rendered).toContain('200 requests / minute');
+      expect(rendered).toContain('5-hour quota:');
+      expect(rendered).toContain('12 used / 250');
+      expect(rendered).toContain('24-hour quota:');
+      expect(rendered).toContain('120 used / 1K');
+      expect(rendered).toContain('Weekly quota:');
+      expect(rendered).toContain('120 used / 7K');
+      expect(rendered).not.toContain('autohandai: not reported by provider');
     } finally {
       Object.defineProperty(process, 'stdin', { value: originalStdin, writable: true, configurable: true });
       Object.defineProperty(process, 'stdout', { value: originalStdout, writable: true, configurable: true });

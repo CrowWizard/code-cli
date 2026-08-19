@@ -47,7 +47,11 @@ function sanitizeMessages(messages: LLMMessage[]): Record<string, unknown>[] {
 
   return messages.flatMap((msg) => {
     if (msg.role === "tool" && (!msg.tool_call_id || !matchedToolCallIds.has(msg.tool_call_id))) {
-      return [];
+      const label = msg.name ? `: ${msg.name}` : "";
+      return [{
+        role: "system",
+        content: `[Recovered Tool Result${label}]\n${msg.content}`,
+      }];
     }
 
     const sanitized: Record<string, unknown> = {
@@ -120,6 +124,139 @@ function coerceErrorDetail(value: unknown): string {
     return JSON.stringify(value);
   }
   return "";
+}
+
+interface StructuredGatewayError {
+  type?: string;
+  message?: string;
+  scope?: string;
+  resetAt?: number;
+  upgradeUrl?: string;
+}
+
+function structuredGatewayError(value: unknown): StructuredGatewayError | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const body = value as Record<string, unknown>;
+  const rawError = body.error;
+  if (!rawError || typeof rawError !== "object" || Array.isArray(rawError)) return undefined;
+  const error = rawError as Record<string, unknown>;
+  return {
+    ...(typeof error.type === "string" ? { type: error.type } : {}),
+    ...(typeof error.message === "string" ? { message: error.message } : {}),
+    ...(typeof error.scope === "string" ? { scope: error.scope } : {}),
+    ...(typeof error.resetAt === "number"
+      && Number.isSafeInteger(error.resetAt)
+      && error.resetAt > 0
+      ? { resetAt: error.resetAt }
+      : {}),
+    ...(typeof error.upgradeUrl === "string" ? { upgradeUrl: error.upgradeUrl } : {}),
+  };
+}
+
+const AUTOHAND_QUOTA_SCOPE_LABELS = {
+  window_5h: "5-hour request quota",
+  window_24h: "24-hour request quota",
+  window_week: "weekly request quota",
+} as const;
+
+const AUTOHAND_TOKEN_THROUGHPUT_SCOPE_LABELS = {
+  input_tpm: "uncached input-token throughput",
+  output_tpm: "output-token throughput",
+} as const;
+
+type AutohandQuotaScope = keyof typeof AUTOHAND_QUOTA_SCOPE_LABELS;
+type AutohandTokenThroughputScope = keyof typeof AUTOHAND_TOKEN_THROUGHPUT_SCOPE_LABELS;
+type AutohandRateLimitScope = AutohandQuotaScope | AutohandTokenThroughputScope | "rpm";
+
+class AutohandRateLimitError extends ApiError {
+  readonly scope: AutohandRateLimitScope;
+
+  constructor(
+    message: string,
+    httpStatus: number,
+    retryable: boolean,
+    scope: AutohandRateLimitScope,
+    retryAfterMs?: number,
+    rawDetail?: string,
+  ) {
+    super(message, "rate_limited", httpStatus, retryable, retryAfterMs, rawDetail);
+    this.scope = scope;
+  }
+}
+
+function isAutohandQuotaScope(value: string | undefined): value is AutohandQuotaScope {
+  return value === "window_5h" || value === "window_24h" || value === "window_week";
+}
+
+function isAutohandTokenThroughputScope(value: string | undefined): value is AutohandTokenThroughputScope {
+  return value === "input_tpm" || value === "output_tpm";
+}
+
+function formatResetDistance(resetAtMs: number, nowMs: number): string {
+  const minutes = Math.max(1, Math.ceil((resetAtMs - nowMs) / 60_000));
+  const days = Math.floor(minutes / (24 * 60));
+  const hours = Math.floor((minutes % (24 * 60)) / 60);
+  const remainingMinutes = minutes % 60;
+  const parts = [
+    ...(days > 0 ? [`${days}d`] : []),
+    ...(hours > 0 ? [`${hours}h`] : []),
+    ...(remainingMinutes > 0 ? [`${remainingMinutes}m`] : []),
+  ];
+  return parts.join(" ") || "less than a minute";
+}
+
+function formatAutohandQuotaReset(resetAtSeconds: number | undefined): string {
+  if (resetAtSeconds === undefined) {
+    return "Reset time is temporarily unavailable. Run /usage to refresh your quota.";
+  }
+
+  const resetAtMs = resetAtSeconds * 1000;
+  const resetAt = new Date(resetAtMs);
+  if (!Number.isFinite(resetAt.getTime())) {
+    return "Reset time is temporarily unavailable. Run /usage to refresh your quota.";
+  }
+
+  const formatter = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  const timeZone = formatter.resolvedOptions().timeZone || "local time";
+  return `Resets ${formatter.format(resetAt)} (${timeZone}) · in ${formatResetDistance(resetAtMs, Date.now())}.`;
+}
+
+function buildAutohandQuotaMessage(error: StructuredGatewayError): string {
+  const scope = error.scope as AutohandQuotaScope;
+  const upgradeUrl = trustedAutohandUpgradeUrl(error.upgradeUrl);
+  const upgradeMessage = upgradeUrl
+    ? `\nUpgrade your Autohand Code plan for more usage: ${upgradeUrl}`
+    : "";
+  return `Autohand AI ${AUTOHAND_QUOTA_SCOPE_LABELS[scope]} reached.`
+    + `\n${error.message ?? "Your current request quota is exhausted."}`
+    + `\n${formatAutohandQuotaReset(error.resetAt)}`
+    + upgradeMessage;
+}
+
+function buildAutohandTokenThroughputMessage(error: StructuredGatewayError): string {
+  const scope = error.scope as AutohandTokenThroughputScope;
+  const upgradeUrl = trustedAutohandUpgradeUrl(error.upgradeUrl);
+  const upgradeMessage = upgradeUrl
+    ? `\nUpgrade your Autohand Code plan for more usage: ${upgradeUrl}`
+    : "";
+  return `Autohand AI ${AUTOHAND_TOKEN_THROUGHPUT_SCOPE_LABELS[scope]} reached.`
+    + `\n${error.message ?? "Your token throughput is exhausted for this minute."}`
+    + upgradeMessage;
+}
+
+function trustedAutohandUpgradeUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname === "console.autohand.ai"
+      ? url.toString()
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export class LLMGatewayClient {
@@ -229,8 +366,12 @@ export class LLMGatewayClient {
 
         // If we have more attempts left, wait before retrying
         if (attempt < this.maxRetries) {
-          const delay = this.retryDelay * Math.pow(2, attempt); // Exponential backoff
-          await this.sleep(delay);
+          const delay = lastError instanceof AutohandRateLimitError
+            && lastError.scope === "rpm"
+            && lastError.retryAfterMs !== undefined
+            ? lastError.retryAfterMs
+            : this.retryDelay * Math.pow(2, attempt);
+          await this.sleep(delay, request.signal);
         }
       }
     }
@@ -444,9 +585,15 @@ export class LLMGatewayClient {
 
     // Try to get the actual error message from the response
     let errorDetail = "";
+    let structuredError: StructuredGatewayError | undefined;
     try {
-      const body = (await response.json()) as any;
-      errorDetail = coerceErrorDetail(body?.error?.message || body?.error || body?.message);
+      const body = await response.json() as unknown;
+      structuredError = structuredGatewayError(body);
+      const bodyRecord = body && typeof body === "object" && !Array.isArray(body)
+        ? body as Record<string, unknown>
+        : undefined;
+      errorDetail = structuredError?.message
+        ?? (coerceErrorDetail(bodyRecord?.error) || coerceErrorDetail(bodyRecord?.message));
     } catch {
       // Fallback to raw text if JSON parsing fails
       try {
@@ -456,14 +603,72 @@ export class LLMGatewayClient {
       }
     }
 
+    if (this.errorLabels.serviceName === "Autohand AI" && structuredError?.type === "model_not_available") {
+      const upgradeUrl = trustedAutohandUpgradeUrl(structuredError.upgradeUrl);
+      const message = `Access denied. ${structuredError.message ?? "This model is not available on your current plan."}`
+        + (upgradeUrl ? `\nPlease upgrade your plan: ${upgradeUrl}` : "");
+      return new ApiError(message, "access_denied", status, false, undefined, errorDetail);
+    }
+
+    if (this.errorLabels.serviceName === "Autohand AI"
+      && structuredError?.type === "rate_limited"
+      && isAutohandQuotaScope(structuredError.scope)) {
+      return new AutohandRateLimitError(
+        buildAutohandQuotaMessage(structuredError),
+        status,
+        false,
+        structuredError.scope,
+        undefined,
+        errorDetail,
+      );
+    }
+
+    if (this.errorLabels.serviceName === "Autohand AI"
+      && structuredError?.type === "rate_limited"
+      && isAutohandTokenThroughputScope(structuredError.scope)) {
+      return new AutohandRateLimitError(
+        buildAutohandTokenThroughputMessage(structuredError),
+        status,
+        false,
+        structuredError.scope,
+        undefined,
+        errorDetail,
+      );
+    }
+
+    if (this.errorLabels.serviceName === "Autohand AI"
+      && structuredError?.type === "rate_limited"
+      && structuredError.scope === "rpm") {
+      const classified = classifyApiError(status, errorDetail, response.headers);
+      const friendlyMessage = buildFriendlyErrors(this.errorLabels).rate_limited;
+      return new AutohandRateLimitError(
+        `${friendlyMessage}\n${structuredError.message ?? errorDetail}`,
+        status,
+        true,
+        "rpm",
+        classified.retryAfterMs,
+        errorDetail,
+      );
+    }
+
     const classified = classifyApiError(status, errorDetail, response.headers);
     const friendlyMessage = buildFriendlyErrors(this.errorLabels)[classified.code];
     if (friendlyMessage) {
+      const upgradeUrl = this.errorLabels.serviceName === "Autohand AI"
+        ? trustedAutohandUpgradeUrl(structuredError?.upgradeUrl)
+        : undefined;
+      const upgradeMessage = classified.code === "rate_limited" && upgradeUrl
+        ? `\nUpgrade your Autohand Code plan for more usage: ${upgradeUrl}`
+        : "";
+      const retryable = this.errorLabels.serviceName === "Autohand AI"
+        && classified.code === "rate_limited"
+        ? false
+        : classified.retryable;
       return new ApiError(
-        errorDetail ? `${friendlyMessage}\n${errorDetail}` : friendlyMessage,
+        `${errorDetail ? `${friendlyMessage}\n${errorDetail}` : friendlyMessage}${upgradeMessage}`,
         classified.code,
         classified.httpStatus,
-        classified.retryable,
+        retryable,
         classified.retryAfterMs,
         classified.rawDetail,
       );
@@ -527,7 +732,21 @@ export class LLMGatewayClient {
     return controller.signal;
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new ApiError("Request cancelled.", "cancelled", 0, false));
+    }
+
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timeoutId);
+        reject(new ApiError("Request cancelled.", "cancelled", 0, false));
+      };
+      const timeoutId = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 }

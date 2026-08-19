@@ -7,7 +7,8 @@ import chalk from 'chalk';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { getProviderConfig } from '../../config.js';
+import { getProviderConfig, saveConfig } from '../../config.js';
+import { applyStartupProviderDefaults } from '../../commands/login.js';
 import type {
   AgentRuntime,
   LLMToolCall,
@@ -37,6 +38,7 @@ import { shouldForceAgentIdleLogout } from './AgentSessionAccounting.js';
 import { consumeAgentInkSubmittedInstructionEcho } from './AgentUIRuntime.js';
 import {
   createQueuedAgentInstruction,
+  resolveActiveGoalContinuation,
   unpackQueuedAgentInstruction,
   type PendingPostTurnAction,
   type SequencedQueuedAgentInstruction,
@@ -122,6 +124,7 @@ export interface FreshAgentSessionStateHost {
   lastActivityAt: number;
   imageManager?: Pick<ImageManager, 'clear'>;
   sessionDiffStatsTracker?: SessionDiffStatsTracker;
+  specialistOrchestrator?: { clearSessionContext(): void };
 }
 
 export function resetFreshAgentSessionState(
@@ -150,6 +153,7 @@ export function resetFreshAgentSessionState(
   host.lastAssistantResponseForNotification = '';
   host.lastActivityAt = startedAt;
   host.imageManager?.clear();
+  host.specialistOrchestrator?.clearSessionContext();
   if (host.sessionDiffStatsTracker) {
     host.sessionDiffStatsTracker = new SessionDiffStatsTracker(host.runtime.workspaceRoot);
   }
@@ -445,7 +449,23 @@ function isRuntimeResourceShutdownStarted(host: AgentLifecycleHost): boolean {
     || host.runtimeResourceShutdownController?.signal.aborted === true;
 }
 
+/**
+ * Retroactively catches accounts that authenticated before autohandai defaulting existed and
+ * never re-run /login (applyPostLoginProviderDefault only fires on a fresh /login). A no-op,
+ * including the write, on every run after the first time it actually applies — see
+ * applyStartupProviderDefaults in commands/login.ts.
+ */
+async function applyStartupProviderDefaultsToHost(host: AgentLifecycleHost): Promise<void> {
+  const before = host.runtime.config as LoadedConfig;
+  const after = applyStartupProviderDefaults(before);
+  if (after === before) return;
+  host.runtime.config = after;
+  await saveConfig(after);
+}
+
 export async function runAgentInteractive(host: AgentLifecycleHost, initialInstruction?: string): Promise<void> {
+    await applyStartupProviderDefaultsToHost(host);
+
     // Bail out early if stdin is not a TTY - interactive mode requires a terminal
     if (!process.stdin.isTTY) {
       console.error(chalk.red('Interactive mode requires a terminal (TTY). Use --prompt for non-interactive usage.'));
@@ -624,6 +644,8 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       host.persistentConsoleBridgeCleanup = null;
       callResourceCleanupSync(host.announcementUnsubscribe ?? undefined);
       host.announcementUnsubscribe = null;
+      callResourceCleanupSync(host.teamActivityUnsubscribe ?? undefined);
+      host.teamActivityUnsubscribe = null;
 
       callResourceCleanupSync(() => host.repeatManager?.shutdown());
       host.persistentInputActiveTurn = false;
@@ -972,6 +994,8 @@ export async function runAgentCommandMode(
   instruction: string,
   commandOptions: AbortSignal | RunAgentCommandModeOptions = {},
 ): Promise<boolean> {
+    await applyStartupProviderDefaultsToHost(host);
+
     const options = 'aborted' in commandOptions
       ? { signal: commandOptions }
       : commandOptions;
@@ -1675,6 +1699,19 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
           } else if (publicationResult) {
             console.log(renderTerminalMarkdown(publicationResult));
           }
+        }
+        const goalContinuation = await resolveActiveGoalContinuation(
+          {
+            runtime: host.runtime,
+            sessionId: host.sessionManager.getCurrentSession()?.metadata.sessionId,
+            shouldExit: host.shouldExit,
+            interactiveAutomodeEnabled: host.interactiveAutomodeEnabled,
+            runtimeResourceShutdownController: host.runtimeResourceShutdownController,
+          },
+          turnSucceeded,
+        );
+        if (goalContinuation) {
+          host.pendingInkInstructions.push(createQueuedAgentInstruction({ text: goalContinuation }));
         }
         host.flushMcpStartupSummaryIfPending();
 

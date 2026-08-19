@@ -28,7 +28,7 @@ import { autoInitTheme, configureThemeSources, themeExists } from "./ui/theme/in
 import { loadLocalProjectSettings, type LocalProjectSettings } from "./permissions/localProjectPermissions.js";
 import { isAwsBedrockProviderEnabled } from "./features/featureRegistry.js";
 import { getCustomProviderConfig, isCustomProviderName } from "./providers/customProviders.js";
-import { getProviderDefaultModel, getProviderRuntimeDefaultModel } from "./providers/modelCatalog.js";
+import { getProviderDefaultModel, getProviderModelOptions, getProviderRuntimeDefaultModel } from "./providers/modelCatalog.js";
 
 const DEFAULT_CONFIG_PATH = AUTOHAND_FILES.configJson;
 const TOML_CONFIG_PATH = AUTOHAND_FILES.configToml;
@@ -45,8 +45,7 @@ const DEFAULT_SAKANA_URL = "https://api.sakana.ai/v1";
 const DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com";
 const DEFAULT_BEDROCK_REGION = "us-east-1";
 const DEFAULT_AUTOHAND_AI_URL = "https://api.autohand.ai/v1";
-const DEFAULT_AUTOHAND_AI_CONTEXT_WINDOW = 16_000;
-const DEFAULT_AUTOHAND_AI_MOA_CONTEXT_WINDOW = 1_000_000;
+const DEFAULT_CONTROL_PLANE_API_URL = "https://api.autohand.ai";
 
 interface LegacyConfigShape {
   api_key?: string;
@@ -142,6 +141,7 @@ function createDefaultConfig(): AutohandConfig {
       completionReportEnabled: true,
       activityVerbsEnabled: true,
       promptSuggestions: true,
+      mouseComposerCursor: true,
     },
     telemetry: {
       enabled: false,
@@ -612,6 +612,27 @@ function mergeWorkspaceSettings(
   return merged;
 }
 
+function normalizeSavedApiBaseUrl(baseUrl: string | undefined): string | undefined {
+  const normalized = baseUrl?.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  try {
+    const hostname = new URL(normalized).hostname.toLowerCase();
+    if (
+      hostname === "autohand-web.pages.dev"
+      || hostname.endsWith(".autohand-web.pages.dev")
+    ) {
+      return DEFAULT_CONTROL_PLANE_API_URL;
+    }
+  } catch {
+    return normalized;
+  }
+
+  return normalized;
+}
+
 /**
  * Merge environment variables into config
  * Env vars take precedence over config file values
@@ -622,8 +643,8 @@ function mergeEnvVariables(config: AutohandConfig): AutohandConfig {
     api: {
       baseUrl:
         process.env.AUTOHAND_API_URL ||
-        config.api?.baseUrl ||
-        "https://api.autohand.ai",
+        normalizeSavedApiBaseUrl(config.api?.baseUrl) ||
+        DEFAULT_CONTROL_PLANE_API_URL,
       companySecret:
         process.env.AUTOHAND_SECRET || config.api?.companySecret || "",
     },
@@ -641,7 +662,7 @@ function mergeEnvVariables(config: AutohandConfig): AutohandConfig {
       plan: "cloud" as const,
       authMode: "api-key" as const,
       model: process.env.AUTOHAND_MODEL || "fantail",
-      contextWindow: DEFAULT_AUTOHAND_AI_CONTEXT_WINDOW,
+      contextWindow: defaultAutohandAIContextWindow({ plan: "cloud", model: "fantail" }),
     };
     config = {
       ...config,
@@ -710,10 +731,10 @@ function mergeEnvVariables(config: AutohandConfig): AutohandConfig {
 }
 
 function defaultAutohandAIContextWindow(settings: AutohandAISettings): number {
-  if (settings.plan === "local" || settings.model === "moa") {
-    return DEFAULT_AUTOHAND_AI_MOA_CONTEXT_WINDOW;
-  }
-  return DEFAULT_AUTOHAND_AI_CONTEXT_WINDOW;
+  return getProviderModelOptions("autohandai")
+    .find((model) => model.id === settings.model)?.contextWindow
+    ?? settings.contextWindow
+    ?? 128_000;
 }
 
 function normalizeConfig(
@@ -750,6 +771,7 @@ function normalizeConfig(
         completionReportEnabled: true,
         activityVerbsEnabled: true,
         promptSuggestions: true,
+        mouseComposerCursor: true,
       },
     };
   }
@@ -867,6 +889,12 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
       typeof config.ui.promptSuggestions !== "boolean"
     ) {
       throw new Error(`ui.promptSuggestions must be boolean in ${configPath}`);
+    }
+    if (
+      config.ui.mouseComposerCursor !== undefined &&
+      typeof config.ui.mouseComposerCursor !== "boolean"
+    ) {
+      throw new Error(`ui.mouseComposerCursor must be boolean in ${configPath}`);
     }
     if (
       config.ui.completionReportEnabled !== undefined &&
@@ -1185,7 +1213,9 @@ export function getProviderConfig(
     ...entry,
     baseUrl: entry.baseUrl ?? defaultBaseUrlFor(builtInProvider, entry.port),
     ...(chosen === "autohandai" && {
-      contextWindow: entry.contextWindow ?? defaultAutohandAIContextWindow(entry as AutohandAISettings),
+      contextWindow: (entry as AutohandAISettings).plan === "local"
+        ? entry.contextWindow ?? defaultAutohandAIContextWindow(entry as AutohandAISettings)
+        : defaultAutohandAIContextWindow(entry as AutohandAISettings),
     }),
   };
 }

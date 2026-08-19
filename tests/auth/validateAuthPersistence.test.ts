@@ -62,6 +62,142 @@ describe('AuthClient.validateSession network error handling', () => {
   });
 });
 
+describe('AuthClient.fetchEntitlement', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns the authoritative plan name, request quotas, and throughput', async () => {
+    const client = new AuthClient({ baseUrl: 'https://auth.example.com', timeout: 5000 });
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        entitlement: {
+          tier: 'pro',
+          freeRemaining: null,
+          limits: {
+            displayName: 'Autohand Code Pro',
+            messagesPer5h: 250,
+            messagesPer24h: 1000,
+            messagesPerWeek: 7000,
+            rpm: 1000,
+            inputTokensPerMinute: 500_000,
+            outputTokensPerMinute: 80_000,
+            requiresEligibility: false,
+            perSeat: false,
+            models: ['fantail', 'moa'],
+          },
+          quota: {
+            available: true,
+            window5h: {
+              used: 12,
+              remaining: 238,
+              limit: 250,
+              resetAt: '2026-08-10T06:00:00.000Z',
+            },
+            window24h: {
+              used: 120,
+              remaining: 880,
+              limit: 1000,
+              resetAt: '2026-08-11T01:00:00.000Z',
+            },
+            week: {
+              used: 120,
+              remaining: 6880,
+              limit: 7000,
+              resetAt: '2026-08-17T01:00:00.000Z',
+            },
+          },
+        },
+      }), { status: 200 }),
+    );
+
+    await expect(client.fetchEntitlement('pro-token')).resolves.toEqual({
+      tier: 'pro',
+      freeRemaining: null,
+      limits: {
+        displayName: 'Autohand Code Pro',
+        messagesPer5h: 250,
+        messagesPer24h: 1000,
+        messagesPerWeek: 7000,
+        rpm: 1000,
+        inputTokensPerMinute: 500_000,
+        outputTokensPerMinute: 80_000,
+        requiresEligibility: false,
+        perSeat: false,
+        models: ['fantail', 'moa'],
+      },
+      quota: {
+        available: true,
+        window5h: {
+          used: 12,
+          remaining: 238,
+          limit: 250,
+          resetAt: '2026-08-10T06:00:00.000Z',
+        },
+        window24h: {
+          used: 120,
+          remaining: 880,
+          limit: 1000,
+          resetAt: '2026-08-11T01:00:00.000Z',
+        },
+        week: {
+          used: 120,
+          remaining: 6880,
+          limit: 7000,
+          resetAt: '2026-08-17T01:00:00.000Z',
+        },
+      },
+    });
+  });
+
+  it('accepts the pre-rollout entitlement contract without a 24-hour quota', async () => {
+    const client = new AuthClient({ baseUrl: 'https://auth.example.com', timeout: 5000 });
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        entitlement: {
+          tier: 'pro',
+          freeRemaining: null,
+          limits: {
+            displayName: 'Autohand Code Pro',
+            messagesPer5h: 100,
+            messagesPerWeek: 1000,
+            rpm: 100,
+            requiresEligibility: false,
+            perSeat: false,
+            models: ['fantail', 'moa'],
+          },
+          quota: {
+            available: true,
+            window5h: {
+              used: 12,
+              remaining: 88,
+              limit: 100,
+              resetAt: '2026-08-10T06:00:00.000Z',
+            },
+            week: {
+              used: 120,
+              remaining: 880,
+              limit: 1000,
+              resetAt: '2026-08-17T01:00:00.000Z',
+            },
+          },
+        },
+      }), { status: 200 }),
+    );
+
+    await expect(client.fetchEntitlement('pro-token')).resolves.toMatchObject({
+      limits: {
+        messagesPer24h: null,
+        inputTokensPerMinute: null,
+        outputTokensPerMinute: null,
+      },
+      quota: { window24h: null },
+    });
+  });
+});
+
 describe('AuthClient device authorization cancellation', () => {
   const deviceCode = 'D'.repeat(43);
 
@@ -77,14 +213,14 @@ describe('AuthClient device authorization cancellation', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({
         success: true,
-        schemaVersion: 1,
+        schemaVersion: 2,
         status: 'cancelled',
       }), { status: 200 }),
     );
 
     await expect(client.cancelDeviceAuth(deviceCode)).resolves.toEqual({
       success: true,
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: 'cancelled',
     });
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -93,7 +229,7 @@ describe('AuthClient device authorization cancellation', () => {
       expect.objectContaining({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceCode, schemaVersion: 1 }),
+        body: JSON.stringify({ deviceCode, schemaVersion: 2 }),
       }),
     );
   });

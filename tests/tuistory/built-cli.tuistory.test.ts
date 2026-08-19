@@ -19,15 +19,19 @@ import { hasTerminalProcessPid } from '../../src/testing/assertions/terminalOutp
 import { getHelpOrderedSlashCommands } from '../../src/ui/inputPrompt.js';
 import {
   clearComposerInput,
+  createMockAutohandAINativeSequenceServer,
+  createMockAutohandAINativeToolServer,
+  createMockAutohandAIQuotaServer,
   createFailingOpenRouterFetchPreload,
   createMockChangelogFetchPreload,
   createMockAuthServer,
   createMockMobilePairingFetchPreload,
+  createMockOllamaServer,
+  createMockOpenRouterServer,
   createMockOpenRouterFetchPreload,
   createMockOpenRouterSequenceServer,
   createMockSkillInstallFetchPreload,
   createMockSubAgentCatalogFetchPreload,
-  createMockOllamaServer,
   createStalledSyncFetchPreload,
   createTempAutohandHome,
   dismissAutocompleteMenu,
@@ -77,6 +81,21 @@ function latestStableRepositoryVersion(): string {
 
 function isModalNumericShortcut(value: string | undefined): value is ModalNumericShortcut {
   return value !== undefined && MODAL_NUMERIC_SHORTCUTS.has(value);
+}
+
+async function selectModalOptionByLabel(session: Session, label: string): Promise<void> {
+  for (let index = 0; index < 30; index += 1) {
+    const screen = await session.text({ trimEnd: true });
+    const selectedLine = screen
+      .split('\n')
+      .find((line) => line.includes('▸') && line.includes(label));
+    if (selectedLine) {
+      await session.press('enter');
+      return;
+    }
+    await session.press('down');
+  }
+  throw new Error(`Could not select modal option: ${label}`);
 }
 
 async function trackSession(sessionPromise: Promise<Session>): Promise<Session> {
@@ -139,6 +158,22 @@ async function waitForCursorAfterTypedText(session: Session, typedText: string):
 
   expectCursorAfterTypedText(screen, visibleText);
   return screen;
+}
+
+async function waitForTerminalCursorVisible(session: Session): Promise<void> {
+  const deadline = Date.now() + 2_000;
+
+  while (Date.now() < deadline) {
+    if (session.getTerminalData().cursorVisible) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  expect(
+    session.getTerminalData().cursorVisible,
+    JSON.stringify(session.getRawOutput().slice(-2_000)),
+  ).toBe(true);
 }
 
 function linesContaining(screen: string, text: string): string[] {
@@ -239,6 +274,201 @@ afterEach(async () => {
 });
 
 describe('built CLI Tuistory smoke tests', () => {
+  it('keeps a prior-session goal dormant when a fresh MOA session starts with an acknowledgement', async () => {
+    const nativeToolServer = await createMockAutohandAINativeSequenceServer([
+      {
+        content: 'Checking whether an old goal should drive this turn.',
+        toolCall: {
+          id: 'call_get_goal',
+          name: 'get_goal',
+        },
+      },
+      { content: 'FRESH_SESSION_ACKNOWLEDGED' },
+    ]);
+    mockServers.push(nativeToolServer);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'autohandai',
+        autohandai: {
+          plan: 'cloud',
+          authMode: 'api-key',
+          apiKey: 'tuistory-autohand-api-key',
+          model: 'moa',
+          baseUrl: nativeToolServer.baseUrl,
+        },
+        features: { autohand_inference: true, slashGoal: true },
+        agent: { autoMemory: false, maxIterations: 4, sessionRetryLimit: 0 },
+        network: { maxRetries: 0, retryDelay: 0 },
+        ui: {
+          promptSuggestions: false,
+          showCompletionNotification: false,
+          terminalBell: false,
+        },
+      },
+    });
+    tempStates.push(state);
+
+    const staleGoalPath = path.join(state.workspaceRoot, '.autohand', 'goals.local.json');
+    const staleUpdatedAt = Date.parse('2026-06-01T00:00:00.000Z');
+    await fs.outputJson(staleGoalPath, {
+      version: 1,
+      goal: {
+        goalId: 'prior-session-goal',
+        objective: 'WRITE_THE_OLD_JUNE_IMPROVEMENT_REPORT',
+        status: 'active',
+        tokensUsed: 27_424_831,
+        timeUsedSeconds: 5_270_977,
+        createdAt: staleUpdatedAt,
+        updatedAt: staleUpdatedAt,
+      },
+      queue: [],
+      completed: [],
+      updatedAt: staleUpdatedAt,
+    });
+
+    const session = await trackSession(launchBuiltAutohand([
+      '--path', state.workspaceRoot,
+      '--config', state.configPath,
+    ], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      waitForDataTimeout: 15_000,
+    }));
+
+    await session.waitForText('❯', { timeout: 20_000 });
+    await session.type('ok');
+    await session.press('enter');
+    await session.waitForText('FRESH_SESSION_ACKNOWLEDGED', { timeout: 20_000 });
+
+    const continuationMessages = nativeToolServer.requests[1]?.messages as Array<{
+      role?: string;
+      content?: string;
+      tool_call_id?: string;
+    }>;
+    const goalResult = continuationMessages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'call_get_goal'
+    ));
+    expect(goalResult?.content).toContain('not attached to the current session');
+    expect(goalResult?.content).not.toContain('WRITE_THE_OLD_JUNE_IMPROVEMENT_REPORT');
+
+    const persisted = await fs.readJson(staleGoalPath) as {
+      goal: { tokensUsed: number; timeUsedSeconds: number; updatedAt: number };
+    };
+    expect(persisted.goal).toMatchObject({
+      tokensUsed: 27_424_831,
+      timeUsedSeconds: 5_270_977,
+      updatedAt: staleUpdatedAt,
+    });
+
+    await exitInteractive(session);
+  }, 45_000);
+
+  it('round-trips one native Moa tool result without repeating the call', async () => {
+    const nativeToolServer = await createMockAutohandAINativeToolServer();
+    mockServers.push(nativeToolServer);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'autohandai',
+        autohandai: {
+          plan: 'cloud',
+          authMode: 'api-key',
+          apiKey: 'tuistory-autohand-api-key',
+          model: 'moa',
+          baseUrl: nativeToolServer.baseUrl,
+        },
+        features: { autohand_inference: true },
+        agent: { maxIterations: 4, sessionRetryLimit: 0 },
+        network: { maxRetries: 0, retryDelay: 0 },
+      },
+    });
+    tempStates.push(state);
+
+    const session = await trackSession(launchBuiltAutohand([
+      '--path', state.workspaceRoot,
+      '--config', state.configPath,
+      '--prompt', 'Read package.json exactly once and report its package name.',
+      '--y',
+    ], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      waitForDataTimeout: 15_000,
+    }));
+
+    await waitForExit(session, 30_000);
+    const output = session.readAll();
+    expect(output).toContain('MOA_NATIVE_TOOL_HISTORY_OK');
+    expect(output).not.toContain('I stopped repeated tool calls');
+    expect(nativeToolServer.requests).toHaveLength(2);
+
+    const firstTools = nativeToolServer.requests[0]?.tools as Array<{
+      function?: { name?: string };
+    }>;
+    expect(firstTools.some((tool) => tool.function?.name === 'read_file')).toBe(true);
+
+    const continuationMessages = nativeToolServer.requests[1]?.messages as Array<{
+      role?: string;
+      content?: string;
+      tool_call_id?: string;
+      tool_calls?: Array<{ id?: string }>;
+    }>;
+    expect(continuationMessages).toContainEqual(expect.objectContaining({
+      role: 'assistant',
+      tool_calls: [expect.objectContaining({ id: 'call_read_package' })],
+    }));
+    expect(continuationMessages).toContainEqual(expect.objectContaining({
+      role: 'tool',
+      tool_call_id: 'call_read_package',
+      content: expect.stringContaining('tuistory-workspace'),
+    }));
+    expectCleanExit(session);
+  }, 45_000);
+
+  it('recommends upgrading when an Autohand AI request quota is exhausted', async () => {
+    const quotaServer = await createMockAutohandAIQuotaServer();
+    mockServers.push(quotaServer);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'autohandai',
+        autohandai: {
+          plan: 'cloud',
+          authMode: 'api-key',
+          apiKey: 'tuistory-autohand-api-key',
+          model: 'fantail',
+          baseUrl: quotaServer.baseUrl,
+        },
+        features: { autohand_inference: true },
+        network: { maxRetries: 0, retryDelay: 0 },
+      },
+    });
+    tempStates.push(state);
+    const session = await trackSession(launchBuiltAutohand([
+      '--path', state.workspaceRoot,
+      '--config', state.configPath,
+      '--offline',
+    ], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: { TZ: 'Pacific/Auckland' },
+      waitForDataTimeout: 15_000,
+    }));
+
+    await session.waitForText('❯', { timeout: 15_000 });
+    await typeLikeUser(session, 'hey');
+    await session.press('enter');
+    await session.waitForText('Upgrade your Autohand Code plan for more usage', { timeout: 20_000 });
+    const output = session.readAll();
+
+    expect(output).toContain('Autohand AI 24-hour request quota reached.');
+    expect(output).toContain("You've used all your requests in this 24-hour window.");
+    expect(output).toContain('(Pacific/Auckland) · in 2h 30m.');
+    expect(output).toContain(
+      'Upgrade your Autohand Code plan for more usage: https://console.autohand.ai/upgrade/?from=cli&tier=pro',
+    );
+    expect(output).not.toContain('Please wait a moment and try again');
+    expect(output.match(/Autohand AI 24-hour request quota reached\./gu)).toHaveLength(1);
+    await exitInteractive(session);
+  });
+
   it('renders help from the built dist entrypoint', async () => {
     const session = await trackSession(launchBuiltAutohand(['--help'], {
       waitForDataTimeout: 15_000,
@@ -304,6 +534,33 @@ describe('built CLI Tuistory smoke tests', () => {
     expect(output).toContain(packageJson.version);
     expect(output).toMatch(/\d+\.\d+\.\d+ \((?:[0-9a-f]{7,40}|unknown)\)/);
 
+    await waitForExit(session);
+    expectCleanExit(session);
+  });
+
+  it('starts when a user catalog has an incomplete Fantail override', async () => {
+    const state = await createTempAutohandHome();
+    tempStates.push(state);
+    await writeFile(
+      path.join(state.autohandHome, 'models.json'),
+      JSON.stringify({
+        providers: {
+          autohandai: {
+            defaultModel: 'fantail',
+            models: ['fantail'],
+          },
+        },
+      }),
+    );
+    const session = await trackSession(launchBuiltAutohand(['--version'], {
+      autohandHome: state.autohandHome,
+      waitForDataTimeout: 15_000,
+    }));
+
+    await session.waitForText(packageJson.version, { timeout: 10_000 });
+    const output = session.readAll();
+
+    expect(output).not.toContain('missing contextWindow');
     await waitForExit(session);
     expectCleanExit(session);
   });
@@ -456,6 +713,7 @@ describe('built CLI Tuistory smoke tests', () => {
       config: {
         openrouter: { baseUrl: openRouterServer.baseUrl },
         agent: { maxIterations: 8, sessionRetryLimit: 0 },
+        features: { automaticSpecialists: false },
       },
     });
     tempStates.push(state);
@@ -629,6 +887,52 @@ describe('interactive built CLI Tuistory tests', () => {
     });
   }
 
+  it('keeps working-turn status refreshes from refocusing a drafted composer', async () => {
+    const openRouterServer = await createMockOpenRouterServer(
+      'Delayed response completed.',
+      4_000,
+    );
+    mockServers.push(openRouterServer);
+    const session = await launchInteractive({
+      config: {
+        openrouter: { baseUrl: openRouterServer.baseUrl },
+        agent: { sessionRetryLimit: 0 },
+      },
+    });
+    await waitForComposer(session);
+
+    await session.type('Run a delayed response while I inspect the chat history.');
+    await session.press('enter');
+    await session.text({
+      timeout: 10_000,
+      waitFor: (text) => text.includes('esc to cancel'),
+    });
+    await session.type('preserve this draft');
+    await session.text({
+      timeout: 5_000,
+      waitFor: (text) => composerLineIncludes(text, 'preserve this draft'),
+    });
+
+    const outputStart = session.getRawOutput().length;
+    await new Promise<void>((resolve) => setTimeout(resolve, 2_200));
+    const refreshOutput = session.getRawOutput().slice(outputStart);
+
+    expect(stripAnsi(refreshOutput)).toMatch(/\b0m 0[12]s\b/u);
+    expect(refreshOutput).not.toContain('\x1b[?25h');
+
+    const completionOutputStart = session.getRawOutput().length;
+    await session.text({
+      timeout: 10_000,
+      waitFor: (text) => text.includes('Delayed response completed.'),
+    });
+    const completionOutput = session.getRawOutput().slice(completionOutputStart);
+    expect(completionOutput).not.toContain('\x1b[?25h');
+
+    await session.type('!');
+    await waitForCursorAfterTypedText(session, 'preserve this draft!');
+    await exitInteractive(session);
+  });
+
   const cachedAnnouncements = [
     {
       id: 'tuistory-announcement-one',
@@ -721,6 +1025,36 @@ describe('interactive built CLI Tuistory tests', () => {
     expect(liveAnnouncementLines[0]).toContain('Squad mode is ready');
     expect(liveAnnouncementLines[0]).not.toContain('Voice dictation is here');
 
+    await exitInteractive(session);
+  });
+
+  it('does not treat the Enter that submits /whatsnew as an announcement dismissal', async () => {
+    const session = await launchWithCachedAnnouncements();
+    await waitForComposer(session);
+
+    await session.type('/whatsnew');
+    await session.press('enter');
+    const modal = await session.text({
+      timeout: 10_000,
+      waitFor: (text) => (
+        text.includes("What's new")
+        && text.includes('Voice dictation is here')
+        && text.includes('Squad mode is ready')
+      ),
+      trimEnd: true,
+    });
+
+    expect(modal).toContain('Voice dictation is here');
+    expect(modal).toContain('Squad mode is ready');
+
+    await session.press('escape');
+    const restored = await session.text({
+      timeout: 10_000,
+      waitFor: (text) => text.includes('❯') && text.includes('Voice dictation is here'),
+      trimEnd: true,
+    });
+
+    expect(restored).toContain('Voice dictation is here');
     await exitInteractive(session);
   });
 
@@ -887,6 +1221,57 @@ describe('interactive built CLI Tuistory tests', () => {
 
     await exitInteractive(session);
   });
+
+  it('continues an active goal after a non-terminal model response', async () => {
+    const openRouterServer = await createMockOpenRouterSequenceServer([
+      JSON.stringify({
+        thought: 'The goal needs implementation work after this planning turn.',
+        toolCalls: [],
+        finalResponse: 'FIRST_GOAL_TURN_FINISHED',
+      }),
+      JSON.stringify({
+        thought: 'The implementation is now complete, so the persistent goal can be completed.',
+        toolCalls: [{ tool: 'update_goal', args: { status: 'complete' } }],
+      }),
+      JSON.stringify({
+        toolCalls: [],
+        finalResponse: 'GOAL_CONTINUATION_FINISHED',
+      }),
+    ]);
+    mockServers.push(openRouterServer);
+    const session = await launchInteractive({
+      config: {
+        openrouter: { baseUrl: openRouterServer.baseUrl },
+        features: { slashGoal: true },
+        agent: { autoMemory: false, maxIterations: 4, sessionRetryLimit: 0 },
+        network: { maxRetries: 0, retryDelay: 0 },
+        ui: {
+          promptSuggestions: false,
+          showCompletionNotification: false,
+          terminalBell: false,
+        },
+      },
+    });
+
+    await waitForComposer(session);
+    await session.type('/goal build a toddler-friendly browser game');
+    await session.press('enter');
+    await session.waitForText('Goal created.', { timeout: 10_000 });
+    await session.waitForText('FIRST_GOAL_TURN_FINISHED', { timeout: 15_000 });
+    await session.waitForText('GOAL_CONTINUATION_FINISHED', { timeout: 5_000 });
+
+    await waitForComposer(session);
+    await session.type('/goal');
+    await session.press('enter');
+    await session.waitForText('Status: complete', { timeout: 5_000 });
+
+    const output = session.readAll();
+    expect(output).toContain('Interactive auto mode active');
+    expect(output).toContain('GOAL_CONTINUATION_FINISHED');
+    expect(output.match(/GOAL_CONTINUATION_FINISHED/gu)).toHaveLength(1);
+
+    await exitInteractive(session);
+  }, 45_000);
 
   it('starts device auth from the startup auth gate', async () => {
     const state = await createTempAutohandHome({
@@ -1097,6 +1482,47 @@ describe('interactive built CLI Tuistory tests', () => {
     expect(screen).not.toContain('helloX');
 
     await exitInteractive(session);
+  });
+
+  it('positions the real composer cursor with a mouse click', async () => {
+    const session = await launchInteractive({
+      config: {
+        ui: {
+          promptSuggestions: false,
+        },
+      },
+    });
+
+    await waitForComposer(session);
+    await session.type('hello');
+    const cursorScreen = await session.text({
+      timeout: 5_000,
+      waitFor: (text) => composerLineIncludes(text, 'hello'),
+      trimEnd: true,
+    });
+
+    expect(session.getRawOutput()).toContain('\x1b[?1000h\x1b[?1006h');
+    expect(composerLineIncludes(cursorScreen, 'hello')).toBe(true);
+
+    await session.click('llo');
+    expect(session.getRawOutput()).toContain('\x1b[6n');
+    const [terminalCursorColumn, terminalCursorRow] = session.getTerminalData().cursor;
+    session.writeRaw(`\x1b[${terminalCursorRow + 1};${terminalCursorColumn + 1}R`);
+    await session.waitIdle();
+    await waitForTerminalCursorVisible(session);
+    await session.type('X');
+
+    const screen = await session.text({
+      timeout: 5_000,
+      waitFor: (text) => composerLineIncludes(text, 'heXllo'),
+      trimEnd: true,
+    });
+
+    expect(screen).toContain('heXllo');
+    expect(screen).not.toContain('helloX');
+
+    await exitInteractive(session);
+    expect(session.getRawOutput()).toContain('\x1b[?1006l\x1b[?1000l');
   });
 
   it('keeps multiline, large paste, and image paste placeholders intact in the real prompt', async () => {
@@ -1613,6 +2039,9 @@ describe('interactive built CLI Tuistory tests', () => {
         agent: {
           maxIterations: 4,
         },
+        features: {
+          automaticSpecialists: false,
+        },
       },
     });
     tempStates.push(state);
@@ -1635,30 +2064,24 @@ describe('interactive built CLI Tuistory tests', () => {
     await session.type('/deep-research Hermes self evolving and DSPy');
     await session.press('enter');
     await session.waitForText('Deep research started', { timeout: 10_000 });
-    const permissionSavedOrPublish = await session.text({
-      timeout: 30_000,
-      waitFor: (text) => (
-        (text.includes('Allow tool write_file?') && text.includes(reportPath)) ||
-        text.includes(`Research saved: ${reportPath}`) ||
-        text.includes('Would you like to publish this research?')
-      ),
-    });
-    if (permissionSavedOrPublish.includes('Allow tool write_file?')) {
-      await session.press('enter');
-    }
-    if (!permissionSavedOrPublish.includes('Would you like to publish this research?')) {
-      await session.waitForText('Would you like to publish this research?', { timeout: 30_000 });
-    }
-    await session.press('enter');
+    // /deep-research switches the session into automode, so tool calls are
+    // auto-approved and the post-turn publish step skips its blocking
+    // confirmation in favor of an informational recovery hint instead.
     await session.waitForText(
-      `Publication cancelled. Research remains local at ${reportPath}.`,
+      'Skipping the interactive publish prompt while auto mode is active.',
+      { timeout: 30_000 },
+    );
+    await session.waitForText(
+      `Publish later with: /publish-research ${reportPath}`,
       { timeout: 10_000 },
     );
 
     const output = session.readAll();
     expect(output).toContain(`Research saved: ${reportPath}`);
+    expect(output).not.toContain('Allow tool write_file?');
     expect(output).not.toContain('Write to this file?');
     expect(output).not.toContain(`Create new file ${reportPath}?`);
+    expect(output).not.toContain('Would you like to publish this research?');
 
     const savedReportPath = path.join(state.workspaceRoot, reportPath);
     expect(existsSync(savedReportPath)).toBe(true);
@@ -2243,6 +2666,104 @@ describe('interactive built CLI Tuistory tests', () => {
     await exitInteractive(session);
   });
 
+  it('shows the signed-in Autohand plan and quota in /usage', async () => {
+    const authServer = await createMockAuthServer();
+    mockAuthServers.push(authServer);
+    const session = await launchInteractive({
+      config: {
+        provider: 'openai',
+        openai: {
+          apiKey: 'tuistory-test-api-key',
+          model: 'gpt-5.5',
+        },
+        auth: {
+          token: 'tuistory-account-token',
+          user: {
+            id: 'tuistory-test-user',
+            email: 'tuistory@example.com',
+            name: 'Tuistory Test',
+          },
+        },
+        features: { cliUsageV2: true },
+      },
+      env: {
+        AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
+      },
+    });
+
+    await waitForComposer(session);
+    await session.type('/usage');
+    await session.press('enter');
+    await session.waitForText('Autohand Code Pro', { timeout: 10_000 });
+    const output = session.readAll();
+
+    expect(output).toContain('Autohand plan');
+    expect(output).toContain('250 requests / 5 hours');
+    expect(output).toContain('1K requests / 24 hours');
+    expect(output).toContain('7K requests / week');
+    expect(output).toContain('1K requests / minute');
+    expect(output).toContain('500K uncached input tokens / minute');
+    expect(output).toContain('80K output tokens / minute');
+    await exitInteractive(session);
+  });
+
+  it('shows the signed-in Autohand plan and live provider quota in the /status Usage tab', async () => {
+    const authServer = await createMockAuthServer();
+    mockAuthServers.push(authServer);
+    const session = await launchInteractive({
+      config: {
+        provider: 'autohandai',
+        autohandai: {
+          plan: 'cloud',
+          authMode: 'account',
+          accountToken: 'tuistory-account-token',
+          model: 'moa',
+          reasoningEffort: 'xhigh',
+          contextWindow: 1_000_000,
+        },
+        auth: {
+          token: 'tuistory-account-token',
+          user: {
+            id: 'tuistory-test-user',
+            email: 'tuistory@example.com',
+            name: 'Tuistory Test',
+          },
+        },
+        features: { usageV2: true, cliUsageV2: false },
+      },
+      env: {
+        AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
+      },
+    });
+
+    await waitForComposer(session);
+    await session.type('/status');
+    await session.press('enter');
+    await session.waitForText('(tab to cycle)', { timeout: 10_000 });
+    await session.press('tab');
+    await session.press('tab');
+    await session.waitForText('Autohand plan:', { timeout: 10_000 });
+    const output = session.readAll();
+
+    expect(output).toContain('Autohand Code Pro');
+    expect(output).toContain('250 requests / 5 hours');
+    expect(output).toContain('1K requests / 24 hours');
+    expect(output).toContain('7K requests / week');
+    expect(output).toContain('1K requests / minute');
+    expect(output).toContain('500K uncached input tokens / minute');
+    expect(output).toContain('80K output tokens / minute');
+    expect(output).toContain('5-hour quota:');
+    expect(output).toContain('12 used / 250');
+    expect(output).toContain('24-hour quota:');
+    expect(output).toContain('120 used / 1K');
+    expect(output).toContain('Weekly quota:');
+    expect(output).toContain('120 used / 7K');
+    expect(output).not.toContain('autohandai:              not reported by provider');
+    await session.press('escape');
+    await waitForComposer(session);
+    await exitInteractive(session);
+  });
+
   it('opens every registered slash command suggestion and dismisses the menu with Escape', async () => {
     const session = await launchInteractive();
     const slashCommands = getHelpOrderedSlashCommands(SLASH_COMMANDS).map(
@@ -2398,6 +2919,7 @@ describe('interactive built CLI Tuistory tests', () => {
         env: {
           AUTOHAND_API_URL: authServer.baseUrl,
           AUTOHAND_AUTH_URL: authServer.baseUrl,
+          AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
         },
         waitForDataTimeout: 15_000,
       })
@@ -2410,16 +2932,7 @@ describe('interactive built CLI Tuistory tests', () => {
     await session.waitForText('What would you like to change?', { timeout: 10_000 });
     await session.press('3');
     await session.waitForText('Choose an LLM provider', { timeout: 10_000 });
-    const providerScreen = await session.text({ trimEnd: true });
-    const ollamaLine = providerScreen
-      .split('\n')
-      .find((line) => line.includes('Ollama'));
-    const ollamaShortcut = ollamaLine?.match(/^\s*(?:▸\s*)?([1-9])\.\s/)?.[1];
-    expect(isModalNumericShortcut(ollamaShortcut), providerScreen).toBe(true);
-    if (!isModalNumericShortcut(ollamaShortcut)) {
-      throw new Error('The visible Ollama option does not expose a numeric shortcut');
-    }
-    await session.press(ollamaShortcut);
+    await selectModalOptionByLabel(session, 'Ollama');
     await session.waitForText('Select a model', { timeout: 10_000 });
     await session.press('enter');
     await session.waitForText(`Using ollama model ${selectedModel}`, { timeout: 10_000 });
@@ -2448,6 +2961,82 @@ describe('interactive built CLI Tuistory tests', () => {
       trimEnd: true,
     });
     expect(restartedScreen).toContain(`autohand (Ollama, ${selectedModel})`);
+    await exitInteractive(restartedSession);
+  });
+
+  it('persists an Autohand AI provider selection and restores it after restart', async () => {
+    const selectedModel = 'fantail';
+    const authServer = await createMockAuthServer();
+    mockAuthServers.push(authServer);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'openrouter',
+        features: {
+          autohand_inference: true,
+        },
+      },
+    });
+    tempStates.push(state);
+    const launchWithPersistedConfig = (): Promise<Session> => trackSession(
+      launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
+        autohandHome: state.autohandHome,
+        cwd: state.workspaceRoot,
+        env: {
+          AUTOHAND_API_URL: authServer.baseUrl,
+          AUTOHAND_AUTH_URL: authServer.baseUrl,
+          AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
+        },
+        waitForDataTimeout: 15_000,
+      })
+    );
+    const session = await launchWithPersistedConfig();
+
+    await waitForComposer(session);
+    await session.type('/model');
+    await session.press('enter');
+    await session.waitForText('What would you like to change?', { timeout: 10_000 });
+    await session.press('3');
+    await session.waitForText('Choose an LLM provider', { timeout: 10_000 });
+    const providerScreen = await session.text({ trimEnd: true });
+    const autohandAILine = providerScreen
+      .split('\n')
+      .find((line) => line.includes('Autohand AI'));
+    const autohandAIShortcut = autohandAILine?.match(/^\s*(?:▸\s*)?([1-9])\.\s/)?.[1];
+    expect(isModalNumericShortcut(autohandAIShortcut), providerScreen).toBe(true);
+    if (!isModalNumericShortcut(autohandAIShortcut)) {
+      throw new Error('The visible Autohand AI option does not expose a numeric shortcut');
+    }
+    await session.press(autohandAIShortcut);
+    await session.waitForText('Choose an Autohand plan', { timeout: 10_000 });
+    await session.press('enter');
+    await session.waitForText('Select a model', { timeout: 10_000 });
+    await session.press('1');
+    await session.waitForText('Autohand AI configured successfully!', { timeout: 10_000 });
+    await session.text({
+      timeout: 10_000,
+      waitFor: (text) => text.includes(`autohand (Autohand AI, ${selectedModel})`),
+    });
+
+    const screen = await session.text({ trimEnd: true });
+    expect(screen).toContain(`autohand (Autohand AI, ${selectedModel})`);
+
+    await exitInteractive(session);
+
+    const savedConfig = await fs.readJson(state.configPath) as {
+      provider?: string;
+      autohandai?: { model?: string };
+    };
+    expect(savedConfig.provider).toBe('autohandai');
+    expect(savedConfig.autohandai?.model).toBe(selectedModel);
+
+    const restartedSession = await launchWithPersistedConfig();
+    await waitForComposer(restartedSession);
+    const restartedScreen = await restartedSession.text({
+      timeout: 10_000,
+      waitFor: (text) => text.includes(`autohand (Autohand AI, ${selectedModel})`),
+      trimEnd: true,
+    });
+    expect(restartedScreen).toContain(`autohand (Autohand AI, ${selectedModel})`);
     await exitInteractive(restartedSession);
   });
 });

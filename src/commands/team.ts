@@ -14,6 +14,7 @@ export const metadata: SlashCommand = {
   implemented: true,
   subcommands: [
     { name: 'create', description: 'Create a new team' },
+    { name: 'view', description: 'Open the live team activity view' },
     { name: 'status', description: 'Show team status' },
     { name: 'shutdown', description: 'Shut down all teammates' },
   ],
@@ -21,6 +22,7 @@ export const metadata: SlashCommand = {
 
 interface TeamCommandContext {
   teamManager?: TeamManager;
+  onToggleTeamView?: (visible: boolean) => void;
 }
 
 export async function team(ctx: TeamCommandContext, args: string[]): Promise<string | null> {
@@ -35,6 +37,7 @@ export async function team(ctx: TeamCommandContext, args: string[]): Promise<str
       chalk.bold('Team Commands:'),
       '',
       `  ${chalk.cyan('/team create <name>')}  Create a new team`,
+      `  ${chalk.cyan('/team view')}           Open the live team activity view`,
       `  ${chalk.cyan('/team status')}         Show current team status`,
       `  ${chalk.cyan('/team shutdown')}       Shut down all teammates`,
       `  ${chalk.cyan('/team')}                Show this help`,
@@ -42,8 +45,25 @@ export async function team(ctx: TeamCommandContext, args: string[]): Promise<str
   }
 
   switch (subcommand) {
+    case 'view': {
+      if (!ctx.teamManager.getTeam()) {
+        return chalk.yellow('No active team. Create one first.');
+      }
+      ctx.onToggleTeamView?.(true);
+      return chalk.green('Opened the live team view. Press Cmd+T or Ctrl+T to close it.');
+    }
+
     case 'create': {
       const name = args.slice(1).join('-') || 'default';
+      const activeTeam = ctx.teamManager.getTeam();
+      if (activeTeam?.status === 'active') {
+        if (activeTeam.name === name) {
+          return chalk.green(`Team "${name}" is already active; reusing it. Use /team status to view.`);
+        }
+        return chalk.yellow(
+          `Team "${activeTeam.name}" is already active. Shut it down with /team shutdown before creating "${name}".`,
+        );
+      }
       ctx.teamManager.createTeam(name);
       return chalk.green(`Team "${name}" created. Use /team status to view.`);
     }
@@ -68,7 +88,11 @@ export async function team(ctx: TeamCommandContext, args: string[]): Promise<str
         const statusColor = member.status === 'working' ? chalk.yellow :
                            member.status === 'idle' ? chalk.green :
                            member.status === 'shutdown' ? chalk.red : chalk.gray;
-        lines.push(`  ${statusColor('●')} ${chalk.white(member.name)} (${member.agentName}) - ${statusColor(member.status)}`);
+        const provenance = [
+          member.requestedRole ? `requested: ${member.requestedRole}` : '',
+          member.agentSource ? `source: ${member.agentSource}` : '',
+        ].filter(Boolean).join(', ');
+        lines.push(`  ${statusColor('●')} ${chalk.white(member.name)} (${member.agentName}) - ${statusColor(member.status)}${provenance ? ` [${provenance}]` : ''}`);
       }
 
       // List tasks

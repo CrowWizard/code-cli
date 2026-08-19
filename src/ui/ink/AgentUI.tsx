@@ -25,10 +25,13 @@ import { UserMessage } from './UserMessage.js';
 import { ShortcutsHelpPanel } from './ShortcutsHelpPanel.js';
 import { SitrepMessage, parseSitrepText } from './SitrepMessage.js';
 import { TaskActivityPanel, type ActivityItem } from './TaskActivityPanel.js';
+import { TeamPanel } from './TeamPanel.js';
+import type { TeamActivitySnapshot } from '../../core/teams/types.js';
 import { useTheme } from '../theme/ThemeContext.js';
 import { useTranslation } from '../i18n/index.js';
 import { getPlanModeManager } from '../../commands/plan.js';
 import type { InputBorderStyle } from '../box.js';
+import { PLAN_BORDER_COLOR, hexToAnsiRgb } from '../box.js';
 import { TextBuffer } from '../textBuffer.js';
 import { handleTextBufferKey, type KeyHandlerResult } from '../textBufferKeyHandler.js';
 import {
@@ -37,6 +40,7 @@ import {
   getPromptBlockWidth,
   isShiftEnterResidualSequence,
   processImagesInText,
+  resolveComposerCursorPosition,
 } from '../inputPrompt.js';
 import { renderTerminalMarkdown } from '../../core/immediateCommandRouter.js';
 import { buildFileMentionSuggestions } from '../mentionFilter.js';
@@ -49,6 +53,39 @@ import {
   type InteractionMode,
 } from '../../core/agent/InteractionModeController.js';
 import { AnnouncementLine } from './AnnouncementLine.js';
+import {
+  REQUEST_CURSOR_POSITION,
+  parseCursorPositionReport,
+  parseSgrMouseInput,
+  resolveComposerClickPosition,
+  type ComposerOutputLayout,
+  type SgrMouseInput,
+} from './mouseInput.js';
+
+/**
+ * Fixed, theme-independent colors for the status-line mode glyph — these must
+ * stay legible on any light/dark theme, so they deliberately bypass useTheme().
+ */
+const INTERACTION_MODE_GLYPH_COLOR: Record<InteractionMode, string | undefined> = {
+  default: undefined,
+  plan: PLAN_BORDER_COLOR,
+  automode: '#ff6b6b',
+  yolo: '#c678dd',
+};
+
+function getInteractionModeLabel(mode: InteractionMode): string {
+  return mode === 'automode' ? 'AUTO' : mode.toUpperCase();
+}
+
+/**
+ * Ink's <Text color> prop routes through chalk's color-support auto-detection,
+ * which no-ops in non-TTY/low-color environments (including ink-testing-library).
+ * The mode glyph must always render its fixed color, so — like PLAN_BORDER_COLOR
+ * and SHELL_BORDER_COLOR elsewhere — embed the ANSI escape directly in the text.
+ */
+function colorizeGlyphText(hex: string, text: string): string {
+  return `${hexToAnsiRgb(hex, 'fg')}${text}\x1b[39m`;
+}
 
 export type { ActivityItem } from './TaskActivityPanel.js';
 
@@ -111,11 +148,17 @@ export interface AgentUIState {
   suggestionRefreshId?: number;
   /** Current mutually-exclusive editing interaction mode. */
   interactionMode: InteractionMode;
+  /** Whether to show the mode word (PLAN/YOLO/AUTO) next to the glyph in the help line. */
+  showModeLabel?: boolean;
   /**
    * Grouped multi-step / multi-agent activity (todo_write + sub-agents).
    * Rendered sticky above the status line.
    */
   activityItems?: ActivityItem[];
+  /** Live background team state owned by TeamManager. */
+  teamActivity?: TeamActivitySnapshot;
+  /** Whether the expanded team view is visible. */
+  teamPanelVisible: boolean;
   /** Highest-priority active CLI announcement rendered above status. */
   announcement?: AnnouncementLineState;
 }
@@ -133,6 +176,8 @@ export interface AgentUIProps {
   /** Dismiss the currently rendered announcement without changing composer input. */
   onDismissAnnouncement?: (id: string) => void;
   onToggleLiveCommandExpanded?: () => void;
+  /** Toggle the expanded live team view. */
+  onToggleTeamPanel?: () => void;
   onInputChange?: (input: string) => void;
   enableQueueInput?: boolean;
   /** Called when a dragged/dropped image is detected in the input */
@@ -161,6 +206,8 @@ export interface AgentUIProps {
   getInteractionMode?: () => InteractionMode;
   /** Cycle the canonical interaction mode and return the selected mode. */
   onCycleInteractionMode?: () => InteractionMode;
+  /** Enable click-to-position composer input. */
+  mouseComposerCursor?: boolean;
 }
 
 interface TextBufferKeyInfo {
@@ -175,11 +222,17 @@ const RESERVED_EXTENSION_KEYBINDINGS = new Set([
   'ctrl+c',
   'ctrl+d',
   'ctrl+x',
+  'ctrl+t',
+  'meta+t',
   'shift+tab',
   'escape',
   'enter',
   'return',
 ]);
+
+export function isTeamViewShortcut(input: string, key: InkKey): boolean {
+  return input.toLowerCase() === 't' && (key.meta || key.ctrl);
+}
 
 export function matchesExtensionKeybinding(
   input: string,
@@ -415,7 +468,8 @@ export function getTextBufferCursorOffset(buffer: TextBuffer): number {
     offset += 1;
   }
 
-  return offset + col;
+  const cursorLine = lines[row] ?? '';
+  return offset + Array.from(cursorLine).slice(0, col).join('').length;
 }
 
 const COMPOSER_TRIGGER_CHARS = new Set(['/', '@', '$', '!', '#']);
@@ -651,6 +705,7 @@ export function AgentUI({
   onCtrlC,
   onDismissAnnouncement,
   onToggleLiveCommandExpanded,
+  onToggleTeamPanel,
   onInputChange,
   enableQueueInput = true,
   onImageDetected,
@@ -665,7 +720,9 @@ export function AgentUI({
   onRemoveQueuedInstruction,
   getInteractionMode,
   onCycleInteractionMode,
+  mouseComposerCursor = true,
 }: AgentUIProps) {
+  const { stdout } = useStdout();
   const { colors } = useTheme();
   const { t } = useTranslation();
   const slashCommands = state.runtimeSlashCommands ?? slashCommandProps;
@@ -725,6 +782,11 @@ export function AgentUI({
   // on every render while keeping handler logic up-to-date.
   const inputRef = useRef(input);
   inputRef.current = input;
+  const composerLayoutRef = useRef<ComposerOutputLayout | null>(null);
+  const pendingMouseClickRef = useRef<SgrMouseInput | null>(null);
+  const handleComposerLayoutChange = useCallback((layout: ComposerOutputLayout | null) => {
+    composerLayoutRef.current = layout;
+  }, []);
   const cursorOffsetRef = useRef(cursorOffset);
   cursorOffsetRef.current = cursorOffset;
   const fileMentionVisibleRef = useRef(fileMentionVisible);
@@ -749,6 +811,8 @@ export function AgentUI({
   announcementRef.current = state.announcement;
   const onToggleLiveCommandExpandedRef = useRef(onToggleLiveCommandExpanded);
   onToggleLiveCommandExpandedRef.current = onToggleLiveCommandExpanded;
+  const onToggleTeamPanelRef = useRef(onToggleTeamPanel);
+  onToggleTeamPanelRef.current = onToggleTeamPanel;
   const onInstructionRef = useRef(onInstruction);
   onInstructionRef.current = onInstruction;
   const onInputChangeRef = useRef(onInputChange);
@@ -1229,11 +1293,61 @@ export function AgentUI({
   const handleInput = useCallback((char: string, key: InkKey) => {
     syncBufferViewport();
 
+    if (mouseComposerCursor) {
+      const mouseInput = parseSgrMouseInput(char);
+      if (mouseInput) {
+        if (
+          mouseInput.action === 'press'
+          && mouseInput.button === 'left'
+          && composerLayoutRef.current
+        ) {
+          pendingMouseClickRef.current = mouseInput;
+          stdout.write(REQUEST_CURSOR_POSITION);
+        }
+        return;
+      }
+
+      const terminalCursor = parseCursorPositionReport(char);
+      if (terminalCursor) {
+        const pendingClick = pendingMouseClickRef.current;
+        const layout = composerLayoutRef.current;
+        pendingMouseClickRef.current = null;
+        if (!pendingClick || !layout) {
+          return;
+        }
+
+        const clickedCell = resolveComposerClickPosition(pendingClick, terminalCursor, layout);
+        if (!clickedCell) {
+          return;
+        }
+
+        const cursor = resolveComposerCursorPosition(
+          inputRef.current,
+          layout.width,
+          clickedCell.visualRow,
+          clickedCell.visualColumn,
+        );
+        if (!cursor) {
+          return;
+        }
+
+        textBufferRef.current.setCursorPosition(cursor.row, cursor.column);
+        syncInputFromBuffer();
+        setCtrlCCount(0);
+        return;
+      }
+    }
+
     const pasteResult = consumeInkBracketedPasteInput(char, pasteStateRef.current);
     if (pasteResult.handled) {
       if (pasteResult.completedText !== undefined) {
         insertPastedText(pasteResult.completedText);
       }
+      return;
+    }
+
+    if (isTeamViewShortcut(char, key)) {
+      onToggleTeamPanelRef.current?.();
       return;
     }
 
@@ -1715,7 +1829,15 @@ export function AgentUI({
       }
       return;
     }
-  }, [syncBufferViewport, syncInputFromBuffer, dismissAutocompleteState, acceptActiveAutocompleteSuggestion, insertPastedText]);
+  }, [
+    acceptActiveAutocompleteSuggestion,
+    dismissAutocompleteState,
+    insertPastedText,
+    mouseComposerCursor,
+    stdout,
+    syncBufferViewport,
+    syncInputFromBuffer,
+  ]);
 
   // Extra safety: wrap in a ref so useInput never re-registers even if
   // the above callback identity changes unexpectedly.
@@ -1910,6 +2032,8 @@ export function AgentUI({
         selectedQueueIndex={queueSelectionIndex}
         completionStats={chatIncludesCompletion ? null : state.completionStats}
         activityItems={state.activityItems ?? []}
+        teamActivity={state.teamActivity}
+        teamPanelVisible={state.teamPanelVisible}
         enableQueueInput={enableQueueInput}
         input={input}
         cursorOffset={cursorOffset}
@@ -1946,7 +2070,11 @@ export function AgentUI({
         borderStyle={inputBorderStyle}
         nextPromptSuggestion={composerNextPromptSuggestion}
         inlineGhostSuffix={composerInlineGhostSuffix}
+        mouseComposerCursor={mouseComposerCursor}
+        onComposerLayoutChange={handleComposerLayoutChange}
         showShortcuts={showShortcuts}
+        interactionMode={interactionMode}
+        showModeLabel={state.showModeLabel ?? true}
       />
     </Box>
   );
@@ -2186,6 +2314,8 @@ interface StatusSectionProps {
   selectedQueueIndex: number | null;
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
   activityItems?: ActivityItem[];
+  teamActivity?: TeamActivitySnapshot;
+  teamPanelVisible: boolean;
   contextPercent?: number;
   contextTokens?: ContextTokenDisplay;
   provider?: string;
@@ -2253,6 +2383,8 @@ const StatusSection = memo(function StatusSection({
   selectedQueueIndex,
   completionStats,
   activityItems = [],
+  teamActivity,
+  teamPanelVisible,
   contextPercent,
   contextTokens,
   provider,
@@ -2271,6 +2403,10 @@ const StatusSection = memo(function StatusSection({
       {/* Grouped todos + sub-agent runs — sticky above the spinner/status line */}
       {showActivity && <TaskActivityPanel items={activityItems} />}
 
+      {teamPanelVisible && teamActivity?.team && (
+        <TeamPanel team={teamActivity.team} tasks={teamActivity.tasks} />
+      )}
+
       {/* Status line with spinner - always renders for stability */}
       <StatusLine
         isWorking={isWorking}
@@ -2282,6 +2418,7 @@ const StatusSection = memo(function StatusSection({
         contextTokens={contextTokens}
         provider={provider}
         model={model}
+        teamActivity={teamActivity}
         lineExtension={lineExtension}
       />
 
@@ -2316,16 +2453,15 @@ const StatusSection = memo(function StatusSection({
          prev.completionStats?.tokens === next.completionStats?.tokens &&
          prev.completionStats?.status === next.completionStats?.status &&
          prev.activityItems === next.activityItems &&
+         prev.teamActivity === next.teamActivity &&
+         prev.teamPanelVisible === next.teamPanelVisible &&
          prev.provider === next.provider &&
          prev.model === next.model &&
          prev.lineExtension === next.lineExtension;
 });
 
-/**
- * Re-render with the footer so Ink receives fresh cursor intent for every repaint.
- */
+/** Keep cursor writes tied to composer changes instead of status-only repaints. */
 interface InputLineWrapperProps {
-  isWorking: boolean;
   enableQueueInput: boolean;
   input: string;
   cursorOffset: number;
@@ -2337,10 +2473,11 @@ interface InputLineWrapperProps {
   nextPromptSuggestion?: string;
   inlineGhostSuffix?: string;
   enableHardwareCursor?: boolean;
+  enableMouseCursor?: boolean;
+  onLayoutChange?: (layout: ComposerOutputLayout | null) => void;
 }
 
-function InputLineWrapper({
-  isWorking,
+const InputLineWrapper = memo(function InputLineWrapper({
   enableQueueInput,
   input,
   cursorOffset,
@@ -2350,6 +2487,8 @@ function InputLineWrapper({
   nextPromptSuggestion,
   inlineGhostSuffix,
   enableHardwareCursor,
+  enableMouseCursor,
+  onLayoutChange,
 }: InputLineWrapperProps) {
   if (!enableQueueInput) {
     return null;
@@ -2366,9 +2505,11 @@ function InputLineWrapper({
       nextPromptSuggestion={nextPromptSuggestion}
       inlineGhostSuffix={inlineGhostSuffix}
       enableHardwareCursor={enableHardwareCursor}
+      enableMouseCursor={enableMouseCursor}
+      onLayoutChange={onLayoutChange}
     />
   );
-}
+});
 
 /**
  * Help line section - shows context info and command hints
@@ -2381,6 +2522,8 @@ interface HelpLineSectionProps {
   provider?: string;
   model?: string;
   lineExtension?: LineExtension;
+  interactionMode?: InteractionMode;
+  showModeLabel?: boolean;
 }
 
 const HelpLineSection = memo(function HelpLineSection({
@@ -2390,6 +2533,8 @@ const HelpLineSection = memo(function HelpLineSection({
   provider,
   model,
   lineExtension,
+  interactionMode = 'default',
+  showModeLabel = true,
 }: HelpLineSectionProps) {
   const { colors } = useTheme();
   const { t } = useTranslation();
@@ -2405,8 +2550,15 @@ const HelpLineSection = memo(function HelpLineSection({
   const providerDisplay = provider
     ? `autohand (${t(`providers.${provider}`) ?? provider}${model ? `, ${model}` : ''})`
     : '';
+  const glyphColor = INTERACTION_MODE_GLYPH_COLOR[interactionMode];
+  const modeLabel = interactionMode !== 'default' && showModeLabel
+    ? getInteractionModeLabel(interactionMode)
+    : '';
   return (
     <Box>
+      {glyphColor ? (
+        <Text>{colorizeGlyphText(glyphColor, modeLabel ? `● ${modeLabel} ` : '● ')}</Text>
+      ) : null}
       <Text color={colors.dim}>
         {getComposerHelpLine(isWorking, providerDisplay, contextDisplay, t('ui.commandHint'), lineExtension)}
       </Text>
@@ -2419,6 +2571,8 @@ const HelpLineSection = memo(function HelpLineSection({
          prev.contextTokens?.total === next.contextTokens?.total &&
          prev.provider === next.provider &&
          prev.model === next.model &&
+         prev.interactionMode === next.interactionMode &&
+         prev.showModeLabel === next.showModeLabel &&
          prev.lineExtension === next.lineExtension;
 });
 
@@ -2518,6 +2672,8 @@ interface FixedBottomProps {
   selectedQueueIndex: number | null;
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
   activityItems?: ActivityItem[];
+  teamActivity?: TeamActivitySnapshot;
+  teamPanelVisible: boolean;
   enableQueueInput: boolean;
   input: string;
   cursorOffset: number;
@@ -2539,8 +2695,44 @@ interface FixedBottomProps {
   placeholderText?: string;
   nextPromptSuggestion?: string;
   inlineGhostSuffix?: string;
+  mouseComposerCursor?: boolean;
+  onComposerLayoutChange?: (layout: ComposerOutputLayout | null) => void;
   /** Whether the shortcuts help panel is visible */
   showShortcuts: boolean;
+  /** Current mutually-exclusive editing interaction mode, rendered as a colored glyph. */
+  interactionMode?: InteractionMode;
+  /** Whether to show the mode word (PLAN/YOLO/AUTO) next to the glyph. */
+  showModeLabel?: boolean;
+}
+
+/** Keep completion repainting passive until the user edits the composer again. */
+function useUserDrivenComposerCursor(
+  isWorking: boolean,
+  input: string,
+  cursorOffset: number,
+): boolean {
+  const previousIsWorking = useRef(isWorking);
+  const completionInput = useRef<{ input: string; cursorOffset: number } | null>(null);
+  const justCompleted = previousIsWorking.current && !isWorking;
+  const inputChangedAfterCompletion = completionInput.current !== null && (
+    completionInput.current.input !== input
+    || completionInput.current.cursorOffset !== cursorOffset
+  );
+
+  useEffect(() => {
+    if (isWorking) {
+      completionInput.current = null;
+    } else if (previousIsWorking.current) {
+      completionInput.current = { input, cursorOffset };
+    } else if (inputChangedAfterCompletion) {
+      completionInput.current = null;
+    }
+    previousIsWorking.current = isWorking;
+  }, [cursorOffset, input, inputChangedAfterCompletion, isWorking]);
+
+  if (isWorking || justCompleted) return false;
+  if (completionInput.current !== null) return inputChangedAfterCompletion;
+  return true;
 }
 
 const FixedBottom = memo(function FixedBottom({
@@ -2554,6 +2746,8 @@ const FixedBottom = memo(function FixedBottom({
   selectedQueueIndex,
   completionStats,
   activityItems = [],
+  teamActivity,
+  teamPanelVisible,
   enableQueueInput,
   input,
   cursorOffset,
@@ -2573,8 +2767,14 @@ const FixedBottom = memo(function FixedBottom({
   placeholderText,
   nextPromptSuggestion,
   inlineGhostSuffix,
+  mouseComposerCursor,
+  onComposerLayoutChange,
   showShortcuts,
+  interactionMode,
+  showModeLabel,
 }: FixedBottomProps) {
+  const enableHardwareCursor = useUserDrivenComposerCursor(isWorking, input, cursorOffset);
+
   return (
     <>
       {announcement ? (
@@ -2594,6 +2794,8 @@ const FixedBottom = memo(function FixedBottom({
         selectedQueueIndex={selectedQueueIndex}
         completionStats={completionStats}
         activityItems={activityItems}
+        teamActivity={teamActivity}
+        teamPanelVisible={teamPanelVisible}
         contextPercent={contextPercent}
         contextTokens={contextTokens}
         provider={provider}
@@ -2605,7 +2807,6 @@ const FixedBottom = memo(function FixedBottom({
         )}
       />
       <InputLineWrapper
-        isWorking={isWorking}
         enableQueueInput={enableQueueInput}
         input={input}
         cursorOffset={cursorOffset}
@@ -2614,7 +2815,9 @@ const FixedBottom = memo(function FixedBottom({
         placeholderText={placeholderText}
         nextPromptSuggestion={nextPromptSuggestion}
         inlineGhostSuffix={inlineGhostSuffix}
-        enableHardwareCursor={!isWorking || input.length > 0}
+        enableHardwareCursor={enableHardwareCursor}
+        enableMouseCursor={mouseComposerCursor}
+        onLayoutChange={onComposerLayoutChange}
       />
       <FileMentionWrapper fileMentionDropdown={fileMentionDropdown} />
       <SlashCommandWrapper slashCommandDropdown={slashCommandDropdown} />
@@ -2626,6 +2829,8 @@ const FixedBottom = memo(function FixedBottom({
         contextTokens={contextTokens}
         provider={provider}
         model={model}
+        interactionMode={interactionMode}
+        showModeLabel={showModeLabel}
         lineExtension={mergeLineExtensions(
           configuredLineExtensions?.help,
           lineExtensions?.help,
@@ -2667,6 +2872,8 @@ export function createInitialUIState(): AgentUIState {
     lineExtensions: undefined,
     configuredLineExtensions: undefined,
     interactionMode: 'default',
+    showModeLabel: true,
     activityItems: [],
+    teamPanelVisible: false,
   };
 }

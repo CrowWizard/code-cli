@@ -7,9 +7,16 @@
 import fs from 'fs-extra';
 import path from 'node:path';
 import os from 'node:os';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { getProviderConfig, loadConfig } from '../src/config';
 import type { AutohandConfig } from '../src/types';
+
+const originalApiUrl = process.env.AUTOHAND_API_URL;
+
+afterEach(() => {
+  if (originalApiUrl === undefined) delete process.env.AUTOHAND_API_URL;
+  else process.env.AUTOHAND_API_URL = originalApiUrl;
+});
 
 describe('getProviderConfig', () => {
   it('creates new configs with completion reports enabled by default', async () => {
@@ -20,6 +27,19 @@ describe('getProviderConfig', () => {
       const config = await loadConfig(configPath);
 
       expect(config.ui?.completionReportEnabled).toBe(true);
+    } finally {
+      await fs.remove(tempDir);
+    }
+  });
+
+  it('enables composer mouse tracking for new configs by default', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-config-'));
+    const configPath = path.join(tempDir, 'config.json');
+
+    try {
+      const config = await loadConfig(configPath);
+
+      expect(config.ui?.mouseComposerCursor).toBe(true);
     } finally {
       await fs.remove(tempDir);
     }
@@ -43,6 +63,65 @@ describe('getProviderConfig', () => {
 
     try {
       await expect(loadConfig(configPath)).rejects.toThrow('ui.completionReportEnabled must be boolean');
+    } finally {
+      await fs.remove(tempDir);
+    }
+  });
+
+  it('rejects non-boolean composer mouse tracking values', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-config-'));
+    const configPath = path.join(tempDir, 'config.json');
+
+    await fs.writeJson(configPath, {
+      provider: 'openrouter',
+      ui: {
+        mouseComposerCursor: 'yes',
+      },
+    });
+
+    try {
+      await expect(loadConfig(configPath)).rejects.toThrow('ui.mouseComposerCursor must be boolean');
+    } finally {
+      await fs.remove(tempDir);
+    }
+  });
+
+  it('repairs a saved website deployment URL used as the control-plane API', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-config-'));
+    const configPath = path.join(tempDir, 'config.json');
+
+    await fs.writeJson(configPath, {
+      provider: 'openrouter',
+      api: {
+        baseUrl: 'https://e2d1306c.autohand-web.pages.dev',
+      },
+    });
+
+    try {
+      const config = await loadConfig(configPath);
+
+      expect(config.api?.baseUrl).toBe('https://api.autohand.ai');
+    } finally {
+      await fs.remove(tempDir);
+    }
+  });
+
+  it('preserves an explicit website deployment API override for development', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-config-'));
+    const configPath = path.join(tempDir, 'config.json');
+    process.env.AUTOHAND_API_URL = 'https://preview.autohand-web.pages.dev';
+
+    await fs.writeJson(configPath, {
+      provider: 'openrouter',
+      api: {
+        baseUrl: 'https://api.autohand.ai',
+      },
+    });
+
+    try {
+      const config = await loadConfig(configPath);
+
+      expect(config.api?.baseUrl).toBe('https://preview.autohand-web.pages.dev');
     } finally {
       await fs.remove(tempDir);
     }

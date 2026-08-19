@@ -14,6 +14,7 @@ import type { SessionMetadata } from '../session/types.js';
 import type { LoadedConfig, PermissionMode, ProviderName, ProviderSettings, ReasoningEffort } from '../types.js';
 import { createCommandTheme } from './commandTheme.js';
 import { formatAccount } from './accountDisplay.js';
+import type { AccountEntitlement } from '../auth/AuthClient.js';
 
 export const USAGE_V2_FLAG = 'usage_v2';
 export const CLI_USAGE_V2_FLAG = 'cli_usage_v2';
@@ -45,6 +46,7 @@ export interface UsageLimitRow {
   percentLeft?: number;
   used?: number;
   limit?: number;
+  unlimited?: boolean;
   resetLabel?: string;
   unavailableReason?: string;
 }
@@ -67,7 +69,7 @@ export interface UsageDashboardData {
 
 export const metadata = {
   command: '/usage',
-  description: 'Show token activity by day, week, or month',
+  description: 'Show account plan limits and token activity',
   implemented: true,
   subcommands: [
     { name: 'daily', description: 'Show daily token activity for the last 12 months' },
@@ -117,6 +119,57 @@ function formatCompactNumber(value: number): string {
   }
 
   return String(Math.round(value));
+}
+
+function formatRequestQuota(value: number | null, window: string): string {
+  return value === null
+    ? `No ${window} request quota`
+    : `${formatCompactNumber(value)} requests / ${window}`;
+}
+
+export function formatAccountPlanName(entitlement: AccountEntitlement): string {
+  return entitlement.limits?.displayName ?? entitlement.tier;
+}
+
+export function formatAccountPlanAllowance(entitlement: AccountEntitlement): string | null {
+  if (!entitlement.limits) return null;
+  return [
+    formatRequestQuota(entitlement.limits.messagesPer5h, '5 hours'),
+    formatRequestQuota(entitlement.limits.messagesPer24h, '24 hours'),
+    formatRequestQuota(entitlement.limits.messagesPerWeek, 'week'),
+  ].join(' · ');
+}
+
+export function formatAccountPlanThroughput(entitlement: AccountEntitlement): string | null {
+  if (!entitlement.limits) return null;
+  return [
+    `${formatCompactNumber(entitlement.limits.rpm)} requests / minute`,
+    ...(entitlement.limits.inputTokensPerMinute === null
+      ? []
+      : [`${formatCompactNumber(entitlement.limits.inputTokensPerMinute)} uncached input tokens / minute`]),
+    ...(entitlement.limits.outputTokensPerMinute === null
+      ? []
+      : [`${formatCompactNumber(entitlement.limits.outputTokensPerMinute)} output tokens / minute`]),
+  ].join(' · ');
+}
+
+export async function resolveAccountEntitlement(ctx: SlashCommandContext): Promise<AccountEntitlement | null> {
+  try {
+    return await ctx.getAccountEntitlement?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function formatAccountPlanSummary(entitlement: AccountEntitlement): string {
+  const theme = createCommandTheme();
+  const allowance = formatAccountPlanAllowance(entitlement);
+  const throughput = formatAccountPlanThroughput(entitlement);
+  return [
+    `${theme.muted('Autohand plan')}  ${theme.warning(formatAccountPlanName(entitlement))}`,
+    ...(allowance ? [`${theme.muted('Allowance')}      ${allowance}`] : []),
+    ...(throughput ? [`${theme.muted('Throughput')}     ${throughput}`] : []),
+  ].join('\n');
 }
 
 function formatPermissionMode(mode?: PermissionMode): string {
@@ -423,6 +476,10 @@ function formatUsageLimitRow(row: UsageLimitRow, labelWidth: number): string {
     return formatInfoRow(`${row.label}:`, row.unavailableReason, labelWidth);
   }
 
+  if (row.unlimited) {
+    return formatInfoRow(`${row.label}:`, 'No request quota', labelWidth);
+  }
+
   const percent = clampPercent(row.percentLeft ?? 100);
   const reset = row.resetLabel ? createCommandTheme().muted(` (${row.resetLabel})`) : '';
   const usage = typeof row.used === 'number' && typeof row.limit === 'number'
@@ -431,12 +488,72 @@ function formatUsageLimitRow(row: UsageLimitRow, labelWidth: number): string {
   return formatInfoRow(`${row.label}:`, `${formatProgressBar(percent)} ${percent}% left${reset}${usage}`, labelWidth);
 }
 
-export function formatUsageDashboard(data: UsageDashboardData): string {
+function accountQuotaUsageRows(entitlement: AccountEntitlement | null): UsageLimitRow[] | null {
+  const quota = entitlement?.quota;
+  if (!quota) return null;
+  if (!quota.available) {
+    return [{
+      label: 'autohandai',
+      unavailableReason: quota.message ?? 'current quota temporarily unavailable',
+    }];
+  }
+
+  return [
+    quotaWindowUsageRow('5-hour quota', quota.window5h),
+    ...(quota.window24h ? [quotaWindowUsageRow('24-hour quota', quota.window24h)] : []),
+    quotaWindowUsageRow('Weekly quota', quota.week),
+  ];
+}
+
+function quotaWindowUsageRow(
+  label: string,
+  window: NonNullable<AccountEntitlement['quota']>['window5h'],
+): UsageLimitRow {
+  if (!window || window.limit === null) {
+    return { label, unlimited: true };
+  }
+  const percentLeft = window.limit === 0
+    ? 0
+    : (window.remaining ?? 0) / window.limit * 100;
+  return {
+    label,
+    percentLeft,
+    used: window.used,
+    limit: window.limit,
+    ...(window.resetAt ? { resetLabel: formatQuotaReset(window.resetAt) } : {}),
+  };
+}
+
+function formatQuotaReset(resetAt: string): string {
+  const reset = new Date(resetAt);
+  if (!Number.isFinite(reset.getTime())) return 'reset pending';
+  return `resets ${reset.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })}`;
+}
+
+export function formatUsageDashboard(
+  data: UsageDashboardData,
+  entitlement: AccountEntitlement | null = null,
+): string {
   const labelWidth = 24;
+  const accountQuotaRows = data.provider === 'autohandai'
+    ? accountQuotaUsageRows(entitlement)
+    : null;
   const providerLimitRows = data.usageLimits.length > 0
     ? data.usageLimits
-    : [{ label: String(data.provider), unavailableReason: 'not reported by provider' }];
+    : accountQuotaRows ?? [{
+      label: String(data.provider),
+      unavailableReason: data.provider === 'autohandai' && entitlement
+        ? 'current quota temporarily unavailable'
+        : 'not reported by provider',
+    }];
 
+  const allowance = entitlement ? formatAccountPlanAllowance(entitlement) : null;
+  const throughput = entitlement ? formatAccountPlanThroughput(entitlement) : null;
   const lines = [
     formatInfoRow('Model:', formatModel(data), labelWidth),
     formatInfoRow('Provider:', String(data.provider), labelWidth),
@@ -444,6 +561,11 @@ export function formatUsageDashboard(data: UsageDashboardData): string {
     formatInfoRow('Permissions:', data.permissions, labelWidth),
     formatInfoRow('Agents.md:', data.agentsFile, labelWidth),
     formatInfoRow('Account:', data.account, labelWidth),
+    ...(entitlement ? [
+      formatInfoRow('Autohand plan:', formatAccountPlanName(entitlement), labelWidth),
+      ...(allowance ? [formatInfoRow('Allowance:', allowance, labelWidth)] : []),
+      ...(throughput ? [formatInfoRow('Throughput:', throughput, labelWidth)] : []),
+    ] : []),
     formatInfoRow('Session:', data.sessionId, labelWidth),
     '',
     formatInfoRow('Context window:', formatContextSummary(data), labelWidth),
@@ -546,12 +668,13 @@ function formatPeriodTabs(period: UsageActivityPeriod): string {
     .join(theme.muted(' · '));
 }
 
-function formatUsageActivityDashboard(data: UsageActivityData): string {
+function formatUsageActivityDashboard(data: UsageActivityData, entitlement: AccountEntitlement | null): string {
   const theme = createCommandTheme();
   const heatmap = data.period === 'daily' ? renderDailyHeatmap(data) : renderLinearHeatmap(data);
   return [
     theme.accent(`/usage ${data.period}`),
     '',
+    ...(entitlement ? [formatAccountPlanSummary(entitlement), ''] : []),
     `${theme.bold('Token activity')}   ${theme.muted(data.rangeLabel)}`,
     formatActivitySummary(data),
     '',
@@ -570,7 +693,11 @@ export async function usage(ctx: SlashCommandContext, args: string[] = []): Prom
       model: ctx.model,
       period,
     });
-    return formatUsageActivityDashboard(await gatherUsageActivityData(ctx, period));
+    const [activity, entitlement] = await Promise.all([
+      gatherUsageActivityData(ctx, period),
+      resolveAccountEntitlement(ctx),
+    ]);
+    return formatUsageActivityDashboard(activity, entitlement);
   }
 
   if (!isUsageV2Enabled(ctx)) {
@@ -582,5 +709,8 @@ export async function usage(ctx: SlashCommandContext, args: string[] = []): Prom
     model: ctx.model,
   });
 
-  return formatUsageDashboard(gatherUsageDashboardData(ctx));
+  return formatUsageDashboard(
+    gatherUsageDashboardData(ctx),
+    await resolveAccountEntitlement(ctx),
+  );
 }

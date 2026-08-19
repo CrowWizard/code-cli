@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
 
+const actionExecutorConstructor = vi.hoisted(() => vi.fn());
+
 // Mock heavy dependencies before importing
 vi.mock("../../src/config.js", () => ({
   loadConfig: vi.fn().mockResolvedValue({
@@ -19,6 +21,7 @@ vi.mock("../../src/providers/ProviderFactory.js", () => ({
   ProviderFactory: {
     create: vi.fn().mockReturnValue({
       getName: () => "mock",
+      getCapabilities: () => ({ nativeToolCalling: true }),
       complete: vi
         .fn()
         .mockResolvedValue({ content: '{"finalResponse": "Done"}' }),
@@ -38,20 +41,12 @@ vi.mock("../../src/core/agents/AgentRegistry.js", () => ({
         name: "tester",
         description: "Writes tests",
         systemPrompt: "You write tests.",
-        tools: ["read_file", "write_file"],
+        tools: ["*"],
         path: "/tmp/tester.md",
         source: "builtin" as const,
       }),
     }),
   },
-}));
-
-vi.mock("../../src/core/agents/SubAgent.js", () => ({
-  SubAgent: vi.fn().mockImplementation(function MockSubAgent() {
-    return {
-    run: vi.fn().mockResolvedValue("Completed: wrote 3 test files"),
-    };
-  }),
 }));
 
 vi.mock("../../src/core/toolsRegistry.js", () => ({
@@ -76,7 +71,9 @@ vi.mock("../../src/core/agent/dynamicRuntimeExtensions.js", () => ({
 
 vi.mock("../../src/core/actionExecutor.js", () => ({
   ActionExecutor: class {
-    constructor() {}
+    constructor(options: unknown) {
+      actionExecutorConstructor(options);
+    }
   },
 }));
 
@@ -90,6 +87,7 @@ import {
   executeTask,
   parseTeammateOptions,
   runTeammateModeWithStreams,
+  withTeammateTaskEnvironment,
 } from "../../src/modes/teammate.js";
 import type { TeammateOptions } from "../../src/modes/teammate.js";
 
@@ -117,6 +115,7 @@ describe("parseTeammateOptions", () => {
       leadSessionId: "session-123",
       model: undefined,
       workspacePath: undefined,
+      configPath: undefined,
     });
   });
 
@@ -138,10 +137,13 @@ describe("parseTeammateOptions", () => {
       "your-modelcard-id-here",
       "--path",
       "/tmp/workspace",
+      "--config",
+      "/tmp/team-config.json",
     ];
     const opts = parseTeammateOptions(argv);
     expect(opts?.model).toBe("your-modelcard-id-here");
     expect(opts?.workspacePath).toBe("/tmp/workspace");
+    expect(opts?.configPath).toBe("/tmp/team-config.json");
   });
 
   it("should return null when required options are missing", () => {
@@ -156,6 +158,98 @@ describe("parseTeammateOptions", () => {
 });
 
 describe("teammate executeTask", () => {
+  it("scopes task identity environment variables to one execution", async () => {
+    const originalTaskId = process.env.AUTOHAND_TEAM_TASK_ID;
+    delete process.env.AUTOHAND_TEAM_TASK_ID;
+
+    try {
+      await withTeammateTaskEnvironment(
+        {
+          teamName: "release-readiness",
+          name: "planner",
+          agentName: "repo-reader",
+          leadSessionId: "lead-123",
+        },
+        {
+          id: "task-17",
+          subject: "Plan the rollout",
+          description: "Produce the implementation sequence.",
+          status: "in_progress",
+          owner: "planner",
+          blockedBy: [],
+          createdAt: "",
+        },
+        async () => {
+          expect(process.env).toMatchObject({
+            AUTOHAND_TEAM_NAME: "release-readiness",
+            AUTOHAND_TEAMMATE_NAME: "planner",
+            AUTOHAND_TEAMMATE_AGENT: "repo-reader",
+            AUTOHAND_TEAM_LEAD_SESSION_ID: "lead-123",
+            AUTOHAND_TEAM_TASK_ID: "task-17",
+            AUTOHAND_TEAM_TASK_SUBJECT: "Plan the rollout",
+            AUTOHAND_TEAM_TASK_OWNER: "planner",
+          });
+        },
+      );
+
+      expect(process.env.AUTOHAND_TEAM_TASK_ID).toBeUndefined();
+    } finally {
+      if (originalTaskId === undefined) delete process.env.AUTOHAND_TEAM_TASK_ID;
+      else process.env.AUTOHAND_TEAM_TASK_ID = originalTaskId;
+    }
+  });
+
+  it("scopes goal tools to the teammate lead-session boundary", async () => {
+    await executeTask(
+      {
+        teamName: "test",
+        name: "worker",
+        agentName: "tester",
+        leadSessionId: "sess-goal-owner",
+      },
+      {
+        id: "task-goal-owner",
+        subject: "Inspect goal",
+        description: "Inspect the active goal",
+        status: "in_progress",
+        blockedBy: [],
+        createdAt: "",
+      },
+    );
+
+    const options = actionExecutorConstructor.mock.calls.at(-1)?.[0] as {
+      getCurrentSessionId?: () => string | undefined;
+    };
+    expect(options.getCurrentSessionId?.()).toBe("sess-goal-owner");
+  });
+
+  it("loads the configuration explicitly forwarded by the lead", async () => {
+    const { loadConfig } = await import("../../src/config.js");
+    const loadConfigMock = vi.mocked(loadConfig);
+    loadConfigMock.mockClear();
+
+    await executeTask(
+      {
+        teamName: "test",
+        name: "worker",
+        agentName: "tester",
+        leadSessionId: "sess-config",
+        workspacePath: "/tmp/workspace",
+        configPath: "/tmp/team-config.json",
+      },
+      {
+        id: "task-config",
+        subject: "Inspect config",
+        description: "Use the lead configuration",
+        status: "in_progress",
+        blockedBy: [],
+        createdAt: "",
+      },
+    );
+
+    expect(loadConfigMock).toHaveBeenCalledWith("/tmp/team-config.json", "/tmp/workspace");
+  });
+
   it("runs SubAgent and returns result", async () => {
     const result = await executeTask(
       {
@@ -173,7 +267,42 @@ describe("teammate executeTask", () => {
         createdAt: "",
       },
     );
-    expect(result).toContain("Completed");
+    expect(result).toContain("Done");
+  });
+
+  it("runs the teammate SubAgent engine with native tools instead of the legacy JSON protocol", async () => {
+    const { ProviderFactory } = await import("../../src/providers/ProviderFactory.js");
+    const provider = ProviderFactory.create({} as never) as {
+      complete: ReturnType<typeof vi.fn>;
+      getCapabilities(): { nativeToolCalling: boolean };
+    };
+    provider.complete.mockClear();
+
+    await executeTask(
+      {
+        teamName: "test",
+        name: "worker",
+        agentName: "tester",
+        leadSessionId: "sess-native",
+      },
+      {
+        id: "task-native",
+        subject: "Inspect tools",
+        description: "Inspect the repository",
+        status: "in_progress",
+        blockedBy: [],
+        createdAt: "",
+      },
+    );
+
+    expect(provider.getCapabilities()).toEqual({ nativeToolCalling: true });
+    const request = provider.complete.mock.calls[0]?.[0];
+    expect(request?.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "read_file" }),
+    ]));
+    const prompt = request?.messages.find((message: { role: string }) => message.role === "system")?.content;
+    expect(prompt).toContain("Use the native tool interface");
+    expect(prompt).not.toContain("Always respond with structured JSON");
   });
 
   it("returns error string on agent not found", async () => {
@@ -232,9 +361,13 @@ describe("teammate executeTask", () => {
     const { syncDynamicRuntimeExtensions } = await import(
       "../../src/core/agent/dynamicRuntimeExtensions.js"
     );
-    const { SubAgent } = await import("../../src/core/agents/SubAgent.js");
-    vi.mocked(syncDynamicRuntimeExtensions).mockClear();
-    vi.mocked(SubAgent).mockClear();
+    const { ProviderFactory } = await import("../../src/providers/ProviderFactory.js");
+    const extensionsMock = syncDynamicRuntimeExtensions as unknown as { mockClear(): void };
+    const provider = ProviderFactory.create({} as never) as {
+      complete: ReturnType<typeof vi.fn>;
+    };
+    extensionsMock.mockClear();
+    provider.complete.mockClear();
 
     await executeTask(
       {
@@ -255,11 +388,10 @@ describe("teammate executeTask", () => {
     );
 
     expect(syncDynamicRuntimeExtensions).toHaveBeenCalledOnce();
-    const subAgentCall = vi.mocked(SubAgent).mock.calls.at(-1);
-    const options = subAgentCall?.[3];
-    expect(options?.getToolDefinitions?.()).toEqual([
+    const request = provider.complete.mock.calls[0]?.[0];
+    expect(request?.tools).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "find_todos" }),
-    ]);
+    ]));
   });
 });
 

@@ -5,6 +5,7 @@
  */
 import type { Ora } from 'ora';
 import type { ThemeDefinition } from './ui/theme/types.js';
+import type { TeamActivitySnapshot } from './core/teams/types.js';
 
 // InkRenderer type defined inline to avoid tsx dev mode issues with .tsx imports
 interface InkRendererInterface {
@@ -274,6 +275,8 @@ export interface StatusLineSettings {
   showActiveMetrics?: boolean;
   /** Show the cancel hint while the agent is working (default: true). */
   showCancelHint?: boolean;
+  /** Show the mode word (PLAN/YOLO/AUTO) next to the glyph in the help line (default: true). */
+  showModeLabel?: boolean;
 }
 
 export interface UISettings {
@@ -312,6 +315,8 @@ export interface UISettings {
   notifications?: boolean | NotificationConfig;
   /** Show LLM-generated next-step suggestions in prompt placeholder (default: true) */
   promptSuggestions?: boolean;
+  /** Enable mouse click-to-position editing in the Ink composer (default: true). */
+  mouseComposerCursor?: boolean;
   /** Fixed composer status-line display preferences. */
   statusLine?: StatusLineSettings;
 }
@@ -379,6 +384,8 @@ export interface FeatureFlagSettings {
   tokenUsageStatus?: boolean;
   /** Enable experimental provider-native prompt cache affinity. */
   promptCaching?: boolean;
+  /** Resolve and run explicitly requested specialist rosters before the lead turn. */
+  automaticSpecialists?: boolean;
   /** Enable the experimental /fork session branching surface. */
   experimentalFork?: boolean;
   /** Enable the experimental /clone session duplication surface. */
@@ -387,6 +394,12 @@ export interface FeatureFlagSettings {
   experimentalHandoff?: boolean;
   /** Enable negotiated browser automation protocol v2 tools. */
   experimentalBrowserToolsV2?: boolean;
+  /** Record model-visible file coverage in the active session. */
+  readStateLedger?: boolean;
+  /** Deduplicate repeated unchanged file windows; implies readStateLedger. */
+  readStateDedup?: boolean;
+  /** Require a complete unchanged read before direct file mutations; implies earlier read-state flags. */
+  readBeforeWrite?: boolean;
 }
 
 export type PermissionMode = 'interactive' | 'unrestricted' | 'restricted' | 'external';
@@ -783,7 +796,7 @@ export interface HookResponse {
 export interface TeamSettings {
   /** Enable team features (default: true) */
   enabled?: boolean;
-  /** Display mode: auto-detect, in-process TUI, or tmux split panes */
+  /** Legacy display preference retained for configuration compatibility. */
   teammateMode?: 'auto' | 'in-process' | 'tmux';
   /** Maximum simultaneous teammates (default: 5) */
   maxTeammates?: number;
@@ -873,6 +886,11 @@ export interface AutohandConfig {
   teams?: TeamSettings;
   /** Browser extension integration settings */
   chrome?: ChromeConfigSettings;
+  /**
+   * Set once the "your provider hit a rate limit — try Autohand?" offer has been shown, so it
+   * never nags a second time. Only relevant for users on their own (non-autohandai) provider.
+   */
+  autohandaiSwitchPromptShown?: boolean;
 }
 
 /** Supported web search providers */
@@ -983,6 +1001,8 @@ export interface CLIOptions {
   output?: string;
   /** Launch in dedicated tmux session */
   tmux?: boolean;
+  /** Legacy team display preference retained for CLI compatibility. */
+  teammateMode?: 'auto' | 'in-process' | 'tmux';
   // Auto-mode options
   /** Inline task prompt for standalone auto-mode loop */
   autoMode?: string;
@@ -1475,9 +1495,11 @@ export type AgentAction =
   | { type: 'create_meta_tool'; name: string; description: string; parameters: Record<string, unknown>; handler: string; scope?: 'user' | 'project' }
   | { type: 'delegate_task'; agent_name: string; task: string }
   | { type: 'delegate_parallel'; tasks: Array<{ agent_name: string; task: string }> }
+  | { type: 'orchestrate_specialists'; objective: string; requested_roles: string[] }
+  | { type: 'install_specialist_roster'; plan_id: string; agent_names: string[] }
   // Team coordination tools
   | { type: 'create_team'; name: string }
-  | { type: 'add_teammate'; name: string; agent_name: string; model?: string }
+  | { type: 'add_teammate'; name: string; agent_name: string; model?: string; requested_role?: string; agent_source?: string }
   | { type: 'create_task'; subject: string; description: string; blocked_by?: string[] }
   | { type: 'task_get'; task_id: string }
   | { type: 'task_list'; status?: 'pending' | 'in_progress' | 'completed'; owner?: string }
@@ -1708,7 +1730,7 @@ export interface AgentStatusSnapshot {
 }
 
 export interface AgentOutputEvent {
-  type: 'message' | 'thinking' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified';
+  type: 'message' | 'thinking' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update';
   content?: string;
   thought?: string;
   toolName?: string;
@@ -1722,6 +1744,8 @@ export interface AgentOutputEvent {
   filePath?: string;
   /** Change type for file_modified events */
   changeType?: 'create' | 'modify' | 'delete';
+  /** Complete live team state for TUI, RPC, and ACP consumers. */
+  teamActivity?: TeamActivitySnapshot;
 }
 
 // ============ Community Skills Marketplace Types ============

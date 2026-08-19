@@ -53,6 +53,19 @@ export interface MockOpenRouterServer {
   close: () => Promise<void>;
 }
 
+export interface MockNativeToolServer extends MockOpenRouterServer {
+  requests: JsonRecord[];
+}
+
+export interface MockNativeAssistantTurn {
+  content: string;
+  toolCall?: {
+    id: string;
+    name: string;
+    args?: JsonRecord;
+  };
+}
+
 export interface MockOpenRouterFetchPreload {
   importSpecifier: string;
   cleanup: () => Promise<void>;
@@ -223,6 +236,148 @@ export async function createMockOpenRouterServer(responseContent: string, delayM
 
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error?: Error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+  };
+}
+
+export async function createMockAutohandAIQuotaServer(): Promise<MockOpenRouterServer> {
+  const server = createServer((request, response) => {
+    if (request.url === '/chat/completions' && request.method === 'POST') {
+      request.resume();
+      const resetAt = Math.floor(Date.now() / 1000) + 2 * 60 * 60 + 30 * 60;
+      response.writeHead(429, {
+        'content-type': 'application/json',
+        'retry-after': String(2 * 60 * 60 + 30 * 60),
+      });
+      response.end(JSON.stringify({
+        error: {
+          type: 'rate_limited',
+          message: "You've used all your requests in this 24-hour window.",
+          scope: 'window_24h',
+          resetAt,
+          upgradeUrl: 'https://console.autohand.ai/upgrade/?from=cli&tier=pro',
+        },
+      }));
+      return;
+    }
+
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Mock Autohand AI quota server did not bind to a TCP port.');
+  }
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error?: Error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+  };
+}
+
+export async function createMockAutohandAINativeToolServer(): Promise<MockNativeToolServer> {
+  return createMockAutohandAINativeSequenceServer([
+    {
+      content: 'Read package.json once.',
+      toolCall: {
+        id: 'call_read_package',
+        name: 'read_file',
+        args: { path: 'package.json' },
+      },
+    },
+    { content: 'MOA_NATIVE_TOOL_HISTORY_OK' },
+  ]);
+}
+
+export async function createMockAutohandAINativeSequenceServer(
+  turns: MockNativeAssistantTurn[],
+): Promise<MockNativeToolServer> {
+  const requests: JsonRecord[] = [];
+  const server = createServer(async (request, response) => {
+    if (request.url !== '/chat/completions' || request.method !== 'POST') {
+      response.writeHead(404, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    const body = recordOrEmpty(JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown);
+    requests.push(body);
+
+    const turn = turns[Math.min(requests.length - 1, turns.length - 1)]
+      ?? { content: '' };
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      id: `chatcmpl-autohand-native-${requests.length}`,
+      created: Math.floor(Date.now() / 1000),
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: turn.content,
+          ...(turn.toolCall
+            ? {
+                tool_calls: [{
+                  id: turn.toolCall.id,
+                  type: 'function',
+                  function: {
+                    name: turn.toolCall.name,
+                    arguments: JSON.stringify(turn.toolCall.args ?? {}),
+                  },
+                }],
+              }
+            : {}),
+        },
+        finish_reason: turn.toolCall ? 'tool_calls' : 'stop',
+      }],
+      usage: {
+        prompt_tokens: 42,
+        completion_tokens: 12,
+        total_tokens: 54,
+      },
+    }));
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Mock Autohand AI native tool server did not bind to a TCP port.');
+  }
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    requests,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error?: Error) => {
@@ -770,12 +925,6 @@ export async function createMockAuthServer(
 ): Promise<MockAuthServer> {
   let pollCount = 0;
   const deviceCode = 'D'.repeat(43);
-  const continuation = [
-    'v1',
-    'current',
-    'eyJhdWQiOiJhdXRvaGFuZC1zaXRlLWNsaS1hdXRoLXYxIn0',
-    'S'.repeat(43),
-  ].join('.');
   const server = createServer((request, response) => {
     if (request.url === '/api/auth/me' && request.method === 'GET') {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -785,6 +934,43 @@ export async function createMockAuthServer(
           email: 'tuistory@example.com',
           name: 'Tuistory Test',
         },
+        entitlement: {
+          tier: 'pro',
+          freeRemaining: null,
+          limits: {
+            displayName: 'Autohand Code Pro',
+            messagesPer5h: 250,
+            messagesPer24h: 1000,
+            messagesPerWeek: 7000,
+            rpm: 1000,
+            inputTokensPerMinute: 500_000,
+            outputTokensPerMinute: 80_000,
+            requiresEligibility: false,
+            perSeat: false,
+            models: ['fantail', 'moa'],
+          },
+          quota: {
+            available: true,
+            window5h: {
+              used: 12,
+              remaining: 238,
+              limit: 250,
+              resetAt: '2026-08-10T06:00:00.000Z',
+            },
+            window24h: {
+              used: 120,
+              remaining: 880,
+              limit: 1000,
+              resetAt: '2026-08-11T01:00:00.000Z',
+            },
+            week: {
+              used: 120,
+              remaining: 6880,
+              limit: 7000,
+              resetAt: '2026-08-17T01:00:00.000Z',
+            },
+          },
+        },
       }));
       return;
     }
@@ -793,12 +979,11 @@ export async function createMockAuthServer(
       response.writeHead(201, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
         success: true,
-        schemaVersion: 1,
+        schemaVersion: 2,
         deviceCode,
         userCode: 'TEST-CAFE',
         verificationUri: 'https://autohand.ai/signin',
-        verificationUriComplete:
-          `https://autohand.ai/signin?continue=${continuation}&user_code=TEST-CAFE`,
+        verificationUriComplete: 'https://autohand.ai/signin?user_code=TEST-CAFE',
         expiresIn: 300,
         interval: 1,
       }));
@@ -814,7 +999,7 @@ export async function createMockAuthServer(
       ) {
         response.end(JSON.stringify({
           success: true,
-          schemaVersion: 1,
+          schemaVersion: 2,
           status: 'authorized',
           token: `ahc_${'C'.repeat(43)}`,
           user: {
@@ -827,7 +1012,7 @@ export async function createMockAuthServer(
       }
       response.end(JSON.stringify({
         success: true,
-        schemaVersion: 1,
+        schemaVersion: 2,
         status: 'pending',
         interval: 1,
       }));

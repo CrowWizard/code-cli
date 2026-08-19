@@ -53,18 +53,19 @@ describe('Blueprint setup-only device authorization', () => {
 
   it('returns only the user-safe challenge and keeps deviceCode private', async () => {
     const pollDeviceAuth = vi.fn();
+    const initiateDeviceAuth = vi.fn(async () => ({
+      success: true,
+      deviceCode: 'private-device-code',
+      userCode: 'ABCD-EFGH',
+      verificationUri: 'https://autohand.ai/signin',
+      verificationUriComplete:
+        'https://autohand.ai/signin?user_code=ABCD-EFGH',
+      expiresIn: 300,
+      interval: 2,
+    }));
     const manager = new BlueprintSetupSessionManager({
       authClient: {
-        initiateDeviceAuth: vi.fn(async () => ({
-          success: true,
-          deviceCode: 'private-device-code',
-          userCode: 'ABCD-EFGH',
-          verificationUri: 'https://autohand.ai/signin',
-          verificationUriComplete:
-            'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
-          expiresIn: 300,
-          interval: 2,
-        })),
+        initiateDeviceAuth,
         pollDeviceAuth,
         cancelDeviceAuth: vi.fn(),
       },
@@ -80,11 +81,12 @@ describe('Blueprint setup-only device authorization', () => {
       sessionId: sessionParams.sessionId,
       userCode: 'ABCD-EFGH',
       verificationUriComplete:
-        'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+        'https://autohand.ai/signin?user_code=ABCD-EFGH',
       expiresAtUnixMs: 1_785_300_000_000,
       pollAfterMs: 2000,
     });
     expect(JSON.stringify(result)).not.toContain('private-device-code');
+    expect(initiateDeviceAuth).toHaveBeenCalledWith('blueprint');
     expect(pollDeviceAuth).not.toHaveBeenCalled();
   });
 
@@ -96,7 +98,7 @@ describe('Blueprint setup-only device authorization', () => {
           deviceCode: 'private-device-code',
           userCode: 'ABCD-EFGH',
           verificationUriComplete:
-            'https://evil.example/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+            'https://evil.example/signin?user_code=ABCD-EFGH',
           expiresIn: 300,
           interval: 2,
         })),
@@ -127,7 +129,7 @@ describe('Blueprint setup-only device authorization', () => {
           deviceCode: 'private-device-code',
           userCode: 'ABCD-EFGH',
           verificationUriComplete:
-            'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+            'https://autohand.ai/signin?user_code=ABCD-EFGH',
           expiresIn: 300,
           interval: 2,
         })),
@@ -143,7 +145,7 @@ describe('Blueprint setup-only device authorization', () => {
 
     const result = await manager.poll(sessionParams);
 
-    expect(pollDeviceAuth).toHaveBeenCalledWith('private-device-code');
+    expect(pollDeviceAuth).toHaveBeenCalledWith('private-device-code', 2);
     expect(persistCredentials).toHaveBeenCalledWith(
       'private-token',
       { id: 'user-1', email: 'user@example.com', name: 'User' },
@@ -162,7 +164,7 @@ describe('Blueprint setup-only device authorization', () => {
           deviceCode: 'private-device-code',
           userCode: 'ABCD-EFGH',
           verificationUriComplete:
-            'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+            'https://autohand.ai/signin?user_code=ABCD-EFGH',
           expiresIn: 300,
           interval: 2,
         })),
@@ -193,7 +195,7 @@ describe('Blueprint setup-only device authorization', () => {
           deviceCode: 'private-device-code',
           userCode: 'ABCD-EFGH',
           verificationUriComplete:
-            'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+            'https://autohand.ai/signin?user_code=ABCD-EFGH',
           expiresIn: 300,
           interval: 2,
         })),
@@ -235,7 +237,7 @@ describe('Blueprint setup-only device authorization', () => {
           deviceCode: 'private-device-code',
           userCode: 'ABCD-EFGH',
           verificationUriComplete:
-            'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+            'https://autohand.ai/signin?user_code=ABCD-EFGH',
           expiresIn: 300,
           interval: 2,
         })),
@@ -271,7 +273,7 @@ describe('Blueprint setup-only device authorization', () => {
           deviceCode: 'private-device-code',
           userCode: 'ABCD-EFGH',
           verificationUriComplete:
-            'https://autohand.ai/signin?continue=signed-opaque&user_code=ABCD-EFGH',
+            'https://autohand.ai/signin?user_code=ABCD-EFGH',
           expiresIn: 300,
           interval: 2,
         })),
@@ -285,7 +287,7 @@ describe('Blueprint setup-only device authorization', () => {
 
     const result = await manager.cancel(sessionParams);
 
-    expect(cancelDeviceAuth).toHaveBeenCalledWith('private-device-code');
+    expect(cancelDeviceAuth).toHaveBeenCalledWith('private-device-code', 2);
     expect(result).toEqual({ contractVersion: 1, status: 'cancelled' });
   });
 

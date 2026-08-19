@@ -51,9 +51,13 @@ brew install autohandai/code/autohand-code
 
 The fully qualified command installs and trusts only the Autohand formula. Every
 supported installation exposes the same CLI as `autohand`, `autohand-code`, and
-`agent`; `autohand` remains the canonical name. The standalone Unix and Windows
-installers refresh all aliases in the selected installation directory, replacing
-an existing `agent` entry there.
+`agent`; `autohand` remains the canonical name. Because `agent` is a generic
+name other AI CLIs also use, every Autohand installer (Unix script, Windows
+script, and Homebrew) scans every writable directory on your `PATH` and
+replaces any existing `agent` command it finds — not only the one in
+Autohand's own install directory — so `agent` reliably resolves to Autohand.
+This happens automatically with no prompt; if another tool's `agent` command
+stops working after installing Autohand, this is why.
 
 ### Manual Installation
 
@@ -345,7 +349,7 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/publish-research`| Preview and publish a saved research report with explicit confirmation             |
 | `/automode`        | Manage auto-mode                                                                 |
 | `/autoresearch`    | Run replayable benchmark loops with history, replay, comparison, and Pareto analysis |
-| `/goal`            | Set, review, or refine the current session goal                                  |
+| `/goal`            | Set a session-attached persistent goal and continue until it reaches a terminal state |
 | `/goal writer`     | Draft one or more well-specified goals with the built-in `$goal-writer` skill    |
 | `/squad`           | Open/manage the local Autohand Squad runtime                                     |
 | `/go`              | Pair this session with the Autohand Code iOS app                                 |
@@ -365,6 +369,8 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/repeat`          | Repeat previous actions                                                          |
 | `/browser`         | Browser integration                                                              |
 | `/review`          | Code review                                                                      |
+
+Persistent goal data remains in the workspace across conversations, but execution does not silently transfer to a fresh session. Use `/goal` to inspect prior state and `/goal resume` to deliberately attach it to the current session.
 
 Published CLI announcements appear as a cached launch block and a persistent line above the composer. Press `Ctrl+X` to dismiss the visible item, or use `/whatsnew` to review and dismiss all active announcements. Dismissal is per announcement; `--offline` keeps cached announcements visible without making announcement requests.
 

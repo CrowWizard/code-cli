@@ -5,6 +5,8 @@
  */
 import fs from 'fs-extra';
 import type { Stats } from 'node:fs';
+import { open, opendir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +14,12 @@ import { applyPatch as applyUnifiedPatch } from 'diff';
 import { GitIgnoreParser } from '../utils/gitIgnore.js';
 import { resolveRipgrepCommand } from '../utils/ripgrep.js';
 import { validateAndFixPatch } from '../utils/patchValidator.js';
+import {
+  readTextFileWindow,
+  type ReadTextWindowOptions,
+  type ReadTextWindowResult,
+} from './readFile.js';
+import type { ReadFileRevision } from '../session/types.js';
 
 /**
  * Resource limits to prevent DoS and resource exhaustion
@@ -65,6 +73,40 @@ export interface SearchOptions {
   relativePath?: string;
 }
 
+export interface ReadFileWindowResult extends ReadTextWindowResult {
+  resolvedPath: string;
+  openedPath: string;
+  repairedPath: boolean;
+  sizeBytes: number;
+  revision: ReadFileRevision;
+  revisionStable: boolean;
+  format: { kind: 'text' } | { kind: 'binary'; mimeType: string };
+}
+
+export interface ReadFileInspection {
+  requestedPath: string;
+  resolvedPath: string;
+  openedPath: string;
+  repairedPath: boolean;
+  revision: ReadFileRevision;
+}
+
+export type FilePathInspection =
+  | { kind: 'missing'; requestedPath: string; resolvedPath: string }
+  | { kind: 'directory'; requestedPath: string; resolvedPath: string }
+  | {
+      kind: 'file';
+      requestedPath: string;
+      resolvedPath: string;
+      revision: ReadFileRevision;
+    };
+
+export interface HashedFileRevision {
+  sha256: string;
+  revision: ReadFileRevision;
+  revisionStable: boolean;
+}
+
 interface AdmittedSearchEntry {
   realPath: string;
   stats: Stats;
@@ -91,6 +133,7 @@ export class FileActionManager {
   private onBatchChange: BatchChangeCallback | null = null;
   private currentToolId = '';
   private currentToolName = '';
+  private previewStaleCheckEnabled = false;
 
   constructor(
     workspaceRoot: string,
@@ -185,6 +228,10 @@ export class FileActionManager {
     this.onBatchChange = null;
   }
 
+  setPreviewStaleCheckEnabled(enabled: boolean): void {
+    this.previewStaleCheckEnabled = enabled;
+  }
+
   /**
    * Check if in preview mode
    */
@@ -240,6 +287,25 @@ export class FileActionManager {
     for (const change of changesToApply) {
       try {
         const fullPath = this.resolvePath(change.filePath);
+        if (this.previewStaleCheckEnabled) {
+          const exists = await fs.pathExists(fullPath);
+          if (change.changeType === 'create') {
+            if (exists) {
+              throw new Error(`${change.filePath} was created after preview; review and retry.`);
+            }
+          } else {
+            if (!exists) {
+              throw new Error(`${change.filePath} changed after preview; review and retry.`);
+            }
+            const stats = await fs.stat(fullPath);
+            const currentContents = stats.isFile()
+              ? await fs.readFile(fullPath, 'utf8')
+              : '';
+            if (currentContents !== change.originalContent) {
+              throw new Error(`${change.filePath} changed after preview; review and retry.`);
+            }
+          }
+        }
 
         if (change.changeType === 'delete') {
           await fs.remove(fullPath);
@@ -324,6 +390,354 @@ export class FileActionManager {
     }
 
     return fs.readFile(filePath, 'utf8');
+  }
+
+  async readFileWindow(
+    target: string,
+    options: ReadTextWindowOptions,
+    inspection?: ReadFileInspection,
+  ): Promise<ReadFileWindowResult> {
+    const inspected = inspection?.requestedPath === target
+      ? inspection
+      : await this.inspectReadFile(target);
+    const {
+      resolvedPath: filePath,
+      openedPath,
+      repairedPath,
+      revision,
+    } = inspected;
+    const format = await this.detectReadFileFormat(filePath, revision.sizeBytes);
+    if (format.kind === 'binary') {
+      const currentRevision = this.toReadFileRevision(await fs.stat(filePath));
+      return {
+        lines: [],
+        reachedEof: true,
+        linesScanned: 0,
+        resolvedPath: filePath,
+        openedPath,
+        repairedPath,
+        sizeBytes: revision.sizeBytes,
+        revision,
+        revisionStable: this.sameReadFileRevision(revision, currentRevision),
+        format,
+      };
+    }
+    const result = await readTextFileWindow(filePath, options);
+    const currentRevision = this.toReadFileRevision(await fs.stat(filePath));
+    return {
+      ...result,
+      resolvedPath: filePath,
+      openedPath,
+      repairedPath,
+      sizeBytes: revision.sizeBytes,
+      revision,
+      revisionStable: this.sameReadFileRevision(revision, currentRevision),
+      format,
+    };
+  }
+
+  async inspectReadFile(target: string): Promise<ReadFileInspection> {
+    this.assertSafeReadFileTarget(target);
+    const { filePath, openedPath, repairedPath } = await this.resolveReadFileTarget(target);
+    const resolvedPath = await fs.realpath(filePath);
+    const stats = await fs.stat(resolvedPath);
+    if (!stats.isFile()) {
+      throw new Error(`Path ${target} is not a regular file.`);
+    }
+    return {
+      requestedPath: target,
+      resolvedPath,
+      openedPath,
+      repairedPath,
+      revision: this.toReadFileRevision(stats),
+    };
+  }
+
+  async inspectPath(target: string): Promise<FilePathInspection> {
+    const requestedPath = target;
+    const admittedPath = this.resolvePath(target);
+    if (!(await fs.pathExists(admittedPath))) {
+      return { kind: 'missing', requestedPath, resolvedPath: admittedPath };
+    }
+    const resolvedPath = await fs.realpath(admittedPath);
+    const stats = await fs.stat(resolvedPath);
+    if (stats.isDirectory()) {
+      return { kind: 'directory', requestedPath, resolvedPath };
+    }
+    if (!stats.isFile()) {
+      throw new Error(`Path ${target} is not a regular file.`);
+    }
+    return {
+      kind: 'file',
+      requestedPath,
+      resolvedPath,
+      revision: this.toReadFileRevision(stats),
+    };
+  }
+
+  async hashInspectedFile(inspection: Extract<FilePathInspection, { kind: 'file' }>): Promise<HashedFileRevision> {
+    const before = this.toReadFileRevision(await fs.stat(inspection.resolvedPath));
+    const hash = createHash('sha256');
+    const stream = fs.createReadStream(inspection.resolvedPath);
+    for await (const chunk of stream) {
+      hash.update(chunk as Buffer);
+    }
+    const after = this.toReadFileRevision(await fs.stat(inspection.resolvedPath));
+    return {
+      sha256: hash.digest('hex'),
+      revision: before,
+      revisionStable: this.sameReadFileRevision(before, after),
+    };
+  }
+
+  private toReadFileRevision(stats: Stats): ReadFileRevision {
+    return {
+      sizeBytes: stats.size,
+      mtimeMs: stats.mtimeMs,
+      ctimeMs: stats.ctimeMs,
+      ...(Number.isSafeInteger(stats.ino) ? { inode: stats.ino } : {}),
+      ...(Number.isSafeInteger(stats.dev) ? { device: stats.dev } : {}),
+    };
+  }
+
+  private sameReadFileRevision(left: ReadFileRevision, right: ReadFileRevision): boolean {
+    return left.sizeBytes === right.sizeBytes
+      && left.mtimeMs === right.mtimeMs
+      && left.ctimeMs === right.ctimeMs
+      && left.inode === right.inode
+      && left.device === right.device;
+  }
+
+  private assertSafeReadFileTarget(target: string): void {
+    if (process.platform === 'win32') {
+      return;
+    }
+    const expandedTarget = target === '~'
+      ? os.homedir()
+      : target.startsWith(`~${path.sep}`) || target.startsWith('~/')
+        ? path.join(os.homedir(), target.slice(2))
+        : target;
+    const absolutePath = path.resolve(
+      path.isAbsolute(expandedTarget)
+        ? expandedTarget
+        : path.join(this.workspaceRoot, expandedTarget),
+    ).replace(/\\/g, '/');
+    const blocked = /^\/dev\/(?:zero|random|urandom|stdin)(?:\/|$)/.test(absolutePath)
+      || /^\/dev\/fd(?:\/|$)/.test(absolutePath)
+      || /^\/proc\/(?:self|thread-self|\d+)\/fd(?:\/|$)/.test(absolutePath);
+    if (blocked) {
+      throw new Error(`read_file refuses device or stream path ${target}.`);
+    }
+  }
+
+  private async resolveReadFileTarget(target: string): Promise<{
+    filePath: string;
+    openedPath: string;
+    repairedPath: boolean;
+  }> {
+    const requestedPath = this.resolvePath(target);
+    if (await fs.pathExists(requestedPath)) {
+      return {
+        filePath: requestedPath,
+        openedPath: this.readFileDisplayPath(requestedPath, target),
+        repairedPath: false,
+      };
+    }
+
+    for (const candidate of this.readPathVariants(target)) {
+      let candidatePath: string;
+      try {
+        candidatePath = this.resolvePath(candidate);
+      } catch {
+        continue;
+      }
+      if (await fs.pathExists(candidatePath)) {
+        return {
+          filePath: candidatePath,
+          openedPath: this.readFileDisplayPath(candidatePath, candidate),
+          repairedPath: true,
+        };
+      }
+    }
+
+    const suggestions = await this.suggestReadPaths(target);
+    const suggestion = suggestions.length === 1
+      ? ` Did you mean "${suggestions[0]}"?`
+      : suggestions.length > 1
+        ? ` Did you mean one of: ${suggestions.map(value => `"${value}"`).join(', ')}?`
+        : '';
+    throw new Error(`File ${target} not found in workspace.${suggestion}`);
+  }
+
+  private readFileDisplayPath(filePath: string, fallback: string): string {
+    const realFilePath = this.resolveRealPathOrAncestor(filePath);
+    if (!this.isPathWithinRoot(realFilePath, this.workspaceRoot)) {
+      return fallback;
+    }
+    const relativePath = path.relative(this.workspaceRoot, realFilePath);
+    return relativePath.split(path.sep).join('/');
+  }
+
+  private readPathVariants(target: string): string[] {
+    const maximumVariants = 32;
+    const variants = new Set<string>();
+    const visited = new Set([target]);
+    const queue = [target];
+    const replacements = [
+      [' ', '\u202F'],
+      ['\u202F', ' '],
+      ["'", '\u2019'],
+      ['\u2019', "'"],
+    ] as const;
+
+    while (queue.length > 0 && variants.size < maximumVariants) {
+      const seed = queue.shift()!;
+      const candidates = [seed.normalize('NFC'), seed.normalize('NFD')];
+      for (const [from, to] of replacements) {
+        let index = seed.indexOf(from);
+        while (index !== -1) {
+          candidates.push(`${seed.slice(0, index)}${to}${seed.slice(index + from.length)}`);
+          index = seed.indexOf(from, index + from.length);
+        }
+      }
+
+      for (const candidate of candidates) {
+        if (visited.has(candidate)) {
+          continue;
+        }
+        visited.add(candidate);
+        variants.add(candidate);
+        queue.push(candidate);
+        if (variants.size >= maximumVariants) {
+          break;
+        }
+      }
+    }
+    return Array.from(variants);
+  }
+
+  private async suggestReadPaths(target: string): Promise<string[]> {
+    const parent = path.dirname(target);
+    let parentPath: string;
+    try {
+      parentPath = this.resolvePath(parent);
+    } catch {
+      return [];
+    }
+    if (!(await fs.pathExists(parentPath))) {
+      return [];
+    }
+    const stats = await fs.stat(parentPath);
+    if (!stats.isDirectory()) {
+      return [];
+    }
+
+    const requestedName = this.normalizeSuggestedFilename(path.basename(target));
+    const matches: Array<{ name: string; distance: number }> = [];
+    const directory = await opendir(parentPath);
+    let inspectedEntries = 0;
+    for await (const entry of directory) {
+      if (inspectedEntries >= FILE_LIMITS.MAX_DIR_ENTRIES) {
+        break;
+      }
+      inspectedEntries++;
+      if (!entry.isFile() && !entry.isSymbolicLink()) {
+        continue;
+      }
+      const normalized = this.normalizeSuggestedFilename(entry.name);
+      const substringMatch = normalized.includes(requestedName) || requestedName.includes(normalized);
+      const distance = this.boundedEditDistance(requestedName, normalized, 2);
+      if (!substringMatch && distance > 2) {
+        continue;
+      }
+      matches.push({ name: entry.name, distance });
+      matches.sort((left, right) => left.distance - right.distance || left.name.localeCompare(right.name));
+      if (matches.length > 3) {
+        matches.pop();
+      }
+    }
+    return matches.map(candidate => (
+      parent === '.' ? candidate.name : path.join(parent, candidate.name)
+    ));
+  }
+
+  private normalizeSuggestedFilename(value: string): string {
+    return value
+      .normalize('NFC')
+      .replace(/\u202F/g, ' ')
+      .replace(/\u2019/g, "'")
+      .toLowerCase();
+  }
+
+  private boundedEditDistance(left: string, right: string, maximum: number): number {
+    const leftCharacters = Array.from(left);
+    const rightCharacters = Array.from(right);
+    if (Math.abs(leftCharacters.length - rightCharacters.length) > maximum) {
+      return maximum + 1;
+    }
+
+    let previous = Array.from({ length: rightCharacters.length + 1 }, (_, index) => index);
+    for (let leftIndex = 1; leftIndex <= leftCharacters.length; leftIndex++) {
+      const current = [leftIndex];
+      let rowMinimum = current[0];
+      for (let rightIndex = 1; rightIndex <= rightCharacters.length; rightIndex++) {
+        const substitutionCost = leftCharacters[leftIndex - 1] === rightCharacters[rightIndex - 1] ? 0 : 1;
+        const distance = Math.min(
+          current[rightIndex - 1] + 1,
+          previous[rightIndex] + 1,
+          previous[rightIndex - 1] + substitutionCost,
+        );
+        current.push(distance);
+        rowMinimum = Math.min(rowMinimum, distance);
+      }
+      if (rowMinimum > maximum) {
+        return maximum + 1;
+      }
+      previous = current;
+    }
+    return previous[rightCharacters.length];
+  }
+
+  private async detectReadFileFormat(
+    filePath: string,
+    sizeBytes: number,
+  ): Promise<ReadFileWindowResult['format']> {
+    const sampleSize = Math.min(sizeBytes, 8 * 1024);
+    if (sampleSize === 0) {
+      return { kind: 'text' };
+    }
+    const handle = await open(filePath, 'r');
+    try {
+      const sample = Buffer.allocUnsafe(sampleSize);
+      const { bytesRead } = await handle.read(sample, 0, sampleSize, 0);
+      return this.sniffReadFileFormat(sample.subarray(0, bytesRead));
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private sniffReadFileFormat(sample: Buffer): ReadFileWindowResult['format'] {
+    if (sample.subarray(0, 5).toString('ascii') === '%PDF-') {
+      return { kind: 'binary', mimeType: 'application/pdf' };
+    }
+    if (sample.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+      return { kind: 'binary', mimeType: 'image/png' };
+    }
+    if (sample[0] === 0xff && sample[1] === 0xd8 && sample[2] === 0xff) {
+      return { kind: 'binary', mimeType: 'image/jpeg' };
+    }
+    const signature = sample.subarray(0, 6).toString('ascii');
+    if (signature === 'GIF87a' || signature === 'GIF89a') {
+      return { kind: 'binary', mimeType: 'image/gif' };
+    }
+    if (sample.subarray(0, 4).toString('ascii') === 'RIFF'
+      && sample.subarray(8, 12).toString('ascii') === 'WEBP') {
+      return { kind: 'binary', mimeType: 'image/webp' };
+    }
+    if (sample.includes(0)) {
+      return { kind: 'binary', mimeType: 'application/octet-stream' };
+    }
+    return { kind: 'text' };
   }
 
   async writeFile(target: string, contents: string, description?: string): Promise<void> {

@@ -24,13 +24,17 @@ This directory contains automated CI/CD workflows for the Autohand CLI project.
    - Linux ARM64 (`autohand-linux-arm64`)
    - Windows x64 (`autohand-windows-x64.exe`)
 
-4. **Generates release notes** from the correct previous release tag
+4. **Signs macOS binaries after Bun compilation** and verifies each transported
+   Actions artifact on a native Apple Silicon or Intel runner before release
+   publication
 
-5. **Creates GitHub Release** with binaries attached
+5. **Generates release notes** from the correct previous release tag
 
-6. **Updates the public Homebrew tap** from the verified release archives (stable releases only)
+6. **Creates GitHub Release** with binaries attached
 
-7. **Publishes to npm**
+7. **Updates the public Homebrew tap** from the verified release archives (stable releases only)
+
+8. **Publishes to npm**
    - Alpha releases use the `alpha` dist-tag
    - Stable releases use the `latest` dist-tag
 

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
-import { GoalManager } from '../goals/GoalManager.js';
+import { buildGoalContinuationInstruction, GoalManager } from '../goals/GoalManager.js';
 import type { SlashCommand, SlashCommandContext } from '../core/slashCommandTypes.js';
 import type { GoalMutationResult, GoalSnapshot } from '../goals/types.js';
 import { GOAL_FEATURE_DISABLED_MESSAGE, resolveGoalFeatureEnabled } from '../goals/feature.js';
@@ -30,7 +30,9 @@ export async function goal(ctx: SlashCommandContext, args: string[] = []): Promi
   }
   await ctx.trackFeatureActivation?.('slash_goal', { surface: 'slash_command' });
 
-  const manager = new GoalManager(ctx.workspaceRoot);
+  const manager = new GoalManager(ctx.workspaceRoot, {
+    sessionId: ctx.sessionManager?.getCurrentSession()?.metadata.sessionId,
+  });
   const input = args.join(' ').trim();
   if (!input) {
     const snapshot = await manager.getSnapshot();
@@ -154,11 +156,8 @@ async function handleQueue(manager: GoalManager, rest: string): Promise<string> 
 }
 
 function queueGoalContinuation(ctx: SlashCommandContext, objective: string): void {
-  ctx.queueInstruction?.([
-    `Active goal: ${objective}`,
-    'Continue working toward this persistent goal until it is complete, blocked, paused, cleared, or budget-limited.',
-    'Use get_goal or update_goal when you need to inspect or modify the goal state.',
-  ].join('\n'));
+  ctx.setInteractionMode?.('automode');
+  ctx.queueInstruction?.(buildGoalContinuationInstruction(objective));
 }
 
 function formatMutation(result: GoalMutationResult): string {

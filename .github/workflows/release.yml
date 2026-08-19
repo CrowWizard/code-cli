@@ -194,7 +194,7 @@ jobs:
           - os: macos-latest
             target: darwin-arm64
             artifact: autohand-macos-arm64
-          - os: macos-latest
+          - os: macos-15-intel
             target: darwin-x64
             artifact: autohand-macos-x64
           - os: ubuntu-latest
@@ -237,6 +237,12 @@ jobs:
           # import for Node/Bun module resolution at runtime, same as `sharp`
           # in tsup.config.ts.
           bun build ./src/index.ts --compile --target=bun-${{ matrix.target }} --external node-llama-cpp --outfile ./binaries/${{ matrix.artifact }}
+
+      - name: Sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - --timestamp=none ./binaries/${{ matrix.artifact }}
+          codesign --verify --strict --verbose=4 ./binaries/${{ matrix.artifact }}
 
       - name: Verify binary
         if: runner.os != 'Windows' && !contains(matrix.target, 'arm64') || matrix.os == 'macos-latest' && contains(matrix.target, 'arm64')
@@ -293,8 +299,36 @@ jobs:
           path: ./binaries/${{ matrix.artifact }}
           retention-days: 1
 
-  release:
+  verify-macos-artifacts:
     needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: autohand-macos-arm64
+          - os: macos-15-intel
+            artifact: autohand-macos-x64
+
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: binaries
+
+      - name: Verify transported macOS binary
+        shell: bash
+        run: |
+          binary="./binaries/${{ matrix.artifact }}"
+          chmod +x "$binary"
+          file "$binary"
+          codesign --verify --strict --verbose=4 "$binary"
+          "$binary" --version < /dev/null
+
+  release:
+    needs: [prepare, build, verify-macos-artifacts]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:

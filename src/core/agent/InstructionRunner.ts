@@ -31,6 +31,7 @@ import {
 
 interface InstructionConversation {
   addMessage(message: { role: 'user'; content: string }): void;
+  addSystemNote(content: string, label?: string): void;
   history(): unknown[];
 }
 
@@ -44,6 +45,7 @@ interface InstructionProviderConfigManager {
 
 interface InstructionSessionManager {
   getCurrentSession(): {
+    metadata?: { sessionId: string };
     recordTurnUsage?: (input: SessionTurnUsageInput) => Promise<void>;
     getMessages?: () => SessionMessage[];
   } | null;
@@ -117,6 +119,7 @@ export interface AgentInstructionHost {
   installPersistentConsoleBridge(): () => void;
   formatStatusLine(): { left: string; right?: string };
   printUserInstructionToChatLog(instruction: string): void;
+  prepareSpecialists?(instruction: string): Promise<string | undefined>;
   setupPersistentInputInterruptHandlers(
     abortController: AbortController,
     onCancel: () => void
@@ -150,6 +153,8 @@ export interface AgentInstructionHost {
   injectContinuationMessage(error: Error, attempt: number): void;
   getDisplayErrorMessage(error: unknown): string;
   notifySessionFailure?(error: Error): void | Promise<void>;
+  /** Offer to switch to Autohand's provider when the user's own provider hit a rate/quota wall. */
+  maybeOfferProviderSwitch?(error: Error): void | Promise<void>;
   recordTurnFailure?(message: string): void;
   emitOutput(event: AgentOutputEvent): void;
   printCompletionSummary(regionsStillActive: boolean, succeeded?: boolean): void;
@@ -385,6 +390,16 @@ export class InstructionRunner {
       : shouldUsePersistentInput
         ? host.setupPersistentInputInterruptHandlers(abortController, handleCancel)
         : host.setupEscListener(abortController, handleCancel, true);
+
+    const specialistResults = await host.prepareSpecialists?.(instruction);
+    if (specialistResults) {
+      host.conversation.addSystemNote(specialistResults, '[Specialist Results]');
+    }
+    if (abortController.signal.aborted) {
+      success = false;
+      return false;
+    }
+
     const stopPreparation = host.startPreparationStatus(instruction);
     try {
       const userMessage = await host.buildUserMessage(instruction);
@@ -550,6 +565,15 @@ export class InstructionRunner {
         } else {
           console.error(errorMessage);
         }
+
+        // After the error is shown, offer a switch to Autohand's provider if this was a
+        // rate-limit/quota wall on the user's own provider. Swallowed like notifySessionFailure:
+        // a prompt failure must never replace the error the user actually needs to see.
+        try {
+          await host.maybeOfferProviderSwitch?.(err);
+        } catch {
+          // ignore
+        }
       }
       success = await finalizeResearchForTurn(success);
     } finally {
@@ -623,7 +647,9 @@ export class InstructionRunner {
         const turnTokens = isActualTurnUsage(completedTurnUsage) && !host.currentTurnHadUnavailableUsage
           ? completedTurnUsage.totalTokens
           : 0;
-        await new GoalManager(host.runtime.workspaceRoot).recordTurnUsage({ tokensUsed: turnTokens });
+        await new GoalManager(host.runtime.workspaceRoot, {
+          sessionId: host.sessionManager?.getCurrentSession()?.metadata?.sessionId,
+        }).recordTurnUsage({ tokensUsed: turnTokens });
       } catch {
         // Goal accounting is best-effort and must never mask the turn result.
       }

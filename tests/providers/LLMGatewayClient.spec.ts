@@ -197,7 +197,7 @@ describe('LLMGatewayClient', () => {
       );
     });
 
-    it('omits orphaned tool messages from OpenAI-compatible chat payloads', async () => {
+    it('preserves orphaned tool observations as API-valid system context', async () => {
       const fetchMock = vi.fn().mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({
@@ -230,7 +230,13 @@ describe('LLMGatewayClient', () => {
       const payload = JSON.parse(fetchMock.mock.calls[0][1].body as string) as {
         messages: Array<{ role: string; tool_call_id?: string }>;
       };
-      expect(payload.messages).toEqual([{ role: 'user', content: 'Continue' }]);
+      expect(payload.messages).toEqual([
+        { role: 'user', content: 'Continue' },
+        {
+          role: 'system',
+          content: '[Recovered Tool Result: read_file]\norphan result',
+        },
+      ]);
     });
 
     it('should throw friendly error on 401 authentication failure', async () => {
@@ -318,6 +324,300 @@ describe('LLMGatewayClient', () => {
       await expect(client.complete({
         messages: [{ role: 'user', content: 'Hello' }]
       })).rejects.toMatchObject({ code: 'rate_limited' });
+    });
+
+    it('recommends a paid plan when Autohand AI quota is exhausted', async () => {
+      const originalTimeZone = process.env.TZ;
+      process.env.TZ = 'Pacific/Auckland';
+      const resetAt = Math.floor(Date.now() / 1000) + 2 * 60 * 60 + 30 * 60;
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers(),
+        json: () => Promise.resolve({
+          error: {
+            type: 'rate_limited',
+            message: "You've used all your requests in this 5-hour window.",
+            scope: 'window_5h',
+            resetAt,
+            upgradeUrl: 'https://console.autohand.ai/upgrade/?from=cli&tier=pro',
+          },
+        }),
+      });
+
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 3, retryDelay: 0 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+
+      try {
+        await expect(client.complete({
+          messages: [{ role: 'user', content: 'Hello' }],
+        })).rejects.toMatchObject({
+          code: 'rate_limited',
+          retryable: false,
+          message: expect.stringMatching(
+            /5-hour request quota reached\.[\s\S]*Resets .+ \(Pacific\/Auckland\) · in 2h 30m\.[\s\S]*Upgrade your Autohand Code plan for more usage: https:\/\/console\.autohand\.ai\/upgrade\/\?from=cli&tier=pro/,
+          ),
+        });
+        expect(global.fetch).toHaveBeenCalledTimes(1);
+      } finally {
+        if (originalTimeZone === undefined) {
+          delete process.env.TZ;
+        } else {
+          process.env.TZ = originalTimeZone;
+        }
+      }
+    });
+
+    it('reports a weekly quota reset safely when the timestamp is unavailable', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers(),
+        json: () => Promise.resolve({
+          error: {
+            type: 'rate_limited',
+            message: "You've used all your requests for this week.",
+            scope: 'window_week',
+            resetAt: 'not-a-timestamp',
+            upgradeUrl: 'https://console.autohand.ai/upgrade/?from=cli&tier=max',
+          },
+        }),
+      });
+      global.fetch = fetchMock;
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 3, retryDelay: 0 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+
+      await expect(client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+      })).rejects.toMatchObject({
+        code: 'rate_limited',
+        retryable: false,
+        message: expect.stringMatching(
+          /weekly request quota reached\.[\s\S]*Reset time is temporarily unavailable\. Run \/usage to refresh your quota\./,
+        ),
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('identifies a 24-hour quota as terminal without calling it a generic rate limit', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'Retry-After': '3600' }),
+        json: () => Promise.resolve({
+          error: {
+            type: 'rate_limited',
+            message: "You've used all your requests in this 24-hour window.",
+            scope: 'window_24h',
+            resetAt: Math.floor(Date.now() / 1000) + 3600,
+          },
+        }),
+      });
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 3, retryDelay: 0 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+
+      await expect(client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+      })).rejects.toMatchObject({
+        code: 'rate_limited',
+        message: expect.stringContaining('Autohand AI 24-hour request quota reached.'),
+        retryable: false,
+      });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('identifies uncached input-token throughput as terminal and never retries it as RPM', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'Retry-After': '1' }),
+        json: () => Promise.resolve({
+          error: {
+            type: 'rate_limited',
+            message: 'Your uncached input-token throughput is exhausted for this minute.',
+            scope: 'input_tpm',
+            upgradeUrl: 'https://console.autohand.ai/upgrade/?from=cli&tier=max',
+          },
+        }),
+      });
+      global.fetch = fetchMock;
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 3, retryDelay: 0 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+
+      await expect(client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+      })).rejects.toMatchObject({
+        code: 'rate_limited',
+        retryable: false,
+        scope: 'input_tpm',
+        message: expect.stringMatching(
+          /uncached input-token throughput reached[\s\S]*Upgrade your Autohand Code plan/,
+        ),
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries a transient Autohand AI RPM throttle after the server delay', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-08-14T00:00:00.000Z'));
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          headers: new Headers({ 'Retry-After': '2' }),
+          json: () => Promise.resolve({
+            error: {
+              type: 'rate_limited',
+              message: 'Too many requests. Slow down and try again shortly.',
+              scope: 'rpm',
+            },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'retry-success',
+            created: Date.now(),
+            choices: [{
+              message: { role: 'assistant', content: 'Recovered after throttling.' },
+              finish_reason: 'stop',
+            }],
+          }),
+        });
+      global.fetch = fetchMock;
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 1, retryDelay: 10 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+
+      try {
+        const completion = client.complete({
+          messages: [{ role: 'user', content: 'Hello' }],
+        });
+        await vi.advanceTimersByTimeAsync(1_999);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(completion).resolves.toMatchObject({
+          content: 'Recovered after throttling.',
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not retry an Autohand AI rate limit with an unknown scope', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'Retry-After': '1' }),
+        json: () => Promise.resolve({
+          error: {
+            type: 'rate_limited',
+            message: 'Unknown rate-limit policy.',
+            scope: 'unexpected_scope',
+          },
+        }),
+      });
+      global.fetch = fetchMock;
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 3, retryDelay: 0 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+
+      await expect(client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+      })).rejects.toMatchObject({ code: 'rate_limited' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels while waiting to retry an Autohand AI RPM throttle', async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'Retry-After': '60' }),
+        json: () => Promise.resolve({
+          error: {
+            type: 'rate_limited',
+            message: 'Too many requests. Slow down and try again shortly.',
+            scope: 'rpm',
+          },
+        }),
+      });
+      const client = new LLMGatewayClient(
+        { apiKey: 'test-key', model: 'fantail' },
+        { maxRetries: 1, retryDelay: 10 },
+        {
+          serviceName: 'Autohand AI',
+          credentialName: 'Autohand AI API key',
+          accountName: 'Autohand AI account',
+        },
+      );
+      let settled = false;
+      const outcome = client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+        signal: controller.signal,
+      }).then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      ).finally(() => {
+        settled = true;
+      });
+
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(true);
+        await expect(outcome).resolves.toMatchObject({
+          error: expect.objectContaining({ code: 'cancelled' }),
+        });
+        expect(global.fetch).toHaveBeenCalledTimes(1);
+      } finally {
+        await vi.runAllTimersAsync();
+        await outcome;
+        vi.useRealTimers();
+      }
     });
 
     it('classifies provider token-per-minute request-size failures as non-retryable context overflow', async () => {

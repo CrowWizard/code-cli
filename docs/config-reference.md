@@ -93,6 +93,7 @@ export AUTOHAND_HOME=/custom/path  # Changes ~/.autohand to /custom/path
 | `AUTOHAND_CLIENT_VERSION`              | Client version (set by ACP extensions)           | `0.169.0`                        |
 | `AUTOHAND_CODE`                        | Environment detection flag (set automatically)   | `1`                              |
 | `AUTOHAND_CODE_SIMPLE`                 | Enable bare mode without passing `--bare`        | `1`                              |
+| `AUTOHAND_DISABLE_STATEFUL_READ`       | Emergency opt-out for all stateful-read experiments | `1`                           |
 
 ### Thinking Level
 
@@ -161,22 +162,20 @@ These explicit inputs remain available in bare mode:
 
 ### `features.autohand_inference`
 
-Autohand-hosted inference is behind the `autohand_inference` feature flag before the release is merged into mainline defaults.
+Autohand-hosted inference (the `autohandai` provider, Fantail/Moa) is enabled by default. Set this to `false` to hide it — for example, to keep a workspace pinned to a different provider without it appearing in `/model`.
 
 ```json
 {
   "features": {
-    "autohand_inference": true
+    "autohand_inference": false
   }
 }
 ```
 
-Environment opt-in is also supported:
+An environment override is also supported:
 
 ```bash
-AUTOHAND_FEATURE_AUTOHAND_INFERENCE=1 autohand
-# or
-AUTOHAND_FEATURES=autohand_inference autohand
+AUTOHAND_FEATURE_AUTOHAND_INFERENCE=0 autohand
 ```
 
 When disabled, Autohand is hidden from setup and `/model`, Fantail/Moa are hidden from ACP and JSON-RPC model discovery, and `autohandai` provider config resolves as unavailable.
@@ -251,8 +250,10 @@ Requires `features.autohand_inference: true` or `AUTOHAND_FEATURE_AUTOHAND_INFER
 | `apiKey`         | string                     | SDK Cloud/API-key Cloud | -                   | Autohand AI API key                                       |
 | `baseUrl`        | string                     | No       | `https://api.autohand.ai/v1`  | OpenAI-compatible API endpoint                            |
 | `model`          | string                     | Yes      | `fantail`                     | `fantail`, `moa`, or a selected local MLX coding model    |
-| `contextWindow`  | number                     | No       | `16000` for Fantail, `1000000` for Moa, `256000` for Local | Model context window                      |
+| `contextWindow`  | number                     | No       | `64000` for Fantail, `1000000` for Moa, `256000` for Local | Model context window                      |
 | `reasoningEffort` | `"medium"`, `"high"`, or `"xhigh"` | Moa Cloud | `"high"` during setup | Moa thinking effort level |
+
+Cloud model context and output limits come from the active `models.json` catalog. The catalog is authoritative over stale persisted `contextWindow` values, so existing Fantail configurations automatically adopt its 64k input window and 16k output ceiling without requiring users to rewrite `~/.autohand/config.json`.
 | `port`           | number                     | Local    | `8080`                        | Local MLX server port                                     |
 | `localModelPath` | string                     | No       | -                             | Downloaded local coding model path                        |
 | `serverCommand`  | string                     | No       | -                             | Local server start command                                |
@@ -665,6 +666,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
     },
     "showCompletionNotification": true,
     "showThinking": true,
+    "mouseComposerCursor": true,
     "terminalBell": true,
     "checkForUpdates": true,
     "updateCheckInterval": 24
@@ -694,6 +696,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `completionReportEnabled`    | boolean | `true`  | Ask the model to include a concise completion report after completed action turns |
 | `showCompletionNotification` | boolean | `true`  | Show system notification when task completes                                                   |
 | `showThinking`               | boolean | `true`  | Display LLM's reasoning/thought process                                                        |
+| `mouseComposerCursor`        | boolean | `true`  | Enable click-to-position editing in the Ink composer                                           |
 | `terminalBell`               | boolean | `true`  | Ring terminal bell when task completes (shows badge on terminal tab/dock)                      |
 | `checkForUpdates`            | boolean | `true`  | Check for CLI updates on startup                                                               |
 | `updateCheckInterval`        | number | `24`    | Hours between update checks (uses cached result within interval)                               |
@@ -805,6 +808,22 @@ AUTOHAND_LEGACY_UI=1 autohand
 ```
 
 Note: This feature is experimental and may have edge cases. The default ora-based UI remains stable and fully functional.
+
+### Mouse Composer Cursor
+
+`mouseComposerCursor` is enabled by default. To enable it explicitly or restore the default, run:
+
+```bash
+autohand config set ui.mouseComposerCursor true
+```
+
+This lets you place the blinking composer cursor by clicking text, including wrapped lines and Unicode text. To disable it, run:
+
+```bash
+autohand config set ui.mouseComposerCursor false
+```
+
+Terminal mouse reporting can change native selection and scroll-wheel behavior. Mouse reporting is disabled while the agent owns the screen for active work and is always restored when Autohand exits. Terminal-specific modifier keys, commonly Shift, may bypass mouse reporting for native selection.
 
 ### Update Check
 
@@ -1421,6 +1440,11 @@ Backend API configuration for team features.
 | --------------- | ------ | ------------------------- | --------------------------------------- |
 | `baseUrl`       | string | `https://api.autohand.ai` | API endpoint                            |
 | `companySecret` | string | -                         | Team/company secret for shared features |
+
+`api.baseUrl` must point to the Autohand control-plane API, not the Autohand website. Saved
+`*.autohand-web.pages.dev` website deployment URLs are repaired to the canonical API during
+config loading. Explicit `AUTOHAND_API_URL` overrides remain unchanged for development and
+staging environments.
 
 Can also be set via environment variables:
 
@@ -2220,7 +2244,7 @@ These flags override config file settings:
 | ----------------------------- | ---------------------------------------------------------------------------------------------- |
 | `--mode <mode>`               | Run mode: interactive (default), rpc, or acp                                                   |
 | `--acp`                       | Shorthand for --mode acp (Agent Client Protocol over stdio)                                    |
-| `--teammate-mode <mode>`      | Team display mode: auto, in-process, or tmux                                                   |
+| `--teammate-mode <mode>`      | Legacy team display preference; the live team view stays in the lead terminal                  |
 
 To register the native stdio agent in Zed, JetBrains IDEs, JetBrains Air, or another compatible development environment, see the [ACP integration guide](./guides/ACP.md).
 
@@ -2274,6 +2298,18 @@ Remote feature flags are fetched from `/v1/feature-flags/evaluate`, cached at `~
 
 `prompt_caching` is an experimental feature switch (config path `features.promptCaching`, default off) that sends an opaque session-affinity hint on eligible provider requests. The initial candidate is the ChatGPT OAuth Responses transport; standard OpenAI Chat Completions and other providers remain unchanged. Enable it with `autohand experiments enable prompt_caching`. The OAuth transport remains unverified until a current two-turn live probe confirms accepted controls and provider-reported cache usage, so an independent remote kill switch and exact-field fallback remain active.
 
+`automatic_specialists` is an experimental feature switch (config path `features.automaticSpecialists`, default on, restart required after an override) that resolves explicit specialist-team requests before the lead ReAct loop. It renders the selected roster, runs bounded read-only work in parallel, serializes workspace-mutating specialist tasks, and feeds structured results back to the lead. Missing exact catalog matches use one aggregate approval and fail soft to valid local specialists. Disable it with `autohand experiments disable automatic_specialists`. This switch never starts or queues `/squad` automatically.
+
+The restart-required stateful-read experiments are ordered and disabled by default:
+
+| Feature | Config path | Behavior |
+| --- | --- | --- |
+| `read_state_ledger` | `features.readStateLedger` | Persists bounded model-visible file coverage in the active session without changing tool results. |
+| `read_state_dedup` | `features.readStateDedup` | Implies the ledger and returns a consume-on-hit stub for an eligible repeated unchanged read. |
+| `read_before_write` | `features.readBeforeWrite` | Implies both earlier increments and requires a complete unchanged read before direct tools mutate an existing regular file. |
+
+Enable an increment with `autohand experiments enable <feature>`. Partial, clamped, invalid-UTF-8, and stale views never authorize a write. Set `AUTOHAND_DISABLE_STATEFUL_READ=1` for a process-local emergency rollback without changing the stored flags.
+
 ---
 
 ## Slash Commands
@@ -2295,8 +2331,8 @@ Autohand provides a rich set of slash commands for interactive use. Type `/` in 
 | `/undo`       | Revert git changes and last turn                      |
 | `/export`     | Export session to markdown/JSON/HTML                  |
 | `/share`      | Share current session                                 |
-| `/status`     | Show session status                                   |
-| `/usage`      | Show project token activity by day, week, or month    |
+| `/status`     | Show session status and the signed-in Autohand plan   |
+| `/usage`      | Show Autohand plan limits and project token activity  |
 
 ### Model & Provider
 

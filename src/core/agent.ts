@@ -8,8 +8,11 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { showModal, type ModalOption } from '../ui/ink/components/Modal.js';
 import { FileActionManager } from '../actions/filesystem.js';
-import { getProviderConfig } from '../config.js';
-import { isAwsBedrockProviderEnabled } from '../features/featureRegistry.js';
+import { getProviderConfig, saveConfig } from '../config.js';
+import { getAuthClient } from '../auth/index.js';
+import { safePrompt } from '../utils/prompt.js';
+import { maybeOfferAutohandAISwitch } from '../commands/login.js';
+import { getFeatureState, isAwsBedrockProviderEnabled } from '../features/featureRegistry.js';
 import type { RemoteFeatureFlagManager } from '../features/RemoteFeatureFlagManager.js';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import { ApiError } from '../providers/errors.js';
@@ -49,6 +52,14 @@ import type {
 } from '../types.js';
 
 import { AgentDelegator } from './agents/AgentDelegator.js';
+import {
+  createSpecialistRequest,
+  detectSpecialistRequest,
+  formatSpecialistResults,
+  formatSpecialistRoster,
+  SpecialistOrchestrator,
+  type SpecialistRequest,
+} from './agents/SpecialistOrchestrator.js';
 import type { ToolDefinition } from './toolManager.js';
 import { ErrorLogger } from './errorLogger.js';
 import { MemoryManager } from '../memory/MemoryManager.js';
@@ -357,6 +368,7 @@ export class AutohandAgent {
   private permissionManager!: PermissionManager;
   private hookManager!: HookManager;
   private delegator!: AgentDelegator;
+  private specialistOrchestrator!: SpecialistOrchestrator;
   private feedbackManager!: FeedbackManager;
   private telemetryManager!: TelemetryManager;
   private featureFlagManager?: RemoteFeatureFlagManager;
@@ -1293,6 +1305,56 @@ export class AutohandAgent {
     return buildAgentUserMessage(this as unknown as AgentContextRuntimeHost, instruction);
   }
 
+  private async prepareSpecialists(instruction: string): Promise<string | undefined> {
+    if (getFeatureState(this.runtime.config, 'automatic_specialists')?.enabled !== true) {
+      return undefined;
+    }
+    if (!this.specialistOrchestrator) {
+      return undefined;
+    }
+
+    const request = detectSpecialistRequest(instruction);
+    if (!request) {
+      const continuation = await this.specialistOrchestrator.continueInterview(instruction);
+      return continuation ? formatSpecialistResults(continuation) : undefined;
+    }
+
+    return this.runSpecialistOrchestration(request);
+  }
+
+  private async orchestrateSpecialistsFromTool(
+    objective: string,
+    requestedRoles: string[],
+  ): Promise<string> {
+    return this.runSpecialistOrchestration(
+      createSpecialistRequest(objective, requestedRoles, 'tool'),
+    );
+  }
+
+  private async runSpecialistOrchestration(request: SpecialistRequest): Promise<string> {
+    const plan = await this.specialistOrchestrator.resolve(request);
+    console.log(`\n${formatSpecialistRoster(plan)}\n`);
+    const stagedInstallation = this.specialistOrchestrator.stageCatalogInstallation(plan);
+    if (stagedInstallation) {
+      const [installation] = await this.toolManager.execute([{
+        tool: 'install_specialist_roster',
+        args: {
+          plan_id: stagedInstallation.planId,
+          agent_names: stagedInstallation.agentNames,
+        },
+      }]);
+      if (!installation.success) {
+        this.specialistOrchestrator.declineStagedCatalogInstallation(stagedInstallation.planId);
+      }
+    }
+    if (plan.selectedAgents.length === 0) {
+      return formatSpecialistResults({ plan, batches: [], completed: false });
+    }
+
+    const result = await this.specialistOrchestrator.execute(plan);
+    return formatSpecialistResults(result);
+  }
+
   private async buildSystemPrompt(): Promise<string> {
     return new SystemPromptBuilder({
       runtime: this.runtime,
@@ -1388,14 +1450,16 @@ export class AutohandAgent {
         ? providerSettings.displayName
         : provider;
     this.ui?.setProviderModel?.(providerLabel, model);
+    const statusLineSettings = getConfigStatusLineSettings(this.runtime.config);
     this.inkRenderer?.setConfiguredLineExtensions?.(withPeerLineExtension(buildStatusLineExtension({
-      settings: getConfigStatusLineSettings(this.runtime.config),
+      settings: statusLineSettings,
       workspaceRoot: this.runtime.workspaceRoot,
       homeDir: os.homedir(),
       gitLabel: resolveStatusLineGitLabel(this as unknown as StatusLineGitLabelHost),
       sessionDiffStats: this.sessionDiffStatsTracker?.getStats(),
       sessionHasFileChanges: this.filesModifiedThisSession === true,
     }), this.peerAwareness.getPeers().length));
+    this.inkRenderer?.setShowModeLabel?.(statusLineSettings.showModeLabel);
   }
 
   /**
@@ -1696,6 +1760,37 @@ export class AutohandAgent {
         model,
         provider: this.activeProvider,
       });
+    }
+  }
+
+  private async maybeOfferProviderSwitch(error: Error): Promise<void> {
+    if (!(error instanceof ApiError)) return;
+
+    const config = this.runtime.config;
+    const next = await maybeOfferAutohandAISwitch({
+      config,
+      errorCode: error.code,
+      activeProvider: this.activeProvider,
+      providerLabel: this.activeProvider ?? 'current provider',
+      isInteractive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      fetchEntitlement: (token: string) => getAuthClient().fetchEntitlement(token),
+      confirm: async (message: string) => {
+        const result = await safePrompt<{ switch: boolean }>({
+          type: 'confirm',
+          name: 'switch',
+          message,
+          initial: true,
+        });
+        return Boolean(result?.switch);
+      },
+      persist: saveConfig,
+    });
+
+    if (next !== config) {
+      this.runtime.config = next;
+      if (next.provider === 'autohandai') {
+        console.log(chalk.green("Switched to Autohand's Fantail model. Send your message again to use it."));
+      }
     }
   }
 

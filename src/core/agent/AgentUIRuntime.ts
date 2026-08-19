@@ -274,6 +274,7 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
         suggestionProvider: () => host.suggestionEngine?.getNextPromptSuggestion() ?? undefined,
         getInteractionMode: () => host.getInteractionMode(),
         onCycleInteractionMode: () => host.cycleInteractionMode(),
+        mouseComposerCursor: host.runtime?.config?.ui?.mouseComposerCursor !== false,
         skillsProvider: () =>
           host.skillsRegistry.listSkills().map((skill: { name: string; description?: string; isActive: boolean; source: string }) => ({
             name: skill.name,
@@ -315,6 +316,9 @@ export async function initializeAgentUI(host: AgentUIRuntimeHost, abortControlle
         host.ui?.setWorking(true, 'Gathering context...');
         host.runtime.inkRenderer = host.inkRenderer;
         syncAgentAnnouncementLine(host);
+        if (host.teamActivitySnapshot) {
+          host.inkRenderer?.setTeamActivity?.(host.teamActivitySnapshot);
+        }
         
         // Ensure fallback spinner is NOT initialized when Ink is active
         if (host.runtime?.spinner) {
@@ -662,14 +666,16 @@ export function forceRenderAgentSpinner(host: AgentUIRuntimeHost): void {
     const statusLine = `${verb}... (esc to interrupt · ${elapsed} · ${tokens}${queueHint})`;
     const footerLine = host.formatStatusLine();
     host.persistentInput.setStatusLine(footerLine);
+    const statusLineSettings = getConfigStatusLineSettings(host.runtime.config);
     host.inkRenderer?.setConfiguredLineExtensions?.(withPeerLineExtension(buildStatusLineExtension({
-      settings: getConfigStatusLineSettings(host.runtime.config),
+      settings: statusLineSettings,
       workspaceRoot: host.runtime.workspaceRoot,
       homeDir: os.homedir(),
       gitLabel: resolveStatusLineGitLabel(host),
       sessionDiffStats: host.sessionDiffStatsTracker?.getStats?.(),
       sessionHasFileChanges: host.filesModifiedThisSession === true,
     }), host.peerAwareness?.getPeers?.().length ?? 0));
+    host.inkRenderer?.setShowModeLabel?.(statusLineSettings.showModeLabel);
     const usingTerminalRegions = host.isUsingTerminalRegionsForActiveTurn();
 
     if (host.inkRenderer) {

@@ -85,8 +85,8 @@ The `/settings` command opens an interactive settings editor directly in the ter
 | `/language` | Change display language |
 | `/login` | Authenticate with Autohand API |
 | `/logout` | Log out |
-| `/status` | Show session status |
-| `/usage` | Show project token activity by day, week, or month when `cli_usage_v2` is enabled |
+| `/status` | Show session status and the signed-in Autohand plan |
+| `/usage` | Show Autohand plan limits plus project token activity by day, week, or month when `cli_usage_v2` is enabled |
 | `/statusline` | Configure composer status-line fields |
 | `/permissions` | Manage tool permissions |
 | `/hooks` | Manage lifecycle hooks |
@@ -101,13 +101,15 @@ The `/settings` command opens an interactive settings editor directly in the ter
 | `/share` | Share current session |
 | `/sync` | Sync settings |
 | `/add-dir` | Add directories to workspace |
-| `/goal` | Set, review, or refine a persistent session goal |
+| `/goal` | Set a session-attached persistent goal and continue successful auto-mode turns until it reaches a terminal state |
 | `/goal writer` | Draft one or more well-specified goals with the built-in `$goal-writer` skill |
 | `/automode` | Start autonomous coding mode |
 | `/autoresearch` | Run replayable benchmark loops with adaptive decisions, history, replay, comparison, and Pareto analysis |
 | `/cc` | Context compaction |
 | `/search` | Search codebase |
 | `/settings` | Interactive settings editor — browse categories, edit values inline |
+
+Persistent goal files survive between conversations, while execution and usage accounting stay attached to the session that created or resumed the goal. A new session can inspect old state with `/goal`, but it must run `/goal resume` before continuing that work.
 
 ## Experiment Switches
 - [x] `autohand experiments list` prints a Codex-style table of feature id, lifecycle stage, and enabled state
@@ -119,6 +121,33 @@ The `/settings` command opens an interactive settings editor directly in the ter
 - [x] Remote feature flags are cached in `~/.autohand/feature-flags.json` and refreshed after their API TTL expires
 - [x] `cli_usage_v2` is enabled by default and powers `/usage`, `/usage weekly`, and `/usage monthly`
 - [x] `experimental_browser_tools_v2` is disabled by default and requires a CLI restart; after an extension capability handshake it adds snapshot refs, typed waits, verified actions, and dedicated form tools
+- [x] `automatic_specialists` is enabled by default and requires a CLI restart after an override; it resolves explicit specialist-team requests before the lead turn, renders the roster, aggregates catalog approval, and returns structured results for synthesis
+
+### Experimental: automatic specialists
+
+Disable `automatic_specialists` with `autohand experiments disable automatic_specialists`
+or set `features.automaticSpecialists: false` in `~/.autohand/config.json`, then
+restart the CLI. Explicit prompts that ask to bring, assemble, or run a team of
+named roles are resolved host-side; incidental mentions of agents or security do
+not trigger orchestration.
+
+The experiment bundles `product-interviewer`, `planner`, `debugger`,
+`security-auditor`, and `release-readiness`. Catalog-backed gaps use one
+authorization request for the resolved roster and continue with local agents if
+installation is denied or the catalog is unavailable. Natural-language
+orchestration does not start `/squad`.
+
+### Experimental: stateful read safety
+
+Stateful read safety ships as three ordered, default-off experiments. All three require a CLI restart after changing them:
+
+- `read_state_ledger` records the exact source-line coverage shown to the model in the active session without changing reads or writes.
+- `read_state_dedup` implies the ledger and replaces an eligible repeated unchanged read with a one-use stub. Repeating the call again restores the full content.
+- `read_before_write` implies both earlier increments and requires a complete, unchanged `read_file` view before a direct tool overwrites or removes an existing regular file. Partial, clamped, invalid-UTF-8, and stale views do not authorize a mutation.
+
+Enable one increment with `autohand experiments enable <feature>` or `/experiments enable <feature>`. The equivalent config paths are `features.readStateLedger`, `features.readStateDedup`, and `features.readBeforeWrite` in `~/.autohand/config.json`.
+
+If compatibility problems prevent startup or a workflow from proceeding, launch the process with `AUTOHAND_DISABLE_STATEFUL_READ=1`. This emergency switch disables all three increments without changing the saved configuration.
 
 ### Experimental: provider prompt caching
 

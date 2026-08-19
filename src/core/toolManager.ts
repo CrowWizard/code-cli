@@ -53,6 +53,11 @@ const SEQUENTIAL_TOOL_CATEGORIES = new Set<ToolCategory>([
   'shell'
 ]);
 
+const SPECIALIST_BUILTIN_TOOL_NAMES = new Set<AgentAction['type']>([
+  'orchestrate_specialists',
+  'install_specialist_roster',
+]);
+
 export function shouldPromptForToolPermission(
   tool: string,
   explicitlyRequired = false,
@@ -112,6 +117,8 @@ export interface ToolDefinition {
   parameters?: ToolParameters;
   requiresApproval?: boolean;
   approvalMessage?: string;
+  /** Internal definitions remain executable but are omitted from model-facing schemas. */
+  modelVisible?: boolean;
 }
 
 export interface ToolManagerOptions {
@@ -161,6 +168,15 @@ const WRITE_CAPABILITY_TOOLS = new Set<AgentAction['type']>([
   'rename_path',
   'copy_path',
 ]);
+
+const READ_FILE_PATH_ALIASES = [
+  'file_path',
+  'filePath',
+  'absolute_path',
+  'absolutePath',
+  'target',
+  'target_file',
+] as const;
 
 function resolveEffectivePermissionTool(
   action: AgentAction,
@@ -249,7 +265,7 @@ export function buildToolPermissionContext(action: AgentAction): PermissionConte
 export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'get_goal',
-    description: 'Inspect the current persistent goal, queue, status, time and token budgets, and progress metadata. Use only for explicit goal-management requests.'
+    description: 'Inspect the current session\'s persistent goal, queue, status, time and token budgets, and progress metadata. Use only for explicit goal-management requests. A detached result must not be continued until the user explicitly resumes it.'
   },
   {
     name: 'create_goal',
@@ -390,13 +406,13 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'read_file',
-    description: 'Read file contents. For large files (>2500 lines), use offset and limit to read in chunks.',
+    description: 'Read a bounded, line-numbered file window. Use offset and limit to continue large files.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Relative path to the file to read' },
-        offset: { type: 'number', description: 'Line number to start reading from (0-indexed). Use for large files.' },
-        limit: { type: 'number', description: 'Maximum number of lines to read. Use for large files.' }
+        offset: { type: 'integer', description: 'Non-negative, 0-indexed line number to start reading from.' },
+        limit: { type: 'integer', description: 'Non-negative maximum number of lines to read. Values above the tool ceiling are clamped.' }
       },
       required: ['path']
     }
@@ -1241,7 +1257,9 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         name: { type: 'string', description: 'Human-readable teammate name' },
         agent_name: { type: 'string', description: 'Registered agent name to run' },
-        model: { type: 'string', description: 'Optional model override for that teammate' }
+        model: { type: 'string', description: 'Optional model override for that teammate' },
+        requested_role: { type: 'string', description: 'Original requested specialist role' },
+        agent_source: { type: 'string', description: 'Resolved agent source' }
       },
       required: ['name', 'agent_name']
     }
@@ -2356,7 +2374,7 @@ export class ToolManager {
   registerMetaTools(toolDefinitions: ToolDefinition[]): void {
     for (const def of toolDefinitions) {
       // Skip if conflicts with a built-in tool
-      if (DEFAULT_TOOL_DEFINITIONS.some(d => d.name === def.name) || GOAL_TOOL_DEFINITIONS.some(d => d.name === def.name)) {
+      if (this.isBuiltInTool(def.name)) {
         continue;
       }
       this.definitions.set(def.name, def);
@@ -2399,7 +2417,9 @@ export class ToolManager {
    * Check if a tool name conflicts with built-in definitions
    */
   isBuiltInTool(name: string): boolean {
-    return DEFAULT_TOOL_DEFINITIONS.some(d => d.name === name) || GOAL_TOOL_DEFINITIONS.some(d => d.name === name);
+    return DEFAULT_TOOL_DEFINITIONS.some(d => d.name === name)
+      || GOAL_TOOL_DEFINITIONS.some(d => d.name === name)
+      || SPECIALIST_BUILTIN_TOOL_NAMES.has(name as AgentAction['type']);
   }
 
   listToolNames(): AgentAction['type'][] {
@@ -2418,7 +2438,9 @@ export class ToolManager {
    * List tool definitions filtered by client context
    */
   listDefinitions(): ToolDefinition[] {
-    return this.toolFilter.filterDefinitions(Array.from(this.definitions.values()));
+    return this.toolFilter.filterDefinitions(
+      Array.from(this.definitions.values()).filter((definition) => definition.modelVisible !== false),
+    );
   }
 
   /**
@@ -2552,6 +2574,13 @@ export class ToolManager {
         results.set(i, result);
         onToolComplete?.(i, result);
       };
+
+      try {
+        call = this.repairReadFileInput(call);
+      } catch (error) {
+        reject(error instanceof Error ? error.message : String(error), 'validation');
+        continue;
+      }
 
       if (signal?.aborted) {
         reject(TOOL_ABORTED_MESSAGE, 'aborted', TOOL_ABORTED_MESSAGE);
@@ -2824,6 +2853,55 @@ export class ToolManager {
     };
   }
 
+  private repairReadFileInput(call: ToolCallRequest): ToolCallRequest {
+    if (call.tool !== 'read_file') {
+      return call;
+    }
+
+    const args = { ...this.getCallArgs(call) };
+    const pathInputs: Array<{ field: string; value: string }> = [];
+    for (const field of ['path', ...READ_FILE_PATH_ALIASES]) {
+      const value = args[field];
+      if (value === undefined) {
+        continue;
+      }
+      if (typeof value !== 'string') {
+        throw new Error(`read_file requires "${field}" to be a string.`);
+      }
+      pathInputs.push({ field, value });
+    }
+
+    const uniquePaths = new Set(pathInputs.map(input => input.value));
+    if (uniquePaths.size > 1) {
+      throw new Error('read_file received conflicting path aliases.');
+    }
+    if (args.path === undefined && pathInputs.length > 0) {
+      args.path = pathInputs[0].value;
+    }
+    for (const alias of READ_FILE_PATH_ALIASES) {
+      delete args[alias];
+    }
+
+    for (const field of ['offset', 'limit'] as const) {
+      const value = args[field];
+      if (value === undefined) {
+        continue;
+      }
+      const repaired = typeof value === 'string' && value.trim() !== ''
+        ? Number(value)
+        : value;
+      if (typeof repaired !== 'number'
+        || !Number.isFinite(repaired)
+        || !Number.isInteger(repaired)
+        || repaired < 0) {
+        throw new Error(`read_file requires "${field}" to be a non-negative integer.`);
+      }
+      args[field] = repaired;
+    }
+
+    return this.cloneToolCall(call, args);
+  }
+
   private getCallArgs(call: ToolCallRequest): Record<string, unknown> {
     return (call.args ?? {}) as Record<string, unknown>;
   }
@@ -3057,6 +3135,9 @@ export class ToolManager {
 
   private buildApprovalMessage(call: ToolCallRequest, definition: ToolDefinition): string {
     const args = this.getCallArgs(call);
+    if (call.tool === 'install_specialist_roster' && Array.isArray(args.agent_names)) {
+      return `Install these resolved specialists from the default Autohand catalog?\n  ${args.agent_names.join(', ')}`;
+    }
     if (call.tool === 'run_command' || call.tool === 'shell') {
       const command = String(args.command ?? '');
       const commandArgs = Array.isArray(args.args) ? args.args.join(' ') : '';

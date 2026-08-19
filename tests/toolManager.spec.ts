@@ -78,6 +78,33 @@ describe('ToolManager', () => {
     expect(names.has('send_team_message')).toBe(true);
   });
 
+  it('keeps internal tools executable without exposing them to the model', async () => {
+    const executor = vi.fn().mockResolvedValue(successfulOutcome('installed'));
+    const manager = new ToolManager({
+      executor,
+      confirmApproval: vi.fn().mockResolvedValue({ decision: 'allow_once' }),
+      definitions: [
+        { name: 'read_file', description: 'Visible read tool' },
+        {
+          name: 'install_specialist_roster',
+          description: 'Internal aggregate install',
+          modelVisible: false,
+        },
+      ],
+    });
+
+    expect(manager.listAllDefinitions().map((definition) => definition.name))
+      .toContain('install_specialist_roster');
+    expect(manager.listDefinitions().map((definition) => definition.name))
+      .not.toContain('install_specialist_roster');
+
+    const [result] = await manager.execute([{
+      tool: 'install_specialist_roster',
+      args: { plan_id: 'plan-1', agent_names: ['ui-designer', 'ux-researcher'] },
+    }]);
+    expect(result.success).toBe(true);
+  });
+
   it('does NOT include plan tool in DEFAULT_TOOL_DEFINITIONS', () => {
     const names = new Set(DEFAULT_TOOL_DEFINITIONS.map((tool) => tool.name));
     expect(names.has('plan')).toBe(false);
@@ -128,6 +155,62 @@ describe('ToolManager', () => {
       expect.objectContaining({ tool: 'read_file' })
     );
     expect(results[0]).toMatchObject({ tool: 'read_file', success: true, output: 'file contents' });
+  });
+
+  it('repairs unambiguous read_file path aliases and integer strings before execution', async () => {
+    const executor = vi.fn().mockResolvedValue(successfulOutcome('numbered contents'));
+    const manager = new ToolManager({
+      executor,
+      confirmApproval: vi.fn().mockResolvedValue(true),
+      definitions: [defaultToolDefinition('read_file')],
+    });
+
+    const [result] = await manager.execute([{
+      tool: 'read_file',
+      args: {
+        filePath: 'src/index.ts',
+        offset: '2',
+        limit: '4',
+      },
+    } as unknown as Parameters<ToolManager['execute']>[0][number]]);
+
+    expect(executor).toHaveBeenCalledWith(
+      { type: 'read_file', path: 'src/index.ts', offset: 2, limit: 4 },
+      expect.objectContaining({ tool: 'read_file' }),
+    );
+    expect(result).toMatchObject({
+      tool: 'read_file',
+      success: true,
+      output: 'numbered contents',
+    });
+  });
+
+  it.each([
+    ['partially numeric offset', { path: 'src/index.ts', offset: '2abc' }],
+    ['fractional offset', { path: 'src/index.ts', offset: 1.5 }],
+    ['negative offset', { path: 'src/index.ts', offset: -1 }],
+    ['non-finite offset', { path: 'src/index.ts', offset: 'Infinity' }],
+    ['NaN limit', { path: 'src/index.ts', limit: 'NaN' }],
+    ['conflicting path aliases', { path: 'src/index.ts', filePath: 'src/other.ts' }],
+  ])('rejects invalid read_file input for %s before execution', async (_case, args) => {
+    const executor = vi.fn().mockResolvedValue(successfulOutcome('must not run'));
+    const manager = new ToolManager({
+      executor,
+      confirmApproval: vi.fn().mockResolvedValue(true),
+      definitions: [defaultToolDefinition('read_file')],
+    });
+
+    const [result] = await manager.execute([{
+      tool: 'read_file',
+      args,
+    } as unknown as Parameters<ToolManager['execute']>[0][number]]);
+
+    expect(result).toMatchObject({
+      tool: 'read_file',
+      success: false,
+      kind: 'validation',
+    });
+    expect(executor).not.toHaveBeenCalled();
   });
 
   it('preserves a resolved typed failure and completes it exactly once', async () => {

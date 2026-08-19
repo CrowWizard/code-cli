@@ -38,6 +38,7 @@ import {
   type WorkspaceChangeSet,
 } from '../../core/agent/WorkspaceChangeCapture.js';
 import type { InteractionMode } from '../../core/agent/InteractionModeController.js';
+import type { TeamActivitySnapshot } from '../../core/teams/types.js';
 import type { LineExtension, LineSegment } from './StatusLine.js';
 import {
   createSequencedQueuedWork,
@@ -70,6 +71,7 @@ export interface InkRendererOptions {
   runtimeLineExtensions?: AgentUILineExtensions;
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
+  mouseComposerCursor?: boolean;
 }
 
 export interface SetWorkingOptions {
@@ -183,6 +185,7 @@ interface AgentUIWrapperProps {
   onCtrlC: () => void;
   onDismissAnnouncement?: (id: string) => void;
   onToggleLiveCommandExpanded: () => void;
+  onToggleTeamPanel: () => void;
   onInputChange: (input: string) => void;
   enableQueueInput?: boolean;
   onImageDetected?: (data: Buffer, mimeType: string, filename?: string) => number;
@@ -198,6 +201,7 @@ interface AgentUIWrapperProps {
   onRemoveQueuedInstruction: (index: number) => void;
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
+  mouseComposerCursor?: boolean;
 }
 
 /**
@@ -213,6 +217,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       onCtrlC,
       onDismissAnnouncement,
       onToggleLiveCommandExpanded,
+      onToggleTeamPanel,
       onInputChange,
       enableQueueInput,
       onImageDetected,
@@ -228,6 +233,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       onRemoveQueuedInstruction,
       getInteractionMode,
       onCycleInteractionMode,
+      mouseComposerCursor,
     } = props;
 
     const [state, setState] = useState<AgentUIState>(initialState);
@@ -258,6 +264,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         onCtrlC={onCtrlC}
         onDismissAnnouncement={onDismissAnnouncement}
         onToggleLiveCommandExpanded={onToggleLiveCommandExpanded}
+        onToggleTeamPanel={onToggleTeamPanel}
         onInputChange={handleInputChange}
         enableQueueInput={enableQueueInput}
         onImageDetected={onImageDetected}
@@ -273,6 +280,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         onRemoveQueuedInstruction={onRemoveQueuedInstruction}
         getInteractionMode={getInteractionMode}
         onCycleInteractionMode={onCycleInteractionMode}
+        mouseComposerCursor={mouseComposerCursor}
       />
     );
   }
@@ -434,6 +442,7 @@ export class InkRenderer {
             onCtrlC={this.options.onCtrlC}
             onDismissAnnouncement={this.options.onDismissAnnouncement}
             onToggleLiveCommandExpanded={() => this.toggleActiveLiveCommandExpanded()}
+            onToggleTeamPanel={() => this.toggleTeamPanel()}
             onInputChange={this.handleInputChange}
             enableQueueInput={this.options.enableQueueInput}
             onImageDetected={this.options.onImageDetected}
@@ -449,6 +458,7 @@ export class InkRenderer {
             onRemoveQueuedInstruction={(index) => this.removeQueuedInstruction(index)}
             getInteractionMode={this.options.getInteractionMode}
             onCycleInteractionMode={this.options.onCycleInteractionMode}
+            mouseComposerCursor={this.options.mouseComposerCursor}
           />
         </I18nProvider>
       </ThemeProvider>,
@@ -1039,6 +1049,18 @@ export class InkRenderer {
     this.updateState({ activityItems: [] });
   }
 
+  setTeamActivity(teamActivity: TeamActivitySnapshot): void {
+    this.updateState({ teamActivity });
+  }
+
+  setTeamPanelVisible(visible: boolean): void {
+    this.updateState({ teamPanelVisible: visible });
+  }
+
+  toggleTeamPanel(): void {
+    this.setTeamPanelVisible(!this.state.teamPanelVisible);
+  }
+
   /**
    * Replace all status/help line extension points.
    */
@@ -1055,6 +1077,13 @@ export class InkRenderer {
       return;
     }
     this.updateState({ configuredLineExtensions });
+  }
+
+  setShowModeLabel(showModeLabel: boolean): void {
+    if (this.state.showModeLabel === showModeLabel) {
+      return;
+    }
+    this.updateState({ showModeLabel });
   }
 
   /**
@@ -1215,6 +1244,7 @@ export class InkRenderer {
               onCtrlC={this.options.onCtrlC}
               onDismissAnnouncement={this.options.onDismissAnnouncement}
               onToggleLiveCommandExpanded={() => this.toggleActiveLiveCommandExpanded()}
+              onToggleTeamPanel={() => this.toggleTeamPanel()}
               onInputChange={this.handleInputChange}
               enableQueueInput={this.options.enableQueueInput}
               onImageDetected={this.options.onImageDetected}
@@ -1230,6 +1260,7 @@ export class InkRenderer {
               onRemoveQueuedInstruction={(index) => this.removeQueuedInstruction(index)}
               getInteractionMode={this.options.getInteractionMode}
               onCycleInteractionMode={this.options.onCycleInteractionMode}
+              mouseComposerCursor={this.options.mouseComposerCursor}
             />
           </I18nProvider>
         </ThemeProvider>,

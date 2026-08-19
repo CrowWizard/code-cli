@@ -88,7 +88,7 @@ import type {
   ToolFailureKind,
   ToolOutputChunk,
 } from '../types.js';
-import type { FileActionManager } from '../actions/filesystem.js';
+import type { FileActionManager, ReadFileWindowResult } from '../actions/filesystem.js';
 import {
   buildToolPermissionContexts,
   DEFAULT_TOOL_DEFINITIONS,
@@ -124,6 +124,11 @@ import {
   isGitMutationCommand,
   type PeerWarning,
 } from '../session/peers/index.js';
+import {
+  ReadSessionLedger,
+  resolveStatefulReadMode,
+  type ReadStateStore,
+} from './agent/ReadSessionLedger.js';
 
 /** Response from permission-request hook */
 export interface PermissionHookResponse {
@@ -142,6 +147,7 @@ export interface ActionExecutorOptions {
   confirmDangerousAction: (message: string, context?: { tool?: string; path?: string; command?: string }) => Promise<boolean>;
   projectManager?: ProjectManager;
   sessionId?: string;
+  getCurrentSessionId?: () => string | undefined;
   onExploration?: (entry: ExplorationEvent) => void;
   toolsRegistry?: ToolsRegistry;
   metaToolService?: MetaToolService;
@@ -218,10 +224,16 @@ export interface ActionExecutorOptions {
   };
   onPeerWarning?: (warning: PeerWarning) => void;
   onToolActivity?: (activity?: { tool: string; command?: string }) => void;
+  /** Optional persistence boundary for stateful model-visible reads. */
+  readStateStore?: ReadStateStore;
 }
 
 type AgentExecutorDeps = ActionExecutorOptions;
 type ToolFailureOutcome = Extract<ToolActionOutcome, { success: false }>;
+
+const READ_FILE_MAX_LINES = 2_000;
+const READ_FILE_MAX_BYTES = 128 * 1024;
+const READ_FILE_MAX_LINE_CHARACTERS = 2_000;
 
 interface ToolOutcomeCapture {
   failure?: ToolFailureOutcome;
@@ -312,6 +324,7 @@ export class ActionExecutor {
   private readonly peerAwareness?: AgentExecutorDeps['peerAwareness'];
   private readonly onPeerWarning?: AgentExecutorDeps['onPeerWarning'];
   private readonly onToolActivity?: AgentExecutorDeps['onToolActivity'];
+  private readonly readSessionLedger: ReadSessionLedger;
   private readonly securityScanner: SecurityScanner;
   private readonly searchCache: Map<string, string> = new Map();
   private fffSearchProviderPromise: Promise<FFFSearchProvider> | null = null;
@@ -351,7 +364,17 @@ export class ActionExecutor {
     this.peerAwareness = deps.peerAwareness;
     this.onPeerWarning = deps.onPeerWarning;
     this.onToolActivity = deps.onToolActivity;
+    this.readSessionLedger = new ReadSessionLedger(deps.readStateStore);
+    this.files.setPreviewStaleCheckEnabled?.(
+      resolveStatefulReadMode(this.runtime.config) === 'enforce',
+    );
     this.securityScanner = new SecurityScanner();
+  }
+
+  private createGoalManager(): GoalManager {
+    return new GoalManager(this.runtime.workspaceRoot, {
+      sessionId: this.deps.getCurrentSessionId?.() ?? this.sessionId,
+    });
   }
 
   private shouldDisplayToolOutput(): boolean {
@@ -554,6 +577,24 @@ export class ActionExecutor {
     }
 
     const values = action as unknown as Record<string, unknown>;
+    if (action.type === 'read_file') {
+      for (const field of ['offset', 'limit'] as const) {
+        const value = values[field];
+        if (value !== undefined
+          && (typeof value !== 'number'
+            || !Number.isFinite(value)
+            || !Number.isInteger(value)
+            || value < 0)) {
+          const error = `read_file requires "${field}" to be a non-negative integer.`;
+          return {
+            success: false,
+            kind: 'validation',
+            error,
+            output: `Error: ${error}`,
+          };
+        }
+      }
+    }
     if ((action.type === 'run_command' || action.type === 'shell')
       && (typeof values.command !== 'string' || values.command.length === 0)) {
       const error = `${action.type} requires a "command" argument (string)`;
@@ -1190,73 +1231,150 @@ export class ActionExecutor {
 
         const offset = typeof action.offset === 'number' ? action.offset : 0;
         const limit = typeof action.limit === 'number' ? action.limit : 0;
+        const effectiveLimit = Math.min(limit > 0 ? limit : READ_FILE_MAX_LINES, READ_FILE_MAX_LINES);
+        const statefulReadMode = resolveStatefulReadMode(this.runtime.config);
+        const viewKey = this.readViewKey(action.path, offset, effectiveLimit);
 
-        const fullContents = await this.files.readFile(action.path);
+        if (typeof this.files.readFileWindow === 'function') {
+          const inspection = typeof this.files.inspectReadFile === 'function'
+            ? await this.files.inspectReadFile(action.path)
+            : undefined;
+          if (inspection && (statefulReadMode === 'dedup' || statefulReadMode === 'enforce')) {
+            const duplicate = await this.readSessionLedger.consumeDuplicate({
+              path: inspection.resolvedPath,
+              revision: inspection.revision,
+              viewKey,
+              offset,
+            });
+            if (duplicate) {
+              await this.recordPeerRead(inspection.openedPath);
+              this.recordExploration('read', inspection.openedPath);
+              return `Note: ${inspection.openedPath} is unchanged since the previous read (offset=${offset}, limit=${effectiveLimit}). Repeat the same read_file call to resend the full content.`;
+            }
+          }
+          const window = await this.files.readFileWindow(action.path, {
+            offset,
+            lineLimit: effectiveLimit,
+            maxBytes: READ_FILE_MAX_BYTES,
+            maxLineCharacters: READ_FILE_MAX_LINE_CHARACTERS,
+            captureDigest: statefulReadMode !== 'off',
+          }, inspection);
+          const openedPath = window.openedPath;
+          await this.recordPeerRead(openedPath);
+          this.recordExploration('read', openedPath);
+
+          if (window.format.kind === 'binary') {
+            const note = window.format.mimeType === 'application/pdf'
+              ? `Note: ${openedPath} is a binary application/pdf file. Use pdftotext "${openedPath}" - to extract its text.`
+              : `Note: ${openedPath} is a binary ${window.format.mimeType} file. read_file did not decode it as text.`;
+            return this.withReadPathRepairNote(note, window, action.path);
+          }
+          if (window.reachedEof && offset > 0 && offset >= window.linesScanned && window.lines.length === 0) {
+            await this.recordModelVisibleRead(
+              window,
+              offset,
+              [],
+              statefulReadMode,
+              viewKey,
+            );
+            return this.withReadPathRepairNote(
+              `Note: offset ${offset} is beyond the end of ${openedPath} (${window.linesScanned} lines scanned). Retry with a smaller offset.`,
+              window,
+              action.path,
+            );
+          }
+          if (window.reachedEof && window.linesScanned === 0 && window.lines.length === 0) {
+            await this.recordModelVisibleRead(
+              window,
+              offset,
+              [],
+              statefulReadMode,
+              viewKey,
+            );
+            return this.withReadPathRepairNote(`Note: ${openedPath} is empty.`, window, action.path);
+          }
+
+          const rendered = this.formatStreamedReadWindow(
+            window,
+            openedPath,
+            effectiveLimit,
+            action.path,
+          );
+          const fileSizeKB = (window.sizeBytes / 1024).toFixed(2);
+          console.log(chalk.cyan(`\n📄 ${openedPath}`));
+          console.log(chalk.gray(`   ${window.lines.length} lines returned (${fileSizeKB} KB total)`));
+          if (rendered.hasMore) {
+            console.log(chalk.yellow('   More content remains'));
+          }
+          await this.recordModelVisibleRead(
+            window,
+            offset,
+            rendered.completeVisibleLines,
+            statefulReadMode,
+            viewKey,
+          );
+          return rendered.output;
+        }
+
+        const fullContents = this.normalizeReadFileContents(await this.files.readFile(action.path));
         await this.recordPeerRead(action.path);
         this.recordExploration('read', action.path);
 
-        const allLines = fullContents.split('\n');
+        const allLines = this.splitReadFileLines(fullContents);
         const totalLines = allLines.length;
         const fileSize = Buffer.byteLength(fullContents, 'utf8');
         const fileSizeKB = (fileSize / 1024).toFixed(2);
 
-        // Large file thresholds
-        const MAX_LINES = 2000;
-        const MAX_SIZE_BYTES = 80 * 1024;
-        const CHUNK_SIZE = 500; // Lines per chunk for smart reading
-
-        // If offset/limit specified, use chunked reading
-        if (offset > 0 || limit > 0) {
-          const effectiveLimit = limit > 0 ? limit : CHUNK_SIZE;
-          const startLine = Math.min(offset, totalLines);
-          const endLine = Math.min(startLine + effectiveLimit, totalLines);
-          const chunk = allLines.slice(startLine, endLine).join('\n');
-
-          console.log(chalk.cyan(`\n📄 ${action.path}`));
-          console.log(chalk.gray(`   Lines ${startLine + 1}-${endLine} of ${totalLines} (${fileSizeKB} KB total)`));
-
-          if (endLine < totalLines) {
-            console.log(chalk.yellow(`   ${totalLines - endLine} more lines remaining`));
-          }
-
-          return chunk;
+        if (totalLines === 0) {
+          return `Note: ${action.path} is empty.`;
         }
 
-        // Check if file is too large for single read - use smart chunking
-        if (totalLines > MAX_LINES || fileSize > MAX_SIZE_BYTES) {
-          console.log(chalk.cyan(`\n📄 ${action.path}`));
-          console.log(chalk.yellow(`   ⚠ Large file: ${totalLines} lines • ${fileSizeKB} KB`));
-          console.log(chalk.gray(`   Smart chunking: outline + first ${CHUNK_SIZE} lines`));
-
-          // Extract file structure/outline
-          const outline = this.extractFileOutline(allLines, action.path);
-
-          // Get first chunk of actual content
-          const firstChunk = allLines.slice(0, CHUNK_SIZE).join('\n');
-
-          // Build smart response with outline and first chunk
-          const response = [
-            `=== FILE OUTLINE (${action.path}) ===`,
-            `Total: ${totalLines} lines • ${fileSizeKB} KB`,
-            '',
-            outline,
-            '',
-            `=== CONTENT (lines 1-${CHUNK_SIZE}) ===`,
-            firstChunk,
-            '',
-            `=== NAVIGATION ===`,
-            `Showing lines 1-${CHUNK_SIZE} of ${totalLines}`,
-            `To read more sections, use: read_file with offset=<line> limit=${CHUNK_SIZE}`,
-            `Example: read_file path="${action.path}" offset=${CHUNK_SIZE} limit=${CHUNK_SIZE}`
-          ].join('\n');
-
-          return response;
+        if (offset >= totalLines) {
+          return `Note: offset ${offset} is beyond the end of ${action.path} (${totalLines} lines scanned). Retry with a smaller offset.`;
         }
+
+        const endLineExclusive = Math.min(offset + effectiveLimit, totalLines);
+        const lines = allLines.slice(offset, endLineExclusive).map((content, index) => {
+          const codePoints = Array.from(content);
+          return {
+            lineNumber: offset + index + 1,
+            content: codePoints.slice(0, READ_FILE_MAX_LINE_CHARACTERS).join(''),
+            clamped: codePoints.length > READ_FILE_MAX_LINE_CHARACTERS,
+          };
+        });
+        const compatibilityWindow: ReadFileWindowResult = {
+          lines,
+          ...(endLineExclusive < totalLines
+            ? { continuation: { kind: 'lines' as const, offset: endLineExclusive } }
+            : {}),
+          reachedEof: endLineExclusive >= totalLines,
+          linesScanned: totalLines,
+          resolvedPath: action.path,
+          openedPath: action.path,
+          repairedPath: false,
+          sizeBytes: fileSize,
+          revision: {
+            sizeBytes: fileSize,
+            mtimeMs: 0,
+            ctimeMs: 0,
+          },
+          revisionStable: false,
+          format: { kind: 'text' },
+        };
+        const rendered = this.formatStreamedReadWindow(
+          compatibilityWindow,
+          action.path,
+          effectiveLimit,
+          action.path,
+        );
 
         console.log(chalk.cyan(`\n📄 ${action.path}`));
-        console.log(chalk.gray(`   ${totalLines} lines • ${fileSizeKB} KB`));
+        console.log(chalk.gray(`   Lines ${offset + 1}-${endLineExclusive} of ${totalLines} (${fileSizeKB} KB total)`));
+        if (rendered.hasMore) {
+          console.log(chalk.yellow('   More content remains'));
+        }
 
-        return fullContents;
+        return rendered.output;
       }
       case 'write_file': {
         if (!action.path) {
@@ -1339,6 +1457,15 @@ export class ActionExecutor {
           // EXISTING FILE with identical content - skip write entirely
           return `No changes needed for ${action.path} (content identical)`;
         } else {
+          const readSafetyFailure = await this.readBeforeMutationFailure(action.path);
+          if (readSafetyFailure) {
+            return this.recordToolFailure(
+              capture,
+              'authorization',
+              readSafetyFailure,
+              readSafetyFailure,
+            );
+          }
           // EXISTING FILE - show diff
           console.log(chalk.cyan(`\n📝 ${action.path}:`));
           this.showDiff(oldContent, newContent, action.path);
@@ -1352,6 +1479,10 @@ export class ActionExecutor {
       case 'append_file': {
         if (!action.path) {
           throw new Error('append_file requires a "path" argument.');
+        }
+        const readSafetyFailure = await this.enforceReadBeforeMutation(action.path, capture);
+        if (readSafetyFailure) {
+          return readSafetyFailure;
         }
         const addition = this.pickText(action.contents, action.content) ?? '';
         const oldContent = await this.files.readFile(action.path).catch(() => '');
@@ -1373,6 +1504,10 @@ export class ActionExecutor {
         if (!patch) {
           return 'Error: apply_patch requires a "patch" argument.';
         }
+        const readSafetyFailure = await this.enforceReadBeforeMutation(action.path, capture);
+        if (readSafetyFailure) {
+          return readSafetyFailure;
+        }
 
         console.log(chalk.cyan(`\n🔧 ${action.path}:`));
         console.log(chalk.gray('Applying patch...'));
@@ -1389,6 +1524,10 @@ export class ActionExecutor {
         if (!action.path) {
           throw new Error('notebook_edit requires a "path" argument.');
         }
+        const readSafetyFailure = await this.enforceReadBeforeMutation(action.path, capture);
+        if (readSafetyFailure) {
+          return readSafetyFailure;
+        }
 
         const current = await this.files.readFile(action.path);
         const { updated, summary } = applyNotebookEdit(current, action);
@@ -1401,15 +1540,15 @@ export class ActionExecutor {
         return JSON.stringify(tools, null, 2);
       }
       case 'get_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
-        return JSON.stringify(await manager.getSnapshot(), null, 2);
+        const manager = this.createGoalManager();
+        return JSON.stringify(await manager.getSessionSnapshot(), null, 2);
       }
       case 'list_goal_templates': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         return JSON.stringify(await manager.listTemplates(), null, 2);
       }
       case 'create_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         const created = await manager.createOrQueueGoal({
           objective: action.objective,
           source: 'tool',
@@ -1424,7 +1563,7 @@ export class ActionExecutor {
         return formatGoalToolResult(created);
       }
       case 'create_goal_from_template': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         const resolution = await import('../goals/templates.js').then((mod) => mod.resolveGoalTemplateByName(
           this.runtime.workspaceRoot,
           action.template,
@@ -1451,7 +1590,7 @@ export class ActionExecutor {
         return formatGoalToolResult(created);
       }
       case 'update_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         const updated = await manager.updateGoal({
           objective: action.objective,
           status: parseGoalStatus(action.status),
@@ -1463,11 +1602,11 @@ export class ActionExecutor {
         return formatGoalToolResult(updated);
       }
       case 'clear_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         return formatGoalToolResult(await manager.clearGoal());
       }
       case 'enqueue_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         return formatGoalToolResult(await manager.enqueueGoal({
           objective: action.objective,
           source: 'tool',
@@ -1478,23 +1617,22 @@ export class ActionExecutor {
         }));
       }
       case 'list_goal_queue': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
-        const snapshot = await manager.getSnapshot();
-        return JSON.stringify({ goal: snapshot.goal, queue: snapshot.queue, completed: snapshot.completed }, null, 2);
+        const manager = this.createGoalManager();
+        return JSON.stringify(await manager.getSessionSnapshot(), null, 2);
       }
       case 'start_queued_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         return formatGoalToolResult(await manager.startQueuedGoal());
       }
       case 'dequeue_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         return formatGoalToolResult(await manager.dequeueGoal({
           rationale: action.rationale,
           authority: action.authority,
         }));
       }
       case 'remove_queued_goal': {
-        const manager = new GoalManager(this.runtime.workspaceRoot);
+        const manager = this.createGoalManager();
         const queueId = action.queueId ?? action.queue_id;
         if (!queueId) return 'Error: remove_queued_goal requires queueId.';
         return formatGoalToolResult(await manager.removeQueuedGoal(queueId));
@@ -1559,6 +1697,10 @@ export class ActionExecutor {
             return `Skipped deleting ${action.path}`;
           }
         }
+        const readSafetyFailure = await this.enforceReadBeforeMutation(action.path, capture);
+        if (readSafetyFailure) {
+          return readSafetyFailure;
+        }
         const oldDeleteContent = await this.files.readFile(action.path).catch(() => null);
         await this.files.deletePath(action.path);
         if (oldDeleteContent !== null) {
@@ -1574,6 +1716,14 @@ export class ActionExecutor {
         if (!action.from || !action.to) {
           throw new Error('rename_path requires "from" and "to" arguments.');
         }
+        const sourceReadSafetyFailure = await this.enforceReadBeforeMutation(action.from, capture);
+        if (sourceReadSafetyFailure) {
+          return sourceReadSafetyFailure;
+        }
+        const destinationReadSafetyFailure = await this.enforceReadBeforeMutation(action.to, capture);
+        if (destinationReadSafetyFailure) {
+          return destinationReadSafetyFailure;
+        }
         await this.files.renamePath(action.from, action.to);
         this.notifyFileModified(action.to, 'create', context?.toolCallId);
         return `Renamed ${action.from} -> ${action.to}`;
@@ -1581,6 +1731,10 @@ export class ActionExecutor {
       case 'copy_path': {
         if (!action.from || !action.to) {
           throw new Error('copy_path requires "from" and "to" arguments.');
+        }
+        const readSafetyFailure = await this.enforceReadBeforeMutation(action.to, capture);
+        if (readSafetyFailure) {
+          return readSafetyFailure;
         }
         await this.files.copyPath(action.from, action.to);
         this.notifyFileModified(action.to, 'create', context?.toolCallId);
@@ -1596,6 +1750,10 @@ export class ActionExecutor {
         const content = await this.files.readFile(action.path);
         const result = this.applySearchReplaceBlocks(content, action.blocks);
         if (content !== result) {
+          const readSafetyFailure = await this.enforceReadBeforeMutation(action.path, capture);
+          if (readSafetyFailure) {
+            return readSafetyFailure;
+          }
           console.log(chalk.cyan(`\n🔄 ${action.path}:`));
           this.showDiff(content, result, action.path);
           await this.files.writeFile(action.path, result);
@@ -1607,6 +1765,10 @@ export class ActionExecutor {
       case 'format_file': {
         if (!action.path) {
           throw new Error('format_file requires a "path" argument.');
+        }
+        const readSafetyFailure = await this.enforceReadBeforeMutation(action.path, capture);
+        if (readSafetyFailure) {
+          return readSafetyFailure;
         }
         const oldFormatContent = await this.files.readFile(action.path).catch(() => '');
         await this.files.formatFile(action.path, (contents, file) => applyFormatter(action.formatter, contents, file));
@@ -2543,6 +2705,10 @@ export class ActionExecutor {
         }
 
         if (oldContent !== newContent) {
+          const readSafetyFailure = await this.enforceReadBeforeMutation(action.file_path, capture);
+          if (readSafetyFailure) {
+            return readSafetyFailure;
+          }
           this.showDiff(oldContent, newContent, action.file_path);
           await this.files.writeFile(action.file_path, newContent);
           this.notifyFileModified(action.file_path, 'modify', context?.toolCallId);
@@ -3374,110 +3540,252 @@ export class ActionExecutor {
     return undefined;
   }
 
-  /**
-   * Extract file outline/structure for smart chunking of large files.
-   * Identifies imports, classes, functions, and key sections with line numbers.
-   */
-  private extractFileOutline(lines: string[], filePath: string): string {
-    const ext = filePath.split('.').pop()?.toLowerCase() || '';
-    const outline: string[] = [];
+  private splitReadFileLines(contents: string): string[] {
+    if (contents.length === 0) {
+      return [];
+    }
+    const lines = contents.split('\n');
+    if (lines.at(-1) === '') {
+      lines.pop();
+    }
+    return lines;
+  }
 
-    // Language-specific patterns
-    const patterns: { [key: string]: RegExp[] } = {
-      ts: [
-        /^(import|export)\s+/,
-        /^(export\s+)?(async\s+)?function\s+(\w+)/,
-        /^(export\s+)?(abstract\s+)?class\s+(\w+)/,
-        /^(export\s+)?interface\s+(\w+)/,
-        /^(export\s+)?type\s+(\w+)/,
-        /^(export\s+)?enum\s+(\w+)/,
-        /^(export\s+)?const\s+(\w+)\s*[=:]/,
-      ],
-      js: [
-        /^(import|export)\s+/,
-        /^(export\s+)?(async\s+)?function\s+(\w+)/,
-        /^(export\s+)?class\s+(\w+)/,
-        /^(export\s+)?const\s+(\w+)\s*=/,
-        /^module\.exports/,
-      ],
-      py: [
-        /^(from|import)\s+/,
-        /^(async\s+)?def\s+(\w+)/,
-        /^class\s+(\w+)/,
-        /^(\w+)\s*=\s*(lambda|def)/,
-      ],
-      rs: [
-        /^(use|mod)\s+/,
-        /^(pub\s+)?(async\s+)?fn\s+(\w+)/,
-        /^(pub\s+)?struct\s+(\w+)/,
-        /^(pub\s+)?enum\s+(\w+)/,
-        /^(pub\s+)?trait\s+(\w+)/,
-        /^impl\s+/,
-      ],
-      go: [
-        /^import\s+/,
-        /^func\s+(\w+|\(\w+\s+\*?\w+\)\s+\w+)/,
-        /^type\s+(\w+)\s+(struct|interface)/,
-        /^var\s+(\w+)/,
-        /^const\s+/,
-      ],
+  private normalizeReadFileContents(contents: string): string {
+    const withoutBom = contents.startsWith('\uFEFF') ? contents.slice(1) : contents;
+    return withoutBom.replace(/\r\n/g, '\n');
+  }
+
+  private formatStreamedReadWindow(
+    window: ReadFileWindowResult,
+    filePath: string,
+    limit: number,
+    requestedPath: string,
+  ): { output: string; hasMore: boolean; completeVisibleLines: number[] } {
+    const repairNote = window.repairedPath
+      ? `Note: Opened "${window.openedPath}" after repairing requested path "${requestedPath}".`
+      : undefined;
+    const clampNote = this.formatReadClampNote(window);
+    const existingContinuationNote = this.formatReadContinuationNote(
+      window.continuation,
+      filePath,
+      limit,
+    );
+    const lastLine = window.lines.at(-1);
+    const possibleByteContinuationNote = lastLine
+      ? this.formatReadContinuationNote({
+          kind: 'bytes',
+          offset: lastLine.lineNumber - 1,
+          sourceLineNumber: lastLine.lineNumber,
+        }, filePath, limit)
+      : undefined;
+    const continuationBytes = Math.max(
+      Buffer.byteLength(existingContinuationNote ?? '', 'utf8'),
+      Buffer.byteLength(possibleByteContinuationNote ?? '', 'utf8'),
+    );
+    const fixedPrefixBytes = repairNote
+      ? Buffer.byteLength(repairNote, 'utf8') + 2
+      : 0;
+    const fixedSuffixBytes = continuationBytes > 0 || clampNote
+      ? 2
+        + continuationBytes
+        + (continuationBytes > 0 && clampNote ? 1 : 0)
+        + Buffer.byteLength(clampNote ?? '', 'utf8')
+      : 0;
+    const rendered = this.renderReadLinesWithinBytes(
+      window.lines,
+      Math.max(0, READ_FILE_MAX_BYTES - fixedPrefixBytes - fixedSuffixBytes),
+    );
+    const continuationNote = this.formatReadContinuationNote(
+      rendered.continuation ?? window.continuation,
+      filePath,
+      limit,
+    );
+    const notes = [continuationNote, clampNote].filter((note): note is string => Boolean(note));
+    const sections = [repairNote, rendered.body, notes.length > 0 ? notes.join('\n') : undefined]
+      .filter((section): section is string => Boolean(section));
+    return {
+      output: sections.join('\n\n'),
+      hasMore: Boolean(rendered.continuation ?? window.continuation),
+      completeVisibleLines: rendered.completeLineNumbers
+        .filter(lineNumber => !window.lines.some(
+          line => line.lineNumber === lineNumber && line.clamped,
+        ))
+        .filter(lineNumber => !(
+          window.continuation?.kind === 'bytes'
+          && window.continuation.sourceLineNumber === lineNumber
+        ))
+        .map(lineNumber => lineNumber - 1),
     };
+  }
 
-    // Get patterns for file type
-    const langPatterns = patterns[ext] || patterns['ts'] || [];
-    if (['tsx', 'jsx', 'mts', 'cts'].includes(ext)) {
-      langPatterns.push(...(patterns['ts'] || []));
+  private renderReadLinesWithinBytes(
+    lines: ReadFileWindowResult['lines'],
+    maximumBytes: number,
+  ): {
+    body: string;
+    continuation?: NonNullable<ReadFileWindowResult['continuation']>;
+    completeLineNumbers: number[];
+  } {
+    const parts: string[] = [];
+    const completeLineNumbers: number[] = [];
+    let usedBytes = 0;
+
+    for (const line of lines) {
+      const separator = parts.length > 0 ? '\n' : '';
+      const prefix = `${String(line.lineNumber).padStart(6)}\t`;
+      const completePart = `${separator}${prefix}${line.content}`;
+      const completeBytes = Buffer.byteLength(completePart, 'utf8');
+      if (usedBytes + completeBytes <= maximumBytes) {
+        parts.push(completePart);
+        usedBytes += completeBytes;
+        completeLineNumbers.push(line.lineNumber);
+        continue;
+      }
+
+      const fixedPart = `${separator}${prefix}`;
+      const remainingBytes = maximumBytes
+        - usedBytes
+        - Buffer.byteLength(fixedPart, 'utf8');
+      if (remainingBytes >= 0) {
+        parts.push(`${fixedPart}${this.utf8Prefix(line.content, remainingBytes)}`);
+      }
+      return {
+        body: parts.join(''),
+        completeLineNumbers,
+        continuation: {
+          kind: 'bytes',
+          offset: line.lineNumber - 1,
+          sourceLineNumber: line.lineNumber,
+        },
+      };
     }
 
-    let importStart = -1;
-    let importEnd = -1;
+    return { body: parts.join(''), completeLineNumbers };
+  }
 
-    lines.forEach((line, idx) => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
-        return;
-      }
-
-      const lineNum = idx + 1;
-
-      // Track import section
-      if (/^(import|from|use|require)\s+/.test(trimmed)) {
-        if (importStart === -1) {
-          importStart = lineNum;
-        }
-        importEnd = lineNum;
-        return;
-      }
-
-      // After imports, check for other patterns
-      for (const pattern of langPatterns) {
-        if (pattern.test(trimmed) && !/^(import|from|use)\s+/.test(trimmed)) {
-          // Extract meaningful identifier
-          let identifier = trimmed.slice(0, 60);
-          if (identifier.length < trimmed.length) identifier += '...';
-          outline.push(`  ${String(lineNum).padStart(4)}: ${identifier}`);
-          break;
-        }
-      }
+  private async recordModelVisibleRead(
+    window: ReadFileWindowResult,
+    offset: number,
+    visibleLines: number[],
+    mode: ReturnType<typeof resolveStatefulReadMode>,
+    viewKey: string,
+  ): Promise<void> {
+    if (mode === 'off') {
+      return;
+    }
+    await this.readSessionLedger.recordRead({
+      path: window.resolvedPath,
+      revision: window.revision,
+      revisionStable: window.revisionStable,
+      visibleLines,
+      reachedEof: window.reachedEof,
+      totalLines: window.linesScanned,
+      sha256: window.sha256,
+      offset,
+      ...(mode === 'dedup' || mode === 'enforce' ? { viewKey } : {}),
     });
+  }
 
-    // Build final outline
-    const result: string[] = [];
+  private readViewKey(requestedPath: string, offset: number, limit: number): string {
+    return JSON.stringify({ version: 1, requestedPath, offset, limit });
+  }
 
-    if (importStart !== -1) {
-      result.push(`Imports: lines ${importStart}-${importEnd}`);
+  private async readBeforeMutationFailure(filePath: string): Promise<string | undefined> {
+    if (resolveStatefulReadMode(this.runtime.config) !== 'enforce') {
+      return undefined;
     }
-
-    if (outline.length > 0) {
-      result.push('');
-      result.push('Definitions:');
-      result.push(...outline.slice(0, 50)); // Limit to 50 items
-      if (outline.length > 50) {
-        result.push(`  ... and ${outline.length - 50} more`);
-      }
+    const inspection = await this.files.inspectPath(filePath);
+    if (inspection.kind !== 'file') {
+      return undefined;
     }
+    const current = await this.files.hashInspectedFile(inspection);
+    if (!current.revisionStable) {
+      return this.formatReadBeforeMutationFailure(filePath, 'changed');
+    }
+    const authorization = await this.readSessionLedger.authorizeMutation(
+      inspection.resolvedPath,
+      current.sha256,
+    );
+    return authorization.allowed
+      ? undefined
+      : this.formatReadBeforeMutationFailure(filePath, authorization.reason);
+  }
 
-    return result.length > 0 ? result.join('\n') : 'No structure detected';
+  private async enforceReadBeforeMutation(
+    filePath: string,
+    capture?: ToolOutcomeCapture,
+  ): Promise<string | undefined> {
+    const failure = await this.readBeforeMutationFailure(filePath);
+    return failure
+      ? this.recordToolFailure(capture, 'authorization', failure, failure)
+      : undefined;
+  }
+
+  private formatReadBeforeMutationFailure(
+    filePath: string,
+    reason: 'unread' | 'partial' | 'changed',
+  ): string {
+    const guidance = `Read the complete current file with read_file path="${filePath}" before retrying.`;
+    if (reason === 'partial') {
+      return `Blocked: Only part of ${filePath} has been read in this session. ${guidance}`;
+    }
+    if (reason === 'changed') {
+      return `Blocked: ${filePath} changed after it was read. ${guidance}`;
+    }
+    return `Blocked: ${filePath} has not been read in this session. ${guidance}`;
+  }
+
+  private formatReadContinuationNote(
+    continuation: ReadFileWindowResult['continuation'],
+    filePath: string,
+    limit: number,
+  ): string | undefined {
+    if (continuation?.kind === 'bytes') {
+      return `Note: The 128 KiB read ceiling cut source line ${continuation.sourceLineNumber}. Continue with read_file path="${filePath}" offset=${continuation.offset} limit=${limit}.`;
+    }
+    if (continuation?.kind === 'lines') {
+      return `Note: More content remains. Continue with read_file path="${filePath}" offset=${continuation.offset} limit=${limit}.`;
+    }
+    return undefined;
+  }
+
+  private formatReadClampNote(window: ReadFileWindowResult): string | undefined {
+    const clampedLineNumbers = window.lines
+      .filter(line => line.clamped)
+      .map(line => line.lineNumber);
+    if (clampedLineNumbers.length === 0) {
+      return undefined;
+    }
+    const label = clampedLineNumbers.length === 1
+      ? `Line ${clampedLineNumbers[0]} exceeded ${READ_FILE_MAX_LINE_CHARACTERS} characters and was clamped.`
+      : `Lines ${clampedLineNumbers.join(', ')} exceeded ${READ_FILE_MAX_LINE_CHARACTERS} characters and were clamped.`;
+    return `Note: ${label} Use fff_grep or shell for targeted inspection.`;
+  }
+
+  private withReadPathRepairNote(
+    output: string,
+    window: ReadFileWindowResult,
+    requestedPath: string,
+  ): string {
+    return window.repairedPath
+      ? `Note: Opened "${window.openedPath}" after repairing requested path "${requestedPath}".\n\n${output}`
+      : output;
+  }
+
+  private utf8Prefix(value: string, maximumBytes: number): string {
+    if (maximumBytes <= 0) {
+      return '';
+    }
+    const bytes = Buffer.from(value, 'utf8');
+    if (bytes.length <= maximumBytes) {
+      return value;
+    }
+    let end = maximumBytes;
+    while (end > 0 && (bytes[end] & 0xc0) === 0x80) {
+      end--;
+    }
+    return bytes.subarray(0, end).toString('utf8');
   }
 
   private executeFind(action: Extract<AgentAction, { type: 'find' }>): string {
