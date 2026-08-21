@@ -22,7 +22,7 @@ describe('index SDK mode startup ordering', () => {
   it('routes RPC and ACP before the interactive auth gate can print or prompt', () => {
     const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
 
-    const authGateIndex = source.indexOf('await ensureAuthenticated(authConfig');
+    const authGateIndex = source.indexOf('// ── Workspace safety gate ──');
     const routerIndex = source.indexOf('const protocolLaunchMode = resolveProtocolLaunchMode(opts)');
     const rpcModeIndex = source.indexOf("if (protocolLaunchMode === 'rpc')");
     const acpModeIndex = source.indexOf("if (protocolLaunchMode === 'acp')");

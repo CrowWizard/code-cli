@@ -30,7 +30,6 @@ import { execSync, spawnSync } from 'node:child_process';
 import { getProviderConfig, loadConfig, resolveWorkspaceRoot, saveConfig } from './config.js';
 import { runStartupChecks, printStartupCheckResults, validateWorkspacePath } from './startup/checks.js';
 import { checkWorkspaceSafety, printDangerousWorkspaceWarning } from './startup/workspaceSafety.js';
-import { ensureAuthenticated } from './auth/index.js';
 import type { AuthUser, BuiltInProviderName, LoadedConfig, SkillInstallScope } from './types.js';
 import { validateAuthOnStartup } from './auth/startupAuth.js';
 import { installProcessErrorHandlers } from './reporting/processErrorReporting.js';
