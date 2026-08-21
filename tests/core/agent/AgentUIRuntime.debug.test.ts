@@ -38,6 +38,18 @@ describe('AgentUIRuntime debug output', () => {
     expect(writeDebugLine).toHaveBeenCalledWith(expect.stringContaining('[DEBUG] initializeUI: useInkRenderer=false'));
     expect(consoleLogSpy).not.toHaveBeenCalled();
   });
+
+  it('does not initialize terminal UI for RPC/ACP turns', async () => {
+    const initFallbackSpinner = vi.fn();
+
+    await initializeAgentUI({
+      runtime: { isRpcMode: true },
+      useInkRenderer: false,
+      initFallbackSpinner,
+    });
+
+    expect(initFallbackSpinner).not.toHaveBeenCalled();
+  });
 });
 
 describe('AgentUIRuntime Ctrl+C exit request', () => {

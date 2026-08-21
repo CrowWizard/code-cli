@@ -188,6 +188,22 @@ describe('InstructionRunner command mode UI', () => {
     expect(host.scheduleTurnMemoryReflection).not.toHaveBeenCalled();
   });
 
+  it('does not activate the persistent queue composer for ACP/RPC turns', async () => {
+    restoreFns.push(overrideStreamTTY(process.stdout, true));
+    restoreFns.push(overrideStreamTTY(process.stdin, true));
+    const host = createHost();
+    host.runtime = {
+      ...host.runtime,
+      options: {},
+      isCommandMode: false,
+      isRpcMode: true,
+    };
+
+    await new InstructionRunner(host).run('respond through ACP');
+
+    expect(host.persistentInput.start).not.toHaveBeenCalled();
+  });
+
   it('schedules automatic memory reflection with a successful interactive outcome', async () => {
     const host = createHost();
     host.runtime = {

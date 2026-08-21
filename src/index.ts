@@ -289,6 +289,8 @@ program
   .option('--timeout <seconds>', 'Timeout in seconds for auto-approve mode', parseInt)
   .option('--fork <pathOrId>', 'Create and resume a new session branch from an existing session reference')
   .action(async (positionalPrompt: string | undefined, opts: RootCliOptions) => {
+    normalizePromptAndProtocolOptions(positionalPrompt, opts);
+
     // Clear screen immediately for Cursor-like behavior (before any output)
     if (
       process.stdout.isTTY

@@ -1092,21 +1092,39 @@ describe("AutohandAcpAdapter", () => {
           createdAt: new Date(2025, 0, 1).toISOString(),
           lastActiveAt: new Date(2025, 0, 2).toISOString(),
         },
-        {
-          sessionId: "b",
-          projectPath: "/workspace/b",
-          summary: "B",
-          createdAt: new Date(2025, 0, 1).toISOString(),
-          lastActiveAt: new Date(2025, 0, 2).toISOString(),
-        },
       ]);
 
       const result = await adapter.unstable_listSessions({
         cwd: "/workspace/a",
       } as any);
+      expect(mockPersistentSessionManager.listSessions).toHaveBeenCalledWith({
+        project: "/workspace/a",
+      });
       expect(result.sessions).toHaveLength(1);
       expect(result.sessions[0].sessionId).toBe("a");
       expect(result.sessions[0].cwd).toBe("/workspace/a");
+    });
+
+    it("delegates workspace path normalization to SessionManager", async () => {
+      mockPersistentSessionManager.listSessions.mockResolvedValue([
+        {
+          sessionId: "a",
+          projectPath: "/workspace/a",
+          summary: "A",
+          createdAt: new Date(2025, 0, 1).toISOString(),
+          lastActiveAt: new Date(2025, 0, 2).toISOString(),
+        },
+      ]);
+
+      const result = await adapter.listSessions({
+        cwd: "/workspace/a/",
+      } as any);
+
+      expect(mockPersistentSessionManager.listSessions).toHaveBeenCalledWith({
+        project: "/workspace/a/",
+      });
+      expect(result.sessions).toHaveLength(1);
+      expect(result.sessions[0].sessionId).toBe("a");
     });
 
     it("returns empty sessions when cursor is invalid", async () => {

@@ -867,10 +867,9 @@ export class AutohandAcpAdapter implements Agent {
       const { SessionManager } = await import('../../session/SessionManager.js');
       const sessionManager = new SessionManager();
       await sessionManager.initialize();
-      const sessions = await sessionManager.listSessions();
-      const filtered = params.cwd
-        ? sessions.filter((session) => session.projectPath === params.cwd)
-        : sessions;
+      const filtered = await sessionManager.listSessions(
+        params.cwd ? { project: params.cwd } : undefined,
+      );
 
       const offset = params.cursor ? Number.parseInt(params.cursor, 10) : 0;
       if (Number.isNaN(offset) || offset < 0) {

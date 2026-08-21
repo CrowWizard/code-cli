@@ -8,6 +8,17 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 describe('index SDK mode startup ordering', () => {
+  it('normalizes the --acp alias before terminal UI can be initialized', () => {
+    const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
+
+    const normalizationIndex = source.indexOf('normalizePromptAndProtocolOptions(positionalPrompt, opts)');
+    const clearScreenIndex = source.indexOf('// Clear screen immediately for Cursor-like behavior');
+
+    expect(normalizationIndex).toBeGreaterThan(-1);
+    expect(clearScreenIndex).toBeGreaterThan(-1);
+    expect(normalizationIndex).toBeLessThan(clearScreenIndex);
+  });
+
   it('routes RPC and ACP before the interactive auth gate can print or prompt', () => {
     const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
 

@@ -302,6 +302,9 @@ export async function initializeAgentUI(host: AgentUIRuntimeHost, abortControlle
       `[DEBUG] initializeUI: useInkRenderer=${host.useInkRenderer}, stdout.isTTY=${process.stdout.isTTY}, stdin.isTTY=${process.stdin.isTTY}`,
       host.writeDebugLine?.bind(host)
     );
+    if (host.runtime?.isRpcMode === true) {
+      return;
+    }
     if (host.useInkRenderer && process.stdout.isTTY && process.stdin.isTTY) {
       try {
         // Update the shared abort controller reference so Ink's onEscape
