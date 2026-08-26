@@ -35,7 +35,7 @@ type Primitive = string | number | boolean | null;
 
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
-export type BuiltInProviderName = 'autohandai' | 'openrouter' | 'ollama' | 'llamacpp' | 'openai' | 'mlx' | 'llmgateway' | 'azure' | 'zai' | 'sakana' | 'vertexai' | 'xai' | 'cerebras' | 'nvidia' | 'deepseek' | 'bedrock';
+export type BuiltInProviderName = 'autohandai' | 'openrouter' | 'anthropic' | 'ollama' | 'llamacpp' | 'openai' | 'mlx' | 'llmgateway' | 'azure' | 'zai' | 'sakana' | 'vertexai' | 'xai' | 'cerebras' | 'nvidia' | 'deepseek' | 'bedrock';
 export type BlueprintLocalProviderName = 'blueprint-local';
 export type CustomProviderId = `custom:${string}`;
 export type ExtensionProviderId = `extension:${string}`;
@@ -119,6 +119,10 @@ export interface AutohandAISettings extends ProviderSettings {
 }
 
 export interface OpenRouterSettings extends ProviderSettings {
+  apiKey: string;
+}
+
+export interface AnthropicSettings extends ProviderSettings {
   apiKey: string;
 }
 
@@ -326,9 +330,11 @@ export interface AgentSettings {
   maxIterations?: number;
   /** Enable request queue - allow typing while agent works (default: true) */
   enableRequestQueue?: boolean;
-  /** Log out authenticated interactive sessions after idle timeout (default: true) */
+  /** Switch the session into auto mode while a goal is active (default: true) */
+  goalAutoMode?: boolean;
+  /** End authenticated interactive sessions after an idle timeout (default: true) */
   idleLogoutEnabled?: boolean;
-  /** Milliseconds of inactivity before logging out an authenticated session (default: 3600000) */
+  /** Milliseconds of inactivity before ending an authenticated session (default: 14400000 — 4 hours) */
   idleTimeoutMs?: number;
   /** Maximum session failure retries before giving up (default: 3) */
   sessionRetryLimit?: number;
@@ -823,6 +829,8 @@ export interface AutohandConfig {
   blueprintLocal?: BlueprintLocalSettings;
   autohandai?: AutohandAISettings;
   openrouter?: OpenRouterSettings;
+  /** Anthropic Claude Messages API settings */
+  anthropic?: AnthropicSettings;
   ollama?: ProviderSettings;
   llamacpp?: ProviderSettings;
   openai?: OpenAISettings;
@@ -1122,6 +1130,14 @@ export interface ImageContentPart {
  */
 export type ContentPart = TextContentPart | ImageContentPart;
 
+/**
+ * Provider-native reasoning content captured from a response so it can be
+ * replayed verbatim on the following request. The shape is opaque to Autohand:
+ * only the provider that produced a block may interpret it. Anthropic rejects
+ * modified or reconstructed thinking blocks, so these are never edited.
+ */
+export type ProviderReasoningBlock = Readonly<Record<string, unknown>>;
+
 export interface LLMMessage {
   role: MessageRole;
   content: string;
@@ -1130,6 +1146,8 @@ export interface LLMMessage {
   tool_call_id?: string;
   /** Tool calls made by the assistant (included when role is 'assistant' and model invoked tools) */
   tool_calls?: LLMToolCall[];
+  /** Provider-native reasoning blocks to replay unchanged on the next request */
+  reasoningBlocks?: ProviderReasoningBlock[];
   /** Priority for context management (default: medium) */
   priority?: MessagePriority;
   /** Metadata for smart compression */
@@ -1260,6 +1278,8 @@ export interface LLMResponse {
   finishReason?: 'stop' | 'tool_calls' | 'length' | 'content_filter';
   /** Token usage statistics */
   usage?: LLMUsage;
+  /** Provider-native reasoning blocks that must be replayed on the next request */
+  reasoningBlocks?: ProviderReasoningBlock[];
   raw: unknown;
 }
 

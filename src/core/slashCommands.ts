@@ -47,6 +47,7 @@ import * as history from '../commands/history.js';
 import * as mcpCmd from '../commands/mcp.js';
 import * as teamCmd from '../commands/team.js';
 import * as tasksCmd from '../commands/tasks.js';
+import * as peersCmd from '../commands/peers.js';
 import * as messageCmd from '../commands/message.js';
 import * as importCmd from '../commands/import.js';
 import * as repeatCmd from '../commands/repeat.js';
@@ -124,6 +125,7 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   mcpCmd.installMetadata,
   teamCmd.metadata,
   tasksCmd.metadata,
+  peersCmd.metadata,
   messageCmd.metadata,
   importCmd.metadata,
   repeatCmd.metadata,

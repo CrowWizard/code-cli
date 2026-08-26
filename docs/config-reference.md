@@ -188,6 +188,7 @@ Active LLM provider to use.
 | -------------- | ---------------------------- |
 | `"autohandai"` | Autohand AI Cloud or Local   |
 | `"openrouter"` | OpenRouter API (default)     |
+| `"anthropic"`  | Anthropic Messages API       |
 | `"ollama"`     | Local Ollama instance        |
 | `"llamacpp"`   | Local llama.cpp server       |
 | `"openai"`     | OpenAI API directly          |
@@ -279,6 +280,29 @@ OpenRouter provider configuration.
 | `baseUrl`       | string | No       | `https://openrouter.ai/api/v1` | API endpoint                                                                |
 | `model`         | string | Yes      | -                              | Model identifier (e.g., `your-modelcard-id-here`)                           |
 | `contextWindow` | number | No       | Auto                           | Exact model context window. Autohand fills this from OpenRouter when known. |
+
+### `anthropic`
+
+Native Anthropic Messages API configuration. Autohand sends system prompts, tool definitions, tool uses, and tool results using Anthropic's native request format.
+
+```json
+{
+  "anthropic": {
+    "apiKey": "sk-ant-xxx",
+    "baseUrl": "https://api.anthropic.com",
+    "model": "claude-sonnet-5",
+    "contextWindow": 1000000
+  }
+}
+```
+
+| Field           | Type   | Required | Default                     | Description                                      |
+| --------------- | ------ | -------- | --------------------------- | ------------------------------------------------ |
+| `apiKey`        | string | Yes      | -                           | Your Anthropic Console API key                   |
+| `baseUrl`       | string | No       | `https://api.anthropic.com` | Anthropic API origin; `/v1/messages` is appended |
+| `model`         | string | Yes      | `claude-sonnet-5`           | Native Anthropic model identifier                |
+| `contextWindow` | number | No       | Catalog value               | Model context window used by Autohand accounting |
+| `reasoningEffort` | string | No     | Provider default            | Native output effort (`low` through `xhigh`)      |
 
 ### `zai`
 
@@ -876,8 +900,9 @@ Control agent behavior and iteration limits.
     "enableRequestQueue": true,
     "toolSelectionCache": true,
     "autoMemory": true,
+    "goalAutoMode": true,
     "idleLogoutEnabled": true,
-    "idleTimeoutMs": 3600000,
+    "idleTimeoutMs": 14400000,
     "debug": false
   }
 }
@@ -889,8 +914,9 @@ Control agent behavior and iteration limits.
 | `enableRequestQueue` | boolean | `true`  | Allow users to type and queue requests while agent is working                  |
 | `toolSelectionCache` | boolean | `true`  | Cache local per-turn tool schema selection for equivalent tool-selection input |
 | `autoMemory`         | boolean | `true`  | Extract and save durable user/project memories after completed interactive turns, including evidence-backed lessons from failures and cancellations |
-| `idleLogoutEnabled`  | boolean | `true`  | Log out authenticated interactive sessions after the idle timeout              |
-| `idleTimeoutMs`      | number  | `3600000` | Milliseconds of inactivity before logging out an authenticated session (60 minutes) |
+| `goalAutoMode`       | boolean | `true`  | Put the session in auto mode while a goal is active (autonomous turns, no tool approval prompts) |
+| `idleLogoutEnabled`  | boolean | `true`  | End authenticated interactive sessions after the idle timeout                  |
+| `idleTimeoutMs`      | number  | `14400000` | Milliseconds of inactivity before ending an authenticated session (4 hours)   |
 | `debug`              | boolean | `false` | Enable verbose debug output (logs agent internal state to stderr)              |
 
 ## Concurrent Session Awareness
@@ -939,7 +965,29 @@ To keep authenticated long-running agent sessions alive while they wait for work
 
 For a single process, use `autohand --no-idle-logout` or set `AUTOHAND_NO_IDLE_LOGOUT=1`.
 
-Set `idleTimeoutMs` to a positive duration in milliseconds to change the idle period. The default is `3600000` (60 minutes); invalid values fall back to the default.
+Set `idleTimeoutMs` to a positive duration in milliseconds to change the idle period. The default is `14400000` (4 hours); invalid values fall back to the default.
+
+### Goals and auto mode
+
+A goal is a standing instruction to keep working, so starting one switches the
+session into auto mode: the agent drives its own turns and stops asking for tool
+approval until the goal is complete. Setting a new goal while one is active
+queues it, and the queue advances automatically as each goal completes.
+
+To keep the normal turn-by-turn loop while goals are active:
+
+```json
+{
+  "agent": {
+    "goalAutoMode": false
+  }
+}
+```
+
+An idle timeout ends the interactive session and exits; it does not sign you
+out. Your credential is stored in the shared `~/.autohand` config, so revoking
+it would sign you out of every other terminal tab and every later run. Signing
+out stays an explicit `/logout`.
 
 ### Debug Mode
 
@@ -1905,7 +1953,7 @@ autohand --no-browser       # Start with browser bridge disabled
     "enableRequestQueue": true,
     "toolSelectionCache": true,
     "idleLogoutEnabled": true,
-    "idleTimeoutMs": 3600000,
+    "idleTimeoutMs": 14400000,
     "debug": false
   },
   "permissions": {
@@ -1992,7 +2040,7 @@ agent:
   enableRequestQueue: true
   toolSelectionCache: true
   idleLogoutEnabled: true
-  idleTimeoutMs: 3600000
+  idleTimeoutMs: 14400000
   debug: false
 
 permissions:
@@ -2088,7 +2136,7 @@ maxIterations = 100
 enableRequestQueue = true
 toolSelectionCache = true
 idleLogoutEnabled = true
-idleTimeoutMs = 3600000
+idleTimeoutMs = 14400000
 debug = false
 
 [permissions]
@@ -2178,7 +2226,7 @@ These flags override config file settings:
 | `--unrestricted`              | No approval prompts                                                                            |
 | `--restricted`                | Deny dangerous operations                                                                      |
 | `--permissions`               | Display current permission settings and exit                                                   |
-| `--no-idle-logout`            | Disable authenticated idle logout for long-running agent sessions                              |
+| `--no-idle-logout`            | Keep authenticated sessions alive past the idle timeout for long-running agents                |
 | `--yolo [pattern]`            | Auto-approve tool calls matching pattern (e.g., `allow:read,write` or `deny:delete`)           |
 | `--timeout <seconds>`         | Timeout in seconds for auto-approve mode                                                       |
 

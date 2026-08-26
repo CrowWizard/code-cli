@@ -316,6 +316,46 @@ describe('AgentUI interaction mode shortcut', () => {
     expect(onCycleInteractionMode).toHaveBeenCalledTimes(4);
   });
 
+  it('renders the bracketed mode indicator below the status line so busy turns cannot flood scrollback', async () => {
+    const { lastFrame } = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state: {
+              ...createInitialUIState(),
+              isWorking: true,
+              status: 'Working... (esc to interrupt)',
+            },
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            getInteractionMode: () => 'automode',
+          })
+        )
+      )
+    );
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const frame = stripAnsi(lastFrame() ?? '');
+
+    // The indicator must still be visible while working...
+    expect(frame).toContain('[AUTO]');
+    expect(frame).toContain('Interactive auto mode active');
+    expect(frame).toContain('Working... (esc to interrupt)');
+
+    // ...but anchored BELOW the status line in the stable bottom section.
+    // Rendering it above the dynamic output region makes Ink flush it into
+    // scrollback on every repaint once tool output exceeds the viewport,
+    // duplicating "[AUTO] Interactive auto mode active" dozens of times.
+    const statusIndex = frame.indexOf('Working... (esc to interrupt)');
+    const indicatorIndex = frame.indexOf('[AUTO]');
+    expect(indicatorIndex).toBeGreaterThan(statusIndex);
+  });
+
   it('colors the mode glyph per mode, labels it, and hides it in default mode', async () => {
     const modes = ['plan', 'yolo', 'automode', 'default'] as const;
     let currentMode: typeof modes[number] = 'default';
@@ -1241,6 +1281,85 @@ describe('AgentUI layout stability', () => {
         segments: [{ id: 'custom', text: 'custom help' }],
       })
     ).toBe('custom help');
+  });
+});
+
+describe('AgentUI plan label in help line', () => {
+  function renderWithPlanLabel(planLabel?: string) {
+    const state = {
+      ...createInitialUIState(),
+      provider: 'openrouter',
+      model: 'fantail',
+      planLabel,
+    };
+    return render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state,
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+          }),
+        ),
+      ),
+    );
+  }
+
+  it('shows the plan label next to the autohand name in the help line', async () => {
+    const instance = renderWithPlanLabel('Free');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('autohand Free (OpenRouter, fantail)');
+    cleanup();
+  });
+
+  it('shows the plan label for Pro', async () => {
+    const instance = renderWithPlanLabel('Pro');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('autohand Pro (OpenRouter, fantail)');
+    cleanup();
+  });
+
+  it('shows the plan label for Max', async () => {
+    const instance = renderWithPlanLabel('Max');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('autohand Max (OpenRouter, fantail)');
+    cleanup();
+  });
+
+  it('omits the plan label when no plan is set', async () => {
+    const instance = renderWithPlanLabel(undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('autohand (OpenRouter, fantail)');
+    expect(frame).not.toContain('autohand Free');
+    expect(frame).not.toContain('autohand Pro');
+    expect(frame).not.toContain('autohand Max');
+    cleanup();
+  });
+
+  it('does not render a standalone plan line above the composer', async () => {
+    const instance = renderWithPlanLabel('Free');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    const lines = frame.split('\n');
+    const standaloneFreeLines = lines.filter(
+      (line) => line.trim() === 'Free' || line.trim() === 'Free · Monthly' || line.trim() === 'Free · Annual',
+    );
+    expect(standaloneFreeLines, frame).toHaveLength(0);
+    cleanup();
   });
 });
 

@@ -28,13 +28,14 @@ import { autoInitTheme, configureThemeSources, themeExists } from "./ui/theme/in
 import { loadLocalProjectSettings, type LocalProjectSettings } from "./permissions/localProjectPermissions.js";
 import { isAwsBedrockProviderEnabled } from "./features/featureRegistry.js";
 import { getCustomProviderConfig, isCustomProviderName } from "./providers/customProviders.js";
-import { getProviderDefaultModel, getProviderModelOptions, getProviderRuntimeDefaultModel } from "./providers/modelCatalog.js";
+import { getProviderDefaultModel, getProviderModelOptions, getProviderRuntimeDefaultModel, normalizeOpenRouterModelId } from "./providers/modelCatalog.js";
 
 const DEFAULT_CONFIG_PATH = AUTOHAND_FILES.configJson;
 const TOML_CONFIG_PATH = AUTOHAND_FILES.configToml;
 const YAML_CONFIG_PATH = AUTOHAND_FILES.configYaml;
 const YML_CONFIG_PATH = AUTOHAND_FILES.configYml;
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com";
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_LLAMACPP_URL = "http://localhost:8080";
 const DEFAULT_OPENAI_URL = "https://api.openai.com/v1";
@@ -85,6 +86,7 @@ function normalizeProviderName(provider: unknown): ProviderName | undefined {
   const validProviders: readonly BuiltInProviderName[] = [
     "autohandai",
     "openrouter",
+    "anthropic",
     "ollama",
     "llamacpp",
     "openai",
@@ -749,7 +751,18 @@ function normalizeConfig(
 
   if (isModernConfig(config)) {
     const provider = normalizeProviderName(config.provider) ?? "openrouter";
-    return { ...config, provider };
+    return {
+      ...config,
+      provider,
+      ...(config.openrouter
+        ? {
+            openrouter: {
+              ...config.openrouter,
+              model: normalizeOpenRouterModelId(config.openrouter.model),
+            },
+          }
+        : {}),
+    };
   }
 
   if (isLegacyConfig(config)) {
@@ -758,7 +771,7 @@ function normalizeConfig(
       openrouter: {
         apiKey: config.api_key ?? "replace-me",
         baseUrl: config.base_url ?? DEFAULT_BASE_URL,
-        model: getProviderDefaultModel("openrouter", "anthropic/claude-4-sonnet"),
+        model: getProviderDefaultModel("openrouter", "anthropic/claude-sonnet-5"),
       },
       workspace: {
         defaultRoot: process.cwd(),
@@ -784,6 +797,7 @@ function isModernConfig(
 ): config is AutohandConfig {
   return (
     typeof (config as AutohandConfig).openrouter === "object" ||
+    typeof (config as AutohandConfig).anthropic === "object" ||
     typeof (config as AutohandConfig).blueprintLocal === "object" ||
     typeof (config as AutohandConfig).autohandai === "object" ||
     typeof (config as AutohandConfig).ollama === "object" ||
@@ -1107,6 +1121,7 @@ export function getProviderConfig(
   const configByProvider: Record<BuiltInProviderName, ProviderSettings | undefined> = {
     autohandai: config.autohandai,
     openrouter: config.openrouter,
+    anthropic: config.anthropic,
     ollama: config.ollama,
     llamacpp: config.llamacpp,
     openai: config.openai,
@@ -1177,6 +1192,7 @@ export function getProviderConfig(
     }
   } else if (
     builtInProvider === "openrouter" ||
+    builtInProvider === "anthropic" ||
     builtInProvider === "llmgateway" ||
     builtInProvider === "zai" ||
     builtInProvider === "sakana" ||
@@ -1225,6 +1241,7 @@ function defaultBaseUrlFor(
   port?: number,
 ): string | undefined {
   if (provider === "openrouter") return DEFAULT_BASE_URL;
+  if (provider === "anthropic") return DEFAULT_ANTHROPIC_URL;
   if (provider === "autohandai") return DEFAULT_AUTOHAND_AI_URL;
   if (provider === "llmgateway") return DEFAULT_LLMGATEWAY_URL;
   if (provider === "zai") return DEFAULT_ZAI_URL;
@@ -1287,9 +1304,53 @@ function normalizeBedrockProviderConfig(
   };
 }
 
-export async function saveConfig(config: LoadedConfig): Promise<void> {
+export interface SaveConfigOptions {
+  /**
+   * Write the in-memory `auth` block. Defaults to false, which keeps whatever
+   * credential is already on disk.
+   *
+   * The config file is shared by every terminal tab, and a long-lived tab still
+   * holds the credential it loaded at startup. Without this, an incidental save
+   * — a model switch, a settings change — rewrites the file with that stale
+   * credential and signs the newer tab out. Only sign-in, sign-out, and startup
+   * validation actually mean to change auth, so only they pass `writeAuth`.
+   */
+  writeAuth?: boolean;
+}
+
+/** Read just the persisted `auth` block, tolerating a missing or corrupt file. */
+async function readPersistedAuth(
+  configPath: string,
+): Promise<{ present: boolean; auth?: LoadedConfig["auth"] }> {
+  try {
+    const parsed = await parseConfigFile(configPath);
+    if (parsed && typeof parsed === "object" && "auth" in parsed) {
+      return { present: true, auth: (parsed as AutohandConfig).auth };
+    }
+    return { present: false };
+  } catch {
+    return { present: false };
+  }
+}
+
+export async function saveConfig(
+  config: LoadedConfig,
+  options: SaveConfigOptions = {},
+): Promise<void> {
   const { configPath, ...data } = config;
   delete (data as Partial<LoadedConfig>).isNewConfig;
+
+  if (!options.writeAuth) {
+    const persisted = await readPersistedAuth(configPath);
+    if (persisted.present) {
+      if (persisted.auth) {
+        (data as AutohandConfig).auth = persisted.auth;
+      } else {
+        delete (data as Partial<AutohandConfig>).auth;
+      }
+    }
+  }
+
   await fs.ensureDir(path.dirname(configPath));
 
   if (isYamlFile(configPath)) {

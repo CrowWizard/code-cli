@@ -107,6 +107,52 @@ describe('/goal command', () => {
     expect(queued).toEqual([]);
   });
 
+  it('queues a second objective instead of refusing while a goal is active', async () => {
+    await goal(ctx, ['ship', 'the', 'auth', 'fix']);
+    queued.length = 0;
+
+    const message = await goal(ctx, ['then', 'update', 'the', 'changelog']);
+
+    expect(message).not.toContain('A goal already exists');
+    const snapshot = await new GoalManager(workspaceRoot).getSnapshot();
+    expect(snapshot.goal?.objective).toBe('ship the auth fix');
+    expect(snapshot.queue.map((entry) => entry.objective))
+      .toEqual(['then update the changelog']);
+    // Queueing must not re-nudge the goal that is already running.
+    expect(queued).toEqual([]);
+  });
+
+  it('puts the session in auto mode when a goal starts', async () => {
+    await goal(ctx, ['ship', 'the', 'auth', 'fix']);
+
+    expect(ctx.setInteractionMode).toHaveBeenCalledWith('automode');
+  });
+
+  it('leaves the interaction mode alone when goal auto mode is disabled', async () => {
+    ctx.config.agent = { ...(ctx.config.agent ?? {}), goalAutoMode: false };
+
+    await goal(ctx, ['ship', 'the', 'auth', 'fix']);
+
+    expect(ctx.setInteractionMode).not.toHaveBeenCalled();
+    // The goal still runs; only the mode switch is opted out of.
+    expect(queued.join('\n')).toContain('ship the auth fix');
+  });
+
+  it('starts the queued objective automatically when the active goal completes', async () => {
+    await goal(ctx, ['ship', 'the', 'auth', 'fix']);
+    await goal(ctx, ['then', 'update', 'the', 'changelog']);
+    queued.length = 0;
+
+    await goal(ctx, ['complete']);
+
+    const snapshot = await new GoalManager(workspaceRoot).getSnapshot();
+    expect(snapshot.goal?.objective).toBe('then update the changelog');
+    expect(snapshot.goal?.status).toBe('active');
+    expect(snapshot.queue).toHaveLength(0);
+    // The agent must be told to carry on, not left idle at the prompt.
+    expect(queued.join('\n')).toContain('then update the changelog');
+  });
+
   it('lists an empty queue', async () => {
     const result = await goal(ctx, ['queue']);
 
