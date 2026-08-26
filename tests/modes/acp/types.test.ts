@@ -390,6 +390,23 @@ describe("parseAvailableModels()", () => {
     expect(models.length).toBeGreaterThanOrEqual(5);
   });
 
+  it("includes the configured BYOK provider model", () => {
+    const config = makeConfig({
+      provider: "custom:private",
+      customProviders: {
+        private: {
+          id: "private",
+          displayName: "Private",
+          apiFormat: "openai-compatible",
+          baseUrl: "https://api.example.test/v1",
+          model: "private/model-v1",
+        },
+      },
+    });
+
+    expect(parseAvailableModels(config)[0]).toBe("private/model-v1");
+  });
+
   it("handles config without provider model gracefully", () => {
     const config = makeConfig({
       provider: undefined,
@@ -453,6 +470,23 @@ describe("resolveDefaultModel()", () => {
     } as any);
 
     expect(resolveDefaultModel(config)).toBe("llama3.2:latest");
+  });
+
+  it("returns the configured BYOK provider model", () => {
+    const config = makeConfig({
+      provider: "custom:private",
+      customProviders: {
+        private: {
+          id: "private",
+          displayName: "Private",
+          apiFormat: "openai-compatible",
+          baseUrl: "https://api.example.test/v1",
+          model: "private/model-v1",
+        },
+      },
+    });
+
+    expect(resolveDefaultModel(config)).toBe("private/model-v1");
   });
 
   it("falls back for autohandai provider settings while autohand_inference is disabled", () => {

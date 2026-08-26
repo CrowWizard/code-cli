@@ -10,6 +10,7 @@ import {
   getProviderModelIds,
   mergeModelIds,
 } from "../../providers/modelCatalog.js";
+import { getCustomProviderConfig, isCustomProviderName } from "../../providers/customProviders.js";
 import { isAutohandInferenceEnabled } from "../../featureFlags.js";
 
 // ============================================================================
@@ -480,12 +481,19 @@ function isBuiltInProviderName(value: string): value is BuiltInProviderName {
   ].includes(value);
 }
 
+function getProviderSettings(config: LoadedConfig, providerName: string): unknown {
+  if (isCustomProviderName(providerName)) {
+    return getCustomProviderConfig(config, providerName);
+  }
+  return (config as unknown as Record<string, unknown>)[providerName];
+}
+
 export function parseAvailableModels(config: LoadedConfig): string[] {
   const models: string[] = [];
 
   // Add current model
   const providerName = config.provider ?? "openrouter";
-  const providerConfig = (config as unknown as Record<string, unknown>)[providerName];
+  const providerConfig = getProviderSettings(config, providerName);
   if (
     hasProviderModel(providerConfig) &&
     (providerName !== "autohandai" || isAutohandInferenceEnabled(config))
@@ -518,7 +526,7 @@ export function resolveDefaultModel(config: LoadedConfig): string {
   if (providerName === "autohandai" && !isAutohandInferenceEnabled(config)) {
     return getProviderDefaultModel("openrouter");
   }
-  const providerConfig = (config as unknown as Record<string, unknown>)[providerName];
+  const providerConfig = getProviderSettings(config, providerName);
   if (hasProviderModel(providerConfig)) {
     return providerConfig.model;
   }
