@@ -63,6 +63,26 @@ describe("ProviderFactory", () => {
       expect(provider.getName()).toBe("custom:acme");
     });
 
+    it("should create a custom OpenAI Responses provider when configured", () => {
+      const config: AutohandConfig = {
+        provider: "custom:acme",
+        customProviders: {
+          acme: {
+            id: "acme",
+            displayName: "Acme AI",
+            apiFormat: "openai-responses",
+            baseUrl: "https://api.acme.example/v1",
+            apiKey: "acme-test-key",
+            model: "acme-code-1",
+            stream: true,
+          },
+        },
+      };
+
+      const provider = ProviderFactory.create(config);
+      expect(provider.getName()).toBe("custom:acme");
+    });
+
     it("should return UnconfiguredProvider when a custom provider is missing", () => {
       const config: AutohandConfig = {
         provider: "custom:missing",

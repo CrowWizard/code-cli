@@ -1021,8 +1021,8 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
       if (typeof provider.displayName !== "string" || provider.displayName.trim() === "") {
         throw new Error(`customProviders.${key}.displayName must be a non-empty string in ${configPath}`);
       }
-      if (provider.apiFormat !== "openai-compatible") {
-        throw new Error(`customProviders.${key}.apiFormat must be "openai-compatible" in ${configPath}`);
+      if (provider.apiFormat !== "openai-compatible" && provider.apiFormat !== "openai-responses") {
+        throw new Error(`customProviders.${key}.apiFormat must be "openai-compatible" or "openai-responses" in ${configPath}`);
       }
       if (typeof provider.baseUrl !== "string" || provider.baseUrl.trim() === "") {
         throw new Error(`customProviders.${key}.baseUrl must be a non-empty string in ${configPath}`);
@@ -1035,6 +1035,9 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
         typeof provider.apiKeyRequired !== "boolean"
       ) {
         throw new Error(`customProviders.${key}.apiKeyRequired must be boolean in ${configPath}`);
+      }
+      if (provider.stream !== undefined && typeof provider.stream !== "boolean") {
+        throw new Error(`customProviders.${key}.stream must be boolean in ${configPath}`);
       }
       if (
         provider.contextWindow !== undefined &&
@@ -1090,7 +1093,7 @@ export function getProviderConfig(
   }
   if (isCustomProviderName(chosen)) {
     const entry = getCustomProviderConfig(config, chosen);
-    if (!entry || entry.apiFormat !== "openai-compatible") {
+    if (!entry || (entry.apiFormat !== "openai-compatible" && entry.apiFormat !== "openai-responses")) {
       return null;
     }
     const model = entry.model?.trim();

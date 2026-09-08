@@ -293,6 +293,30 @@ describe('getProviderConfig', () => {
     }));
   });
 
+  it('returns custom OpenAI Responses provider settings when configured', () => {
+    const cfg: AutohandConfig = {
+      provider: 'custom:acme',
+      customProviders: {
+        acme: {
+          id: 'acme',
+          displayName: 'Acme AI',
+          apiFormat: 'openai-responses',
+          baseUrl: 'https://api.acme.example/v1',
+          apiKey: 'acme-test-key',
+          model: 'acme-code-1',
+          stream: true,
+        },
+      },
+    };
+
+    expect(getProviderConfig(cfg)).toEqual(expect.objectContaining({
+      baseUrl: 'https://api.acme.example/v1',
+      model: 'acme-code-1',
+      apiKey: 'acme-test-key',
+      stream: true,
+    }));
+  });
+
   it('allows custom OpenAI-compatible providers with optional API keys', () => {
     const cfg: AutohandConfig = {
       provider: 'custom:local-openai',

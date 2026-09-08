@@ -81,7 +81,7 @@ export interface ExtensionProviderSettings extends ProviderSettings {
   [key: string]: unknown;
 }
 
-export type CustomProviderApiFormat = 'openai-compatible';
+export type CustomProviderApiFormat = 'openai-compatible' | 'openai-responses';
 
 export interface CustomProviderModel {
   id: string;
@@ -97,6 +97,8 @@ export interface CustomProviderSettings extends ProviderSettings {
   displayName: string;
   /** API compatibility contract used by the generic provider adapter. */
   apiFormat: CustomProviderApiFormat;
+  /** Request server-sent events from a Responses API endpoint. Defaults to false. */
+  stream?: boolean;
   /** Whether this endpoint requires a bearer API key. Defaults to true. */
   apiKeyRequired?: boolean;
   /** Optional curated models for this provider. */
@@ -1222,6 +1224,8 @@ export interface LLMRequest {
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
+  /** Receives provider text deltas as they arrive for incremental rendering. */
+  onTextDelta?: (delta: string) => void;
   /** Tool/function definitions for function calling */
   tools?: FunctionDefinition[];
   /** How the model should choose which tool to use */

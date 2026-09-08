@@ -17,6 +17,27 @@ import type { ToolCallRequest } from '../../../src/types.js';
 import { ReactionParser } from '../../../src/core/agent/ReactionParser.js';
 
 describe('ReactLoopRunner composer status', () => {
+  it('passes text deltas from the LLM through agent output events', async () => {
+    const parser = new ReactionParser();
+    const llmComplete = vi.fn().mockImplementation(async (request) => {
+      request.onTextDelta?.('{"finalResponse":"Working');
+      request.onTextDelta?.('..."}');
+      return {
+        id: 'final-response',
+        created: 1,
+        content: '{"finalResponse":"Working..."}',
+        raw: {},
+      };
+    });
+    const host = createReactLoopTestHost(llmComplete, parser);
+
+    await runAgentReactLoop(host, new AbortController());
+
+    expect(host.emitOutput).toHaveBeenNthCalledWith(1, { type: 'message', content: 'Working' });
+    expect(host.emitOutput).toHaveBeenNthCalledWith(2, { type: 'message', content: '...' });
+    expect(host.emitOutput).toHaveBeenCalledTimes(2);
+  });
+
   it('omits prompt cache affinity while the experimental gate is disabled', async () => {
     const parser = new ReactionParser();
     const llmComplete = vi.fn().mockResolvedValue({
