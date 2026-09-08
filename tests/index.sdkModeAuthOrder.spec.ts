@@ -22,6 +22,14 @@ describe('index SDK mode startup ordering', () => {
     expect(catalogRefresh).toBeGreaterThan(backgroundStartup);
   });
 
+  it('allows a configured BYOK provider to bypass account authentication', () => {
+    const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
+
+    expect(source).toContain('function canUseProviderWithoutAccountAuth(config: LoadedConfig): boolean');
+    expect(source).toContain("(config.provider ?? 'openrouter') !== 'autohandai'");
+    expect(source).toContain('if (!canUseProviderWithoutAccountAuth(authConfig)) {');
+  });
+
   it('routes RPC and ACP before the interactive auth gate can print or prompt', () => {
     const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
 
@@ -38,5 +46,8 @@ describe('index SDK mode startup ordering', () => {
     expect(routerIndex).toBeLessThan(acpModeIndex);
     expect(rpcModeIndex).toBeLessThan(authGateIndex);
     expect(acpModeIndex).toBeLessThan(authGateIndex);
+    expect(source).toContain('function canUseProviderWithoutAccountAuth(config: LoadedConfig): boolean');
+    expect(source).toContain("(config.provider ?? 'openrouter') !== 'autohandai'");
+    expect(source).toContain('if (!canUseProviderWithoutAccountAuth(authConfig)) {');
   });
 });

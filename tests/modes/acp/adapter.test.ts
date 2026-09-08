@@ -29,6 +29,7 @@ const {
 } = vi.hoisted(() => {
   const mockSessionManager = {
     getCurrentSession: vi.fn(),
+    createSession: vi.fn(),
     loadSession: vi.fn(),
     listSessions: vi.fn(),
   };
@@ -160,6 +161,15 @@ vi.mock("../../../src/core/conversationManager.js", () => ({
 
 vi.mock("../../../src/config.js", () => ({
   loadConfig: mockLoadConfig,
+  getProviderConfig: (config: LoadedConfig) => {
+    const provider = config.provider ?? "openrouter";
+    if (provider.startsWith("custom:")) {
+      const customProvider = config.customProviders?.[provider.slice("custom:".length)];
+      return customProvider?.apiKey ? customProvider : null;
+    }
+    const settings = config[provider as keyof LoadedConfig];
+    return settings && typeof settings === "object" && "apiKey" in settings ? settings : null;
+  },
   resolveWorkspaceRoot: vi.fn().mockReturnValue("/workspace"),
 }));
 
@@ -287,6 +297,9 @@ describe("AutohandAcpAdapter", () => {
       },
       getMessages: () => [],
       save: mockPersistedSessionSave,
+    });
+    mockSessionManager.createSession.mockResolvedValue({
+      metadata: { sessionId: "persisted-acp-session" },
     });
     mockPersistentSessionManager.initialize.mockResolvedValue(undefined);
     mockPersistentSessionManager.listSessions.mockResolvedValue([]);
@@ -447,6 +460,28 @@ describe("AutohandAcpAdapter", () => {
       expect(result).toEqual({});
     });
 
+    it("succeeds with a configured custom provider API key", async () => {
+      const configWithCustomKey = makeConfig({
+        auth: undefined,
+        provider: "custom:ailili",
+        customProviders: {
+          ailili: {
+            id: "ailili",
+            displayName: "AILILI",
+            apiFormat: "openai-responses",
+            baseUrl: "https://ailili.chat/v1",
+            apiKey: "sk-ailili-valid",
+            model: "gpt-5.6-terra",
+          },
+        },
+      });
+      mockLoadConfig.mockResolvedValue(configWithCustomKey);
+
+      await adapter.initialize(makeInitRequest());
+
+      await expect(adapter.authenticate(makeAuthRequest())).resolves.toEqual({});
+    });
+
     it("throws when no auth available", async () => {
       const configNoAuth = makeConfig({
         auth: undefined,
@@ -570,7 +605,17 @@ describe("AutohandAcpAdapter", () => {
     it("returns the persisted agent session ID", async () => {
       const result = await adapter.newSession(makeNewSessionRequest());
 
-      expect(result.sessionId).toBe("persisted-session-123");
+      expect(result.sessionId).toBe("persisted-acp-session");
+    });
+
+    it("returns the durable session identifier created by SessionManager", async () => {
+      const result = await adapter.newSession(makeNewSessionRequest());
+
+      expect(mockSessionManager.createSession).toHaveBeenCalledWith(
+        "/workspace",
+        "your-modelcard-id-here",
+      );
+      expect(result.sessionId).toBe("persisted-acp-session");
     });
 
     it("returns available modes matching DEFAULT_ACP_MODES", async () => {

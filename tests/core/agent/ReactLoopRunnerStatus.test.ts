@@ -237,6 +237,26 @@ describe('ReactLoopRunner composer status', () => {
     } finally {
       vi.useRealTimers();
     }
+
+  it('emits streamed final response text without duplicating the terminal response', async () => {
+    const parser = new ReactionParser();
+    const llmComplete = vi.fn(async (request) => {
+      request.onTextDelta?.('{"finalResponse":"Hello ');
+      request.onTextDelta?.('world."}');
+      return {
+        id: 'final-response',
+        created: 1,
+        content: '{"finalResponse":"Hello world."}',
+        raw: {},
+      };
+    });
+    const host = createReactLoopTestHost(llmComplete, parser);
+
+    await runAgentReactLoop(host, new AbortController());
+
+    expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'Hello ' });
+    expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'world.' });
+    expect(host.emitOutput).not.toHaveBeenCalledWith({ type: 'message', content: 'Hello world.' });
   });
 
   it('omits prompt cache affinity while the experimental gate is disabled', async () => {

@@ -83,7 +83,7 @@ export interface ExtensionProviderSettings extends ProviderSettings {
   [key: string]: unknown;
 }
 
-export type CustomProviderApiFormat = 'openai-compatible';
+export type CustomProviderApiFormat = 'openai-compatible' | 'openai-responses';
 
 export interface CustomProviderModel {
   id: string;
@@ -105,6 +105,8 @@ export interface CustomProviderSettings extends ProviderSettings {
   models?: CustomProviderModel[];
   /** Hidden from provider selection without deleting saved credentials. */
   disabled?: boolean;
+  /** Stream Responses API events when the provider supports them. */
+  stream?: boolean;
 }
 
 export type AutohandAIPlan = 'cloud' | 'local';
@@ -1457,6 +1459,8 @@ export interface LLMRequest {
   stream?: boolean;
   /** Live provider deltas; completion still returns the assembled answer and tool calls. */
   onDelta?: (delta: { type: 'content' | 'reasoning'; text: string }) => void;
+  /** Receives provider text increments before the final response is available. */
+  onTextDelta?: (delta: string) => void;
   /** Tool/function definitions for function calling */
   tools?: FunctionDefinition[];
   /** How the model should choose which tool to use */

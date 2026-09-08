@@ -173,6 +173,10 @@ function applyCliModelOverride(config: LoadedConfig, model: string): void {
   }
 }
 
+function canUseProviderWithoutAccountAuth(config: LoadedConfig): boolean {
+  return (config.provider ?? 'openrouter') !== 'autohandai' && getProviderConfig(config) !== null;
+}
+
 /**
  * Exit with a clear error when a non-interactive run targets a workspace path
  * that is invalid or one of the dangerous directories.
@@ -755,12 +759,14 @@ program
       process.exit(1);
     }
 
-    // ── Mandatory authentication gate ──
-    // Everything below requires a valid login. --login, --logout, --setup,
-    // --about, --permissions, --skill-install, and --learn* are exempt above.
+    // ── Authentication gate ──
+    // Account-backed providers require a valid login. Configured BYOK and local
+    // providers authenticate directly with their selected provider instead.
     {
-      let authConfig = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
-      authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
+  let authConfig = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+      if (!canUseProviderWithoutAccountAuth(authConfig)) {
+        authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
+      }
       // Propagate refreshed auth into the options so downstream code sees
       // the updated token (e.g. runCLI, runRpcMode, runAutoMode).
       (opts as any)._authConfig = authConfig;
@@ -885,9 +891,10 @@ registerDoctorCommand(program, {
 
 registerResumeCommand(program, {
   run: async (opts) => {
-    // Mandatory auth gate for resume
     let authConfig = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
-    authConfig = await ensureAuthenticated(authConfig);
+    if (!canUseProviderWithoutAccountAuth(authConfig)) {
+      authConfig = await ensureAuthenticated(authConfig);
+    }
     await runCLI({ ...opts, _authConfig: authConfig });
   },
 });
