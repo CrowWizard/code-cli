@@ -307,7 +307,8 @@ export class AutohandAcpAdapter implements Agent {
 
   private async createManagedSession(
     sessionId: string,
-    workspaceRoot: string
+    workspaceRoot: string,
+    persist = false,
   ): Promise<{ config: LoadedConfig; state: AcpSessionState; agent: AutohandAgent }> {
     const config = await this.ensureConfig();
 
@@ -338,6 +339,11 @@ export class AutohandAcpAdapter implements Agent {
     const files = new FileActionManager(workspaceRoot);
     const agent = new AutohandAgent(provider, files, runtime);
     await agent.initializeForRPC();
+
+    if (persist) {
+      const persistentSession = await agent.getSessionManager().createSession(workspaceRoot, modelId);
+      sessionId = persistentSession.metadata.sessionId;
+    }
 
     const state: AcpSessionState = {
       sessionId,
@@ -568,15 +574,15 @@ export class AutohandAcpAdapter implements Agent {
   async newSession(params: NewSessionRequest): Promise<ResponseWithLegacyModels<NewSessionResponse>> {
     const sessionId = crypto.randomUUID();
     const workspaceRoot = this.resolveWorkspaceRoot(sessionId, params.cwd);
-    const { config, state, agent } = await this.createManagedSession(sessionId, workspaceRoot);
+    const { config, state, agent } = await this.createManagedSession(sessionId, workspaceRoot, true);
     await this.connectSessionMcpServers(agent, params.mcpServers);
-    this.emitHookSessionStart(sessionId, 'startup');
+    this.emitHookSessionStart(state.sessionId, 'startup');
 
     const response: ResponseWithLegacyModels<NewSessionResponse> = {
-      sessionId,
+      sessionId: state.sessionId,
       modes: this.buildSessionModes(state.modeId),
       models: this.buildSessionModels(config, state.modelId),
-      configOptions: this.getSessionConfigOptions(sessionId),
+      configOptions: this.getSessionConfigOptions(state.sessionId),
       _meta: {
         commands: this.getSessionCommands(config).map((cmd) => ({
           name: cmd.name,

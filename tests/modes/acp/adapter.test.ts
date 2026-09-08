@@ -26,6 +26,7 @@ const {
   SessionManagerMockClass,
 } = vi.hoisted(() => {
   const mockSessionManager = {
+    createSession: vi.fn(),
     loadSession: vi.fn(),
     listSessions: vi.fn(),
   };
@@ -249,6 +250,9 @@ describe("AutohandAcpAdapter", () => {
     mockSessionManager.listSessions.mockResolvedValue([]);
     mockPersistentSessionManager.initialize.mockResolvedValue(undefined);
     mockPersistentSessionManager.listSessions.mockResolvedValue([]);
+    mockSessionManager.createSession.mockResolvedValue({
+      metadata: { sessionId: "persisted-session-id" },
+    });
     mockSessionManager.loadSession.mockResolvedValue({
       metadata: {
         model: "your-modelcard-id-here",
@@ -411,6 +415,22 @@ describe("AutohandAcpAdapter", () => {
       expect(result.sessionId).toBeDefined();
       expect(typeof result.sessionId).toBe("string");
       expect(result.sessionId.length).toBeGreaterThan(0);
+    });
+
+    it("persists the session before returning its ID", async () => {
+      mockSessionManager.createSession.mockResolvedValue({
+        metadata: {
+          sessionId: "persisted-session-id",
+        },
+      });
+
+      const result = await adapter.newSession(makeNewSessionRequest());
+
+      expect(mockSessionManager.createSession).toHaveBeenCalledWith(
+        "/workspace",
+        "your-modelcard-id-here",
+      );
+      expect(result.sessionId).toBe("persisted-session-id");
     });
 
     it("returns available modes matching DEFAULT_ACP_MODES", async () => {
