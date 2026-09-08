@@ -410,6 +410,25 @@ describe("parseAvailableModels()", () => {
     expect(models.length).toBeGreaterThanOrEqual(5);
   });
 
+  it("exposes the configured model for a custom BYOK provider", () => {
+    const config = makeConfig({
+      provider: "custom:ailili",
+      customProviders: {
+        ailili: {
+          apiKey: "sk-test",
+          baseUrl: "https://ailili.chat/v1",
+          model: "ailili/custom-model",
+          apiFormat: "openai-responses",
+        },
+      },
+    });
+
+    const models = parseAvailableModels(config);
+
+    expect(models[0]).toBe("ailili/custom-model");
+    expect(resolveDefaultModel(config)).toBe("ailili/custom-model");
+  });
+
   it("handles config without provider model gracefully", () => {
     const config = makeConfig({
       provider: undefined,

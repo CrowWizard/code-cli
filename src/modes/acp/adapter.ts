@@ -40,7 +40,7 @@ import { isLikelyFilePathSlashInput } from '../../core/slashInputDetection.js';
 import { ConversationManager } from '../../core/conversationManager.js';
 import { FileActionManager } from '../../actions/filesystem.js';
 import { ProviderFactory } from '../../providers/ProviderFactory.js';
-import { loadConfig } from '../../config.js';
+import { getProviderConfig, loadConfig } from '../../config.js';
 import { prepareBareModeConfig } from '../../runtime/bareMode.js';
 import type { AgentOutputEvent, AgentRuntime, CLIOptions, LoadedConfig, LLMToolCall } from '../../types.js';
 import type { McpServerConfig } from '../../mcp/types.js';
@@ -355,7 +355,7 @@ export class AutohandAcpAdapter implements Agent {
     this.sessionConfigOptions.set(sessionId, buildConfigOptions(config));
 
     agent.setOutputListener((event: AgentOutputEvent) => {
-      this.handleAgentOutput(sessionId, event);
+      this.handleAgentOutput(state.sessionId, event);
     });
 
     const permBridge = createPermissionBridge({
@@ -365,11 +365,40 @@ export class AutohandAcpAdapter implements Agent {
     });
 
     agent.setConfirmationCallback(async (message, context) => {
-      return permBridge.confirmAction(message, context);
+      const activePermBridge = this.permissionBridges.get(state.sessionId);
+      if (!activePermBridge) {
+        throw new Error(`Missing ACP permission bridge for session ${state.sessionId}`);
+      }
+      return activePermBridge.confirmAction(message, context);
     });
     this.permissionBridges.set(sessionId, permBridge);
 
     return { config, state, agent };
+  }
+
+  private rekeyManagedSession(
+    provisionalSessionId: string,
+    sessionId: string,
+    state: AcpSessionState,
+    agent: AutohandAgent,
+  ): void {
+    this.sessions.delete(provisionalSessionId);
+    this.agents.delete(provisionalSessionId);
+    this.permissionBridges.delete(provisionalSessionId);
+    const configOptions = this.sessionConfigOptions.get(provisionalSessionId);
+    this.sessionConfigOptions.delete(provisionalSessionId);
+
+    state.sessionId = sessionId;
+    this.sessions.set(sessionId, state);
+    this.agents.set(sessionId, agent);
+    if (configOptions) this.sessionConfigOptions.set(sessionId, configOptions);
+
+    const permBridge = createPermissionBridge({
+      connection: this.connection,
+      sessionId,
+      modeId: state.modeId,
+    });
+    this.permissionBridges.set(sessionId, permBridge);
   }
 
   private restoreConversation(messages: SessionMessage[]): void {
@@ -551,8 +580,7 @@ export class AutohandAcpAdapter implements Agent {
     }
 
     // No token - but we can proceed without auth for local providers
-    const provider = this.config?.provider ?? 'openrouter';
-    const providerConfig = (this.config as Record<string, any>)?.[provider];
+    const providerConfig = this.config ? getProviderConfig(this.config) : null;
     if (providerConfig?.apiKey) {
       return {};
     }
@@ -567,9 +595,12 @@ export class AutohandAcpAdapter implements Agent {
   // ==========================================================================
 
   async newSession(params: NewSessionRequest): Promise<ResponseWithLegacyModels<NewSessionResponse>> {
-    const sessionId = crypto.randomUUID();
-    const workspaceRoot = this.resolveWorkspaceRoot(sessionId, params.cwd);
-    const { config, state, agent } = await this.createManagedSession(sessionId, workspaceRoot);
+    const provisionalSessionId = crypto.randomUUID();
+    const workspaceRoot = this.resolveWorkspaceRoot(provisionalSessionId, params.cwd);
+    const { config, state, agent } = await this.createManagedSession(provisionalSessionId, workspaceRoot);
+    const persistedSession = await agent.getSessionManager().createSession(workspaceRoot, state.modelId);
+    const sessionId = persistedSession.metadata.sessionId;
+    this.rekeyManagedSession(provisionalSessionId, sessionId, state, agent);
     await this.connectSessionMcpServers(agent, params.mcpServers);
     this.emitHookSessionStart(sessionId, 'startup');
 

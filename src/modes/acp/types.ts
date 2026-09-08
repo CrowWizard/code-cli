@@ -472,11 +472,23 @@ function isBuiltInProviderName(value: string): value is BuiltInProviderName {
   ].includes(value);
 }
 
+function getConfiguredProviderModel(config: LoadedConfig, providerName: string): unknown {
+  if (providerName.startsWith("custom:")) {
+    const customProviderId = providerName.slice("custom:".length);
+    const customProviders = (config as unknown as Record<string, unknown>).customProviders;
+    if (typeof customProviders !== "object" || customProviders === null) {
+      return undefined;
+    }
+    return (customProviders as Record<string, unknown>)[customProviderId];
+  }
+  return (config as unknown as Record<string, unknown>)[providerName];
+}
+
 export function parseAvailableModels(config: LoadedConfig): string[] {
   const models: string[] = [];
 
   const providerName = config.provider ?? "openrouter";
-  const providerConfig = (config as unknown as Record<string, unknown>)[providerName];
+  const providerConfig = getConfiguredProviderModel(config, providerName);
   const catalogProvider = providerName === "autohandai" && !isAutohandInferenceEnabled(config)
     ? "openrouter"
     : isBuiltInProviderName(providerName)
@@ -516,7 +528,7 @@ export function resolveDefaultModel(config: LoadedConfig): string {
   if (providerName === "autohandai" && !isAutohandInferenceEnabled(config)) {
     return getProviderDefaultModel("openrouter");
   }
-  const providerConfig = (config as unknown as Record<string, unknown>)[providerName];
+  const providerConfig = getConfiguredProviderModel(config, providerName);
   if (hasProviderModel(providerConfig)) {
     return providerConfig.model;
   }

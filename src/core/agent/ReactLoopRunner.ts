@@ -71,6 +71,17 @@ class LoopAbortedError extends Error {
   }
 }
 
+function extractStreamedFinalResponse(rawContent: string): string | undefined {
+  const match = rawContent.match(/"(?:finalResponse|response)"\s*:\s*"((?:\\.|[^"\\])*)/);
+  if (!match) return undefined;
+
+  try {
+    return JSON.parse(`"${match[1]}"`) as string;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ReactLoopInkRenderer {
   setStatus(status: string): void;
   addToolCall(tool: AgentAction['type'], detail: string): void;
@@ -459,7 +470,7 @@ export async function runAgentReactLoop(
 
     const renderFinalResponse = (
       response: string,
-      options: { thought?: string; usedThoughtAsResponse: boolean },
+      options: { thought?: string; usedThoughtAsResponse: boolean; streamedResponse?: string },
     ): void => {
       host.stopStatusUpdates();
       consecutiveEmptyResponseCount = 0;
@@ -469,7 +480,12 @@ export async function runAgentReactLoop(
       if (options.thought && !suppressThinking) {
         host.emitOutput({ type: 'thinking', thought: options.thought });
       }
-      host.emitOutput({ type: 'message', content: response });
+      const remainingResponse = options.streamedResponse && response.startsWith(options.streamedResponse)
+        ? response.slice(options.streamedResponse.length)
+        : response;
+      if (remainingResponse) {
+        host.emitOutput({ type: 'message', content: remainingResponse });
+      }
 
       if (host.inkRenderer) {
         if (showThinking && options.thought && !suppressThinking) {
@@ -633,6 +649,8 @@ export async function runAgentReactLoop(
       if (debugMode) host.writeDebugLine(`[AGENT DEBUG] Calling LLM with ${messagesWithImages.length} messages, ${tools.length} tools`);
 
       let completion;
+      let streamedResponse = '';
+      let streamedRawContent = '';
       try {
         // ACP and CLI can override thinking level at runtime; fall back to env and then normal.
         const runtimeThinking = host.runtime.options.thinking;
@@ -654,6 +672,15 @@ export async function runAgentReactLoop(
           maxTokens: 16000,  // Allow large outputs for file generation
           thinkingLevel,
           promptCache: getSessionPromptCacheDirective(host),
+          onTextDelta: (delta) => {
+            streamedRawContent += delta;
+            const nextResponse = extractStreamedFinalResponse(streamedRawContent);
+            if (!nextResponse?.startsWith(streamedResponse)) return;
+            const nextDelta = nextResponse.slice(streamedResponse.length);
+            if (!nextDelta) return;
+            streamedResponse = nextResponse;
+            host.emitOutput({ type: 'message', content: nextDelta });
+          },
         });
         if (abortController.signal.aborted) {
           host.stopStatusUpdates();
@@ -1318,6 +1345,7 @@ export async function runAgentReactLoop(
       renderFinalResponse(turnOutcome.response, {
         thought: payload.thought,
         usedThoughtAsResponse: turnOutcome.usedThoughtAsResponse,
+        streamedResponse,
       });
       return { status: 'completed' };
     }

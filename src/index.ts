@@ -135,6 +135,10 @@ function applyCliModelOverride(config: LoadedConfig, model: string): void {
   }
 }
 
+function canUseProviderWithoutAccountAuth(config: LoadedConfig): boolean {
+  return (config.provider ?? 'openrouter') !== 'autohandai' && getProviderConfig(config) !== null;
+}
+
 /**
  * Get git commit hash (short)
  * Uses build-time embedded commit, falls back to runtime git command for dev
@@ -559,12 +563,14 @@ program
       }
     }
 
-    // ── Mandatory authentication gate ──
-    // Everything below requires a valid login. --login, --logout, --setup,
-    // --about, --permissions, --skill-install, and --learn* are exempt above.
+    // ── Authentication gate ──
+    // Account-backed providers require a valid login. Configured BYOK and local
+    // providers authenticate directly with their selected provider instead.
     {
       let authConfig = await loadConfig(opts.config, process.cwd());
-      authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
+      if (!canUseProviderWithoutAccountAuth(authConfig)) {
+        authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
+      }
       // Propagate refreshed auth into the options so downstream code sees
       // the updated token (e.g. runCLI, runRpcMode, runAutoMode).
       (opts as any)._authConfig = authConfig;
@@ -643,9 +649,12 @@ program
   .action(async (sessionId: string, opts: CLIOptions & { offline?: boolean }) => {
     await refreshModelCatalogBeforeAgentStart(opts);
 
-    // Mandatory auth gate for resume
+    // Account-backed providers require a valid login; configured BYOK and local
+    // providers authenticate directly with their selected provider instead.
     let authConfig = await loadConfig(opts.config, process.cwd());
-    authConfig = await ensureAuthenticated(authConfig);
+    if (!canUseProviderWithoutAccountAuth(authConfig)) {
+      authConfig = await ensureAuthenticated(authConfig);
+    }
     (opts as any)._authConfig = authConfig;
 
     await runCLI({ ...opts, resumeSessionId: sessionId });
