@@ -191,6 +191,7 @@ function parseAssistantReplayParts(content: string): AssistantReplayParts {
  * All agent interaction happens in-process (no subprocess spawning).
  */
 export class AutohandAcpAdapter implements Agent {
+  private outputNotificationQueues = new Map<string, Promise<void>>();
   private sessions = new Map<string, AcpSessionState>();
   private agents = new Map<string, AutohandAgent>();
   private permissionBridges = new Map<string, ReturnType<typeof createPermissionBridge>>();
@@ -459,7 +460,11 @@ export class AutohandAcpAdapter implements Agent {
     this.sessionConfigOptions.set(managedSessionId, buildConfigOptions(config, await this.availableModelIds(config)));
 
     agent.setOutputListener((event: AgentOutputEvent) => {
-      this.handleAgentOutput(state.sessionId, event);
+      const previous = this.outputNotificationQueues.get(state.sessionId) ?? Promise.resolve();
+      const next = previous
+        .then(() => this.handleAgentOutput(state.sessionId, event));
+      this.outputNotificationQueues.set(state.sessionId, next);
+      return next;
     });
 
     const permBridge = createPermissionBridge({
@@ -906,6 +911,7 @@ export class AutohandAcpAdapter implements Agent {
             execute: runInstruction,
           })
         : await runInstruction();
+      await (this.outputNotificationQueues.get(params.sessionId) ?? Promise.resolve());
       const turnDuration = Date.now() - turnStart;
       try {
         await agent.getHookManager?.()?.executeHooks('stop', {

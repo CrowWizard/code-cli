@@ -119,4 +119,69 @@ describe('CustomOpenAICompatibleProvider', () => {
     expect(onTextDelta).toHaveBeenNthCalledWith(1, 'Hello ');
     expect(onTextDelta).toHaveBeenNthCalledWith(2, 'world');
   });
+
+  it('uses accumulated text when a Responses-compatible stream ends with [DONE]', async () => {
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'ailili',
+      displayName: 'AILILI',
+      apiFormat: 'openai-responses',
+      baseUrl: 'https://ailili.chat/v1',
+      apiKey: 'test-key',
+      model: 'gpt-5.6-terra',
+      stream: true,
+    });
+    const sseBody = [
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"Partial "}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"response"}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n');
+    globalThis.fetch = vi.fn().mockResolvedValueOnce(
+      new Response(sseBody, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    ) as typeof globalThis.fetch;
+
+    const result = await provider.complete({
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    });
+
+    expect(result).toMatchObject({
+      content: 'Partial response',
+      finishReason: 'length',
+    });
+  });
+
+  it('writes privacy-safe SSE diagnostics when a stream has no terminal event or text', async () => {
+    const previousDebug = process.env.AUTOHAND_DEBUG;
+    process.env.AUTOHAND_DEBUG = '1';
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'ailili',
+      displayName: 'AILILI',
+      apiFormat: 'openai-responses',
+      baseUrl: 'https://ailili.chat/v1',
+      apiKey: 'test-key',
+      model: 'gpt-5.6-terra',
+      stream: true,
+    });
+    globalThis.fetch = vi.fn().mockResolvedValueOnce(
+      new Response('event: response.created\ndata: {"type":"response.created","response":{"id":"secret-response"}}\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      }),
+    ) as typeof globalThis.fetch;
+
+    await expect(provider.complete({ messages: [{ role: 'user', content: 'Sensitive prompt' }] }))
+      .rejects.toThrow('Responses stream ended before a terminal response event.');
+
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('[RESPONSES SSE] stream ended without recoverable output'));
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('events=response.created'));
+    expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('secret-response'));
+    stderr.mockRestore();
+    if (previousDebug === undefined) delete process.env.AUTOHAND_DEBUG;
+    else process.env.AUTOHAND_DEBUG = previousDebug;
+  });
 });

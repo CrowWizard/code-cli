@@ -84,6 +84,24 @@ describe('normalizeLLMUsage', () => {
     });
   });
 
+  it('normalizes Responses-compatible cache metrics from prompt token details', () => {
+    expect(normalizeLLMUsage({
+      input_tokens: 40,
+      output_tokens: 5,
+      total_tokens: 45,
+      prompt_tokens_details: {
+        cached_tokens: 30,
+        cache_write_tokens: 10,
+      },
+    }, 'openai-responses')).toEqual({
+      promptTokens: 40,
+      completionTokens: 5,
+      totalTokens: 45,
+      cacheReadTokens: 30,
+      cacheWriteTokens: 10,
+    });
+  });
+
   it('normalizes Chat Completions cache metrics from prompt token details', () => {
     expect(normalizeLLMUsage({
       prompt_tokens: 40,
