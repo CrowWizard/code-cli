@@ -704,6 +704,29 @@ describe("AutohandAcpAdapter", () => {
       );
     });
 
+    it("waits for agent output notifications before completing a prompt", async () => {
+      mockAgent.isSlashCommand.mockReturnValue(false);
+      mockAgent.runInstruction.mockImplementation(async () => {
+        const listener = mockAgent.setOutputListener.mock.calls[0][0];
+        await listener({ type: "message", content: "First response" });
+        return true;
+      });
+
+      const result = await adapter.prompt({
+        sessionId,
+        prompt: [{ type: "text", text: "Say hello" }],
+      } as any);
+
+      expect(result.stopReason).toBe("end_turn");
+      expect(connection.sessionUpdate).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId,
+        update: expect.objectContaining({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "First response" },
+        }),
+      }));
+    });
+
     it("throws for invalid session ID", async () => {
       await expect(
         adapter.prompt({

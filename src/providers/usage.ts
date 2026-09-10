@@ -44,7 +44,10 @@ export function normalizeLLMUsage(
   const completionTokens = readTokenCount(usage, ['completion_tokens', 'output_tokens', 'completionTokens', 'outputTokens']);
   const reportedTotal = readTokenCount(usage, ['total_tokens', 'totalTokens']);
   const promptTokenDetails = dialect === 'openai-responses'
-    ? asUsageRecord(usage.input_tokens_details) ?? asUsageRecord(usage.inputTokensDetails)
+    ? asUsageRecord(usage.input_tokens_details)
+      ?? asUsageRecord(usage.inputTokensDetails)
+      ?? asUsageRecord(usage.prompt_tokens_details)
+      ?? asUsageRecord(usage.promptTokensDetails)
     : asUsageRecord(usage.prompt_tokens_details) ?? asUsageRecord(usage.promptTokensDetails);
   let cacheReadTokens = readTokenCount(usage, ['cached_tokens', 'cache_read_input_tokens', 'cacheReadTokens'])
     ?? (promptTokenDetails ? readTokenCount(promptTokenDetails, ['cached_tokens', 'cache_read_input_tokens']) : undefined);

@@ -162,6 +162,7 @@ function parseAssistantReplayParts(content: string): AssistantReplayParts {
  * All agent interaction happens in-process (no subprocess spawning).
  */
 export class AutohandAcpAdapter implements Agent {
+  private outputNotificationQueues = new Map<string, Promise<void>>();
   private sessions = new Map<string, AcpSessionState>();
   private agents = new Map<string, AutohandAgent>();
   private permissionBridges = new Map<string, ReturnType<typeof createPermissionBridge>>();
@@ -355,7 +356,11 @@ export class AutohandAcpAdapter implements Agent {
     this.sessionConfigOptions.set(sessionId, buildConfigOptions(config));
 
     agent.setOutputListener((event: AgentOutputEvent) => {
-      this.handleAgentOutput(state.sessionId, event);
+      const previous = this.outputNotificationQueues.get(state.sessionId) ?? Promise.resolve();
+      const next = previous
+        .then(() => this.handleAgentOutput(state.sessionId, event));
+      this.outputNotificationQueues.set(state.sessionId, next);
+      return next;
     });
 
     const permBridge = createPermissionBridge({
@@ -736,6 +741,7 @@ export class AutohandAcpAdapter implements Agent {
       const success = await agent.runInstruction(instruction, {
         signal: session.abortController.signal,
       });
+      await (this.outputNotificationQueues.get(params.sessionId) ?? Promise.resolve());
       const turnDuration = Date.now() - turnStart;
       this.emitHookStop(params.sessionId, 0, 0, turnDuration);
       if (!success && this.cancelledSessions.has(params.sessionId)) {

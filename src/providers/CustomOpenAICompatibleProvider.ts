@@ -17,6 +17,7 @@ import type {
 import { toCustomProviderName } from "./customProviders.js";
 import { ApiError, classifyApiError } from "./errors.js";
 import { normalizeLLMUsage } from "./usage.js";
+import { writeAutohandDebugLine } from '../utils/debugLog.js';
 
 interface ResponsesFunctionCall {
   type: 'function_call';
@@ -142,6 +143,11 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
     if (!response.ok) {
       throw classifyApiError(response.status, await response.text(), response.headers);
     }
+    if (this.stream) {
+      writeAutohandDebugLine(
+        `[RESPONSES SSE] opened provider=${this.providerName} status=${response.status} contentType=${response.headers.get('content-type') ?? '(missing)'}`,
+      );
+    }
 
     const data = this.stream
       ? await this.parseResponsesStream(response, request.onTextDelta)
@@ -177,22 +183,57 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
   private async parseResponsesStream(response: Response, onTextDelta?: (delta: string) => void): Promise<ResponsesResponse> {
     let event = '';
     let buffer = '';
+    let streamedOutputText = '';
+    let dataEventCount = 0;
+    let malformedDataCount = 0;
+    let doneMarkerSeen = false;
+    const observedEvents = new Set<string>();
+    const logEvent = (type: string, raw: string, data?: Record<string, unknown>): void => {
+      if (observedEvents.has(type)) return;
+      observedEvents.add(type);
+      const fields = data ? Object.keys(data).sort().join(',') || '(none)' : '(unparsed)';
+      writeAutohandDebugLine(`[RESPONSES SSE] event=${type || '(missing)'} dataBytes=${raw.length} fields=${fields}`);
+    };
+    const streamSummary = (): string =>
+      `events=${[...observedEvents].join(',') || '(none)'} dataEvents=${dataEventCount} malformedData=${malformedDataCount} deltaChars=${streamedOutputText.length} doneMarker=${doneMarkerSeen}`;
+    const recoverStreamedResponse = (): ResponsesResponse | undefined => {
+      if (!streamedOutputText.trim()) return undefined;
+      writeAutohandDebugLine(`[RESPONSES SSE] recovered partial response ${streamSummary()}`);
+      return {
+        id: 'streamed-response',
+        output_text: streamedOutputText,
+        incomplete_details: { reason: 'stream_ended_without_completed' },
+      };
+    };
     const processLine = (line: string): ResponsesResponse | undefined => {
       if (line.startsWith('event: ')) event = line.slice(7).trim();
       if (!line.startsWith('data: ')) return undefined;
       const raw = line.slice(6).trim();
-      if (!raw || raw === '[DONE]') return undefined;
+      if (!raw) return undefined;
+      dataEventCount++;
+      if (raw === '[DONE]') {
+        doneMarkerSeen = true;
+        logEvent('[DONE]', raw);
+        return recoverStreamedResponse();
+      }
       let data: { type?: string; response?: ResponsesResponse; delta?: unknown };
       try {
         data = JSON.parse(raw) as { type?: string; response?: ResponsesResponse; delta?: unknown };
       } catch {
+        malformedDataCount++;
+        logEvent(event || '(missing)', raw);
         return undefined;
       }
       const type = event || data.type;
+      logEvent(type || '(missing)', raw, data as Record<string, unknown>);
       if (type === 'response.output_text.delta' && typeof data.delta === 'string') {
+        streamedOutputText += data.delta;
         onTextDelta?.(data.delta);
       }
-      if (type === 'response.completed' || type === 'response.incomplete') return data.response ?? data as ResponsesResponse;
+      if (type === 'response.completed' || type === 'response.incomplete') {
+        writeAutohandDebugLine(`[RESPONSES SSE] terminal event=${type} ${streamSummary()}`);
+        return data.response ?? data as ResponsesResponse;
+      }
       if (type === 'response.failed' || type === 'response.error') throw new ApiError(`Responses stream ended with ${type}.`, 'server_error', 0, true);
       return undefined;
     };
@@ -202,6 +243,9 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
         const terminalResponse = processLine(line);
         if (terminalResponse) return terminalResponse;
       }
+      const recoveredResponse = recoverStreamedResponse();
+      if (recoveredResponse) return recoveredResponse;
+      writeAutohandDebugLine(`[RESPONSES SSE] stream ended without recoverable output ${streamSummary()}`);
       throw new ApiError('Responses stream ended before a terminal response event.', 'server_error', 0, true);
     }
 
@@ -218,6 +262,11 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
       }
       if (done) break;
     }
+    const terminalResponse = processLine(buffer.replace(/\r$/, ''));
+    if (terminalResponse) return terminalResponse;
+    const recoveredResponse = recoverStreamedResponse();
+    if (recoveredResponse) return recoveredResponse;
+    writeAutohandDebugLine(`[RESPONSES SSE] stream ended without recoverable output ${streamSummary()}`);
     throw new ApiError('Responses stream ended before a terminal response event.', 'server_error', 0, true);
   }
 
