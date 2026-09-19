@@ -32,11 +32,13 @@ import { routeOutput } from '../immediateCommandRouter.js';
 import { SLASH_COMMANDS } from '../slashCommands.js';
 import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js';
 import { parseYoloPattern, buildPermissionSettingsFromYolo } from '../../permissions/yoloMode.js';
-import { SessionManager } from '../../session/SessionManager.js';
+import { SessionManager, type Session } from '../../session/SessionManager.js';
 import { ProjectManager } from '../../session/ProjectManager.js';
 import { createToolsRegistry } from '../toolsRegistry.js';
 import type { AgentRuntime, HookEvent, ToolActionOutcome } from '../../types.js';
 import { AgentDelegator } from '../agents/AgentDelegator.js';
+import { AgentRunStore, type AgentRunsSnapshot, type AgentRunSource } from '../agents/AgentRunStore.js';
+import { createAgentRunLifecycleHandler } from '../agents/AgentRunLifecycle.js';
 import { attachTeamActivityBridge, enableAutomaticCoordinationMode } from './TeamActivityBridge.js';
 import { buildTeamTaskPayload, taskToolTruncatesDescriptions } from '../teams/taskPayload.js';
 import { ErrorLogger } from '../errorLogger.js';
@@ -51,11 +53,21 @@ import { CommunitySkillsCache } from '../../skills/CommunitySkillsCache.js';
 import { GitHubRegistryFetcher } from '../../skills/GitHubRegistryFetcher.js';
 import { fetchRegistryWithFallback, installSkillWithSecurity } from '../../skills/communityInstaller.js';
 import { McpClientManager } from '../../mcp/McpClientManager.js';
+import {
+  findCommunityMcpServers,
+  installCommunityMcpServer,
+  resolveCommunityMcpServer,
+} from '../../commands/mcp-install.js';
 import { AUTOHAND_PATHS, PROJECT_DIR_NAME } from '../../constants.js';
 import { createPersistentInput } from '../../ui/persistentInput.js';
 import { PermissionManager } from '../../permissions/PermissionManager.js';
 import { HookManager } from '../HookManager.js';
+import { HookAuthoringService } from '../HookAuthoringService.js';
+import { executeHookTool, HOOK_TOOL_DEFINITIONS, isHookAction } from '../hookTools.js';
+import { isAllowedPermissionPrompt, normalizePermissionPromptResponse, type PermissionMode } from '../../permissions/types.js';
 import { TeamManager } from '../teams/TeamManager.js';
+import { authorizeTeammateTool, createTeammateConfirmation } from '../teams/TeammateAuthorization.js';
+import { SessionThreadBudget, DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION } from '../agents/SessionThreadBudget.js';
 import type { TeamMember, TeamTask } from '../teams/types.js';
 import { resolveTeamModelAssignment } from '../teams/TeamModelPolicy.js';
 import { RepeatManager } from '../RepeatManager.js';
@@ -91,10 +103,14 @@ import { activityItemsFromTodos, formatSubAgentActivityLabel } from '../../ui/in
 import { getFeatureState } from '../../features/featureRegistry.js';
 import { SpecialistOrchestrator } from '../agents/SpecialistOrchestrator.js';
 import { isGoalFeatureEnabled, resolveGoalFeatureEnabled } from '../../goals/feature.js';
+import { GoalManager } from '../../goals/GoalManager.js';
+import type { GoalSessionSnapshot } from '../../goals/types.js';
 import { isLikelyFilePathSlashInput } from '../slashInputDetection.js';
 import { SuggestionEngine } from '../SuggestionEngine.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { configureAgentRegistry, syncDynamicRuntimeExtensions } from './dynamicRuntimeExtensions.js';
+import { runCancellableAgentCommand } from './AgentCommandRuntime.js';
+import { SquadRunMonitor } from '../agents/SquadRunSnapshot.js';
 import { extensionRuntimeHost } from '../../extensions/ExtensionRuntimeHost.js';
 import { ExtensionService } from '../../extensions/ExtensionService.js';
 import type {
@@ -109,6 +125,7 @@ import type { MobileAgentSessionExecutionContext } from './AgentLifecycleRunner.
 import {
   createQueuedAgentInstruction,
   type PendingPostTurnAction,
+  type QueuedInstructionPolicy,
   type QueuedMobileComposerCommand,
 } from './PostTurnActionCoordinator.js';
 
@@ -480,10 +497,16 @@ export function initializeAgentDependencies(
       settings: runtime.config.hooks,
       workspaceRoot: runtime.workspaceRoot,
       onPersist: async () => {
-        runtime.config.hooks = host.hookManager.getSettings();
-        await saveConfig(runtime.config);
+        const hooks = host.hookManager.getSettings();
+        await saveConfig({ ...runtime.config, hooks });
+        runtime.config.hooks = hooks;
       },
       onHookOutput: (result) => {
+        if (result.response?.additionalContext && ![
+          'pre-tool', 'pre-prompt', 'permission-request', 'subagent-start', 'subagent-progress',
+        ].includes(result.hook.event)) {
+          host.conversation.addSystemNote(result.response.additionalContext, '[Hook Context]');
+        }
         // In RPC mode, stdout must only contain JSON-RPC messages
         // Hook output would break the protocol, so suppress it
         if (runtime.isRpcMode) {
@@ -504,6 +527,9 @@ export function initializeAgentDependencies(
           promptNotify(chalk.yellow(`[hook:${result.hook.event}] ${result.stderr}`));
         }
       }
+    });
+    host.permissionManager.setModeChangeListener?.(async (mode: PermissionMode, previousMode: PermissionMode) => {
+      await host.hookManager.executeHooks('mode-change', { mode, previousMode });
     });
     host.notificationService.setListener(async (options: Readonly<NotificationOptions>) => {
       await host.hookManager.executeHooks('notification', {
@@ -537,11 +563,39 @@ export function initializeAgentDependencies(
     });
 
     // Initialize team manager for /team, /tasks, /message commands
+    host.agentRunStore = new AgentRunStore({
+      onLifecycleEvent: createAgentRunLifecycleHandler({
+        executeHooks: (event, context) => host.hookManager.executeHooks(event, context),
+        sendMessage: (id, content) => host.agentRunStore.sendMessage(id, content),
+        requestCancel: (id) => host.agentRunStore.requestCancel(id),
+      }),
+    });
+    host.agentRunStore.subscribe((snapshot: AgentRunsSnapshot) => {
+      host.inkRenderer?.setAgentRuns?.(snapshot);
+    });
+    const squadRunMonitor = new SquadRunMonitor(host.agentRunStore, {
+      workspaceRoot: runtime.workspaceRoot,
+      getWorkspaceRoot: () => runtime.workspaceRoot,
+      signal: host.runtimeResourceShutdownController?.signal,
+      isVisible: () => host.inkRenderer?.getState?.().agentRunsPanelVisible === true,
+    });
+    host.sessionThreadBudget = new SessionThreadBudget(() =>
+      runtime.config.features?.multi_agent_v2?.max_concurrent_threads_per_session
+        ?? DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION);
     host.teamManager = new TeamManager({
-      leadSessionId: randomUUID(),
+      runStore: host.agentRunStore,
+      leadSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
+      threadBudget: host.sessionThreadBudget,
       workspacePath: runtime.workspaceRoot,
+      getWorkspacePath: () => runtime.workspaceRoot,
       configPath: runtime.config.configPath,
       maxTeammates: runtime.config.teams?.maxTeammates,
+      authorizeTool: (call, signal) => authorizeTeammateTool(call, {
+        definitions: host.toolManager?.listDefinitions() ?? [],
+        clientContext: runtime.options.clientContext ?? (runtime.options.restricted ? 'restricted' : 'cli'),
+        authorization: toolAuthorization,
+        confirmApproval: createTeammateConfirmation(runtime, (message, context) => host.confirmDangerousAction(message, context)),
+      }, signal),
       onTeammateMessage: (from, msg) => {
         if (msg.method === 'team.log') {
           const { level, text } = msg.params as { level: string; text: string };
@@ -700,6 +754,11 @@ export function initializeAgentDependencies(
     const delegatorContext = runtime.options.clientContext
       ?? (runtime.options.restricted ? 'restricted' : 'cli');
     host.delegator = new AgentDelegator(llm, host.actionExecutor, {
+      workspaceRoot: runtime.workspaceRoot,
+      projectMemoryEnabled: !runtime.options.bare,
+      getWorkspaceRoot: () => runtime.workspaceRoot,
+      getUserRequest: () => host.currentInstructionText,
+      threadBudget: host.sessionThreadBudget,
       clientContext: delegatorContext,
       maxDepth: 3,
       featureConfig: runtime.config,
@@ -727,6 +786,15 @@ export function initializeAgentDependencies(
         return subagentProvider;
       },
       onSubagentStart: async (context) => {
+        host.agentRunStore.start({
+          id: context.subagentId, parentId: context.parentId, depth: context.depth,
+          source: 'delegate', name: context.subagentName, task: context.task,
+          workspaceRoot: context.workspaceRoot, userRequest: context.userRequest,
+          provider: context.provider, model: context.model,
+          agentType: context.subagentType,
+        });
+        if (context.cancel) host.agentRunStore.registerCancel(context.subagentId, context.cancel);
+        if (context.sendMessage) host.agentRunStore.registerMessage(context.subagentId, context.sendMessage);
         enableAutomaticCoordinationMode({
           isInteractive: !runtime.isCommandMode && !runtime.isRpcMode,
           getInteractionMode: () => host.getInteractionMode(),
@@ -743,8 +811,20 @@ export function initializeAgentDependencies(
             ? `${context.provider} · ${context.model}`
             : context.subagentType,
         });
+        await host.agentRunStore.waitForLifecycle(context.subagentId);
+      },
+      onSubagentProgress: async (context) => {
+        host.agentRunStore.progress(context.subagentId, {
+          status: 'running', activity: context.tool ?? 'Thinking', usage: context.usage,
+          ...(context.output === undefined ? {} : { output: context.output }),
+        });
+        await host.agentRunStore.waitForLifecycle(context.subagentId);
       },
       onSubagentStop: async (context) => {
+        host.agentRunStore.finish(context.subagentId, {
+          status: context.status ?? (context.success ? 'completed' : 'failed'),
+          result: context.result, error: context.error, usage: context.usage,
+        });
         host.inkRenderer?.upsertActivityItem?.({
           id: context.subagentId,
           kind: 'subagent',
@@ -754,14 +834,7 @@ export function initializeAgentDependencies(
             ? `${Math.max(0, Math.round(context.duration / 1000))}s`
             : context.error ?? 'failed',
         });
-        await host.hookManager.executeHooks('subagent-stop', {
-          subagentId: context.subagentId,
-          subagentName: context.subagentName,
-          subagentType: context.subagentType,
-          subagentSuccess: context.success,
-          subagentError: context.error,
-          subagentDuration: context.duration
-        });
+        await host.agentRunStore.waitForLifecycle(context.subagentId);
       }
     });
     host.specialistOrchestrator = new SpecialistOrchestrator(host.delegator, {
@@ -777,7 +850,7 @@ export function initializeAgentDependencies(
       apiBaseUrl: runtime.config.api?.baseUrl || 'https://api.autohand.ai',
       cliVersion: packageJson.version
     });
-    host.skillsRegistry = new SkillsRegistry(AUTOHAND_PATHS.skills);
+    host.skillsRegistry = new SkillsRegistry(AUTOHAND_PATHS.skills, 'autohand-user', { accountConfigPath: runtime.config.configPath });
     if (!runtime.options.bare) {
       host.skillsRegistry.setCapabilityUsageRecorder((usage: CapabilityUsageInput) =>
         host.memoryManager.recordCapabilityUse(usage)
@@ -789,7 +862,8 @@ export function initializeAgentDependencies(
       enableSessionSync: runtime.config.telemetry?.enableSessionSync !== false,
       companySecret: runtime.config.telemetry?.companySecret || runtime.config.api?.companySecret || '',
       authToken: runtime.config.auth?.token,
-      clientVersion: packageJson.version
+      clientVersion: packageJson.version,
+      offline: runtime.options.offline === true || runtime.options.bare === true,
     });
     host.featureFlagManager = new RemoteFeatureFlagManager(runtime.config);
     if (!runtime.options.bare) {
@@ -910,7 +984,7 @@ export function initializeAgentDependencies(
       },
       {
         name: 'delegate_parallel',
-        description: 'Run multiple sub-agents in parallel (max 5, swarm mode)',
+        description: 'Run independent sub-agents in parallel within the configured shared session thread limit.',
         parameters: {
           type: 'object',
           properties: {
@@ -942,6 +1016,19 @@ export function initializeAgentDependencies(
             name: { type: 'string', description: 'Short team name (e.g., "auth-refactor")' }
           },
           required: ['name']
+        },
+        requiresApproval: false
+      },
+      {
+        name: 'compose_team',
+        description: 'Analyze a task, rank candidate sub-agents by role fit and repository context, and produce a recommended roster with a dependency-linked task graph. Feature-gated like automatic_specialists.',
+        parameters: {
+          type: 'object',
+          properties: {
+            objective: { type: 'string', description: 'The concrete objective the team should accomplish' },
+            team_name: { type: 'string', description: 'Optional short team name (e.g., "auth-refactor")' }
+          },
+          required: ['objective']
         },
         requiresApproval: false
       },
@@ -994,7 +1081,7 @@ export function initializeAgentDependencies(
         parameters: {
           type: 'object',
           properties: {
-            status: { type: 'string', description: 'Optional status filter', enum: ['pending', 'in_progress', 'completed'] },
+            status: { type: 'string', description: 'Optional status filter', enum: ['pending', 'in_progress', 'completed', 'failed', 'cancelled'] },
             owner: { type: 'string', description: 'Optional owner filter' }
           }
         },
@@ -1010,7 +1097,7 @@ export function initializeAgentDependencies(
             subject: { type: 'string', description: 'Updated task title' },
             description: { type: 'string', description: 'Updated task description' },
             blocked_by: { type: 'array', description: 'Updated dependency task IDs', items: { type: 'string' } },
-            status: { type: 'string', description: 'Updated task status', enum: ['pending', 'in_progress', 'completed'] }
+            status: { type: 'string', description: 'Updated task status', enum: ['pending', 'in_progress', 'completed', 'failed', 'cancelled'] }
           },
           required: ['task_id']
         },
@@ -1018,7 +1105,7 @@ export function initializeAgentDependencies(
       },
       {
         name: 'task_stop',
-        description: 'Stop an active team task and return it to pending.',
+        description: 'Cancel a team task and stop its executing teammate. Cancelled work is not retried automatically.',
         parameters: {
           type: 'object',
           properties: {
@@ -1097,6 +1184,7 @@ export function initializeAgentDependencies(
     } : undefined;
 
     host.toolManager = new ToolManager({
+      getActiveProvider: () => host.activeProvider ?? runtime.config.provider ?? 'openrouter',
       maxConcurrency: runtime.config.agent?.parallelToolConcurrency ?? 5,
       executor: async (action, context) => {
         const startTime = Date.now();
@@ -1116,12 +1204,24 @@ export function initializeAgentDependencies(
 
           let outcome: ToolActionOutcome | undefined;
           let result: string | undefined;
-          if (action.type === 'delegate_task') {
-            outcome = await host.delegator.delegateTaskForTool(action.agent_name, action.task);
+          if (isHookAction(action)) {
+            result = await executeHookTool(action, {
+              manager: host.hookManager,
+              getActiveProvider: () => host.activeProvider,
+              authoring: new HookAuthoringService({
+                manager: host.hookManager, workspaceRoot: runtime.workspaceRoot,
+                getProvider: () => host.llm, requireAutohand: true,
+                confirm: async preview => isAllowedPermissionPrompt(normalizePermissionPromptResponse(
+                  await host.confirmDangerousAction(preview, { tool: 'create_hook' }),
+                )),
+              }),
+            }, context?.signal);
+          } else if (action.type === 'delegate_task') {
+            outcome = await host.delegator.delegateTaskForTool(action.agent_name, action.task, { signal: context?.signal });
           } else if (action.type === 'delegate_parallel') {
-            outcome = await host.delegator.delegateParallelForTool(action.tasks);
+            outcome = await host.delegator.delegateParallelForTool(action.tasks, { signal: context?.signal });
           } else if (action.type === 'orchestrate_specialists') {
-            result = await host.orchestrateSpecialistsFromTool(action.objective, action.requested_roles);
+            result = await host.orchestrateSpecialistsFromTool(action.objective, action.requested_roles, context?.signal);
           } else if (action.type === 'install_specialist_roster') {
             const installation = await host.specialistOrchestrator.installStagedCatalogSelections(
               action.plan_id,
@@ -1148,10 +1248,22 @@ export function initializeAgentDependencies(
               const { ProjectProfiler } = await import('../teams/ProjectProfiler.js');
               const profiler = new ProjectProfiler(host.runtime.workspaceRoot);
               const profile = await profiler.analyze();
-              // List available agents
+              const { TeamComposer } = await import('../agents/TeamComposer.js');
+              const { analyzeTask } = await import('../agents/TaskAnalyzer.js');
               const { AgentRegistry } = await import('../agents/AgentRegistry.js');
               const registry = AgentRegistry.getInstance();
               await registry.loadAgents();
+              const request = analyzeTask(host.runtime.options.prompt ?? '', profile);
+              const composer = new TeamComposer({
+                registry,
+                profile,
+                maxTeammates: host.runtime.config.teams?.maxTeammates,
+              });
+              const composition = await composer.compose(request);
+              const roster = composition.selectedAgents.length > 0
+                ? `\nRecommended roster:\n${TeamComposer.formatRoster(composition)}`
+                : '';
+              // List available agents
               const agents = registry.getAllAgents().map(a => `  - ${a.name}: ${a.description}`).join('\n');
               const header = created
                 ? `Team "${team.name}" created.`
@@ -1160,8 +1272,58 @@ export function initializeAgentDependencies(
                 header,
                 `\nProject: ${profile.languages.join(', ')} | Frameworks: ${profile.frameworks.join(', ') || 'none'}`,
                 `Signals: ${profile.signals.map(s => `${s.type}(${s.severity})`).join(', ') || 'none'}`,
+                roster,
                 `\nAvailable agents:\n${agents || '  (none)'}`,
                 `\nNext: call add_teammate for each role, then create_task.`,
+              ].join('\n');
+            }
+          } else if (action.type === 'compose_team') {
+            const { TeamComposer } = await import('../agents/TeamComposer.js');
+            const { analyzeTask } = await import('../agents/TaskAnalyzer.js');
+            const { AgentRegistry } = await import('../agents/AgentRegistry.js');
+            const { ProjectProfiler } = await import('../teams/ProjectProfiler.js');
+            const registry = AgentRegistry.getInstance();
+            const profiler = new ProjectProfiler(host.runtime.workspaceRoot);
+            const profile = await profiler.analyze();
+            const request = analyzeTask(action.objective, profile);
+            const composer = new TeamComposer({
+              registry,
+              profile,
+              maxTeammates: host.runtime.config.teams?.maxTeammates,
+            });
+            const composition = await composer.compose(request);
+            const roster = TeamComposer.formatRoster(composition);
+            const teamName = action.team_name ?? 'composed-team';
+            let team = host.teamManager.getTeam();
+            if (team && team.name !== teamName) {
+              const error = `Team "${team.name}" is already active. Shut it down explicitly before composing "${teamName}".`;
+              outcome = { success: false, kind: 'validation', error, output: error };
+            } else {
+              if (!team) {
+                team = host.teamManager.createTeam(teamName);
+              }
+              for (const selected of composition.selectedAgents) {
+                host.teamManager.addTeammate({
+                  name: selected.agentName,
+                  agentName: selected.agentName,
+                  requestedRole: selected.requestedRole,
+                  agentSource: selected.source,
+                });
+              }
+              for (const task of composition.tasks) {
+                host.teamManager.tasks.createTask({
+                  subject: task.subject,
+                  description: task.description,
+                  userRequest: host.currentInstructionText,
+                  workspaceRoot: runtime.workspaceRoot,
+                  blockedBy: task.blockedBy,
+                });
+              }
+              host.teamManager.tryAssignIdleTeammate();
+              result = [
+                roster,
+                `\nTeam "${teamName}" composed with ${composition.selectedAgents.length} members and ${composition.tasks.length} tasks.`,
+                `Unresolved roles: ${composition.unresolvedRoles.join(', ') || 'none'}`,
               ].join('\n');
             }
           } else if (action.type === 'add_teammate') {
@@ -1193,6 +1355,8 @@ export function initializeAgentDependencies(
             const task = host.teamManager.tasks.createTask({
               subject: action.subject,
               description: action.description,
+              userRequest: host.currentInstructionText,
+              workspaceRoot: runtime.workspaceRoot,
               blockedBy: action.blocked_by,
             });
             // Auto-assign to idle teammates
@@ -1223,7 +1387,7 @@ export function initializeAgentDependencies(
               truncateDescriptions: taskToolTruncatesDescriptions(action.type),
             });
           } else if (action.type === 'task_update') {
-            const task = host.teamManager.tasks.updateTask(action.task_id, {
+            const task = host.teamManager.updateTask(action.task_id, {
               subject: action.subject,
               description: action.description,
               blockedBy: action.blocked_by,
@@ -1240,22 +1404,10 @@ export function initializeAgentDependencies(
               const error = `Task "${action.task_id}" not found.`;
               outcome = { success: false, kind: 'validation', error, output: error };
             } else {
-              const previousOwner = existingTask.owner;
-              const task = host.teamManager.tasks.stopTask(action.task_id);
-              if (previousOwner) {
-                try {
-                  host.teamManager.sendMessageTo(
-                    previousOwner,
-                    'lead',
-                    `Stop working on ${task.id} (${task.subject}) and return to idle.`,
-                  );
-                } catch {
-                  // Best-effort notification only; task state update is authoritative.
-                }
-              }
+              const task = host.teamManager.stopTask(action.task_id);
               result = buildTeamTaskPayload({
                 tasks: [task],
-                headline: `Task ${task.id} stopped and returned to pending.`,
+                headline: task.cancelRequested ? `Cancellation requested for task ${task.id}.` : `Task ${task.id} cancelled.`,
                 truncateDescriptions: taskToolTruncatesDescriptions(action.type),
               });
             }
@@ -1362,6 +1514,44 @@ export function initializeAgentDependencies(
             }
           } else if (action.type === 'exit_plan_mode') {
             outcome = await host.handleExitPlanMode((action as { summary?: string }).summary);
+          } else if (action.type === 'find_mcp_servers') {
+            const servers = await findCommunityMcpServers(
+              action.query,
+              action.category,
+              action.limit,
+            );
+            result = servers.length > 0
+              ? JSON.stringify(servers)
+              : 'No community MCP servers matched that search.';
+          } else if (action.type === 'install_mcp_server') {
+            const server = await resolveCommunityMcpServer(action.server_id);
+            if (!server) {
+              const error = `No community MCP server has the exact ID "${action.server_id}".`;
+              outcome = { success: false, kind: 'validation', error, output: error };
+            } else {
+              const installation = await installCommunityMcpServer(
+                {
+                  config: host.runtime.config,
+                  mcpManager: host.mcpManager,
+                },
+                server,
+                {
+                  requiredArgs: action.required_args,
+                  overwrite: action.overwrite,
+                },
+              );
+              if (!installation.success) {
+                outcome = {
+                  success: false,
+                  kind: installation.kind === 'validation' ? 'validation' : 'operational',
+                  error: installation.message,
+                  output: installation.message,
+                };
+              } else {
+                if (installation.connected) host.syncMcpTools();
+                result = installation.message;
+              }
+            }
           } else if (action.type === 'install_agent_skill') {
             const skillName = (action as { name: string }).name;
             if (!skillName) {
@@ -1534,7 +1724,7 @@ export function initializeAgentDependencies(
         }
       },
       confirmApproval: (message, context) => host.confirmDangerousAction(message, context),
-      definitions: [...featureGatedToolDefinitions, ...delegationTools],
+      definitions: [...featureGatedToolDefinitions, ...delegationTools, ...HOOK_TOOL_DEFINITIONS],
       clientContext,
       customPolicy,
       authorization: toolAuthorization,
@@ -1542,6 +1732,13 @@ export function initializeAgentDependencies(
 
     host.sessionManager = new SessionManager();
     host.projectManager = new ProjectManager();
+    host.goalActivityManager = new GoalManager(runtime.workspaceRoot, {
+      getSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
+    });
+    host.goalActivityUnsubscribe = host.goalActivityManager.subscribe((snapshot: GoalSessionSnapshot) => {
+      host.goalActivitySnapshot = snapshot;
+      host.inkRenderer?.setGoalActivity?.(snapshot);
+    });
 
     // Ink 7 + React 19 is the default interactive UI. Do not let stale
     // config.ui.useInkRenderer values force the legacy composer.
@@ -1689,6 +1886,13 @@ export function initializeAgentDependencies(
       permissionManager: host.permissionManager,
       hookManager: host.hookManager,
       skillsRegistry: host.skillsRegistry,
+      hookAuthoring: new HookAuthoringService({
+        manager: host.hookManager, workspaceRoot: runtime.workspaceRoot, getProvider: () => host.llm,
+        confirm: async preview => {
+          const { showHookScriptReview } = await import('../../ui/ink/components/HookScriptReview.js');
+          return await showHookScriptReview(preview);
+        },
+      }),
       toolsRegistry: host.toolsRegistry,
       extensionService: host.extensionService,
       refreshDynamicExtensions: async () => {
@@ -1714,13 +1918,18 @@ export function initializeAgentDependencies(
       restoreSession: async (sessionId: string) => {
         await host.restoreSessionState(sessionId);
       },
+      restoreLoadedSession: async (session: Session) => {
+        await host.restoreSessionState(session);
+      },
       undoFileMutation: () => host.files.undoLast(),
       removeLastTurn: () => host.conversation.removeLastTurn(),
       // Status command context
       get provider() {
         return host.activeProvider;
       },
-      config: runtime.config,
+      get config() {
+        return runtime.config;
+      },
       getContextPercentLeft: () => host.contextPercentLeft,
       getTotalTokensUsed: () => {
         const currentTurnTokens = host.currentTurnActualUsage?.kind === 'actual'
@@ -1786,6 +1995,13 @@ export function initializeAgentDependencies(
       isContextCompactionEnabled: () => host.isContextCompactionEnabled(),
       // Non-interactive mode (RPC/ACP) - guards interactive commands
       isNonInteractive: runtime.isRpcMode === true,
+      setComposerInput: (text: string) => {
+        if (host.inkRenderer) {
+          host.inkRenderer.setInput(text);
+        } else {
+          host.promptSeedInput = text;
+        }
+      },
       onBeforeModal: async () => {
         writeAutohandDebugLine(
           `[DEBUG] onBeforeModal: inkRenderer exists=${!!host.inkRenderer}, persistentInputActive=${host.persistentInputActiveTurn}`,
@@ -1828,13 +2044,31 @@ export function initializeAgentDependencies(
       },
       // Team manager for /team, /tasks, /message commands
       teamManager: host.teamManager,
+      runCancellableOperation: <T>(operation: (signal: AbortSignal) => Promise<T>) => runCancellableAgentCommand({
+        get activeAbortController() { return host.activeAbortController; },
+        set activeAbortController(value) { host.activeAbortController = value; },
+        get currentInkAbortController() { return host.currentInkAbortController; },
+        set currentInkAbortController(value) { host.currentInkAbortController = value; },
+        get currentInkOnCancel() { return host.currentInkOnCancel; },
+        set currentInkOnCancel(value) { host.currentInkOnCancel = value; },
+        runtimeResourceShutdownController: host.runtimeResourceShutdownController,
+        inkRenderer: host.inkRenderer,
+        setupEscListener: (controller, onCancel, ctrlCInterrupt) => host.setupEscListener(controller, onCancel, ctrlCInterrupt),
+      }, operation),
       onToggleTeamView: (visible: boolean) => host.inkRenderer?.setTeamPanelVisible?.(visible),
+      onToggleAgentRunsView: (visible: boolean, source?: AgentRunSource) => {
+        host.inkRenderer?.setAgentRunsPanelVisible?.(visible, source);
+        if (visible && (source === undefined || source === 'squad')) squadRunMonitor.start();
+      },
+      onToggleGoalView: (visible: boolean) => host.inkRenderer?.setGoalPanelVisible?.(visible),
       // Repeat manager for /repeat recurring prompt scheduling
       repeatManager: host.repeatManager,
       // Queue an instruction to be sent to the LLM silently (e.g. /review)
-      queueInstruction: (instruction: string, postTurnAction?: PendingPostTurnAction) => {
+      queueInstruction: (instruction: string, postTurnAction?: PendingPostTurnAction, policy?: QueuedInstructionPolicy) => {
         host.pendingInkInstructions.push(createQueuedAgentInstruction({
           text: instruction,
+          echoInTranscript: false,
+          ...(policy ? { executionPolicy: { ...policy } } : {}),
           ...(postTurnAction ? { postTurnAction } : {}),
         }));
       },

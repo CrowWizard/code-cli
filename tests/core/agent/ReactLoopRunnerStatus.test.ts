@@ -8,12 +8,13 @@ import { readFileSync } from 'node:fs';
 import {
   type AgentReactLoopHost,
   collapseToolCallLogLines,
+  createRetryWaitStatus,
   formatComposerToolCallStatus,
   isDeferredFinalResponse,
   runAgentReactLoop,
   shouldDisplayToolOutput,
 } from '../../../src/core/agent/ReactLoopRunner.js';
-import type { ToolCallRequest } from '../../../src/types.js';
+import type { LLMRetryEvent, ToolCallRequest } from '../../../src/types.js';
 import { ReactionParser } from '../../../src/core/agent/ReactionParser.js';
 
 describe('ReactLoopRunner composer status', () => {
@@ -36,6 +37,108 @@ describe('ReactLoopRunner composer status', () => {
     expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'Hello ' });
     expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'world.' });
     expect(host.emitOutput).not.toHaveBeenCalledWith({ type: 'message', content: 'Hello world.' });
+  });
+
+  it.each([
+    { attached: 1, error: undefined },
+    { attached: 0, error: 'Screenshot was removed before visual inspection.' },
+  ])('attaches captured tool images before saving text-only observations ($attached)', async (attachment) => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const llmComplete = vi.fn()
+      .mockResolvedValueOnce({
+        id: 'capture', created: 1, raw: {},
+        content: JSON.stringify({ toolCalls: [{ tool: 'capture_test_evidence', args: { url: 'http://localhost:3000' } }] }),
+      })
+      .mockResolvedValueOnce({ id: 'answer', created: 2, raw: {}, content: '{"finalResponse":"Evidence captured."}' });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    const attachToolImages = vi.fn(async () => attachment);
+    Object.assign(host, { attachToolImages });
+    const imagePaths = ['.autohand/test-evidence/run-proof/frame-001.png'];
+    host.toolManager.execute = vi.fn().mockResolvedValue([
+      { tool: 'capture_test_evidence', success: true, output: 'Capture passed; visual inspection pending.', imagePaths },
+    ]);
+    const controller = new AbortController();
+
+    try {
+      await runAgentReactLoop(host, controller);
+
+      const toolMessage = vi.mocked(host.conversation.addMessage).mock.calls
+        .map(([message]) => message).find((message) => message.role === 'tool');
+      expect(toolMessage).toBeDefined();
+      expect(attachToolImages).toHaveBeenCalledWith(toolMessage, imagePaths, controller.signal);
+      expect(attachToolImages.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(host.saveToolMessage).mock.invocationCallOrder[0],
+      );
+      expect(typeof toolMessage?.content).toBe('string');
+      expect(toolMessage?.content).not.toContain('base64');
+      if (attachment.error) expect(toolMessage?.content).toContain(attachment.error);
+      expect(host.saveToolMessage).toHaveBeenCalledWith('capture_test_evidence', toolMessage?.content, toolMessage?.tool_call_id);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('pauses the periodic status while the provider waits on a rate limit and resumes when the retry is sent', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const llmComplete = vi.fn().mockImplementationOnce(async (request: { onRetry?: (event: LLMRetryEvent) => void }) => {
+      request.onRetry?.({ phase: 'waiting', delayMs: 2_000, attempt: 1, maxAttempts: 3, reason: 'Autohand AI uncached input-token throughput' });
+      request.onRetry?.({ phase: 'retrying', attempt: 1, maxAttempts: 3 });
+      return { id: 'answer', created: 1, raw: {}, content: '{"finalResponse":"Done."}' };
+    });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+
+    try {
+      await runAgentReactLoop(host, new AbortController());
+
+      expect(host.stopStatusUpdates).toHaveBeenCalled();
+      expect(host.setSpinnerStatus).toHaveBeenCalledWith(
+        'Waiting 2s for Autohand AI uncached input-token throughput (retry 1/3)... (esc to interrupt)',
+      );
+      const stopOrder = vi.mocked(host.stopStatusUpdates).mock.invocationCallOrder[0];
+      const resumeOrder = vi.mocked(host.startStatusUpdates).mock.invocationCallOrder
+        .find((order) => order > stopOrder);
+      expect(resumeOrder).toBeDefined();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('counts down the wait once a second and stops updating when the retry starts', () => {
+    vi.useFakeTimers();
+    const host = {
+      inkRenderer: { setStatus: vi.fn() } as unknown as AgentReactLoopHost['inkRenderer'],
+      setSpinnerStatus: vi.fn(),
+      startStatusUpdates: vi.fn(),
+      stopStatusUpdates: vi.fn(),
+    };
+
+    try {
+      const wait = createRetryWaitStatus(host);
+      wait.handle({ phase: 'waiting', delayMs: 3_000, attempt: 2, maxAttempts: 3, reason: 'Autohand AI request rate limit' });
+      expect(host.stopStatusUpdates).toHaveBeenCalledTimes(1);
+      expect(host.setSpinnerStatus).toHaveBeenLastCalledWith(
+        'Waiting 3s for Autohand AI request rate limit (retry 2/3)... (esc to interrupt)',
+      );
+      vi.advanceTimersByTime(1_000);
+      expect(host.setSpinnerStatus).toHaveBeenLastCalledWith(
+        'Waiting 2s for Autohand AI request rate limit (retry 2/3)... (esc to interrupt)',
+      );
+      expect(host.inkRenderer?.setStatus).toHaveBeenLastCalledWith(
+        'Waiting 2s for Autohand AI request rate limit (retry 2/3)... (esc to interrupt)',
+      );
+
+      wait.handle({ phase: 'retrying', attempt: 2, maxAttempts: 3 });
+      expect(host.startStatusUpdates).toHaveBeenCalledTimes(1);
+      const renders = host.setSpinnerStatus.mock.calls.length;
+      vi.advanceTimersByTime(5_000);
+      expect(host.setSpinnerStatus.mock.calls.length).toBe(renders);
+
+      // Disposing after a resume must not resume twice.
+      wait.dispose();
+      expect(host.startStatusUpdates).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('omits prompt cache affinity while the experimental gate is disabled', async () => {

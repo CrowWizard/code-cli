@@ -163,6 +163,9 @@ Features:
 - Press `Ctrl+C` twice to exit
 - Press `Shift+Tab` to cycle edit, plan, YOLO, and auto modes
 - Press `?` to toggle keyboard shortcuts panel
+- Use `/goals` to open the [goals view](#viewing-and-managing-goals); press `Ctrl+G` (`Cmd+G` on macOS) to toggle it open or closed
+- Press `Up` to recall older typed messages and `Down` for newer messages or your unfinished draft. In multiline drafts, `Up` moves the cursor until it reaches the first visual row.
+- Use `/whatityped` to select a message from any working directory and load it into the composer for editing. The latest 200 submissions are saved locally in `~/.autohand/typed-message-history.json` (or your `AUTOHAND_HOME`), starting when you use this feature.
 - Press `Enter` or `Shift+Enter` for newlines in multi-line input
 
 ### Command Mode (Non-Interactive)
@@ -211,6 +214,7 @@ events and writes exactly one final `result` or `error` object to stdout.
 | `--auto-skill`                  |       | Auto-generate skills based on project analysis                                   |
 | `--unrestricted`                |       | Run without approval prompts (use with caution)                                  |
 | `--restricted`                  |       | Deny all dangerous operations automatically                                      |
+| `--plan`                        |       | Start in read-only plan mode before the first prompt                             |
 | `--no-idle-logout`              |       | Disable authenticated idle logout for long-running agent sessions                |
 | `--config <path>`               |       | Path to config file                                                              |
 | `--temperature <value>`         |       | Sampling temperature for LLM                                                     |
@@ -311,7 +315,7 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/model`           | Switch LLM models                                                                |
 | `/new`             | Start fresh conversation                                                         |
 | `/clear`           | Clear conversation history                                                       |
-| `/undo`            | Revert last changes                                                              |
+| `/undo`            | Revert the last recorded agent file mutation and conversation turn               |
 | `/session`         | Show current session details                                                     |
 | `/sessions`        | List past sessions                                                               |
 | `/resume`          | Resume a previous session                                                        |
@@ -351,6 +355,15 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/autoresearch`    | Run replayable benchmark loops with history, replay, comparison, and Pareto analysis |
 | `/goal`            | Set a session-attached persistent goal and continue until it reaches a terminal state |
 | `/goal writer`     | Draft one or more well-specified goals with the built-in `$goal-writer` skill    |
+| `/goals`, `/goals view` | Open the live goals view with compact summaries and statuses                  |
+| `/goal view`       | Alias for `/goals view`                                                          |
+| `/goals edit <id> <objective>` | Update this session's goal or a queued goal by ID                     |
+| `/goals queue [objective]` | List queued goals and their IDs, or add an objective to the queue          |
+| `/goals pause`     | Pause this session's current goal                                               |
+| `/goals resume`    | Resume this session's goal, or start queued work when it has no current goal     |
+| `/goals complete`  | Mark the current goal complete and advance queued work when completion requirements are met |
+| `/goals clear`     | Clear this session's current goal while retaining queued work                   |
+| `/goals templates` | List reusable goal templates                                                    |
 | `/squad`           | Open/manage the local Autohand Squad runtime                                     |
 | `/go`              | Pair this session with the Autohand Code iOS app                                 |
 | `/sync`            | Sync settings across devices                                                     |
@@ -361,16 +374,16 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/ide`             | Open in IDE                                                                      |
 | `/history`         | View command history                                                             |
 | `/mcp`             | Manage MCP servers                                                               |
-| `/mcp install`     | Install community MCP servers                                                    |
+| `/mcp install`     | Install validated Official MCP Registry servers (stdio and HTTP)                |
 | `/team`            | Manage team collaboration                                                        |
 | `/tasks`           | List team tasks                                                                  |
 | `/message`         | Send team message                                                                |
-| `/import`          | Import data from Claude, Codex, Gemini, Cursor, OpenCode, Kimi, and other agents |
+| `/import`          | Import data from Claude, Codex, Gemini, Cursor, OpenCode, Kimi, Grok hooks, and other agents |
 | `/repeat`          | Repeat previous actions                                                          |
 | `/browser`         | Browser integration                                                              |
 | `/review`          | Code review                                                                      |
 
-Persistent goal data remains in the workspace across conversations, but execution does not silently transfer to a fresh session. Use `/goal` to inspect prior state and `/goal resume` to deliberately attach it to the current session.
+Persistent goal data remains in the workspace across conversations, but execution does not silently transfer work owned by another live session. Bare `/goal` inspects prior state and starts the next queued item when this session has no goal and no live peer owns the backlog. Use `/goal resume` to resume this session's paused goal or explicitly start queued work.
 
 Published CLI announcements appear as a cached launch block and a persistent line above the composer. Press `Ctrl+X` to dismiss the visible item, or use `/whatsnew` to review and dismiss all active announcements. Dismissal is per announcement; `--offline` keeps cached announcements visible without making announcement requests.
 
@@ -410,6 +423,36 @@ session before running the prompt; a missing or different-workspace target
 fails the task instead of silently starting fresh or continuing another
 session. The phone remains paired to the existing live CLI connection while
 the resumed session is identified in task progress and results.
+
+### Viewing and managing goals
+
+Enable the experimental goals feature, then open the live view:
+
+```text
+/experiments enable slash_goal
+/goals view
+```
+
+`/goals` and `/goal view` also open this view. It groups the current goal, queued
+goals, and goals from other sessions into short, single-line previews with
+statuses. The full objectives remain available for editing. Other-session rows
+are informational; editing applies to this session's goal and the shared queue.
+
+| Control | Action |
+|---------|--------|
+| `Ctrl+G` (`Cmd+G` on macOS) | Open or close the goals view |
+| `Up` / `Down`, with an empty composer | Select an editable goal |
+| `Enter` on a selected goal, or click its row | Load the full objective into the composer |
+| `Enter` while editing | Save the edited objective |
+| `Esc` with a goal selected or being edited | Clear the selection or cancel the unsaved edit; the view stays open |
+
+The footer shows **`Ctrl+G close`** beside the editing controls. Closing the view
+hides the panel; use `/goals pause` to pause the current goal. All goal subcommands
+accept either `/goal` or `/goals`. Bare `/goals` opens the view, while bare `/goal`
+can start the goal writer or queued work, depending on the current session state.
+
+See [goal commands and examples](docs/features.md#viewing-and-managing-goals) and
+[goals and auto mode](docs/config-reference.md#goals-and-auto-mode) for more details.
 
 ## Tool System
 
@@ -482,7 +525,7 @@ Create `~/.autohand/config.json` or use `config.toml`, `config.yaml`, or `config
     "allowDangerousOps": false
   },
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "autoConfirm": false
   }
 }
@@ -508,12 +551,27 @@ Create `~/.autohand/config.json` or use `config.toml`, `config.yaml`, or `config
 Sessions are auto-saved to `~/.autohand/sessions/`:
 
 ```bash
-# Resume via command
-autohand resume <session-id>
+# Pick a session from the current project
+autohand resume
+
+# Resume the most recently active session in this project
+autohand resume --last
+
+# Browse all projects, or resume the most recently active session across them
+autohand resume --all
+autohand resume --last --all
+
+# Resume by full ID, unique ID prefix, or saved session directory/file
+autohand resume <reference>
+
+# Select sessions for a different workspace
+autohand resume --path /path/to/project
 
 # Or in interactive mode
 /resume
 ```
+
+The picker supports arrow keys, Enter, and page navigation for older sessions. Escape or Ctrl+C cancels without starting a session. `--last` uses the last activity time, falling back to creation time for older session metadata. Without a terminal, provide `--last` or an explicit reference. References cannot be combined with `--last` or `--all`; `-c` remains auto-commit.
 
 ## Entire Integration
 
@@ -533,6 +591,10 @@ entire disable --agent autohand-code
 Once enabled, Entire works automatically through the Autohand Code CLI hooks system. No changes to your workflow are needed. See the [Entire Integration Guide](docs/entire-integration.md) for setup details and troubleshooting.
 
 ## Security & Permissions
+
+Start with `autohand --plan` to investigate and plan before editing. For a one-shot plan, use `autohand --plan --prompt "Plan a refactor of the authentication module"`. The first model request receives the plan instructions and read-only tools; mutating tool calls are blocked.
+
+Interactive plans require an explicit acceptance decision, including with `--yes` or `--unrestricted`. One-shot and unattended plans remain pending review. Shift+Tab and `/plan on|off` still change the interaction mode. `--plan` cannot be combined with `--yolo`, `--auto-mode`, or `--auto-commit`.
 
 Autohand Code CLI includes a permission system for sensitive operations:
 

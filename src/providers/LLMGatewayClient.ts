@@ -10,7 +10,7 @@ import type {
   LLMGatewaySettings,
   NetworkSettings,
   FunctionDefinition,
-  LLMMessage,
+  MultimodalMessage,
   NvidiaChatTemplateKwargs,
 } from "../types.js";
 import { ApiError, classifyApiError } from "./errors.js";
@@ -32,9 +32,12 @@ import { normalizeLLMUsage } from "./usage.js";
  * the gateway keeps its own recovery for orphaned tool observations so their
  * content stays in context instead of being dropped.
  */
-function sanitizeMessages(messages: LLMMessage[]): Record<string, unknown>[] {
+function sanitizeMessages(
+  messages: MultimodalMessage[],
+  supportsImageInput: boolean,
+): Record<string, unknown>[] {
   return normalizeOutboundMessages(messages, {
-    transformContent: toTextOnlyContent,
+    transformContent: supportsImageInput ? (content) => content : toTextOnlyContent,
     orphanedToolResults: "recover",
     recoverOrphanedToolResult: (message) => {
       const label = message.name ? `: ${message.name}` : "";
@@ -280,6 +283,7 @@ export class LLMGatewayClient {
   private readonly timeout: number;
   private readonly errorLabels: LLMGatewayCompatibleErrorLabels;
   private readonly reasoningEffort?: LLMGatewaySettings["reasoningEffort"];
+  private readonly supportsImageInput: boolean;
 
   constructor(
     settings: LLMGatewaySettings,
@@ -290,6 +294,7 @@ export class LLMGatewayClient {
     this.baseUrl = settings.baseUrl ?? DEFAULT_BASE_URL;
     this.defaultModel = settings.model;
     this.reasoningEffort = settings.reasoningEffort;
+    this.supportsImageInput = settings.supportsImageInput ?? false;
     this.errorLabels = errorLabels;
 
     // Network settings with sensible defaults and max limits
@@ -345,7 +350,7 @@ export class LLMGatewayClient {
     // Validate payload size before sending
     const payloadJson = JSON.stringify(payload);
     const payloadSizeBytes = payloadJson.length;
-    const maxPayloadSize = 5 * 1024 * 1024; // 5MB safety limit
+    const maxPayloadSize = 6 * 1024 * 1024; // Matches the inference Worker request limit.
 
     if (payloadSizeBytes > maxPayloadSize) {
       const sizeMB = (payloadSizeBytes / (1024 * 1024)).toFixed(2);
@@ -369,6 +374,9 @@ export class LLMGatewayClient {
         );
         return response;
       } catch (error) {
+        if (request.signal?.aborted) {
+          throw new ApiError('Request cancelled.', 'cancelled', 0, false);
+        }
         lastError = error as Error;
 
         // Don't retry if user cancelled or if it's a non-retryable error
@@ -379,11 +387,18 @@ export class LLMGatewayClient {
         // If we have more attempts left, wait before retrying
         if (attempt < this.maxRetries) {
           const delay = lastError instanceof AutohandRateLimitError
-            && lastError.scope === "rpm"
             && lastError.retryAfterMs !== undefined
             ? lastError.retryAfterMs
             : this.retryDelay * Math.pow(2, attempt);
+          request.onRetry?.({
+            phase: "waiting",
+            delayMs: delay,
+            attempt: attempt + 1,
+            maxAttempts: this.maxRetries,
+            reason: this.describeRetryReason(lastError),
+          });
           await this.sleep(delay, request.signal);
+          request.onRetry?.({ phase: "retrying", attempt: attempt + 1, maxAttempts: this.maxRetries });
         }
       }
     }
@@ -398,7 +413,7 @@ export class LLMGatewayClient {
   private buildPayload(request: LLMRequest): Record<string, unknown> {
     const payload: Record<string, unknown> = {
       model: request.model ?? this.defaultModel,
-      messages: sanitizeMessages(request.messages),
+      messages: sanitizeMessages(request.messages, this.supportsImageInput),
       temperature: request.temperature ?? 0.2,
       max_tokens: request.maxTokens ?? 16000,
       stream: request.stream ?? false,
@@ -437,7 +452,7 @@ export class LLMGatewayClient {
 
       // Combine user signal with timeout
       const combinedSignal = signal
-        ? this.combineSignals(signal, timeoutController.signal)
+        ? AbortSignal.any([signal, timeoutController.signal])
         : timeoutController.signal;
 
       try {
@@ -452,11 +467,6 @@ export class LLMGatewayClient {
       }
     } catch (error) {
       const err = error as Error;
-
-      // User cancelled
-      if (err.name === "AbortError" && signal?.aborted) {
-        throw new ApiError("Request cancelled.", "cancelled", 0, false);
-      }
 
       // Timeout. Retrying is only worth it for a streaming request, where nothing arrived
       // within a budget that only ever had to cover time to headers. A non-streaming one
@@ -653,15 +663,18 @@ export class LLMGatewayClient {
       );
     }
 
+    // Token-throughput buckets refill within the minute, so the throttle is transient: wait
+    // out the server-supplied delay like an RPM throttle rather than abandoning the turn.
     if (this.errorLabels.serviceName === "Autohand AI"
       && structuredError?.type === "rate_limited"
       && isAutohandTokenThroughputScope(structuredError.scope)) {
+      const classified = classifyApiError(status, errorDetail, response.headers);
       return new AutohandRateLimitError(
         buildAutohandTokenThroughputMessage(structuredError),
         status,
-        false,
+        true,
         structuredError.scope,
-        undefined,
+        classified.retryAfterMs,
         errorDetail,
       );
     }
@@ -715,6 +728,21 @@ export class LLMGatewayClient {
     return classifyApiError(status, errorDetail, response.headers);
   }
 
+  private describeRetryReason(error: Error): string {
+    if (error instanceof AutohandRateLimitError) {
+      const label = error.scope === "rpm"
+        ? "request rate limit"
+        : isAutohandTokenThroughputScope(error.scope)
+          ? AUTOHAND_TOKEN_THROUGHPUT_SCOPE_LABELS[error.scope]
+          : AUTOHAND_QUOTA_SCOPE_LABELS[error.scope];
+      return `${this.errorLabels.serviceName} ${label}`;
+    }
+    if (error instanceof ApiError) {
+      return error.code.replace(/_/g, " ");
+    }
+    return "a transient error";
+  }
+
   private isNonRetryableError(error: Error): boolean {
     if (error instanceof ApiError) {
       return !error.retryable;
@@ -743,23 +771,6 @@ export class LLMGatewayClient {
     }
 
     return false;
-  }
-
-  private combineSignals(
-    signal1: AbortSignal,
-    signal2: AbortSignal
-  ): AbortSignal {
-    const controller = new AbortController();
-
-    const abort = () => controller.abort();
-    signal1.addEventListener("abort", abort);
-    signal2.addEventListener("abort", abort);
-
-    if (signal1.aborted || signal2.aborted) {
-      controller.abort();
-    }
-
-    return controller.signal;
   }
 
   private sleep(ms: number, signal?: AbortSignal): Promise<void> {

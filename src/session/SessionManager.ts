@@ -16,6 +16,7 @@ import type {
 } from './types.js';
 import { AUTOHAND_PATHS } from '../constants.js';
 import { atomicWriteJson, withFileLock } from '../utils/atomicFile.js';
+import { runWithConcurrency } from '../utils/parallel.js';
 
 const SESSION_INDEX_FILE = 'index.json';
 const SESSION_INDEX_LOCK_FILE = 'index.json.lock';
@@ -94,6 +95,7 @@ export function isSessionIndex(value: unknown): value is SessionIndex {
 export interface BranchSessionOptions {
     type: 'fork' | 'clone';
     userMessageOrdinal?: number;
+    projectPath?: string;
 }
 
 export class SessionManager {
@@ -199,6 +201,7 @@ export class SessionManager {
         const createdAt = new Date().toISOString();
         const sessionId = this.generateSessionId();
         const sessionDir = path.join(this.sessionsDir, sessionId);
+        const projectPath = path.resolve(options.projectPath ?? sourceSession.metadata.projectPath);
         await fs.ensureDir(sessionDir);
 
         const metadata: SessionMetadata = {
@@ -206,6 +209,8 @@ export class SessionManager {
             sessionId,
             createdAt,
             lastActiveAt: createdAt,
+            projectPath,
+            projectName: path.basename(projectPath),
             closedAt: undefined,
             messageCount: copiedMessages.length,
             status: 'active',
@@ -226,7 +231,10 @@ export class SessionManager {
         await session.replaceMessages(copiedMessages);
         const sourceState = sourceSession.getState();
         if (sourceState) {
-            await session.updateState(sourceState);
+            await session.updateState({
+                ...sourceState,
+                workspaceRoot: projectPath,
+            });
         }
         await session.save();
 
@@ -235,41 +243,101 @@ export class SessionManager {
         return session;
     }
 
-    async listSessions(filter?: { project?: string; since?: Date }): Promise<SessionMetadata[]> {
-        await this.loadIndex();
+    private async getIndexedSessions(filter?: { project?: string; since?: Date }): Promise<SessionIndex['sessions']> {
         if (!this.index) return [];
 
-        let sessions = this.index.sessions;
+        let sessions = [...this.index.sessions];
 
         if (filter?.project) {
             const projectPath = path.resolve(filter.project);
-            const sessionIds = this.index.byProject[projectPath] || [];
-            sessions = sessions.filter(s => sessionIds.includes(s.id));
+            const canonicalPath = await fs.realpath(projectPath).catch(() => projectPath);
+            const matches = await runWithConcurrency(
+                Object.entries(this.index.byProject).map(([indexedPath, ids]) => ({
+                    label: `resolve session project ${indexedPath}`,
+                    run: async (): Promise<string[]> => {
+                        const resolvedPath = path.resolve(indexedPath);
+                        if (resolvedPath === projectPath) return ids;
+                        const canonicalIndexedPath = await fs.realpath(resolvedPath).catch(() => resolvedPath);
+                        return canonicalIndexedPath === canonicalPath ? ids : [];
+                    },
+                })),
+                8,
+            );
+            const sessionIds = new Set(matches.flat());
+            sessions = sessions.filter(s => sessionIds.has(s.id));
         }
 
         if (filter?.since) {
             sessions = sessions.filter(s => new Date(s.createdAt) >= filter.since!);
         }
 
-        // Load full metadata for each session
-        const fullMetadata: SessionMetadata[] = [];
-        for (const s of sessions) {
-            const sessionDir = path.join(this.sessionsDir, s.id);
-            const metadataPath = path.join(sessionDir, 'metadata.json');
-            if (await fs.pathExists(metadataPath)) {
-                const metadata = await fs.readJson(metadataPath) as SessionMetadata;
-                fullMetadata.push(metadata);
-            }
-        }
+        return sessions.sort((a, b) =>
+            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+    }
+
+    private async loadIndexedSessionMetadata(sessions: SessionIndex['sessions']): Promise<SessionMetadata[]> {
+        const results = await runWithConcurrency(
+            sessions.map((session) => ({
+                label: `load session metadata ${session.id}`,
+                run: async (): Promise<SessionMetadata | null> => {
+                    const metadataPath = path.join(this.sessionsDir, session.id, 'metadata.json');
+                    if (!await fs.pathExists(metadataPath)) {
+                        return null;
+                    }
+                    return fs.readJson(metadataPath) as Promise<SessionMetadata>;
+                },
+            })),
+            8,
+        );
+
+        return results.filter((metadata): metadata is SessionMetadata => metadata !== null);
+    }
+
+    async listSessions(filter?: { project?: string; since?: Date }): Promise<SessionMetadata[]> {
+        await this.loadIndex();
+        if (!this.index) return [];
+
+        const fullMetadata = await this.loadIndexedSessionMetadata(await this.getIndexedSessions(filter));
 
         return fullMetadata.sort((a, b) =>
             new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
         );
     }
 
+    /**
+     * Return a bounded, newest-first page for interactive session pickers.
+     * This avoids waiting for every historical metadata file before the picker opens.
+     */
+    async listRecentSessions(
+        filter?: { project?: string; since?: Date },
+        limit = 20,
+        offset = 0,
+    ): Promise<{ sessions: SessionMetadata[]; total: number }> {
+        await this.loadIndex();
+        if (!this.index) return { sessions: [], total: 0 };
+
+        const indexedSessions = await this.getIndexedSessions(filter);
+        const start = Math.max(0, offset);
+        const sessions = await this.loadIndexedSessionMetadata(indexedSessions.slice(start, start + Math.max(0, limit)));
+
+        return {
+            sessions: sessions.sort((a, b) =>
+                new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            ),
+            total: indexedSessions.length,
+        };
+    }
+
     async getLastSession(projectPath?: string): Promise<SessionMetadata | null> {
         const sessions = await this.listSessions(projectPath ? { project: projectPath } : undefined);
-        return sessions[0] || null;
+        const activityTime = (metadata: SessionMetadata): number => {
+            const activeAt = Date.parse(metadata.lastActiveAt);
+            return Number.isFinite(activeAt) ? activeAt : Date.parse(metadata.createdAt) || 0;
+        };
+        return sessions.reduce<SessionMetadata | null>((latest, session) => {
+            return !latest || activityTime(session) > activityTime(latest) ? session : latest;
+        }, null);
     }
 
     async closeSession(summary?: string): Promise<void> {

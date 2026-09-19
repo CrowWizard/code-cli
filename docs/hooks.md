@@ -2,6 +2,95 @@
 
 Autohand's hooks system allows you to run custom shell commands in response to lifecycle events like tool execution, file modifications, session lifecycle, and LLM interactions. Hooks can be configured via `config.json` or managed interactively with the `/hooks` command.
 
+## Create a hook in plain English
+
+Open `/hooks` to browse every supported lifecycle event, including events with no
+hooks installed. The table shows **Installed** and **Active** counts and a short
+explanation of each trigger. Counts combine config hooks (including the bundled
+examples) and hooks registered by enabled, trusted runtime extensions/plugins.
+Disabled config hooks count as installed; the global switch makes every active
+count zero. `post-response` is displayed under its canonical event, `stop`.
+An active count means enabled; tool/path filters still decide whether a particular
+event matches.
+
+1. Navigate with **↑/↓**, then press **Enter** on an event.
+2. Read the installed hooks and their sources, then describe the automation in
+   plain English. For example, select `post-tool` and type:
+   “After a successful write_file, append the edited path and timestamp to changes.log.”
+3. Autohand generates a Node.js script using the current provider. It validates the
+   returned definition and JavaScript syntax without executing the script.
+4. Review the event, workspace, filters, timeout, execution mode, and full script.
+   Use **↑/↓**, **PgUp/PgDn**, or **g/G** to scroll. Press **s** to save and enable,
+   or **Esc/Ctrl+C** to cancel. Cancellation writes nothing.
+5. The table refreshes. The saved hook runs on future matching lifecycle events,
+   including in later sessions. Global disable remains in effect until you enable
+   it through `/hooks manage`.
+
+Generated scripts are saved as unique `.cjs` files under
+`$AUTOHAND_HOME/hooks/generated/` (normally `~/.autohand/hooks/generated/`).
+The hook definition is added to the active config file, including a custom
+`--config` file. Existing hooks and plugin code are preserved. Generated scripts
+require **Node.js on PATH** and use only built-in Node modules by default. They
+run only in the workspace where they were created; moving the workspace requires
+creating a new hook. The generated wrapper reads JSON stdin once and provides its parsed fields as
+`hookContext` (for example, `hookContext.tool_name` or `hookContext.team_task_id`).
+Scripts can also read the documented environment variables. They are not run automatically for testing: use `/hooks manage` →
+“Test a hook” only when you intend its side effects to occur.
+
+Useful requests include:
+
+- `session-end`: “Append the session ID and timestamp to sessions.log.”
+- `pre-tool`: “Block run_command when it tries to run git push --force.”
+- `file-modified`: “Format changed TypeScript files with this project's formatter.”
+- `rate-limit`: “Write the provider and retry delay to quota-events.log.”
+- `task-completed`: “Log the team task ID and result to team-results.log.”
+
+Hook scripts execute with your local permissions. Review generated scripts as you
+would review a script you wrote yourself. A syntax check does not prove behavior;
+keep secrets in environment variables, and use argument arrays instead of shell
+interpolation for values received from hook context.
+
+### Commands and existing hooks
+
+| Command | Behavior |
+| --- | --- |
+| `/hooks` | Event browser and plain-English creation |
+| `/hooks list` | Complete event table, also usable without a TTY |
+| `/hooks manage` | Existing toggle, test, remove, manual-add, and global-switch controls |
+| `/hooks help` | Command help |
+| `/extensions` | Manage the plugins that own extension hooks |
+
+Plugin handlers are identified by extension ID on the selected event. They are
+not copied into config or toggled individually by config-hook controls. Disable
+the owning extension to stop those handlers. The global hook switch also applies
+to extension hooks. Lifecycle hooks are separate from Git's `.git/hooks`.
+
+### Autohand AI tools
+
+When the active provider is **Autohand AI** (`autohandai`), the assistant can use:
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `list_hooks` | none | List all event counts, plugin ownership, and config hooks with indexes |
+| `create_hook` | `prompt`, optional `event` | Infer a trigger if omitted, generate a script from plain English, then request approval and save it |
+| `set_hook_enabled` | `event`, `index`, `enabled` | Set one config hook's enabled state after normal tool authorization |
+
+For example: “Create a hook that logs the session ID when a session ends.”
+Autohand AI can call `create_hook` with that request; you do not need to write a
+shell command or edit JSON. These tools are intended for explicit requests for
+persistent automation, not one-off tasks. Normal approval modes (`--yes`,
+unrestricted mode, and transport approval callbacks) apply to tool-driven
+creation. Interactive `/hooks` creation always shows its script review.
+
+Hook tools are absent from other providers' model tool schemas, and execution
+checks reject them after a provider switch as well. The event browser and manual
+management remain available with every provider, and interactive authoring uses
+your currently selected provider. Hook execution itself is provider-independent.
+
+If generation fails, no hook is installed. If config persistence fails, the new
+script is removed and the hook is not left active in memory. Existing scripts
+are never overwritten by generated drafts.
+
 ## Overview
 
 Hooks are useful for:
@@ -13,12 +102,15 @@ Hooks are useful for:
 - Automating permission decisions
 - Custom session management
 
-## Two Modes of Hook Integration
+## Hook Integration
 
 ### 1. Config-Based Hooks (CLI)
 Define shell commands in your `~/.autohand/config.json` that run automatically on lifecycle events. These hooks run in your local shell environment.
 
-### 2. JSON-RPC 2.0 Notifications (IDE Integration)
+### 2. Runtime extension hooks
+Enabled, trusted extensions register lifecycle handlers through `api.hooks.on(event, handler)`. The `/hooks` browser includes these handlers and identifies the owning extension.
+
+### 3. JSON-RPC 2.0 Notifications (IDE Integration)
 When running in RPC mode (VS Code, Zed, etc.), hook events are also emitted as JSON-RPC 2.0 notifications that IDE extensions can subscribe to.
 
 ---
@@ -38,7 +130,11 @@ When running in RPC mode (VS Code, Zed, etc.), hook events are also emitted as J
 | `pre-clear` | Before memory extraction on `/clear` or `/new` | session id, cwd |
 | `session-error` | When an error occurs | error message, code, context |
 | `rate-limit` | When a provider rate limit ends the turn | error message, code, retryAfterMs, httpStatus, model, provider |
-| `subagent-stop` | When a subagent finishes execution | subagent id, name, type, success, duration |
+| `subagent-start` | Before a worker begins its task | run id, parent id, source, workspace, task, name, type |
+| `subagent-progress` | When a worker's actual activity changes | run identity, status, activity, usage |
+| `subagent-message` | When a message is queued for a worker | run identity, queued message |
+| `subagent-cancel-requested` | When a worker stop is requested | run identity, status |
+| `subagent-stop` | When a worker completes, fails, or is cancelled | run identity, status, success, duration, error |
 | `permission-request` | Before showing permission dialog | tool, path, permission type |
 | `notification` | When a notification is sent to user | notification type, message |
 | `automode:start` | When auto-mode starts | auto-mode session id, prompt, max iterations |
@@ -49,6 +145,19 @@ When running in RPC mode (VS Code, Zed, etc.), hook events are also emitted as J
 | `automode:cancel` | When auto-mode is cancelled | cancel reason, iteration, cost |
 | `automode:complete` | When auto-mode completes successfully | iterations, actions, files changed, cost |
 | `automode:error` | When auto-mode encounters an error | error message, iteration |
+| `autoresearch:start` | When an auto-research session starts or resumes | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:pause` | When an auto-research session is paused | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:init` | When init_experiment configures the session | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:before` | Before run_experiment starts an iteration | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:run` | When run_experiment executes the benchmark | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:after` | After run_experiment finishes an iteration | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:log` | When log_experiment records a result | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:decision` | When the deterministic experiment decision is persisted | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:replay` | When an isolated candidate replay completes | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:rescore` | When stored measurements are rescored with the current policy | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:prune` | When artifact retention is previewed or applied | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:complete` | When the auto-research loop completes | goal, active state, iteration, subcommand, attempt id, decision |
+| `autoresearch:error` | When auto-research encounters an error | goal, active state, iteration, subcommand, attempt id, decision |
 | `pre-learn` | Before a learn operation begins | instruction, cwd |
 | `post-learn` | After a learn operation completes | instruction, duration, success |
 | `goal-written:completed` | After a goal objective is created | goal id, objective, source |
@@ -90,8 +199,9 @@ with backoff, honoring `Retry-After` when the provider sends one.
 ```json
 {
   "hooks": {
-    "rate-limit": [
+    "hooks": [
       {
+        "event": "rate-limit",
         "command": "notify-send \"Autohand: $HOOK_ERROR\"",
         "description": "Desktop notification when a quota is hit"
       }
@@ -185,7 +295,7 @@ What the matcher matches against depends on the event type:
 | `notification` | Notification type |
 | `session-start` | Session type (startup/resume/clear) |
 | `session-end` | End reason (quit/clear/exit/error) |
-| `subagent-stop` | Subagent type |
+| `subagent-start`, `subagent-progress`, `subagent-message`, `subagent-cancel-requested`, `subagent-stop` | Subagent type |
 | `automode:*` | Event-specific auto-mode prompt, iteration, or reason |
 | `review:*` | Event-specific review path, scope, instructions, or error |
 | `team-created`, `team-shutdown` | Team name |
@@ -392,9 +502,14 @@ When your hook command executes, these environment variables are available:
 | `HOOK_PROVIDER` | Provider that reported the rate limit | rate-limit |
 | `HOOK_SESSION_TYPE` | startup, resume, or clear | session-start |
 | `HOOK_SESSION_END_REASON` | quit, clear, exit, or error | session-end |
-| `HOOK_SUBAGENT_ID` | Subagent task ID | subagent-stop |
-| `HOOK_SUBAGENT_NAME` | Subagent name | subagent-stop |
-| `HOOK_SUBAGENT_TYPE` | Subagent type | subagent-stop |
+| `HOOK_SUBAGENT_ID` | Exact worker run ID | subagent events |
+| `HOOK_SUBAGENT_NAME` | Subagent name | subagent events |
+| `HOOK_SUBAGENT_TYPE` | Subagent type | subagent events |
+| `HOOK_SUBAGENT_PARENT_ID` | Parent worker run ID, when nested | subagent events |
+| `HOOK_SUBAGENT_SOURCE` | `delegate` or `team` | subagent events |
+| `HOOK_SUBAGENT_STATUS` | Current worker status | subagent events |
+| `HOOK_SUBAGENT_WORKSPACE` | Selected execution workspace | subagent events |
+| `HOOK_SUBAGENT_ACTIVITY` | Actual model/tool activity, when available | subagent-progress |
 | `HOOK_SUBAGENT_SUCCESS` | "true" or "false" | subagent-stop |
 | `HOOK_SUBAGENT_ERROR` | Error message if failed | subagent-stop |
 | `HOOK_SUBAGENT_DURATION` | Duration in ms | subagent-stop |
@@ -516,7 +631,25 @@ echo '{"decision": "allow", "reason": "Read operations are safe"}'
 }
 ```
 
-### Track Subagent Performance
+### Track and control subagents
+
+Direct, nested, and team workers emit lifecycle events using their unique run IDs. These are the same runs displayed by `/agents view`; external Squad records remain read-only and do not emit local worker-control events. Task and queued message text are available as `subagent_task` and `subagent_message` in the JSON sent to a hook's stdin, rather than embedded in shell commands.
+
+Synchronous `subagent-start` and `subagent-progress` hooks can return the existing response fields on stdout:
+
+```json
+{ "additionalContext": "Verify the focused regression test before marking this task complete." }
+```
+
+This queues context for that worker's next safe model step. To stop only that worker:
+
+```json
+{ "continue": false, "stopReason": "The user has withdrawn this task." }
+```
+
+A stop response takes precedence over queued context. Messages are bounded to 8000 characters and the worker inbox is bounded; queued does not mean read. `subagent-message`, `subagent-cancel-requested`, and `subagent-stop` are observational: returned control fields are ignored to prevent recursive control loops. Use `async: true` only for observation, not returned control decisions. Hook failures are isolated, and frequent pending progress events may be coalesced. A cancellation request is not a completed cancellation; track `subagent-stop` with `subagent_status="cancelled"` for the final state.
+
+For example, add this hook definition to the configuration's `hooks.hooks` array to track completion:
 
 ```json
 {
@@ -528,9 +661,9 @@ echo '{"decision": "allow", "reason": "Read operations are safe"}'
 
 ---
 
-## Managing Hooks with `/hooks`
+## Manual management with `/hooks manage`
 
-Use the `/hooks` slash command to interactively:
+Use `/hooks manage` for existing config hooks:
 - View all registered hooks grouped by event
 - Add new hooks
 - Enable/disable individual hooks
@@ -735,7 +868,7 @@ rpcClient.onNotification('autohand.hook.subagentStop', (params) => {
 
 ## Built-in Hooks
 
-Autohand ships with default hooks that are installed on first run. All hooks are **disabled by default** and can be enabled via `/hooks` or by editing your config.
+Autohand ships with default hooks that are installed on first run. All hooks are **disabled by default** and can be enabled via `/hooks manage` or by editing your config.
 
 ### Logging Hooks
 
@@ -881,11 +1014,11 @@ Automatically runs lint, test, and creates a commit with an LLM-generated messag
 
 ### Enabling Built-in Hooks
 
-Use `/hooks` and select "Enable/disable hooks" to toggle individual hooks:
+Use `/hooks manage` and select "Toggle hooks on/off" to toggle individual hooks:
 
 ```
-› /hooks
-? Hook action: Enable/disable hooks
+› /hooks manage
+? Action: Toggle hooks on/off
 ? Select hook to toggle:
   ❯ [disabled] session-start - Log session start
     [disabled] sound-alert - Play sound when task completes
@@ -915,7 +1048,7 @@ Or manually edit your `~/.autohand/config.json` to enable specific hooks.
 - Hook failures do not crash the agent
 - Errors are logged but execution continues
 - Exit code 2 blocks execution with the stderr message
-- Test hooks with the `/hooks` command before relying on them
+- Test hooks with `/hooks manage` before relying on them
 
 ### Security Considerations
 - Hook commands run in your shell with your permissions
@@ -928,3 +1061,59 @@ Or manually edit your `~/.autohand/config.json` to enable specific hooks.
 - Use `decision: "ask"` as the default fallback
 - Use `decision: "block"` with exit code 2 for truly dangerous operations
 - Always provide a `reason` for allow/deny decisions for auditability
+
+## Import hooks from another coding agent
+
+Use the `hooks` category to import command hooks into the configuration Autohand actually uses:
+
+```sh
+autohand import claude --categories hooks
+autohand import codex --categories hooks
+autohand import cursor --categories hooks
+autohand import grok --categories hooks
+```
+
+Inside a session, use `/import claude --categories hooks`. `--dry-run` scans without writing. `--all --categories hooks` restricts an all-source import to hooks. The CLI respects the selected `--path`, `--config`, and `AUTOHAND_CONFIG`; the slash command updates the current session's hook manager. Legacy Codex `notify` commands are discovered and reported for manual porting because they receive their JSON payload as a command argument.
+
+Imported commands are **saved disabled**. Review the original scripts, then enable the desired entries through `/hooks manage`. Importing does not execute commands, copy scripts, install dependencies, or carry over another agent's trust approvals. Commands continue to reference their original scripts. Repeating the same import skips existing definitions and preserves their enabled state. Existing hooks and unrelated configuration remain intact; malformed destination configuration is reported without overwriting it.
+
+| Source | User files | Current project files |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` (or `CLAUDE_CONFIG_DIR`) | `.claude/settings.json`, `.claude/settings.local.json` |
+| Codex | `~/.codex/hooks.json`, `config.toml` (or `CODEX_HOME`) | `.codex/hooks.json`, `.codex/config.toml` |
+| Cursor | `~/.cursor/hooks.json` | `.cursor/hooks.json` |
+| Grok | `~/.grok/hooks/*.json` | `.grok/hooks/*.json` |
+
+Codex JSON and inline TOML definitions are both read, including nested array tables and multiline commands. Grok import currently imports hooks only. Plugin bundles, managed policies, ancestor-project layers, and additional Grok `hooks-paths` roots are outside this importer. Import Claude/Cursor configurations under their own source names even when Grok also loads those files.
+
+| Source event | Autohand event |
+| --- | --- |
+| `PreToolUse` / Cursor `preToolUse` | `pre-tool` |
+| `PostToolUse` / Cursor `postToolUse` | `post-tool` on success (Codex observes both outcomes) |
+| Claude/Grok `PostToolUseFailure` / Cursor `postToolUseFailure` | `post-tool` on failure |
+| `UserPromptSubmit` / Cursor `beforeSubmitPrompt` | `pre-prompt` |
+| Claude/Codex `PermissionRequest` | `permission-request` |
+| `SessionStart` / Cursor `sessionStart` | `session-start` |
+| `SessionEnd` / Cursor `sessionEnd` | `session-end` |
+| Claude/Grok `Notification` | `notification` |
+| `PostCompact` | `context:compact` |
+| Cursor `beforeShellExecution` / `afterShellExecution` | Shell-only `pre-tool` / successful `post-tool` |
+| Grok `Stop` | `stop` |
+
+The adapter translates common tool names, file paths/content, shell arguments, event names, JSON stdin, and supported permission responses. Cursor shell matchers inspect the command string. Success/failure filters and project scope are enforced before spawning a command. Cursor user hooks retain their user-directory working directory; project hooks run in the project. Claude-compatible commands receive `CLAUDE_PROJECT_DIR`; Grok commands receive the Grok hook environment fields.
+
+Timeout values are converted from seconds to milliseconds. When omitted, Claude command hooks use 600 seconds, prompt hooks 30 seconds, and session-end hooks 1.5 seconds; Codex uses 600 seconds except session-end at 1 second. Grok uses 5 seconds. Cursor documents a platform-dependent default, so imports use Autohand's 5-second default; set an explicit source timeout to retain a particular budget. Source-wide/shared shutdown budgets are not reproduced.
+
+This is a command-hook adapter, not an emulation of the source agent. Review any script that depends on its complete payload or tool schema. Transcript paths, source-specific IDs, permission-mode/sandbox metadata, file attachments, tool-response object shapes, and source-specific file-edit formats are not reconstructed. Codex shell calls use `Bash`; native file tools retain their names (`apply_patch` also matches `Edit` and `Write`). Claude/Cursor file operations expose common file fields, while patch/edit input rewrites are denied with an explanation. Permission persistence updates also require manual porting.
+
+HTTP, prompt/agent/MCP-tool handlers, asynchronous hooks, `failClosed`, unsupported matcher shapes, and unmapped events are reported as skipped. In particular, Claude/Codex/Cursor stop or subagent-stop hooks that continue a turn, pre-compaction hooks, Cursor file-read content gates and Tab/workspace hooks, and new source-specific events need manual porting. Post-compaction is never substituted for pre-compaction. Hooks that add context can deliver it to the conversation; lifecycle observers cannot restart turns or replace MCP responses.
+
+Grok's only blocking event is `PreToolUse`. An explicit deny or exit code 2 blocks there; its other events stay passive. An `allow` response from Grok does not override Autohand permissions.
+
+Formats were checked against the official [Claude Code hook reference](https://code.claude.com/docs/en/hooks), [Codex hook manual](https://learn.chatgpt.com/docs/hooks.md), [Cursor hook reference](https://cursor.com/docs/hooks), and [Grok hook reference](https://docs.x.ai/build/features/hooks).
+
+### Runtime wiring checked with hook imports
+
+`pre-prompt` runs in the common instruction runner, including interactive CLI, command, ACP, and JSON-RPC turns. Denial happens before prompt preparation or model calls, and running prompt hooks can be cancelled. RPC adapters forward original Review prompts and mentioned files instead of executing a duplicate hook. ACP also executes configured `stop` hooks after a turn.
+
+Permission changes emit `mode-change` with `previous_mode`/`mode` JSON fields and `HOOK_PREVIOUS_MODE`/`HOOK_MODE` environment fields. `/learn` emits `pre-learn` before analysis and `post-learn` afterwards. The hook summary uses the same event catalogue as the browser, and autoresearch `decision`, `replay`, `rescore`, and `prune` events honor their matchers.

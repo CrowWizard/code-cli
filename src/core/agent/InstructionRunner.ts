@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import type { HookManager, HookExecutionResult } from '../HookManager.js';
 import { ProviderNotConfiguredError } from '../../providers/ProviderFactory.js';
 import { ApiError } from '../../providers/errors.js';
 import {
@@ -18,6 +19,7 @@ import { GoalManager } from '../../goals/GoalManager.js';
 import type { SessionMessage, SessionTurnUsageInput } from '../../session/types.js';
 import type { MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
 import type { TurnMemoryReflectionOutcome } from '../../memory/extractSessionMemories.js';
+import type { QueuedInstructionPolicy } from './PostTurnActionCoordinator.js';
 import type {
   AgentLoopStep,
   ReactLoopControl,
@@ -91,6 +93,8 @@ export interface AgentInstructionHost {
   sessionTokenUsageUnavailable: boolean;
   lastIntent: Intent;
   activeAbortController: AbortController | null;
+  currentInkAbortController?: AbortController | null;
+  currentInkOnCancel?: (() => void) | null;
   persistentInputActiveTurn: boolean;
   promptSeedInput: string;
   useInkRenderer: boolean;
@@ -101,6 +105,7 @@ export interface AgentInstructionHost {
   runtime: AgentRuntime;
   sessionManager?: InstructionSessionManager;
   permissionManager?: PermissionManager;
+  hookManager?: HookManager;
   intentDetector: InstructionIntentDetector;
   persistentInput: InstructionPersistentInput;
   conversation: InstructionConversation;
@@ -165,9 +170,13 @@ export interface AgentInstructionHost {
   writeDebugLine?(message: string): void;
 }
 
-export interface RunInstructionOptions {
+export interface RunInstructionOptions extends QueuedInstructionPolicy {
+  mentionedFiles?: string[];
+  hookInstruction?: string;
   signal?: AbortSignal;
   mobileTurn?: MobileClaimedTurnContext;
+  /** Internal instructions still reach the model and session log when their terminal echo is hidden. */
+  echoInTranscript?: boolean;
   onStepFinish?: (step: AgentLoopStep) => boolean | Promise<boolean>;
 }
 
@@ -257,6 +266,58 @@ export class InstructionRunner {
       return false;
     }
 
+    host.isInstructionActive = true;
+    host.activeAbortController = abortController;
+    const useInkInput = !host.runtime.isRpcMode && host.useInkRenderer && !!host.inkRenderer;
+    if (useInkInput) {
+      host.currentInkAbortController = abortController;
+      host.currentInkOnCancel = null;
+    }
+    const stopPromptInput = !host.runtime.isRpcMode && !useInkInput && process.stdin.isTTY
+      && (host.hookManager?.getHooksForEvent('pre-prompt').length ?? 0) > 0
+      ? host.setupEscListener(abortController, () => {}, true) : () => {};
+    let promptInputClosed = false;
+    const cleanupPromptInterrupts = (): void => {
+      if (promptInputClosed) return;
+      promptInputClosed = true;
+      stopPromptInput();
+    };
+    abortController.signal.addEventListener('abort', cleanupPromptInterrupts, { once: true });
+    let hookResults: HookExecutionResult[];
+    try {
+      hookResults = await host.hookManager?.executeHooks('pre-prompt', {
+        instruction: options.hookInstruction ?? instruction,
+        sessionId: host.sessionManager?.getCurrentSession()?.metadata?.sessionId,
+        mentionedFiles: options.mentionedFiles,
+      }, { signal: abortController.signal }) ?? [];
+    } finally {
+      abortController.signal.removeEventListener('abort', cleanupPromptInterrupts);
+      cleanupPromptInterrupts();
+      if (useInkInput && host.currentInkAbortController === abortController) {
+        host.currentInkAbortController = null;
+      }
+      host.isInstructionActive = false;
+      host.activeAbortController = null;
+    }
+    if (abortController.signal.aborted) {
+      if (!host.runtime.isRpcMode) console.log(chalk.yellow('Request canceled.'));
+      return false;
+    }
+    const blocked = hookResults.find(result => result.blockingError
+      || result.response?.decision === 'block' || result.response?.decision === 'deny'
+      || result.response?.continue === false);
+    if (blocked) {
+      const reason = blocked.response?.reason ?? blocked.response?.stopReason ?? blocked.error ?? 'Prompt blocked by hook';
+      host.emitOutput({ type: 'error', content: reason });
+      if (!host.runtime.isRpcMode) console.log(chalk.yellow(reason));
+      return false;
+    }
+    for (const result of hookResults) {
+      if (result.response?.additionalContext) {
+        host.conversation.addSystemNote(result.response.additionalContext, '[Pre-prompt Hook Context]');
+      }
+    }
+
     if (deepResearch.runId) {
       await markDeepResearchRunStarted(host.runtime.workspaceRoot, deepResearch.runId);
     }
@@ -292,14 +353,16 @@ export class InstructionRunner {
     host.currentTurnHadUnavailableUsage = false;
 
     // Detect user intent (diagnostic vs implementation)
-    const intentResult = host.intentDetector.detect(instruction);
+    const intentResult: IntentResult = options.intent
+      ? { intent: options.intent, confidence: 1, keywords: [], reason: 'Trusted command execution policy' }
+      : host.intentDetector.detect(instruction);
     host.lastIntent = intentResult.intent;
 
     // Display mode indicator
     host.displayIntentMode(intentResult);
 
     // Run environment bootstrap for implementation mode
-    if (intentResult.intent === 'implementation') {
+    if (intentResult.intent === 'implementation' && options.environmentBootstrap !== 'skip') {
       const bootstrapResult = await host.runEnvironmentBootstrap();
       if (!bootstrapResult.success) {
         console.log(chalk.red('\n[BLOCKED] Environment setup failed. Fix issues before proceeding.'));
@@ -374,7 +437,9 @@ export class InstructionRunner {
 
     // Print user instruction AFTER persistent input is started so it
     // renders inside the scroll region (not overwritten by the fixed region).
-    host.printUserInstructionToChatLog(instruction);
+    if (options.echoInTranscript !== false) {
+      host.printUserInstructionToChatLog(instruction);
+    }
 
     // Only one input owner should handle interrupts:
     // InkRenderer, PersistentInput, or fallback ESC listener.

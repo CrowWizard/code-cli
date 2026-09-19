@@ -24,11 +24,12 @@ import type {
 } from "./types.js";
 import { AUTOHAND_FILES, AUTOHAND_HOME } from "./constants.js";
 import { isAutohandInferenceEnabled } from "./featureFlags.js";
-import { autoInitTheme, configureThemeSources, themeExists } from "./ui/theme/index.js";
+import { autoInitTheme, configureThemeSources, getDefaultThemeName, themeExists } from "./ui/theme/index.js";
 import { loadLocalProjectSettings, type LocalProjectSettings } from "./permissions/localProjectPermissions.js";
 import { isAwsBedrockProviderEnabled } from "./features/featureRegistry.js";
 import { getCustomProviderConfig, isCustomProviderName } from "./providers/customProviders.js";
 import { getProviderDefaultModel, getProviderModelOptions, getProviderRuntimeDefaultModel, normalizeOpenRouterModelId } from "./providers/modelCatalog.js";
+import { DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION, MAX_CONCURRENT_THREADS_PER_SESSION, isValidSessionThreadLimit } from "./core/agents/SessionThreadBudget.js";
 
 const DEFAULT_CONFIG_PATH = AUTOHAND_FILES.configJson;
 const TOML_CONFIG_PATH = AUTOHAND_FILES.configToml;
@@ -137,9 +138,10 @@ function createDefaultConfig(): AutohandConfig {
       allowDangerousOps: false,
     },
     ui: {
-      theme: "dark",
+      theme: getDefaultThemeName(),
       autoConfirm: false,
       silentToolOutput: false,
+      taskListPosition: "above-composer",
       completionReportEnabled: true,
       activityVerbsEnabled: true,
       promptSuggestions: true,
@@ -154,13 +156,18 @@ function createDefaultConfig(): AutohandConfig {
     agent: {
       toolSelectionCache: true,
     },
+    features: {
+      multi_agent_v2: {
+        max_concurrent_threads_per_session: DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION,
+      },
+    },
   };
 }
 
 /**
  * Detect config file path - checks for TOML/YAML first, then JSON
  */
-async function detectConfigPath(customPath?: string): Promise<string> {
+export async function detectConfigPath(customPath?: string): Promise<string> {
   if (customPath) {
     return path.resolve(customPath);
   }
@@ -518,7 +525,7 @@ export async function loadConfig(
 
   if (initializeTheme) {
     // Initialize theme from config.
-    const themeName = withEnv.ui?.theme || "dark";
+    const themeName = withEnv.ui?.theme || getDefaultThemeName();
     autoInitTheme(themeName);
   }
 
@@ -643,6 +650,7 @@ function mergeEnvVariables(config: AutohandConfig): AutohandConfig {
   config = {
     ...config,
     api: {
+      accountId: process.env.AUTOHAND_ACCOUNT_ID || config.api?.accountId,
       baseUrl:
         process.env.AUTOHAND_API_URL ||
         normalizeSavedApiBaseUrl(config.api?.baseUrl) ||
@@ -779,8 +787,9 @@ function normalizeConfig(
       },
       ui: {
         autoConfirm: config.dry_run ?? false,
-        theme: "dark",
+        theme: getDefaultThemeName(),
         silentToolOutput: false,
+        taskListPosition: "above-composer",
         completionReportEnabled: true,
         activityVerbsEnabled: true,
         promptSuggestions: true,
@@ -824,6 +833,19 @@ function isLegacyConfig(
 }
 
 function validateConfig(config: AutohandConfig, configPath: string): void {
+  const multiAgentConfig: unknown = config.features?.multi_agent_v2;
+  if (multiAgentConfig !== undefined) {
+    if (!isPlainObject(multiAgentConfig)) {
+      throw new Error(`features.multi_agent_v2 must be an object in ${configPath}`);
+    }
+    const threadLimit = multiAgentConfig.max_concurrent_threads_per_session;
+    if (threadLimit !== undefined && !isValidSessionThreadLimit(threadLimit)) {
+      throw new Error(
+        `features.multi_agent_v2.max_concurrent_threads_per_session must be an integer between 1 and ${MAX_CONCURRENT_THREADS_PER_SESSION} in ${configPath}`,
+      );
+    }
+  }
+
   if (config.blueprintLocal !== undefined) {
     if (!isPlainObject(config.blueprintLocal)) {
       throw new Error(`blueprintLocal must be an object in ${configPath}`);
@@ -881,7 +903,7 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
     if (config.ui.theme && typeof config.ui.theme !== "string") {
       throw new Error(`ui.theme must be a string in ${configPath}`);
     }
-    // Theme validation is lenient — unknown themes fall back to dark at init time.
+    // Theme validation is lenient — unknown themes fall back to the default at init time.
     // This avoids crashes when a Ghostty or custom theme was saved but is no longer available.
     if (
       config.ui.theme &&
@@ -909,6 +931,14 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
       typeof config.ui.mouseComposerCursor !== "boolean"
     ) {
       throw new Error(`ui.mouseComposerCursor must be boolean in ${configPath}`);
+    }
+    const taskListPosition: unknown = config.ui.taskListPosition;
+    if (
+      taskListPosition !== undefined &&
+      taskListPosition !== "up" &&
+      taskListPosition !== "above-composer"
+    ) {
+      throw new Error(`ui.taskListPosition must be up or above-composer in ${configPath}`);
     }
     if (
       config.ui.completionReportEnabled !== undefined &&

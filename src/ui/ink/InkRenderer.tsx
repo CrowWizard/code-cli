@@ -19,14 +19,17 @@ import {
   type AnnouncementLineState,
   type AgentUILineExtensions,
   type AgentUIState,
+  type CommandResultState,
   type ContextTokenDisplay,
   type TurnCompletionStatus,
 } from './AgentUI.js';
+import type { GoalEditRequest } from './GoalPanel.js';
 import type { LiveCommandEntry, ToolOutputEntry, ToolOutputBatchEntry, ToolOutputItem, BatchToolItem } from './ToolOutput.js';
 import type { SlashCommand } from '../../core/slashCommandTypes.js';
 import type { SkillMentionInfo } from '../mentionFilter.js';
 import type { ExtensionKeybinding } from '../../extensions/ExtensionRuntimeHost.js';
 import { ThemeProvider } from '../theme/ThemeContext.js';
+import { getTypedMessageHistory } from '../../session/TypedMessageHistory.js';
 import { I18nProvider } from '../i18n/index.js';
 import { inkRenderOptions } from '../inkRenderOptions.js';
 import { stripAnsiCodes } from '../displayUtils.js';
@@ -39,6 +42,9 @@ import {
 } from '../../core/agent/WorkspaceChangeCapture.js';
 import type { InteractionMode } from '../../core/agent/InteractionModeController.js';
 import type { TeamActivitySnapshot } from '../../core/teams/types.js';
+import type { AgentRunsSnapshot, AgentRunSource } from '../../core/agents/AgentRunStore.js';
+import type { GoalSessionSnapshot } from '../../goals/types.js';
+import type { TaskListPosition } from '../../types.js';
 import type { LineExtension, LineSegment } from './StatusLine.js';
 import {
   createSequencedQueuedWork,
@@ -72,6 +78,10 @@ export interface InkRendererOptions {
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
   mouseComposerCursor?: boolean;
+  taskListPositionProvider?: () => TaskListPosition;
+  onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
+  onCancelAgentRun?: (id: string) => void | Promise<unknown>;
+  onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
 }
 
 export interface SetWorkingOptions {
@@ -184,8 +194,13 @@ interface AgentUIWrapperProps {
   onEscape: () => void;
   onCtrlC: () => void;
   onDismissAnnouncement?: (id: string) => void;
-  onToggleLiveCommandExpanded: () => void;
+  onToggleLiveCommandExpanded: (id?: string) => void;
   onToggleTeamPanel: () => void;
+  onCloseAgentRunsPanel: () => void;
+  onCancelAgentRun?: (id: string) => void | Promise<unknown>;
+  onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
+  onToggleGoalPanel: () => void;
+  onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
   onInputChange: (input: string) => void;
   enableQueueInput?: boolean;
   onImageDetected?: (data: Buffer, mimeType: string, filename?: string) => number;
@@ -202,6 +217,7 @@ interface AgentUIWrapperProps {
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
   mouseComposerCursor?: boolean;
+  taskListPositionProvider?: () => TaskListPosition;
 }
 
 /**
@@ -218,6 +234,11 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       onDismissAnnouncement,
       onToggleLiveCommandExpanded,
       onToggleTeamPanel,
+      onCloseAgentRunsPanel,
+      onCancelAgentRun,
+      onMessageAgentRun,
+      onToggleGoalPanel,
+      onEditGoalObjective,
       onInputChange,
       enableQueueInput,
       onImageDetected,
@@ -234,6 +255,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       getInteractionMode,
       onCycleInteractionMode,
       mouseComposerCursor,
+      taskListPositionProvider,
     } = props;
 
     const [state, setState] = useState<AgentUIState>(initialState);
@@ -259,12 +281,18 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
     return (
       <AgentUI
         state={state}
+        typedMessageHistory={getTypedMessageHistory()}
         onInstruction={onInstruction}
         onEscape={onEscape}
         onCtrlC={onCtrlC}
         onDismissAnnouncement={onDismissAnnouncement}
         onToggleLiveCommandExpanded={onToggleLiveCommandExpanded}
         onToggleTeamPanel={onToggleTeamPanel}
+        onCloseAgentRunsPanel={onCloseAgentRunsPanel}
+        onCancelAgentRun={onCancelAgentRun}
+        onMessageAgentRun={onMessageAgentRun}
+        onToggleGoalPanel={onToggleGoalPanel}
+        onEditGoalObjective={onEditGoalObjective}
         onInputChange={handleInputChange}
         enableQueueInput={enableQueueInput}
         onImageDetected={onImageDetected}
@@ -281,6 +309,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         getInteractionMode={getInteractionMode}
         onCycleInteractionMode={onCycleInteractionMode}
         mouseComposerCursor={mouseComposerCursor}
+        taskListPosition={taskListPositionProvider?.() ?? 'above-composer'}
       />
     );
   }
@@ -442,8 +471,13 @@ export class InkRenderer {
             onEscape={this.options.onEscape}
             onCtrlC={this.options.onCtrlC}
             onDismissAnnouncement={this.options.onDismissAnnouncement}
-            onToggleLiveCommandExpanded={() => this.toggleActiveLiveCommandExpanded()}
+            onToggleLiveCommandExpanded={(id) => this.toggleActiveLiveCommandExpanded(id)}
             onToggleTeamPanel={() => this.toggleTeamPanel()}
+            onCloseAgentRunsPanel={() => this.setAgentRunsPanelVisible(false)}
+            onCancelAgentRun={this.options.onCancelAgentRun}
+            onMessageAgentRun={this.options.onMessageAgentRun}
+            onToggleGoalPanel={() => this.toggleGoalPanel()}
+            onEditGoalObjective={this.options.onEditGoalObjective}
             onInputChange={this.handleInputChange}
             enableQueueInput={this.options.enableQueueInput}
             onImageDetected={this.options.onImageDetected}
@@ -460,6 +494,7 @@ export class InkRenderer {
             getInteractionMode={this.options.getInteractionMode}
             onCycleInteractionMode={this.options.onCycleInteractionMode}
             mouseComposerCursor={this.options.mouseComposerCursor}
+            taskListPositionProvider={this.options.taskListPositionProvider}
           />
         </I18nProvider>
       </ThemeProvider>,
@@ -602,6 +637,7 @@ export class InkRenderer {
     // When starting new work, clear completion stats
     if (isWorking) {
       updates.completionStats = null;
+      updates.commandResult = undefined;
     }
 
     this.updateState(updates);
@@ -661,6 +697,19 @@ export class InkRenderer {
     });
   }
 
+  /**
+   * Keep high-frequency operational command results adjacent to the status
+   * line, rather than growing the transcript above the composer.
+   */
+  setCommandResult(command: string, output: string): void {
+    const content = output.trim();
+    if (!content) {
+      return;
+    }
+    const commandResult: CommandResultState = { command, output: content };
+    this.updateState({ commandResult });
+  }
+
   addNotification(message: string): void {
     const content = message.trim();
     if (!content) {
@@ -700,6 +749,7 @@ export class InkRenderer {
     this.updateState({
       chatMessages: messages,
       staticChatMessageOffset: 0,
+      chatHistoryEpoch: this.state.chatHistoryEpoch + 1,
       userMessages: messages
         .filter((message) => message.role === 'user')
         .map((message) => message.content),
@@ -989,15 +1039,19 @@ export class InkRenderer {
     });
   }
 
-  toggleActiveLiveCommandExpanded(): void {
-    let active = this.state.liveCommands[this.state.liveCommands.length - 1];
+  toggleActiveLiveCommandExpanded(commandId?: string): void {
+    let active = commandId
+      ? this.state.liveCommands.find((entry) => entry.id === commandId)
+      : this.state.liveCommands[this.state.liveCommands.length - 1];
     if (!active) {
       return;
     }
 
     if (this.pendingLiveOutput.has(active.id)) {
       this.flushLiveCommandOutput();
-      active = this.state.liveCommands[this.state.liveCommands.length - 1];
+      active = commandId
+        ? this.state.liveCommands.find((entry) => entry.id === commandId)
+        : this.state.liveCommands[this.state.liveCommands.length - 1];
       if (!active) {
         return;
       }
@@ -1083,12 +1137,32 @@ export class InkRenderer {
     this.updateState({ teamActivity });
   }
 
+  setAgentRuns(agentRuns: AgentRunsSnapshot): void {
+    this.updateState({ agentRuns });
+  }
+
+  setAgentRunsPanelVisible(visible: boolean, source?: AgentRunSource): void {
+    this.updateState({ agentRunsPanelVisible: visible, agentRunsSource: source });
+  }
+
   setTeamPanelVisible(visible: boolean): void {
     this.updateState({ teamPanelVisible: visible });
   }
 
   toggleTeamPanel(): void {
     this.setTeamPanelVisible(!this.state.teamPanelVisible);
+  }
+
+  setGoalActivity(goalActivity: GoalSessionSnapshot): void {
+    this.updateState({ goalActivity });
+  }
+
+  setGoalPanelVisible(visible: boolean): void {
+    this.updateState({ goalPanelVisible: visible });
+  }
+
+  toggleGoalPanel(): void {
+    this.setGoalPanelVisible(!this.state.goalPanelVisible);
   }
 
   /**
@@ -1157,6 +1231,10 @@ export class InkRenderer {
    */
   clearInput(): void {
     this.updateState({ currentInput: '' });
+  }
+
+  setInput(text: string): void {
+    this.updateState({ currentInput: text });
   }
 
   setPendingSuggestion(pendingSuggestion?: Promise<void>): void {
@@ -1273,8 +1351,13 @@ export class InkRenderer {
               onEscape={this.options.onEscape}
               onCtrlC={this.options.onCtrlC}
               onDismissAnnouncement={this.options.onDismissAnnouncement}
-              onToggleLiveCommandExpanded={() => this.toggleActiveLiveCommandExpanded()}
+              onToggleLiveCommandExpanded={(id) => this.toggleActiveLiveCommandExpanded(id)}
               onToggleTeamPanel={() => this.toggleTeamPanel()}
+              onCloseAgentRunsPanel={() => this.setAgentRunsPanelVisible(false)}
+              onCancelAgentRun={this.options.onCancelAgentRun}
+              onMessageAgentRun={this.options.onMessageAgentRun}
+              onToggleGoalPanel={() => this.toggleGoalPanel()}
+              onEditGoalObjective={this.options.onEditGoalObjective}
               onInputChange={this.handleInputChange}
               enableQueueInput={this.options.enableQueueInput}
               onImageDetected={this.options.onImageDetected}
@@ -1291,6 +1374,7 @@ export class InkRenderer {
               getInteractionMode={this.options.getInteractionMode}
               onCycleInteractionMode={this.options.onCycleInteractionMode}
               mouseComposerCursor={this.options.mouseComposerCursor}
+              taskListPositionProvider={this.options.taskListPositionProvider}
             />
           </I18nProvider>
         </ThemeProvider>,

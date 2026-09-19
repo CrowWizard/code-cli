@@ -9,6 +9,7 @@ import os from 'node:os';
 import { showModal, type ModalOption } from '../ui/ink/components/Modal.js';
 import { FileActionManager } from '../actions/filesystem.js';
 import { getProviderConfig, saveConfig } from '../config.js';
+import { resolveAutohandAIModelForTier } from './agent/AutohandAIModelTierPolicy.js';
 import { getAuthClient } from '../auth/index.js';
 import {
   formatComposerPlanLabel,
@@ -17,7 +18,7 @@ import {
 } from '../billing/planSummary.js';
 
 /** Slow on purpose: the plan changes rarely and this must not add load. */
-const ACCOUNT_PLAN_REFRESH_MS = 5 * 60 * 1000;
+const ACCOUNT_PLAN_REFRESH_MS = 30_000;
 import { safePrompt } from '../utils/prompt.js';
 import { maybeOfferAutohandAISwitch } from '../commands/login.js';
 import { getFeatureState, isAwsBedrockProviderEnabled } from '../features/featureRegistry.js';
@@ -32,6 +33,7 @@ import { isAutohandDebugEnabled, writeAutohandDebugLine } from '../utils/debugLo
 import type { UIManager } from '../ui/UIManager.js';
 import { GitIgnoreParser } from '../utils/gitIgnore.js';
 import { ConversationManager } from './conversationManager.js';
+import { ToolImageStore } from './ToolImageStore.js';
 import { ContextOrchestrator } from './context/orchestrator.js';
 import {
   BROWSER_V2_TOOL_DEFINITIONS,
@@ -49,6 +51,7 @@ import type {
   AgentRuntime,
   AgentAction,
   LLMMessage,
+  MultimodalMessage,
   AgentStatusSnapshot,
   AgentOutputEvent,
   ToolCallRequest,
@@ -74,6 +77,7 @@ import { ErrorLogger } from './errorLogger.js';
 import { MemoryManager } from '../memory/MemoryManager.js';
 import { FeedbackManager } from '../feedback/FeedbackManager.js';
 import { TelemetryManager } from '../telemetry/TelemetryManager.js';
+import type { CommandUseData, CommandUseSurface } from '../telemetry/types.js';
 import {
   extractAndSaveSessionMemories,
   type ExtractedMemory,
@@ -96,6 +100,8 @@ import {
 } from '../permissions/types.js';
 import { HookManager } from './HookManager.js';
 import { TeamManager } from './teams/TeamManager.js';
+import type { AgentRunStore } from './agents/AgentRunStore.js';
+import type { SessionThreadBudget } from './agents/SessionThreadBudget.js';
 import { RepeatManager } from './RepeatManager.js';
 import type { SessionWorktreeInfo } from '../utils/sessionWorktree.js';
 import { ActivityIndicator } from '../ui/activityIndicator.js';
@@ -178,6 +184,7 @@ import {
   type FreshAgentSessionHost,
   type FreshAgentSessionRecord,
   type FreshAgentSessionStateHost,
+  type RunAgentCommandModeOptions,
 } from './agent/AgentLifecycleRunner.js';
 import { promptForAgentInstruction, type AgentPromptInstructionHost } from './agent/PromptInstructionReader.js';
 import {
@@ -406,6 +413,8 @@ export class AutohandAgent {
   private notificationService!: NotificationService;
   private versionCheckResult?: VersionCheckResult;
   private teamManager!: TeamManager;
+  private agentRunStore!: AgentRunStore;
+  private sessionThreadBudget!: SessionThreadBudget;
   private repeatManager!: RepeatManager;
   private shutdownPromise: Promise<void> | null = null;
   private teamShutdownPromise: Promise<void> | null = null;
@@ -418,6 +427,8 @@ export class AutohandAgent {
   private sessionDiffStatsTracker?: SessionDiffStatsTracker;
   /** Account plan shown on the status line; refreshed so upgrades appear mid-session. */
   private accountPlan: PlanSummary | null = null;
+  private lastPaymentNotice: string | null = null;
+  private accountPlanRefresh?: Promise<void>;
   private accountPlanTimer?: ReturnType<typeof setInterval>;
   private activeAgentHeartbeat: ActiveAgentHeartbeat | null = null;
   private readonly peerAwareness: PeerAwarenessManager;
@@ -476,6 +487,7 @@ export class AutohandAgent {
 
   // New feature modules
   private imageManager!: ImageManager;
+  private toolImages?: { workspaceRoot: string; store: ToolImageStore };
   private intentDetector!: IntentDetector;
   private environmentBootstrap!: EnvironmentBootstrap;
   private codeQualityPipeline!: CodeQualityPipeline;
@@ -535,7 +547,12 @@ export class AutohandAgent {
       },
       setPermissionProfile: (profile) => this.setInteractionModePermissionProfile(profile),
     });
-    this.interactionModeController.normalizeCurrentMode();
+    if (runtime.options.plan) {
+      getPlanModeManager().disable();
+      this.interactionModeController.setMode('plan');
+    } else {
+      this.interactionModeController.normalizeCurrentMode();
+    }
     this.sessionDiffStatsTracker = new SessionDiffStatsTracker(runtime.workspaceRoot);
     this.instructionRunner = new InstructionRunner(this as unknown as AgentInstructionHost);
   }
@@ -682,13 +699,13 @@ export class AutohandAgent {
   /**
    * Initialize the agent for RPC mode (no interactive loop or command mode)
    */
-  async initializeForRPC(signal?: AbortSignal): Promise<void> {
-    return initializeAgentForRPC(this, signal);
+  async initializeForRPC(signal?: AbortSignal, existingSessionId?: string): Promise<void> {
+    return initializeAgentForRPC(this, signal, existingSessionId);
   }
 
   async runCommandMode(
     instruction: string,
-    options: AbortSignal | { signal?: AbortSignal; keepAlive?: boolean } = {},
+    options: AbortSignal | RunAgentCommandModeOptions = {},
   ): Promise<boolean> {
     return runAgentCommandMode(
       this,
@@ -724,8 +741,8 @@ export class AutohandAgent {
     };
   }
 
-  private async restoreSessionState(sessionId: string) {
-    return restoreAgentSessionState(this, sessionId);
+  private async restoreSessionState(session: string | import('../session/SessionManager.js').Session) {
+    return restoreAgentSessionState(this, session);
   }
 
   async attachSession(sessionId: string): Promise<{ sessionId: string; model: string; workspaceRoot: string; messageCount: number }> {
@@ -980,6 +997,7 @@ export class AutohandAgent {
   }
 
   async runInstruction(instruction: string, options?: RunInstructionOptions): Promise<boolean> {
+    await this.refreshAccountPlan();
     this.currentInstructionText = instruction;
     try {
       return await this.runInstructionWithPeerActivity(instruction, options);
@@ -1270,6 +1288,7 @@ export class AutohandAgent {
       ensureSpinnerRunning: () => agent.ensureSpinnerRunning(),
       forceRenderSpinner: () => agent.forceRenderSpinner(),
       getMessagesWithImages: () => agent.getMessagesWithImages(),
+      attachToolImages: (message, imagePaths, signal) => agent.getToolImageStore().attach(message, imagePaths, signal),
       getReactionParser: () => agent.getReactionParser(),
       handleSmartContextCrop: (call) => agent.handleSmartContextCrop(call),
       isContextOverflowError: (errorOrMessage) => agent.isContextOverflowError(errorOrMessage),
@@ -1343,7 +1362,7 @@ export class AutohandAgent {
 
     const request = detectSpecialistRequest(instruction);
     if (!request) {
-      const continuation = await this.specialistOrchestrator.continueInterview(instruction);
+      const continuation = await this.specialistOrchestrator.continueInterview(instruction, { signal: this.activeAbortController?.signal });
       return continuation ? formatSpecialistResults(continuation) : undefined;
     }
 
@@ -1353,14 +1372,21 @@ export class AutohandAgent {
   private async orchestrateSpecialistsFromTool(
     objective: string,
     requestedRoles: string[],
+    signal?: AbortSignal,
   ): Promise<string> {
     return this.runSpecialistOrchestration(
       createSpecialistRequest(objective, requestedRoles, 'tool'),
+      signal,
     );
   }
 
-  private async runSpecialistOrchestration(request: SpecialistRequest): Promise<string> {
+  private async runSpecialistOrchestration(
+    request: SpecialistRequest,
+    signal = this.activeAbortController?.signal,
+  ): Promise<string> {
+    signal?.throwIfAborted();
     const plan = await this.specialistOrchestrator.resolve(request);
+    signal?.throwIfAborted();
     console.log(`\n${formatSpecialistRoster(plan)}\n`);
     const stagedInstallation = this.specialistOrchestrator.stageCatalogInstallation(plan);
     if (stagedInstallation) {
@@ -1370,16 +1396,17 @@ export class AutohandAgent {
           plan_id: stagedInstallation.planId,
           agent_names: stagedInstallation.agentNames,
         },
-      }]);
-      if (!installation.success) {
+      }], undefined, { signal });
+      if (!installation?.success) {
         this.specialistOrchestrator.declineStagedCatalogInstallation(stagedInstallation.planId);
       }
+      signal?.throwIfAborted();
     }
     if (plan.selectedAgents.length === 0) {
       return formatSpecialistResults({ plan, batches: [], completed: false });
     }
 
-    const result = await this.specialistOrchestrator.execute(plan);
+    const result = await this.specialistOrchestrator.execute(plan, { signal });
     return formatSpecialistResults(result);
   }
 
@@ -1434,8 +1461,12 @@ export class AutohandAgent {
     // Remove **Thought:** prefix pattern
     cleaned = cleaned.replace(/^\*\*Thought:\*\*\s*/i, '');
 
-    // Remove trailing JSON-like fragments
-    cleaned = cleaned.replace(/\}\s*\]\s*\}?\s*$/g, '');
+    // A valid structured answer can end in the same brackets as a leaked fragment.
+    try {
+      JSON.parse(cleaned);
+    } catch {
+      cleaned = cleaned.replace(/\}\s*\]\s*\}?\s*$/g, '');
+    }
 
     // Clean up excessive whitespace
     cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
@@ -1468,15 +1499,24 @@ export class AutohandAgent {
   }
 
   /**
-   * Sync the active provider and model into the Ink status line.
+   * Refresh the plan and payment notice without requiring a restart. At an idle
+   * instruction boundary, align the Cloud model with current access. Failed
+   * refreshes retain the last known display; the API enforces each request.
    */
-  /**
-   * Re-read the account plan and put it back on the status line. Runs at startup and
-   * on a slow timer, so an upgrade made in the console shows up without a restart.
-   * Never throws: the plan is decoration, not something worth interrupting a session for.
-   */
-  private async refreshAccountPlan(): Promise<void> {
-    const token = this.runtime.config.auth?.token;
+  private refreshAccountPlan(): Promise<void> {
+    if (this.accountPlanRefresh) return this.accountPlanRefresh;
+    const pending = this.readAccountPlan().finally(() => { this.accountPlanRefresh = undefined; });
+    this.accountPlanRefresh = pending;
+    return pending;
+  }
+
+  private async readAccountPlan(): Promise<void> {
+    const currentToken = () => this.activeProvider === 'autohandai' && this.runtime.config.autohandai?.plan === 'cloud'
+      ? (this.runtime.config.autohandai.authMode === 'account'
+          ? this.runtime.config.autohandai.accountToken ?? this.runtime.config.auth?.token
+          : this.runtime.config.autohandai.apiKey ?? this.runtime.config.auth?.token)
+      : this.runtime.config.auth?.token;
+    const token = currentToken();
     if (!token) {
       this.accountPlan = null;
       return;
@@ -1484,7 +1524,23 @@ export class AutohandAgent {
 
     try {
       const entitlement = await getAuthClient().fetchEntitlement(token);
+      if (!entitlement || token !== currentToken()) return;
       const next = planSummaryFromEntitlement(entitlement);
+      const payment = entitlement.paymentAccess;
+      const noticeId = payment ? `${payment.actionUrl}:${payment.since}` : null;
+      if (payment && noticeId !== this.lastPaymentNotice) {
+        const content = `${payment.message}\nManage billing: ${payment.actionUrl}`;
+        this.emitOutput({ type: 'message', content });
+        if (!this.runtime.isRpcMode) this.notifyUser(content);
+      }
+      this.lastPaymentNotice = noticeId;
+      const settings = this.runtime.config.autohandai;
+      const model = this.runtime.options.model ?? settings?.model;
+      const resolvedModel = resolveAutohandAIModelForTier({ provider: this.activeProvider, plan: settings?.plan, model, tier: entitlement.tier });
+      if (!this.isInstructionActive && model && resolvedModel !== model && this.providerConfigManager) {
+        if (settings) delete settings.reasoningEffort;
+        await this.providerConfigManager.applyModelChangeRemote('autohandai', resolvedModel);
+      }
       const changed =
         next?.tier !== this.accountPlan?.tier ||
         next?.interval !== this.accountPlan?.interval ||
@@ -2238,8 +2294,16 @@ export class AutohandAgent {
    * Handle a slash command (e.g., /skills, /skills install, /model)
    * Returns the command output or null if the command doesn't exist
    */
-  async handleSlashCommand(command: string, args: string[] = []): Promise<string | null> {
-    return handleAgentSlashCommand(this, command, args);
+  async handleSlashCommand(
+    command: string,
+    args: string[] = [],
+    surface: CommandUseSurface = 'interactive',
+  ): Promise<string | null> {
+    return handleAgentSlashCommand(this, command, args, surface);
+  }
+
+  async trackCommandUsage(data: CommandUseData): Promise<void> {
+    await this.telemetryManager.trackCommand(data);
   }
 
   /**
@@ -2264,22 +2328,20 @@ export class AutohandAgent {
     return parseAgentSlashCommand(this, input);
   }
 
-  /**
-   * Get messages with images included for the LLM API call.
-   * Modifies the last user message to include any images from the session.
-   * Uses ImageManager.toOpenAIFormat() which applies size limits to prevent
-   * the 53MB+ payload overflow issue (Issue #81).
-   * The returned messages may have multimodal content (array of text/image parts)
-   * which is supported by OpenAI/OpenRouter APIs but not strictly typed.
-   * @returns Messages formatted for API with multimodal content
-   */
-  private async getMessagesWithImages(): Promise<LLMMessage[]> {
+  private getToolImageStore(): ToolImageStore {
+    const workspaceRoot = this.runtime.workspaceRoot;
+    if (this.toolImages?.workspaceRoot !== workspaceRoot) {
+      this.toolImages = { workspaceRoot, store: new ToolImageStore(workspaceRoot) };
+    }
+    return this.toolImages.store;
+  }
+
+  private async getMessagesWithImages(): Promise<MultimodalMessage[]> {
     const messages = this.conversation.history();
     const images = this.imageManager.getAll();
 
-    // If no images, return messages as-is
     if (images.length === 0) {
-      return messages;
+      return this.getToolImageStore().prepare(messages);
     }
 
     // Find the last user message to attach images to
@@ -2294,27 +2356,17 @@ export class AutohandAgent {
     // Use ImageManager's size-limited format (prevents 53MB+ payloads)
     const imageContents = await this.imageManager.toOpenAIFormat();
 
-    // Clone messages and modify the last user message to include images
-    const result: LLMMessage[] = messages.map((msg, i) => {
+    const result: MultimodalMessage[] = messages.map((msg, i) => {
       if (i === lastUserMessageIndex && imageContents.length > 0) {
-        // Create multimodal content array
-        // Note: content will be an array, which the API accepts but our type says string
-        // This is intentional for multimodal support
-        const contentParts = [
-          { type: 'text', text: msg.content },
-          ...imageContents,
-        ];
-
         return {
           ...msg,
-          // Cast to string to satisfy type, API actually accepts array
-          content: contentParts as unknown as string
+          content: [{ type: 'text', text: msg.content }, ...imageContents],
         };
       }
-      return { ...msg };
+      return msg;
     });
 
-    return result;
+    return this.getToolImageStore().prepare(result);
   }
 
 
@@ -2822,7 +2874,10 @@ export class AutohandAgent {
           claims: this.peerAwareness.getClaims(),
           headRef: this.peerAwareness.getRepoBaseline(),
         }),
-        onHeartbeat: () => this.refreshPeerAwareness(),
+        onHeartbeat: (record) => {
+          this.peerAwareness.setSessionId(record.sessionId);
+          return this.refreshPeerAwareness();
+        },
       },
     );
     this.activeAgentHeartbeat = heartbeat;

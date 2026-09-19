@@ -106,8 +106,11 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
       ...(request.promptCache ? { prompt_cache_key: request.promptCache.key } : {}),
     };
     const instructions = request.messages
-      .filter((message) => message.role === 'system' && message.content.trim())
-      .map((message) => message.content.trim())
+      .flatMap((message) => {
+        if (message.role !== 'system' || typeof message.content !== 'string') return [];
+        const content = message.content.trim();
+        return content ? [content] : [];
+      })
       .join('\n\n');
     if (instructions) body.instructions = instructions;
     if (request.temperature !== undefined) body.temperature = request.temperature;

@@ -10,6 +10,8 @@ import fs from 'fs-extra';
 import path from 'node:path';
 import { AUTOHAND_HOME } from '../constants.js';
 import { loadConfig } from '../config.js';
+import { syncAccountSkills } from './AccountSkills.js';
+import { getOrCreateCodingAgentDeviceId } from './CodingAgentControlPlane.js';
 import type { McpSettings } from '../types.js';
 import {
   syncCodingAgentControlPlane,
@@ -75,6 +77,8 @@ class SyncOperationStoppedError extends Error {
 }
 
 export interface SyncServiceOptions {
+  /** The CLI profile whose account owns managed connectors and skills. */
+  controlPlaneConfigPath?: string;
   /** Auth token for API calls */
   authToken: string;
   /** User ID from auth */
@@ -105,18 +109,16 @@ function isJsonObject(value: unknown): value is JsonObject {
 function stripUnsyncedConfigFields(config: JsonObject): JsonObject {
   const rest = { ...config };
   delete rest.auth;
+  delete rest.mcp;
   return rest;
 }
 
 function mergeDownloadedConfig(downloaded: JsonObject, local: JsonObject | null): JsonObject {
-  const sanitizedDownloaded = stripUnsyncedConfigFields(downloaded);
-  if (local && Object.prototype.hasOwnProperty.call(local, 'auth')) {
-    return {
-      ...sanitizedDownloaded,
-      auth: local.auth,
-    };
+  const merged = stripUnsyncedConfigFields(downloaded);
+  for (const key of ['auth', 'mcp']) {
+    if (local && Object.prototype.hasOwnProperty.call(local, key)) merged[key] = local[key];
   }
-  return sanitizedDownloaded;
+  return merged;
 }
 
 function isRemoteNewer(localFile: SyncFileEntry, remoteFile: SyncFileEntry): boolean {
@@ -139,6 +141,7 @@ export class SyncService {
   private readonly onAuthFailure: (() => void) | undefined;
   private readonly onControlPlaneMcpApplied: ((mcp: McpSettings | undefined) => Promise<void> | void) | undefined;
   private readonly basePath: string;
+  private readonly controlPlaneConfigPath: string;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private syncing = false;
@@ -149,6 +152,7 @@ export class SyncService {
   private operationController: AbortController | null = null;
   private activeOperation: Promise<SyncResult> | null = null;
   private shutdownPromise: Promise<void> | null = null;
+  private lastAppliedMcpFingerprint: string | undefined;
 
   constructor(options: SyncServiceOptions) {
     this.authToken = options.authToken;
@@ -159,6 +163,7 @@ export class SyncService {
     this.onAuthFailure = options.onAuthFailure;
     this.onControlPlaneMcpApplied = options.onControlPlaneMcpApplied;
     this.basePath = AUTOHAND_HOME;
+    this.controlPlaneConfigPath = options.controlPlaneConfigPath ?? path.join(this.basePath, 'config.json');
   }
 
   /**
@@ -303,6 +308,8 @@ export class SyncService {
     try {
       this.assertOperationActive(context);
       this.onEvent({ type: 'sync_started' });
+      const accountSkillError = await this.syncCodingAgentControlPlane(context);
+      this.assertOperationActive(context);
 
       // 1. Build local manifest
       const enabledRoots = await this.getIncludePaths();
@@ -411,15 +418,9 @@ export class SyncService {
       });
       this.assertOperationActive(context);
 
-      // Connector configuration and safe settings metadata live on a dedicated
-      // account-scoped control plane. They deliberately do not share the generic
-      // encrypted file sync manifest because Console needs a redacted, structured
-      // view while connector credentials must remain unavailable to the browser.
-      await this.syncCodingAgentControlPlane(context);
-      this.assertOperationActive(context);
-
       const result: SyncResult = {
-        success: true,
+        success: !accountSkillError,
+        ...(accountSkillError ? { error: accountSkillError } : {}),
         uploaded,
         downloaded,
         conflicts,
@@ -460,21 +461,34 @@ export class SyncService {
     }
   }
 
-  private async syncCodingAgentControlPlane(context: SyncOperationContext): Promise<void> {
+  private async syncCodingAgentControlPlane(context: SyncOperationContext): Promise<string | undefined> {
     // Account-managed connectors belong to the user's global Coding Agent
     // configuration. Project and test sync roots must remain file-sync only.
     if (path.resolve(this.basePath) !== path.resolve(AUTOHAND_HOME)) return;
-    const config = await loadConfig(path.join(this.basePath, 'config.json'));
+    const config = await loadConfig(this.controlPlaneConfigPath);
     this.assertOperationActive(context);
     if (!config.auth?.token) return;
-    const result = await syncCodingAgentControlPlane(config, this.authToken, {
+    let skillSyncError: string | undefined;
+    try {
+      await syncAccountSkills(config, this.authToken, await getOrCreateCodingAgentDeviceId(), { signal: context.signal });
+    } catch (error) {
+      this.assertOperationActive(context);
+      skillSyncError = error instanceof Error ? error.message : 'Account skill sync failed';
+      this.emitOperationEvent(context, { type: 'download_error', path: '.account-skills/snapshot.json', error: skillSyncError });
+    }
+    await syncCodingAgentControlPlane(config, this.authToken, {
       signal: context.signal,
+      onMcpApplied: async (mcp) => {
+        this.assertOperationActive(context);
+        const fingerprint = JSON.stringify(mcp ?? null);
+        if (this.lastAppliedMcpFingerprint === fingerprint) return;
+        await this.onControlPlaneMcpApplied?.(mcp);
+        this.assertOperationActive(context);
+        this.lastAppliedMcpFingerprint = fingerprint;
+      },
     });
     this.assertOperationActive(context);
-    if (result.changed) {
-      await this.onControlPlaneMcpApplied?.(result.mcp);
-      this.assertOperationActive(context);
-    }
+    return skillSyncError;
   }
 
   private isOperationActive(context: SyncOperationContext): boolean {

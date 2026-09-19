@@ -31,7 +31,7 @@ import type {
   MobileRelayController,
 } from '../mobile/MobileRelay.js';
 import type { ExtensionService } from '../extensions/ExtensionService.js';
-import type { PendingPostTurnAction } from './agent/PostTurnActionCoordinator.js';
+import type { PendingPostTurnAction, QueuedInstructionPolicy } from './agent/PostTurnActionCoordinator.js';
 import type { InteractionMode } from './agent/InteractionModeController.js';
 import type { AnnouncementManagerContract } from '../announcements/AnnouncementManager.js';
 import type { AccountEntitlement } from '../auth/AuthClient.js';
@@ -45,12 +45,14 @@ export interface SlashCommandContext {
     promptApprovalMode?: () => Promise<void>;
     createAgentsFile: () => Promise<void>;
     resetConversation: () => void | Promise<void>;
+    setComposerInput?: (text: string) => void;
     sessionManager: SessionManager;
     currentSession?: Session;
     memoryManager: MemoryManager;
     permissionManager: PermissionManager;
     /** Hook manager for /hooks commands */
     hookManager?: HookManager;
+    hookAuthoring?: Pick<import('./HookAuthoringService.js').HookAuthoringService, 'create'>;
     llm: LLMProvider;
     workspaceRoot: string;
     model: string;
@@ -114,6 +116,7 @@ export interface SlashCommandContext {
     isContextCompactionEnabled?: () => boolean;
     /** Whether running in non-interactive mode (RPC/ACP) where stdin is not a TTY */
     isNonInteractive?: boolean;
+    runCancellableOperation?: <T>(operation: (signal: AbortSignal) => Promise<T>) => Promise<T>;
     /** Called before /learn shows a modal (pause persistent input) */
     onBeforeModal?: () => void | Promise<void>;
     /** Called after /learn modal closes (resume persistent input) */
@@ -124,12 +127,15 @@ export interface SlashCommandContext {
     teamManager?: TeamManager;
     /** Toggle the expanded live team activity view. */
     onToggleTeamView?: (visible: boolean) => void;
+    onToggleAgentRunsView?: (visible: boolean, source?: import('./agents/AgentRunStore.js').AgentRunSource) => void;
+    /** Toggle the expanded persistent goal queue view. */
+    onToggleGoalView?: (visible: boolean) => void;
     /** Peer awareness manager for /peers command */
     peerAwareness?: import('../session/peers/PeerAwarenessManager.js').PeerAwarenessManager;
     /** Repeat manager for /repeat recurring prompt scheduling */
     repeatManager?: RepeatManager;
     /** Queue an instruction to be sent to the LLM on the next turn (not displayed to user) */
-    queueInstruction?: (instruction: string, postTurnAction?: PendingPostTurnAction) => void;
+    queueInstruction?: (instruction: string, postTurnAction?: PendingPostTurnAction, policy?: QueuedInstructionPolicy) => void;
     /** Run the consent-gated Open Research publication flow for a saved report. */
     requestResearchPublication?: (reportPath: string) => Promise<string>;
     /** Queue a visible user instruction, matching a typed prompt in the interactive UI */
@@ -166,6 +172,8 @@ export interface SlashCommandContext {
     clearScreen?: () => void;
     /** Restore an existing session into the active conversation and UI. */
     restoreSession?: (sessionId: string) => Promise<void>;
+    /** Restore an already loaded session without a duplicate disk read. */
+    restoreLoadedSession?: (session: Session) => Promise<void>;
 }
 
 export interface SlashCommandSubcommand {

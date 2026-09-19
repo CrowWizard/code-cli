@@ -7,12 +7,14 @@ import crypto from 'node:crypto';
 import fs from 'fs-extra';
 import path from 'node:path';
 import { PROJECT_DIR_NAME } from '../constants.js';
+import { ActiveAgentRegistry } from '../session/ActiveAgentRegistry.js';
 import { parseQueueBlockItems } from './queueBlockParser.js';
 import { listGoalTemplateMetadata, resolveGoalTemplateByName, resolveGoalTemplateInvocation } from './templates.js';
 import type {
   CompletedGoal,
   GoalCreateInput,
   GoalMutationResult,
+  GoalPeer,
   GoalSessionSnapshot,
   GoalSnapshot,
   GoalState,
@@ -23,9 +25,23 @@ import type {
 
 const GOAL_STATE_FILE = 'goals.local.json';
 const MAX_OBJECTIVE_LENGTH = 80_000;
+/** Key used for goals created by managers without a session (RPC/CLI). */
+const UNKNOWN_SESSION_KEY = '__unscoped__';
+
+type GoalSnapshotPublisher = () => Promise<void>;
+
+const snapshotPublishers = new Map<string, Set<GoalSnapshotPublisher>>();
 
 export interface GoalManagerOptions {
   sessionId?: string;
+  /** Resolve the active session lazily for long-lived UI subscriptions. */
+  getSessionId?: () => string | undefined;
+  /**
+   * Liveness probe for sessions that own active goals. Defaults to the
+   * active-agent heartbeat registry, which prunes records for dead PIDs and
+   * stale heartbeats. Peer goals are reported, never mutated, by this probe.
+   */
+  isSessionAlive?: (sessionId: string) => Promise<boolean>;
 }
 
 export function buildGoalContinuationInstruction(objective: string): string {
@@ -38,68 +54,93 @@ export function buildGoalContinuationInstruction(objective: string): string {
 
 export class GoalManager {
   private readonly sessionId?: string;
+  private readonly getSessionId?: () => string | undefined;
+  private readonly isSessionAlive: (sessionId: string) => Promise<boolean>;
 
   constructor(
     private readonly workspaceRoot: string,
     options: GoalManagerOptions = {},
   ) {
     this.sessionId = options.sessionId?.trim() || undefined;
+    this.getSessionId = options.getSessionId;
+    this.isSessionAlive = options.isSessionAlive ?? defaultSessionLivenessProbe;
+  }
+
+  /** The key under which this manager's goal lives in the snapshot. */
+  private goalKey(): string {
+    return this.getSessionId?.()?.trim() || this.sessionId || UNKNOWN_SESSION_KEY;
   }
 
   async getSnapshot(): Promise<GoalSnapshot> {
     const snapshot = await this.readSnapshot();
-    const goal = snapshot.goal ? this.withLiveElapsed(snapshot.goal) : null;
-    return { ...snapshot, goal };
+    const goals = Object.fromEntries(
+      Object.entries(snapshot.goals).map(([key, goal]) => [key, this.withLiveElapsed(goal)]),
+    );
+    return { ...snapshot, goals };
   }
 
   async getSessionSnapshot(): Promise<GoalSessionSnapshot> {
     const snapshot = await this.getSnapshot();
-    const publicSnapshot: Omit<GoalSnapshot, 'activeSessionId'> = {
-      version: snapshot.version,
-      goal: snapshot.goal,
+    const key = this.goalKey();
+    const goal = snapshot.goals[key] ?? null;
+    const peers = await this.buildPeers(snapshot, key);
+    const hasDetachedUnscopedGoal = key !== UNKNOWN_SESSION_KEY
+      && snapshot.goals[UNKNOWN_SESSION_KEY] !== undefined;
+    let message: string | undefined;
+    if (peers.length > 0) {
+      message = 'No goal is attached to this session. Other sessions are running goals in this workspace; create your own with /goal <objective> to run concurrently.';
+    } else if (hasDetachedUnscopedGoal) {
+      message = 'A persisted goal exists but is not attached to the current session.';
+    }
+
+    if (!goal) {
+      return {
+        version: 2,
+        goal: null,
+        queue: snapshot.queue,
+        completed: snapshot.completed,
+        updatedAt: snapshot.updatedAt,
+        sessionAttachment: key === UNKNOWN_SESSION_KEY ? 'unscoped' : 'none',
+        peers,
+        message,
+      };
+    }
+    return {
+      version: 2,
+      goal,
       queue: snapshot.queue,
       completed: snapshot.completed,
       updatedAt: snapshot.updatedAt,
+      sessionAttachment: key === UNKNOWN_SESSION_KEY ? 'unscoped' : 'attached',
+      peers,
     };
+  }
 
-    if (!snapshot.goal) {
-      return { ...publicSnapshot, sessionAttachment: 'none' };
-    }
-    if (!this.sessionId) {
-      return { ...publicSnapshot, sessionAttachment: 'unscoped' };
-    }
-    if (snapshot.activeSessionId === this.sessionId) {
-      return { ...publicSnapshot, sessionAttachment: 'attached' };
-    }
+  subscribe(listener: (snapshot: GoalSessionSnapshot) => void): () => void {
+    const statePath = this.statePath();
+    const publish = async (): Promise<void> => {
+      listener(await this.getSessionSnapshot());
+    };
+    const publishers = snapshotPublishers.get(statePath) ?? new Set<GoalSnapshotPublisher>();
+    publishers.add(publish);
+    snapshotPublishers.set(statePath, publishers);
+    void publish().catch(() => {});
 
-    return {
-      ...publicSnapshot,
-      goal: null,
-      queue: [],
-      completed: [],
-      sessionAttachment: 'detached',
-      detachedGoal: {
-        goalId: snapshot.goal.goalId,
-        status: snapshot.goal.status,
-        createdAt: snapshot.goal.createdAt,
-        updatedAt: snapshot.goal.updatedAt,
-      },
-      message: [
-        'A persistent goal exists for this workspace but is not attached to the current session.',
-        'Do not continue it from this turn. Use /goal to inspect it or /goal resume to explicitly attach it.',
-      ].join(' '),
+    return () => {
+      publishers.delete(publish);
+      if (publishers.size === 0) {
+        snapshotPublishers.delete(statePath);
+      }
     };
   }
 
   async getActiveGoalForSession(): Promise<GoalState | null> {
     const snapshot = await this.getSnapshot();
-    if (
-      snapshot.goal?.status !== 'active'
-      || !this.isSnapshotAttachedToCurrentSession(snapshot)
-    ) {
+    const goal = snapshot.goals[this.goalKey()];
+    if (!goal || goal.status !== 'active') {
       return null;
     }
-    return snapshot.goal;
+    return goal;
   }
 
   async listTemplates(): Promise<GoalTemplateMetadata[]> {
@@ -124,10 +165,12 @@ export class GoalManager {
   async createGoal(input: GoalCreateInput, opts: { replace?: boolean } = {}): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
     const validation = validateGoalInput(input);
-    if (validation) return result(snapshot, false, validation);
+    if (validation) return this.result(snapshot, false, validation);
 
-    if (snapshot.goal && snapshot.goal.status !== 'complete' && !opts.replace) {
-      return result(snapshot, false, 'A goal already exists. Clear it, complete it, or queue the new objective before replacing it.');
+    const key = this.goalKey();
+    const existing = snapshot.goals[key];
+    if (existing && existing.status !== 'complete' && !opts.replace) {
+      return this.result(snapshot, false, 'A goal already exists for this session. Clear it, complete it, or queue the new objective before replacing it.');
     }
 
     const now = Date.now();
@@ -146,17 +189,20 @@ export class GoalManager {
     };
     const next: GoalSnapshot = {
       ...snapshot,
-      goal,
+      goals: { ...snapshot.goals, [key]: goal },
       updatedAt: now,
-      activeSessionId: this.sessionId,
     };
     await this.writeSnapshot(next);
-    return result(next, true, snapshot.goal?.status === 'complete' ? 'Goal created; replaced completed goal.' : 'Goal created.');
+    const message = existing && existing.status === 'complete'
+      ? 'Goal created; replaced completed goal.'
+      : 'Goal created.';
+    return this.result(next, true, message);
   }
 
   async createOrQueueGoal(input: GoalCreateInput & { source: QueuedGoal['source'] }): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
-    const current = snapshot.goal ? this.withLiveElapsed(snapshot.goal) : null;
+    const key = this.goalKey();
+    const current = snapshot.goals[key] ? this.withLiveElapsed(snapshot.goals[key]) : null;
     if (current && current.status !== 'complete' && current.status !== 'budgetLimited') {
       return this.enqueueGoal(input);
     }
@@ -165,15 +211,16 @@ export class GoalManager {
 
   async updateGoal(input: GoalUpdateInput): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
-    const current = snapshot.goal ? this.withLiveElapsed(snapshot.goal) : null;
-    if (!current) return result(snapshot, false, 'No goal exists to update.');
+    const key = this.goalKey();
+    const current = snapshot.goals[key] ? this.withLiveElapsed(snapshot.goals[key]) : null;
+    if (!current) return this.result(snapshot, false, 'No goal exists for this session to update.');
 
     let next: GoalState = { ...current };
     const changes: string[] = [];
     if (input.objective !== undefined) {
       const objective = input.objective.trim();
-      if (!objective) return result(snapshot, false, 'objective must be non-empty.');
-      if (objective.length > MAX_OBJECTIVE_LENGTH) return result(snapshot, false, `objective is too long (max ${MAX_OBJECTIVE_LENGTH} characters).`);
+      if (!objective) return this.result(snapshot, false, 'objective must be non-empty.');
+      if (objective.length > MAX_OBJECTIVE_LENGTH) return this.result(snapshot, false, `objective is too long (max ${MAX_OBJECTIVE_LENGTH} characters).`);
       next = { ...next, objective };
       changes.push('objective');
     }
@@ -182,51 +229,51 @@ export class GoalManager {
       next = { ...next, tokenBudget: value };
       changes.push('token budget');
     });
-    if (budgetError) return result(snapshot, false, budgetError);
+    if (budgetError) return this.result(snapshot, false, budgetError);
     const timeBudgetError = applyOptionalPositiveInteger(input.timeBudgetSeconds, (value) => {
       next = { ...next, timeBudgetSeconds: value };
       changes.push('time budget');
     });
-    if (timeBudgetError) return result(snapshot, false, timeBudgetError);
+    if (timeBudgetError) return this.result(snapshot, false, timeBudgetError);
     const minTokensError = applyOptionalPositiveInteger(input.minTokensBeforeWrapUp, (value) => {
       next = { ...next, minTokensBeforeWrapUp: value };
       changes.push('token floor');
     });
-    if (minTokensError) return result(snapshot, false, minTokensError);
+    if (minTokensError) return this.result(snapshot, false, minTokensError);
     const minTimeError = applyOptionalPositiveInteger(input.minTimeSecondsBeforeWrapUp, (value) => {
       next = { ...next, minTimeSecondsBeforeWrapUp: value };
       changes.push('time floor');
     });
-    if (minTimeError) return result(snapshot, false, minTimeError);
+    if (minTimeError) return this.result(snapshot, false, minTimeError);
 
     const floorError = validateFloors(next);
-    if (floorError) return result(snapshot, false, floorError);
+    if (floorError) return this.result(snapshot, false, floorError);
 
     if (input.status !== undefined) {
       if (!['active', 'paused', 'complete', 'budgetLimited'].includes(input.status)) {
-        return result(snapshot, false, 'status must be active, paused, complete, or budgetLimited.');
+        return this.result(snapshot, false, 'status must be active, paused, complete, or budgetLimited.');
       }
       if (input.status === 'complete' && !floorMet(next)) {
-        return result(snapshot, false, 'Completion floor is not met yet. Keep working, raise the floor, or clear the goal if the user explicitly wants to stop.');
+        return this.result(snapshot, false, 'Completion floor is not met yet. Keep working, raise the floor, or clear the goal if the user explicitly wants to stop.');
       }
       next = transitionStatus(next, input.status);
       changes.push(`status ${input.status}`);
     }
 
     if (next.status === 'active' && budgetLimitReason(next)) {
-      return result(snapshot, false, 'Cannot resume: budget is exhausted. Raise the budget or clear the goal before resuming.');
+      return this.result(snapshot, false, 'Cannot resume: budget is exhausted. Raise the budget or clear the goal before resuming.');
     }
-    if (changes.length === 0) return result(snapshot, false, 'No goal updates were provided.');
+    if (changes.length === 0) return this.result(snapshot, false, 'No goal updates were provided.');
 
     if (next.status === 'complete') {
-      if (current.status === 'complete') return result({ ...snapshot, goal: current }, false, 'Goal is already complete.');
+      if (current.status === 'complete') return this.result({ ...snapshot, goals: { ...snapshot.goals, [key]: current } }, false, 'Goal is already complete.');
       const completedGoal = buildCompletedGoal(next, Date.now());
       const completedRun = appendCompletedGoal(snapshot.completed, completedGoal);
       const nextQueued = snapshot.queue[0];
       if (nextQueued) {
         const started = await this.startQueuedGoalFromSnapshot({
           ...snapshot,
-          goal: next,
+          goals: { ...snapshot.goals, [key]: next },
           completed: completedRun,
         }, nextQueued);
         if (!started.ok) return started;
@@ -240,12 +287,12 @@ export class GoalManager {
       next = { ...next, updatedAt: Date.now() };
       const updated = {
         ...snapshot,
-        goal: next,
+        goals: { ...snapshot.goals, [key]: next },
         completed: completedRun,
         updatedAt: next.updatedAt,
       };
       await this.writeSnapshot(updated);
-      return result(updated, true, formatAllCompleteMessage(completedRun), {
+      return this.result(updated, true, formatAllCompleteMessage(completedRun), {
         completed: completedGoal,
         completedRun,
       });
@@ -254,36 +301,36 @@ export class GoalManager {
     next = { ...next, updatedAt: Date.now() };
     const updated: GoalSnapshot = {
       ...snapshot,
-      goal: next,
+      goals: { ...snapshot.goals, [key]: next },
       updatedAt: next.updatedAt,
-      activeSessionId: input.status === 'active' && this.sessionId
-        ? this.sessionId
-        : snapshot.activeSessionId,
     };
     await this.writeSnapshot(updated);
-    return result(updated, true, `Goal updated: ${changes.join(', ')}.`);
+    return this.result(updated, true, `Goal updated: ${changes.join(', ')}.`);
   }
 
   async clearGoal(): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
+    const key = this.goalKey();
+    const hadGoal = Boolean(snapshot.goals[key]);
+    const goals = { ...snapshot.goals };
+    delete goals[key];
     const next: GoalSnapshot = {
       ...snapshot,
-      goal: null,
+      goals,
       updatedAt: Date.now(),
-      activeSessionId: undefined,
     };
     await this.writeSnapshot(next);
-    return result(next, true, snapshot.goal ? 'Goal cleared.' : 'No goal was set.');
+    return this.result(next, true, hadGoal ? 'Goal cleared.' : 'No goal was set.');
   }
 
   async enqueueGoal(input: GoalCreateInput & { source: QueuedGoal['source']; template?: string; templateFlags?: Record<string, string>; templateArgs?: string }): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
     const validation = validateGoalInput(input);
-    if (validation) return result(snapshot, false, validation);
+    if (validation) return this.result(snapshot, false, validation);
     const queued = buildQueuedGoal(input);
     const next = { ...snapshot, queue: [...snapshot.queue, queued], updatedAt: Date.now() };
     await this.writeSnapshot(next);
-    return { ...result(next, true, 'Queued goal.'), queued: [queued] };
+    return { ...this.result(next, true, 'Queued goal.'), queued: [queued] };
   }
 
   async enqueueGoalBlock(input: string, source: QueuedGoal['source']): Promise<GoalMutationResult> {
@@ -294,9 +341,9 @@ export class GoalManager {
     const queued: QueuedGoal[] = [];
     for (const item of items) {
       const resolved = await this.resolveObjective(item.objectiveInput);
-      if (!resolved.ok) return result(snapshot, false, `Queue item ${item.marker} could not be resolved: ${resolved.message}`);
+      if (!resolved.ok) return this.result(snapshot, false, `Queue item ${item.marker} could not be resolved: ${resolved.message}`);
       const validation = validateGoalInput(resolved.input);
-      if (validation) return result(snapshot, false, `Queue item ${item.marker}: ${validation}`);
+      if (validation) return this.result(snapshot, false, `Queue item ${item.marker}: ${validation}`);
       queued.push(buildQueuedGoal({
         ...resolved.input,
         source,
@@ -307,14 +354,14 @@ export class GoalManager {
     }
     const next = { ...snapshot, queue: [...snapshot.queue, ...queued], updatedAt: Date.now() };
     await this.writeSnapshot(next);
-    return { ...result(next, true, `Queued ${queued.length} goals.`), queued };
+    return { ...this.result(next, true, `Queued ${queued.length} goals.`), queued };
   }
 
   async enqueueResolvedGoalInput(input: string, source: QueuedGoal['source']): Promise<GoalMutationResult> {
     const resolved = await this.resolveObjective(input);
     if (!resolved.ok) {
       const snapshot = await this.readSnapshot();
-      return result(snapshot, false, resolved.message);
+      return this.result(snapshot, false, resolved.message);
     }
     return this.enqueueGoal({
       ...resolved.input,
@@ -327,20 +374,21 @@ export class GoalManager {
 
   async startQueuedGoal(): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
-    const current = snapshot.goal ? this.withLiveElapsed(snapshot.goal) : null;
+    const key = this.goalKey();
+    const current = snapshot.goals[key] ? this.withLiveElapsed(snapshot.goals[key]) : null;
     if (current && current.status !== 'complete' && current.status !== 'budgetLimited') {
-      return result({ ...snapshot, goal: current }, false, 'A non-terminal goal is already active. The queued goal was left in the queue.');
+      return this.result({ ...snapshot, goals: { ...snapshot.goals, [key]: current } }, false, 'A non-terminal goal is already active for this session. The queued goal was left in the queue.');
     }
     const nextQueued = snapshot.queue[0];
-    if (!nextQueued) return result({ ...snapshot, goal: current }, false, 'No queued goals.');
+    if (!nextQueued) return this.result(snapshot, false, 'No queued goals.');
 
     const snapshotWithTerminalHistory = current && (current.status === 'complete' || current.status === 'budgetLimited')
       ? {
         ...snapshot,
-        goal: current,
+        goals: { ...snapshot.goals, [key]: current },
         completed: appendCompletedGoal(snapshot.completed, buildCompletedGoal(current, Date.now())),
       }
-      : { ...snapshot, goal: current };
+      : snapshot;
     return this.startQueuedGoalFromSnapshot(snapshotWithTerminalHistory, nextQueued);
   }
 
@@ -348,7 +396,7 @@ export class GoalManager {
     let objective = nextQueued.objective;
     if (nextQueued.template) {
       const resolved = await resolveGoalTemplateByName(this.workspaceRoot, nextQueued.template, nextQueued.templateFlags ?? {}, nextQueued.templateArgs ?? '');
-      if (!resolved.ok) return result(snapshot, false, 'notTemplate' in resolved ? `Unknown goal template '${nextQueued.template}'.` : resolved.error);
+      if (!resolved.ok) return this.result(snapshot, false, 'notTemplate' in resolved ? `Unknown goal template '${nextQueued.template}'.` : resolved.error);
       objective = resolved.template.objective;
     }
 
@@ -368,50 +416,90 @@ export class GoalManager {
     };
     const updated: GoalSnapshot = {
       ...snapshot,
-      goal,
+      goals: { ...snapshot.goals, [this.goalKey()]: goal },
       queue: snapshot.queue.slice(1),
       updatedAt: now,
-      activeSessionId: this.sessionId,
     };
     await this.writeSnapshot(updated);
-    return { ...result(updated, true, 'Started queued goal.'), started: nextQueued, dequeued: nextQueued };
+    return { ...this.result(updated, true, 'Started queued goal.'), started: nextQueued, dequeued: nextQueued };
   }
 
   async dequeueGoal(audit?: { rationale?: string; authority?: string }): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
     if (!audit?.rationale?.trim() || !audit.authority?.trim()) {
-      return result(snapshot, false, 'rationale and authority are required to dequeue a queued goal.');
+      return this.result(snapshot, false, 'rationale and authority are required to dequeue a queued goal.');
     }
     const dequeued = snapshot.queue[0];
-    if (!dequeued) return result(snapshot, false, 'No queued goals.');
+    if (!dequeued) return this.result(snapshot, false, 'No queued goals.');
     const next = { ...snapshot, queue: snapshot.queue.slice(1), updatedAt: Date.now() };
     await this.writeSnapshot(next);
-    return { ...result(next, true, 'Dequeued goal.'), dequeued };
+    return { ...this.result(next, true, 'Dequeued goal.'), dequeued };
   }
 
   async removeQueuedGoal(queueId: string): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
     const removed = snapshot.queue.find((item) => item.queueId === queueId);
-    if (!removed) return result(snapshot, false, `No queued goal found with id ${queueId}.`);
+    if (!removed) return this.result(snapshot, false, `No queued goal found with id ${queueId}.`);
     const next = { ...snapshot, queue: snapshot.queue.filter((item) => item.queueId !== queueId), updatedAt: Date.now() };
     await this.writeSnapshot(next);
-    return { ...result(next, true, 'Removed queued goal.'), removed };
+    return { ...this.result(next, true, 'Removed queued goal.'), removed };
+  }
+
+  async editGoalObjective(goalOrQueueId: string, objectiveInput: string): Promise<GoalMutationResult> {
+    const snapshot = await this.readSnapshot();
+    const objective = objectiveInput.trim();
+    if (!objective) {
+      return this.result(snapshot, false, 'objective must be non-empty.');
+    }
+    if (objective.length > MAX_OBJECTIVE_LENGTH) {
+      return this.result(snapshot, false, `objective is too long (max ${MAX_OBJECTIVE_LENGTH} characters).`);
+    }
+
+    const key = this.goalKey();
+    const current = snapshot.goals[key];
+    if (current?.goalId === goalOrQueueId) {
+      const goal = { ...current, objective, updatedAt: Date.now() };
+      const next = {
+        ...snapshot,
+        goals: { ...snapshot.goals, [key]: goal },
+        updatedAt: goal.updatedAt,
+      };
+      await this.writeSnapshot(next);
+      return this.result(next, true, 'Active goal updated.');
+    }
+
+    const queueIndex = snapshot.queue.findIndex((item) => item.queueId === goalOrQueueId);
+    if (queueIndex === -1) {
+      return this.result(
+        snapshot,
+        false,
+        `No goal found with id ${goalOrQueueId} for the current session or queue.`,
+      );
+    }
+
+    const queued = snapshot.queue[queueIndex];
+    const queue = snapshot.queue.slice();
+    queue[queueIndex] = {
+      ...queued,
+      objective,
+      template: undefined,
+      templateFlags: undefined,
+      templateArgs: undefined,
+    };
+    const next = { ...snapshot, queue, updatedAt: Date.now() };
+    await this.writeSnapshot(next);
+    return this.result(next, true, 'Queued goal updated.');
   }
 
   async recordTurnUsage(input: { tokensUsed?: number }): Promise<GoalMutationResult> {
     const snapshot = await this.readSnapshot();
-    if (!snapshot.goal) return result(snapshot, true, 'No active goal.');
-    if (!this.isSnapshotAttachedToCurrentSession(snapshot)) {
-      return result(
-        snapshot,
-        true,
-        'Goal usage not recorded because the goal is not attached to the current session.',
-      );
+    const key = this.goalKey();
+    const current = snapshot.goals[key];
+    if (!current) return this.result(snapshot, true, 'No active goal for this session.');
+    if (current.status !== 'active') {
+      return this.result(snapshot, true, 'Goal usage not recorded because the goal is not active.');
     }
-    if (snapshot.goal.status !== 'active') {
-      return result(snapshot, true, 'Goal usage not recorded because the goal is not active.');
-    }
-    let goal = this.withLiveElapsed(snapshot.goal);
+    let goal = this.withLiveElapsed(current);
     goal = {
       ...goal,
       tokensUsed: goal.tokensUsed + Math.max(0, Math.floor(input.tokensUsed ?? 0)),
@@ -421,25 +509,28 @@ export class GoalManager {
     if (limitReason) {
       goal = transitionStatus(goal, 'budgetLimited');
     }
-    const next = { ...snapshot, goal, updatedAt: goal.updatedAt };
+    const next = { ...snapshot, goals: { ...snapshot.goals, [key]: goal }, updatedAt: goal.updatedAt };
     await this.writeSnapshot(next);
-    return result(next, true, limitReason ? `Goal budget limited: ${limitReason}.` : 'Goal usage recorded.');
+    return this.result(next, true, limitReason ? `Goal budget limited: ${limitReason}.` : 'Goal usage recorded.');
   }
 
   formatSnapshot(snapshot: GoalSnapshot): string {
     const lines: string[] = [];
-    if (!snapshot.goal) {
+    const entries = Object.entries(snapshot.goals);
+    if (entries.length === 0) {
       lines.push('No goal is currently set.');
     } else {
-      const goal = snapshot.goal;
-      lines.push(`Goal ${goal.goalId}`);
-      lines.push(`Status: ${goal.status}`);
-      lines.push(`Objective: ${goal.objective}`);
-      lines.push(`Elapsed: ${formatDuration(goal.timeUsedSeconds)}`);
-      lines.push(`Tokens: ${goal.tokensUsed}${goal.tokenBudget ? ` / ${goal.tokenBudget}` : ''}`);
-      if (goal.timeBudgetSeconds) lines.push(`Time budget: ${formatDuration(goal.timeBudgetSeconds)}`);
-      if (goal.minTokensBeforeWrapUp) lines.push(`Token floor: ${goal.minTokensBeforeWrapUp}`);
-      if (goal.minTimeSecondsBeforeWrapUp) lines.push(`Time floor: ${formatDuration(goal.minTimeSecondsBeforeWrapUp)}`);
+      entries.forEach(([key, goal], index) => {
+        if (index > 0) lines.push('');
+        lines.push(`Goal ${goal.goalId}${key !== UNKNOWN_SESSION_KEY ? ` (session ${key})` : ''}`);
+        lines.push(`Status: ${goal.status}`);
+        lines.push(`Objective: ${goal.objective}`);
+        lines.push(`Elapsed: ${formatDuration(goal.timeUsedSeconds)}`);
+        lines.push(`Tokens: ${goal.tokensUsed}${goal.tokenBudget ? ` / ${goal.tokenBudget}` : ''}`);
+        if (goal.timeBudgetSeconds) lines.push(`Time budget: ${formatDuration(goal.timeBudgetSeconds)}`);
+        if (goal.minTokensBeforeWrapUp) lines.push(`Token floor: ${goal.minTokensBeforeWrapUp}`);
+        if (goal.minTimeSecondsBeforeWrapUp) lines.push(`Time floor: ${formatDuration(goal.minTimeSecondsBeforeWrapUp)}`);
+      });
     }
     if (snapshot.queue.length > 0) {
       lines.push('');
@@ -455,13 +546,45 @@ export class GoalManager {
     return lines.join('\n');
   }
 
+  private async buildPeers(snapshot: GoalSnapshot, ownKey: string): Promise<GoalPeer[]> {
+    const peers: GoalPeer[] = [];
+    for (const [key, goal] of Object.entries(snapshot.goals)) {
+      if (key === ownKey || key === UNKNOWN_SESSION_KEY) continue;
+      if (goal.status !== 'active' && goal.status !== 'paused') continue;
+      let ownerAlive = true;
+      try {
+        ownerAlive = await this.isSessionAlive(key);
+      } catch {
+        // A failed liveness probe must never block goal inspection.
+      }
+      peers.push({ sessionId: key, objective: goal.objective, status: goal.status, ownerAlive });
+    }
+    return peers;
+  }
+
+  private result(snapshot: GoalSnapshot, ok: boolean, message: string, extras: Partial<GoalMutationResult> = {}): GoalMutationResult {
+    const goal = snapshot.goals[this.goalKey()] ?? null;
+    return {
+      ok,
+      goal,
+      queue: snapshot.queue,
+      message,
+      telemetry: goal ? {
+        timeRemainingSeconds: goal.timeBudgetSeconds !== undefined ? Math.max(0, goal.timeBudgetSeconds - goal.timeUsedSeconds) : undefined,
+        tokensRemaining: goal.tokenBudget !== undefined ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : undefined,
+        completionFloorMet: floorMet(goal),
+      } : undefined,
+      ...extras,
+    };
+  }
+
   private async readSnapshot(): Promise<GoalSnapshot> {
     const filePath = this.statePath();
     if (!(await fs.pathExists(filePath))) {
       return emptySnapshot();
     }
     try {
-      const raw = await fs.readJson(filePath) as Partial<GoalSnapshot>;
+      const raw = await fs.readJson(filePath) as unknown;
       return normalizeSnapshot(raw);
     } catch {
       return emptySnapshot();
@@ -469,8 +592,13 @@ export class GoalManager {
   }
 
   private async writeSnapshot(snapshot: GoalSnapshot): Promise<void> {
-    await fs.ensureDir(path.dirname(this.statePath()));
-    await fs.writeJson(this.statePath(), snapshot, { spaces: 2 });
+    const statePath = this.statePath();
+    await fs.ensureDir(path.dirname(statePath));
+    await fs.writeJson(statePath, snapshot, { spaces: 2 });
+    const publishers = snapshotPublishers.get(statePath);
+    if (publishers) {
+      await Promise.allSettled([...publishers].map((publish) => publish()));
+    }
   }
 
   private statePath(): string {
@@ -482,26 +610,45 @@ export class GoalManager {
     const elapsedDelta = Math.max(0, Math.floor((Date.now() - goal.updatedAt) / 1000));
     return { ...goal, timeUsedSeconds: goal.timeUsedSeconds + elapsedDelta };
   }
+}
 
-  private isSnapshotAttachedToCurrentSession(snapshot: GoalSnapshot): boolean {
-    return !this.sessionId || snapshot.activeSessionId === this.sessionId;
-  }
+async function defaultSessionLivenessProbe(sessionId: string): Promise<boolean> {
+  const registry = new ActiveAgentRegistry();
+  const active = await registry.listActive();
+  return active.some((record) => record.sessionId === sessionId);
 }
 
 function emptySnapshot(): GoalSnapshot {
-  return { version: 1, goal: null, queue: [], completed: [], updatedAt: Date.now() };
+  return { version: 2, goals: {}, queue: [], completed: [], updatedAt: Date.now() };
 }
 
-function normalizeSnapshot(raw: Partial<GoalSnapshot>): GoalSnapshot {
+function normalizeSnapshot(value: unknown): GoalSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return emptySnapshot();
+  }
+  const raw = value as Record<string, unknown>;
+  const goals: Record<string, GoalState> = {};
+  if (raw.goals && typeof raw.goals === 'object' && !Array.isArray(raw.goals)) {
+    for (const [key, value] of Object.entries(raw.goals)) {
+      const goal = normalizeGoal(value);
+      if (goal) goals[key] = goal;
+    }
+  }
+  // v1 -> v2 migration: a single `goal` + `activeSessionId` becomes a
+  // per-session goal under the owning session (or __unscoped__).
+  const legacyGoal = normalizeGoal(raw.goal);
+  if (legacyGoal) {
+    const legacyKey = typeof raw.activeSessionId === 'string' && raw.activeSessionId.trim()
+      ? raw.activeSessionId
+      : UNKNOWN_SESSION_KEY;
+    goals[legacyKey] = legacyGoal;
+  }
   return {
-    version: 1,
-    goal: normalizeGoal(raw.goal),
+    version: 2,
+    goals,
     queue: Array.isArray(raw.queue) ? raw.queue.map(normalizeQueuedGoal).filter((item): item is QueuedGoal => Boolean(item)) : [],
     completed: Array.isArray(raw.completed) ? raw.completed.map(normalizeCompletedGoal).filter((item): item is CompletedGoal => Boolean(item)) : [],
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
-    activeSessionId: typeof raw.activeSessionId === 'string' && raw.activeSessionId.trim()
-      ? raw.activeSessionId
-      : undefined,
   };
 }
 
@@ -644,22 +791,6 @@ function applyOptionalPositiveInteger(value: number | null | undefined, apply: (
   if (!Number.isInteger(value) || value <= 0) return 'budget and floor values must be positive integers or null.';
   apply(value);
   return null;
-}
-
-function result(snapshot: GoalSnapshot, ok: boolean, message: string, extras: Partial<GoalMutationResult> = {}): GoalMutationResult {
-  const goal = snapshot.goal;
-  return {
-    ok,
-    goal,
-    queue: snapshot.queue,
-    message,
-    telemetry: goal ? {
-      timeRemainingSeconds: goal.timeBudgetSeconds !== undefined ? Math.max(0, goal.timeBudgetSeconds - goal.timeUsedSeconds) : undefined,
-      tokensRemaining: goal.tokenBudget !== undefined ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : undefined,
-      completionFloorMet: floorMet(goal),
-    } : undefined,
-    ...extras,
-  };
 }
 
 function floorMet(goal: GoalState): boolean {

@@ -113,6 +113,11 @@ describe('SETTINGS_REGISTRY', () => {
     expect(new Set(keys).size).toBe(keys.length);
   });
 
+  it('exposes a nine-thread session budget in Teams settings', () => {
+    expect(SETTINGS_REGISTRY.find(setting => setting.key === 'features.multi_agent_v2.max_concurrent_threads_per_session'))
+      .toMatchObject({ category: 'teams', type: 'number', defaultValue: 9 });
+  });
+
   it('exposes silent tool output as an off-by-default UI setting', () => {
     const setting = SETTINGS_REGISTRY.find(s => s.key === 'ui.silentToolOutput');
     expect(setting).toMatchObject({
@@ -128,6 +133,16 @@ describe('SETTINGS_REGISTRY', () => {
       category: 'ui',
       type: 'boolean',
       defaultValue: true,
+    });
+  });
+
+  it('exposes task list placement as an above-composer-by-default UI setting', () => {
+    const setting = SETTINGS_REGISTRY.find(s => s.key === 'ui.taskListPosition');
+    expect(setting).toMatchObject({
+      category: 'ui',
+      type: 'enum',
+      enumValues: ['up', 'above-composer'],
+      defaultValue: 'above-composer',
     });
   });
 
@@ -189,6 +204,23 @@ describe('resolveAwarenessTier', () => {
 });
 
 describe('setConfigSetting', () => {
+  it.each(['features.multi_agent_v2.max_concurrent_threads_per_session', 'max_agents'])('sets the session budget using %s', (key) => {
+    const config = createMockConfig();
+
+    expect(setConfigSetting(config, key, '4')).toEqual({
+      key: 'features.multi_agent_v2.max_concurrent_threads_per_session', value: 4,
+    });
+    expect(config.features.multi_agent_v2.max_concurrent_threads_per_session).toBe(4);
+    expect(config.teams.maxTeammates).toBe(5);
+  });
+
+  it.each(['0', '-1', '65', '1.5', '', 'many'])('rejects invalid thread limit %j without mutation', (value) => {
+    const config = createMockConfig();
+
+    expect(() => setConfigSetting(config, 'max_agents', value)).toThrow('integer between 1 and 64');
+    expect(config.features).toBeUndefined();
+  });
+
   it('enables mouse composer cursor editing from its dotted config key', () => {
     const config = createMockConfig();
 
@@ -223,6 +255,18 @@ describe('setConfigSetting', () => {
       value: false,
     });
     expect(config.ui.activityVerbsEnabled).toBe(false);
+  });
+
+  it('maps task_list position to ui.taskListPosition', () => {
+    const config = createMockConfig();
+
+    const result = setConfigSetting(config, 'task_list position', 'up');
+
+    expect(result).toEqual({
+      key: 'ui.taskListPosition',
+      value: 'up',
+    });
+    expect(config.ui.taskListPosition).toBe('up');
   });
 
   it('maps sitrep to ui.completionReportEnabled', () => {
@@ -427,8 +471,177 @@ function createMockConfig(): any {
 
 describe('settings command integration', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+    vi.mocked(mockSaveConfig).mockResolvedValue(undefined);
   });
+
+  it('persists a direct session thread setting without opening a modal', async () => {
+    const config = createMockConfig();
+
+    const result = await settingsCmd({ config }, ['features.multi_agent_v2.max_concurrent_threads_per_session', '4']);
+
+    expect(result).toContain('Set features.multi_agent_v2.max_concurrent_threads_per_session = 4');
+    expect(config.features.multi_agent_v2.max_concurrent_threads_per_session).toBe(4);
+    expect(mockShowModal).not.toHaveBeenCalled();
+    expect(mockSaveConfig).toHaveBeenCalledWith(config);
+  });
+
+  it('reports invalid direct settings without writing configuration', async () => {
+    const config = createMockConfig();
+
+    const result = await settingsCmd({ config }, ['max_agents', '0']);
+
+    expect(result).toContain('integer between 1 and 64');
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+    expect(mockShowModal).not.toHaveBeenCalled();
+  });
+
+  it('keeps the live configuration unchanged when saving a direct setting fails', async () => {
+    const config = createMockConfig();
+    vi.mocked(mockSaveConfig).mockRejectedValueOnce(new Error('disk unavailable'));
+
+    const result = await settingsCmd({ config }, ['max_agents', '4']);
+
+    expect(result).toContain('Settings not saved: disk unavailable');
+    expect(config.features).toBeUndefined();
+  });
+
+  it('documents the canonical thread setting in command help', async () => {
+    const result = await settingsCmd({ config: createMockConfig() }, ['help']);
+
+    expect(result).toContain('/settings features.multi_agent_v2.max_concurrent_threads_per_session 4');
+    expect(result).toContain('main agent');
+    expect(mockShowModal).not.toHaveBeenCalled();
+  });
+
+  it('validates and saves the session budget through Teams settings', async () => {
+    vi.mocked(mockShowModal)
+      .mockResolvedValueOnce({ label: 'Teams', value: 'teams' })
+      .mockResolvedValueOnce({ label: 'Session thread limit (main agent included)', value: 'features.multi_agent_v2.max_concurrent_threads_per_session' })
+      .mockResolvedValueOnce({ label: 'Back', value: '__back__' })
+      .mockResolvedValueOnce(null);
+    vi.mocked(mockShowInput).mockImplementationOnce(async (options) => {
+      expect(options.defaultValue).toBe('9');
+      expect(options.validate?.('1')).toBe(true);
+      expect(options.validate?.('64')).toBe(true);
+      expect(options.validate?.('0')).toContain('integer between 1 and 64');
+      expect(options.validate?.('1.5')).toContain('integer between 1 and 64');
+      expect(options.validate?.('65')).toContain('integer between 1 and 64');
+      return '4';
+    });
+    const config = createMockConfig();
+
+    await settingsCmd({ config });
+
+    expect(config.features.multi_agent_v2.max_concurrent_threads_per_session).toBe(4);
+    expect(mockSaveConfig).toHaveBeenCalledWith(config);
+  });
+
+  it('keeps the live thread limit unchanged when saving a Teams edit fails', async () => {
+    vi.mocked(mockShowModal)
+      .mockResolvedValueOnce({ label: 'Teams', value: 'teams' })
+      .mockResolvedValueOnce({ label: 'Session thread limit', value: 'features.multi_agent_v2.max_concurrent_threads_per_session' });
+    vi.mocked(mockShowInput).mockResolvedValueOnce('4');
+    vi.mocked(mockSaveConfig).mockRejectedValueOnce(new Error('disk unavailable'));
+    const config = createMockConfig();
+
+    await expect(settingsCmd({ config })).rejects.toThrow('disk unavailable');
+
+    expect(config.features).toBeUndefined();
+  });
+
+  it.each([
+    { args: ['task_list', 'position', 'up'], expected: 'up' },
+    { args: ['task_list', 'position', 'above-composer'], expected: 'above-composer' },
+    { args: ['task_list', 'position', 'above', 'composer'], expected: 'above-composer' },
+    { args: ['ui.taskListPosition', 'up'], expected: 'up' },
+  ])('sets task list position directly with $args', async ({ args, expected }) => {
+    const config = createMockConfig();
+    const originalUi = config.ui;
+
+    const result = await settingsCmd({ config }, args);
+
+    expect(result).toBe(`Task list position: ${expected}`);
+    expect(config.ui.taskListPosition).toBe(expected);
+    expect(config.ui).toBe(originalUi);
+    expect(config.ui.theme).toBe('dark');
+    expect(mockSaveConfig).toHaveBeenCalledOnce();
+    expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({
+      configPath: config.configPath,
+      ui: expect.objectContaining({ taskListPosition: expected, theme: 'dark' }),
+    }));
+    expect(mockShowModal).not.toHaveBeenCalled();
+  });
+
+  it('opens only the position picker when its value is omitted', async () => {
+    vi.mocked(mockShowModal).mockResolvedValueOnce({ label: 'up', value: 'up' });
+    const config = createMockConfig();
+
+    expect(await settingsCmd({ config }, ['task_list', 'position']))
+      .toBe('Task list position: up');
+
+    expect(mockShowModal).toHaveBeenCalledOnce();
+    expect(mockShowModal).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Task list position',
+      options: [{ label: 'up', value: 'up' }, { label: 'above-composer', value: 'above-composer' }],
+    }));
+    expect(config.ui.taskListPosition).toBe('up');
+  });
+
+  it('creates UI settings when they were not configured', async () => {
+    const config: LoadedConfig = { configPath: '/tmp/test/config.json' };
+
+    expect(await settingsCmd({ config }, ['task_list', 'position', 'up']))
+      .toBe('Task list position: up');
+    expect(config.ui?.taskListPosition).toBe('up');
+  });
+
+  it('does not save or change the position when its picker is cancelled', async () => {
+    vi.mocked(mockShowModal).mockResolvedValueOnce(null);
+    const config = createMockConfig();
+
+    expect(await settingsCmd({ config }, ['task_list', 'position'])).toBeNull();
+
+    expect(config.ui.taskListPosition).toBeUndefined();
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid positions without opening a modal or saving', async () => {
+    const config = createMockConfig();
+
+    await expect(settingsCmd({ config }, ['task_list', 'position', 'below']))
+      .rejects.toThrow('Expected one of up, above-composer');
+
+    expect(config.ui.taskListPosition).toBeUndefined();
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+    expect(mockShowModal).not.toHaveBeenCalled();
+  });
+
+  it('returns usage for an unrecognized settings argument', async () => {
+    const config = createMockConfig();
+
+    expect(await settingsCmd({ config }, ['task_list', 'location', 'up']))
+      .toContain('/settings task_list position [up|above-composer]');
+
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+    expect(mockShowModal).not.toHaveBeenCalled();
+  });
+
+  it.each([['task_list', 'position', 'up'], ['task_list', 'position']])(
+    'preserves the live configuration when saving fails (%s %s %s)',
+    async (...args) => {
+      const config = createMockConfig();
+      config.ui.taskListPosition = 'above-composer';
+      if (args.length === 2) {
+        vi.mocked(mockShowModal).mockResolvedValueOnce({ label: 'up', value: 'up' });
+      }
+      vi.mocked(mockSaveConfig).mockRejectedValueOnce(new Error('disk full'));
+
+      await expect(settingsCmd({ config }, args)).rejects.toThrow('disk full');
+
+      expect(config.ui.taskListPosition).toBe('above-composer');
+    },
+  );
 
   it('exits when user presses ESC at category level', async () => {
     (mockShowModal as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
@@ -470,6 +683,21 @@ describe('settings command integration', () => {
     const config = createMockConfig();
     await settingsCmd({ config });
     expect(config.permissions.mode).toBe('unrestricted');
+    expect(mockSaveConfig).toHaveBeenCalled();
+  });
+
+  it('edits task list position and saves it through UI settings', async () => {
+    (mockShowModal as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ label: 'UI & Display', value: 'ui' })
+      .mockResolvedValueOnce({ label: 'Task list position', value: 'ui.taskListPosition' })
+      .mockResolvedValueOnce({ label: 'up', value: 'up' })
+      .mockResolvedValueOnce({ label: 'Back', value: '__back__' })
+      .mockResolvedValueOnce(null);
+    const config = createMockConfig();
+
+    await settingsCmd({ config });
+
+    expect(config.ui.taskListPosition).toBe('up');
     expect(mockSaveConfig).toHaveBeenCalled();
   });
 

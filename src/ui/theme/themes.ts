@@ -7,7 +7,7 @@
 import type { ThemeDefinition } from './types.js';
 
 /**
- * Dark theme - default theme optimized for dark terminal backgrounds.
+ * Dark theme optimized for dark terminal backgrounds.
  * Uses vibrant colors for visibility against dark backgrounds.
  */
 export const darkTheme: ThemeDefinition = {
@@ -395,6 +395,130 @@ export const githubDarkTheme: ThemeDefinition = {
   },
 };
 
+export const auroraTheme: ThemeDefinition = {
+  name: 'aurora',
+  vars: {
+    background: '#111216',
+    surface: '#1b1c22',
+    raised: '#222326',
+    periwinkle: '#9b9ef5',
+    pearl: '#e4e5ec',
+    silver: '#bfc1cc',
+    slate: '#a4a6b2',
+    mint: '#86cfa3',
+    rose: '#ed9a9a',
+    amber: '#e2be80',
+    blue: '#a5b9e8',
+    violet: '#b8a5e5',
+    sage: '#9ccfb1',
+    border: '#505460',
+    borderMuted: '#34363f',
+  },
+  colors: {
+    accent: 'periwinkle',
+    border: 'border',
+    borderAccent: 'periwinkle',
+    borderMuted: 'borderMuted',
+    success: 'mint',
+    error: 'rose',
+    warning: 'amber',
+    muted: 'slate',
+    dim: 'silver',
+    text: 'pearl',
+    userMessageBg: 'raised',
+    userMessageText: 'pearl',
+    toolPendingBg: 'surface',
+    toolSuccessBg: '#22312b',
+    toolErrorBg: '#34242a',
+    toolTitle: 'periwinkle',
+    toolOutput: 'silver',
+    diffAdded: 'mint',
+    diffRemoved: 'rose',
+    diffContext: 'slate',
+    syntaxComment: 'slate',
+    syntaxKeyword: 'violet',
+    syntaxFunction: 'blue',
+    syntaxVariable: 'pearl',
+    syntaxString: 'sage',
+    syntaxNumber: 'amber',
+    syntaxType: 'periwinkle',
+    syntaxOperator: 'silver',
+    syntaxPunctuation: 'silver',
+    mdHeading: 'periwinkle',
+    mdLink: 'blue',
+    mdLinkUrl: 'slate',
+    mdCode: 'violet',
+    mdCodeBlock: 'pearl',
+    mdCodeBlockBorder: 'border',
+    mdQuote: 'silver',
+    mdQuoteBorder: 'border',
+    mdHr: 'borderMuted',
+    mdListBullet: 'periwinkle',
+  },
+};
+
+export const tuataraTheme: ThemeDefinition = {
+  name: 'tuatara',
+  vars: {
+    burrow: '#171c17',
+    surface: '#242d23',
+    raised: '#303c2d',
+    lichen: '#b7c98a',
+    fern: '#9cba91',
+    clay: '#e69a83',
+    amber: '#d9bd7b',
+    mist: '#9fc2c4',
+    iris: '#c0afd2',
+    sky: '#b7c7dc',
+    bone: '#dfdfcf',
+    stone: '#b8c0ad',
+    quiet: '#9da992',
+    border: '#64745b',
+    borderMuted: '#404c39',
+  },
+  colors: {
+    accent: 'lichen',
+    border: 'border',
+    borderAccent: 'lichen',
+    borderMuted: 'borderMuted',
+    success: 'fern',
+    error: 'clay',
+    warning: 'amber',
+    muted: 'quiet',
+    dim: 'stone',
+    text: 'bone',
+    userMessageBg: 'raised',
+    userMessageText: 'bone',
+    toolPendingBg: 'surface',
+    toolSuccessBg: '#263527',
+    toolErrorBg: '#3b2925',
+    toolTitle: 'lichen',
+    toolOutput: 'stone',
+    diffAdded: 'fern',
+    diffRemoved: 'clay',
+    diffContext: 'quiet',
+    syntaxComment: 'quiet',
+    syntaxKeyword: 'iris',
+    syntaxFunction: 'mist',
+    syntaxVariable: 'bone',
+    syntaxString: 'lichen',
+    syntaxNumber: 'amber',
+    syntaxType: 'sky',
+    syntaxOperator: 'clay',
+    syntaxPunctuation: 'stone',
+    mdHeading: 'lichen',
+    mdLink: 'mist',
+    mdLinkUrl: 'quiet',
+    mdCode: 'amber',
+    mdCodeBlock: 'bone',
+    mdCodeBlockBorder: 'border',
+    mdQuote: 'stone',
+    mdQuoteBorder: 'border',
+    mdHr: 'borderMuted',
+    mdListBullet: 'lichen',
+  },
+};
+
 export const cappadociaTheme: ThemeDefinition = {
   name: 'cappadocia',
   vars: {
@@ -680,11 +804,13 @@ export const lightTheme: ThemeDefinition = {
  * Map of built-in theme names to their definitions.
  */
 export const builtInThemes: Record<string, ThemeDefinition> = {
+  aurora: auroraTheme,
   dark: darkTheme,
   light: lightTheme,
   dracula: draculaTheme,
   sandy: sandyTheme,
   tui: tuiTheme,
+  tuatara: tuataraTheme,
   'github-dark': githubDarkTheme,
   cappadocia: cappadociaTheme,
   rio: rioTheme,
@@ -721,5 +847,5 @@ export function getBuiltInThemeNames(): string[] {
  * Get the default theme name.
  */
 export function getDefaultThemeName(): string {
-  return 'dark';
+  return 'aurora';
 }

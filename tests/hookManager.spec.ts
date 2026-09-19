@@ -14,10 +14,12 @@ vi.mock('node:child_process', () => {
   return {
     spawn: vi.fn((command: string) => {
       const mockProcess = new EventEmitter() as EventEmitter & {
+        stdin: EventEmitter & { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
         stdout: EventEmitter;
         stderr: EventEmitter;
         kill: (signal?: NodeJS.Signals) => boolean;
       };
+      mockProcess.stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
       mockProcess.stdout = new EventEmitter();
       mockProcess.stderr = new EventEmitter();
       let closed = false;
@@ -135,6 +137,38 @@ describe('HookManager', () => {
   });
 
   describe('getHooksForEvent', () => {
+    it('exports documented subagent result scalars including false and zero', async () => {
+      await manager.addHook({ event: 'subagent-stop', command: 'true' });
+      await manager.executeHooks('subagent-stop', {
+        subagentSuccess: false, subagentDuration: 0, subagentError: 'e'.repeat(5_000),
+      });
+      const env = vi.mocked(spawn).mock.calls.at(-1)?.[2]?.env;
+      expect(env?.HOOK_SUBAGENT_SUCCESS).toBe('false');
+      expect(env?.HOOK_SUBAGENT_DURATION).toBe('0');
+      expect(env?.HOOK_SUBAGENT_ERROR).toHaveLength(4_000);
+    });
+
+    it('exposes subagent controls in summaries and passes run context through filtered shell hooks', async () => {
+      const events = ['subagent-start', 'subagent-progress', 'subagent-message', 'subagent-cancel-requested'] as const;
+      for (const event of events) await manager.addHook({ event, command: 'true', matcher: '^reviewer$' });
+      expect(manager.getSummary()).toMatchObject(Object.fromEntries(events.map(event => [event, { total: 1, enabled: 1 }])));
+      await manager.executeHooks('subagent-progress', { subagentType: 'different' });
+      expect(spawn).not.toHaveBeenCalled();
+      await manager.executeHooks('subagent-progress', {
+        subagentId: 'run-1', subagentName: 'reader', subagentType: 'reviewer', subagentParentId: 'lead',
+        subagentSource: 'delegate', subagentStatus: 'running', subagentActivity: 'Reading files',
+        subagentWorkspace: '/test/workspace', subagentTask: 'Inspect code', subagentMessage: 'Check tests',
+      });
+      expect(spawn).toHaveBeenCalledWith('true', [], expect.objectContaining({ env: expect.objectContaining({
+        HOOK_SUBAGENT_ID: 'run-1', HOOK_SUBAGENT_NAME: 'reader', HOOK_SUBAGENT_TYPE: 'reviewer',
+        HOOK_SUBAGENT_PARENT_ID: 'lead', HOOK_SUBAGENT_SOURCE: 'delegate', HOOK_SUBAGENT_STATUS: 'running',
+        HOOK_SUBAGENT_ACTIVITY: 'Reading files', HOOK_SUBAGENT_WORKSPACE: '/test/workspace',
+      }) }));
+      const child = vi.mocked(spawn).mock.results.at(-1)?.value;
+      expect(child?.stdin?.write).toHaveBeenCalledWith(expect.stringContaining('"subagent_message":"Check tests"'));
+      expect(child?.stdin?.write).toHaveBeenCalledWith(expect.stringContaining('"subagent_task":"Inspect code"'));
+    });
+
     it('returns only enabled hooks for specific event', async () => {
       await manager.addHook({ event: 'pre-tool', command: 'echo 1', enabled: true });
       await manager.addHook({ event: 'pre-tool', command: 'echo 2', enabled: false });
@@ -335,6 +369,36 @@ describe('HookManager', () => {
       expect(results).toHaveLength(0);
     });
 
+    it('publishes the complete review execution context to lifecycle observers', async () => {
+      const listener = vi.fn();
+      manager.subscribeLifecycle(listener);
+
+      await manager.executeHooks('review:start', {
+        sessionId: 'session-review',
+        reviewAudience: 'forensic',
+        reviewBase: 'origin/main',
+        reviewFormat: 'markdown',
+        reviewHead: 'HEAD',
+        reviewKind: 'security',
+        reviewPath: 'src/auth',
+        reviewScope: 'security',
+        reviewStatus: 'running',
+        reviewSurface: 'acp',
+      });
+
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'review:start',
+        workspace: '/test/workspace',
+        reviewAudience: 'forensic',
+        reviewBase: 'origin/main',
+        reviewFormat: 'markdown',
+        reviewHead: 'HEAD',
+        reviewKind: 'security',
+        reviewStatus: 'running',
+        reviewSurface: 'acp',
+      }));
+    });
+
     it('executes async hooks in parallel', async () => {
       await manager.addHook({ event: 'pre-tool', command: 'true', async: true });
       await manager.addHook({ event: 'pre-tool', command: 'true', async: true });
@@ -359,6 +423,52 @@ describe('HookManager', () => {
 
       expect(results).toEqual([]);
       expect(spawn).not.toHaveBeenCalled();
+    });
+
+    it.each(['true', 'block request'])('preserves the exit result when %s closes stdin early', async (command) => {
+      await manager.addHook({ event: 'pre-prompt', command });
+      const resultsPromise = manager.executeHooks('pre-prompt', { instruction: 'Review changes' });
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      const child = vi.mocked(spawn).mock.results[0]?.value;
+
+      expect(() => child.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))).not.toThrow();
+      const [result] = await resultsPromise;
+
+      expect(result).toMatchObject(command === 'true'
+        ? { success: true, exitCode: 0 }
+        : { success: false, exitCode: 2, blockingError: true });
+    });
+
+    it.skipIf(process.platform === 'win32')('signals the hook process group when cancelling a shell hook', async () => {
+      await manager.addHook({ event: 'pre-prompt', command: 'slow hook' });
+      const controller = new AbortController();
+      const resultsPromise = manager.executeHooks('pre-prompt', {}, { signal: controller.signal });
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      const child = vi.mocked(spawn).mock.results[0]?.value;
+      Object.defineProperty(child, 'pid', { value: 4321 });
+      const signal = vi.spyOn(process, 'kill').mockImplementation(() => {
+        child.emit('close', null, 'SIGTERM');
+        return true;
+      });
+      try {
+        controller.abort();
+        const [result] = await resultsPromise;
+        expect(signal).toHaveBeenCalledWith(-4321, 'SIGTERM');
+        expect(spawn).toHaveBeenCalledWith('slow hook', [], expect.objectContaining({ detached: true }));
+        expect(result).toMatchObject({ success: false, aborted: true });
+      } finally {
+        signal.mockRestore();
+      }
+    });
+
+    it('reports unexpected stdin errors as hook failures', async () => {
+      await manager.addHook({ event: 'pre-prompt', command: 'slow hook' });
+      const resultsPromise = manager.executeHooks('pre-prompt', {});
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      const child = vi.mocked(spawn).mock.results[0]?.value;
+
+      expect(() => child.stdin.emit('error', Object.assign(new Error('write EIO'), { code: 'EIO' }))).not.toThrow();
+      expect((await resultsPromise)[0]).toMatchObject({ success: false, error: 'write EIO' });
     });
 
     it('still publishes an already-aborted post-tool lifecycle event without spawning user hooks', async () => {
@@ -504,5 +614,24 @@ describe('HookManager', () => {
       const result = await manager.testHook(hook);
       expect(result.success).toBe(false);
     });
+  });
+});
+
+
+describe('complete lifecycle catalogue', () => {
+  it.each(['decision', 'replay', 'rescore', 'prune'] as const)('summarizes and filters autoresearch:%s', async name => {
+    const event = `autoresearch:${name}` as const;
+    const manager = new HookManager({ workspaceRoot: process.cwd(), settings: { hooks: [{ event, matcher: 'matched-goal', command: 'echo invoked' }] } });
+    expect(manager.getSummary()[event]).toEqual({ total: 1, enabled: 1 });
+    expect(await manager.executeHooks(event, { autoresearchGoal: 'different' })).toEqual([]);
+    expect(await manager.executeHooks(event, { autoresearchGoal: 'matched-goal' })).toHaveLength(1);
+  });
+});
+
+describe('autoresearch decision matching', () => {
+  it('matches the decision and attempt id carried by the event', async () => {
+    const manager = new HookManager({ workspaceRoot: process.cwd(), settings: { hooks: [{ event: 'autoresearch:decision', matcher: 'attempt-42.*keep', command: 'echo matched' }] } });
+    expect(await manager.executeHooks('autoresearch:decision', { autoresearchAttemptId: 'attempt-42', autoresearchDecision: 'keep' })).toHaveLength(1);
+    expect(await manager.executeHooks('autoresearch:decision', { autoresearchAttemptId: 'attempt-42', autoresearchDecision: 'discard' })).toEqual([]);
   });
 });

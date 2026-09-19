@@ -18,6 +18,7 @@ import {
   getTextBufferCursorOffset,
   handleInkTextBufferInput,
   isBareComposerTrigger,
+  isGoalViewShortcut,
   matchesExtensionKeybinding,
   isTeamViewShortcut,
   resolveInkHiddenPastes,
@@ -27,6 +28,7 @@ import { AgentUI, createInitialUIState } from '../../../src/ui/ink/AgentUI.js';
 import { I18nProvider } from '../../../src/ui/i18n/index.js';
 import { ThemeProvider } from '../../../src/ui/theme/ThemeContext.js';
 import { getPromptBlockWidth } from '../../../src/ui/inputPrompt.js';
+import { GoalPanel } from '../../../src/ui/ink/GoalPanel.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '');
@@ -86,6 +88,12 @@ describe('AgentUI TextBuffer integration helpers', () => {
     expect(isTeamViewShortcut('t', createInkKey())).toBe(false);
   });
 
+  it('recognizes Cmd+G and Ctrl+G as goal view shortcuts', () => {
+    expect(isGoalViewShortcut('g', createInkKey({ meta: true }))).toBe(true);
+    expect(isGoalViewShortcut('g', createInkKey({ ctrl: true }))).toBe(true);
+    expect(isGoalViewShortcut('g', createInkKey())).toBe(false);
+  });
+
   it('matches extension keybindings without claiming reserved composer controls', () => {
     expect(matchesExtensionKeybinding('k', createInkKey({ ctrl: true }), {
       key: 'ctrl+k',
@@ -101,6 +109,14 @@ describe('AgentUI TextBuffer integration helpers', () => {
     })).toBe(false);
     expect(matchesExtensionKeybinding('x', createInkKey({ ctrl: true }), {
       key: 'ctrl+x',
+      command: '/runtime-dashboard',
+    })).toBe(false);
+    expect(matchesExtensionKeybinding('g', createInkKey({ ctrl: true }), {
+      key: 'ctrl+g',
+      command: '/runtime-dashboard',
+    })).toBe(false);
+    expect(matchesExtensionKeybinding('g', createInkKey({ meta: true }), {
+      key: 'meta+g',
       command: '/runtime-dashboard',
     })).toBe(false);
   });
@@ -1575,6 +1591,129 @@ describe('AgentUI queued instruction panel', () => {
   });
 });
 
+describe('AgentUI persistent goals panel', () => {
+  it('reports measured layouts for clickable goal rows', async () => {
+    const onRowLayoutChange = vi.fn();
+    render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(GoalPanel, {
+            snapshot: {
+              version: 2,
+              goal: {
+                goalId: 'goal-active',
+                objective: 'ship the active goal',
+                status: 'active',
+                tokensUsed: 0,
+                timeUsedSeconds: 0,
+                createdAt: 1,
+                updatedAt: 1,
+              },
+              queue: [{
+                queueId: 'queue-next',
+                objective: 'ship the queued goal',
+                source: 'command',
+                createdAt: 2,
+              }],
+              completed: [],
+              updatedAt: 2,
+              sessionAttachment: 'attached',
+              peers: [],
+            },
+            selectedIndex: null,
+            onRowLayoutChange,
+          }),
+        ),
+      ),
+    );
+
+    await vi.waitFor(() => {
+      const activeLayouts = new Map<string, unknown>();
+      for (const [target, layout] of onRowLayoutChange.mock.calls) {
+        if (layout) {
+          activeLayouts.set(target.id, layout);
+        } else {
+          activeLayouts.delete(target.id);
+        }
+      }
+      expect([...activeLayouts.keys()]).toEqual(expect.arrayContaining(['goal-active', 'queue-next']));
+    });
+  });
+
+  it.each([
+    'ship the queued goal',
+    `ship the queued goal\n${'Preserve the full acceptance criteria. '.repeat(30)}`,
+  ])('navigates to a queued goal and submits its full edited objective (%#)', async (objective) => {
+    const onEditGoalObjective = vi.fn();
+    const state = {
+      ...createInitialUIState(),
+      goalPanelVisible: true,
+      goalActivity: {
+        version: 2 as const,
+        goal: {
+          goalId: 'goal-active',
+          objective: 'ship the active goal',
+          status: 'active' as const,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+        queue: [{
+          queueId: 'queue-next',
+          objective,
+          source: 'command' as const,
+          createdAt: 2,
+        }],
+        completed: [],
+        updatedAt: 2,
+        sessionAttachment: 'attached' as const,
+        peers: [],
+      },
+    };
+    const instance = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state,
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            onEditGoalObjective,
+          }),
+        ),
+      ),
+    );
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('Goals · 2 total');
+
+    instance.stdin.write('\x1b[B');
+    instance.stdin.write('\x1b[B');
+    instance.stdin.write('\r');
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('❯ ship the queued goal');
+
+    instance.stdin.write(' after review');
+    instance.stdin.write('\r');
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(onEditGoalObjective).toHaveBeenCalledWith({
+      id: 'queue-next',
+      kind: 'queued',
+      objective: `${objective} after review`,
+    });
+  });
+});
+
 describe('AgentUI multiline input regression', () => {
   it('inserts a newline via Shift+Enter', () => {
     const buffer = new TextBuffer(80, 10, 'line1');
@@ -1898,7 +2037,7 @@ describe('AgentUI Ctrl+C behavior', () => {
 });
 
 describe('AgentUI task activity layout', () => {
-  it('keeps the live task plan above the status line and composer', () => {
+  it('keeps the live task plan below the status line and above the composer', () => {
     const state = {
       ...createInitialUIState(),
       isWorking: true,
@@ -1934,12 +2073,98 @@ describe('AgentUI task activity layout', () => {
     const planIndex = frame.indexOf('Tasks');
     const statusIndex = frame.indexOf('Reviewing tool output...');
     const composerIndex = frame.lastIndexOf('❯');
+    const helpIndex = frame.indexOf('100% context left');
 
     expect(planIndex).toBeGreaterThan(-1);
     expect(frame).toContain('0/2 done');
+    expect(planIndex).toBeGreaterThan(statusIndex);
+    expect(composerIndex).toBeGreaterThan(planIndex);
+    expect(helpIndex).toBeGreaterThan(composerIndex);
+  });
+
+  it('moves the live task plan up above status when configured', () => {
+    const state = {
+      ...createInitialUIState(),
+      isWorking: true,
+      status: 'Reviewing tool output...',
+      activityItems: [
+        { id: 'active', kind: 'todo' as const, label: 'Keeping active task progress visible', status: 'in_progress' as const },
+        { id: 'queued', kind: 'todo' as const, label: 'Writing terminal coverage', status: 'pending' as const },
+      ],
+    };
+
+    const { lastFrame } = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state,
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            enableQueueInput: true,
+            taskListPosition: 'up',
+          }),
+        ),
+      ),
+    );
+
+    const frame = stripAnsi(lastFrame() ?? '');
+    const planIndex = frame.indexOf('Tasks');
+    const statusIndex = frame.indexOf('Reviewing tool output...');
+    const composerIndex = frame.lastIndexOf('❯');
+    const helpIndex = frame.indexOf('100% context left');
+
+    expect(planIndex).toBeGreaterThan(-1);
     expect(statusIndex).toBeGreaterThan(planIndex);
     expect(composerIndex).toBeGreaterThan(statusIndex);
+    expect(helpIndex).toBeGreaterThan(composerIndex);
   });
+
+  it.each(['/tasks', '/team', '/squad'])(
+    'renders the %s result below the status line instead of in transcript history',
+    (command) => {
+      const state = {
+        ...createInitialUIState(),
+        isWorking: true,
+        status: 'Ready',
+        commandResult: {
+          command,
+          output: `${command} result`,
+        },
+      };
+
+      const { lastFrame } = render(
+        React.createElement(
+          I18nProvider,
+          null,
+          React.createElement(
+            ThemeProvider,
+            null,
+            React.createElement(AgentUI, {
+              state,
+              onInstruction: () => {},
+              onEscape: () => {},
+              onCtrlC: () => {},
+              enableQueueInput: true,
+            }),
+          ),
+        ),
+      );
+
+      const frame = stripAnsi(lastFrame() ?? '');
+      const statusIndex = frame.indexOf('Ready');
+      const resultIndex = frame.indexOf(`${command} result`);
+      const composerIndex = frame.lastIndexOf('❯');
+
+      expect(statusIndex).toBeGreaterThan(-1);
+      expect(resultIndex).toBeGreaterThan(statusIndex);
+      expect(composerIndex).toBeGreaterThan(resultIndex);
+    },
+  );
 });
 
 // =========================================================================

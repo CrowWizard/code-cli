@@ -44,21 +44,43 @@ export interface CompletedGoal {
   completedAt: number;
 }
 
+/**
+ * Persistent goal state for a workspace.
+ *
+ * v2 stores one active goal per session (`goals` keyed by sessionId, with
+ * `__unscoped__` for managers without a session) so multiple terminals can run
+ * goals concurrently. The workspace-wide `queue` remains a shared backlog.
+ */
 export interface GoalSnapshot {
-  version: 1;
+  version: 2;
+  /** sessionId (or `__unscoped__`) -> that session's active goal. */
+  goals: Record<string, GoalState>;
+  queue: QueuedGoal[];
+  completed: CompletedGoal[];
+  updatedAt: number;
+}
+
+export type GoalSessionAttachment = 'none' | 'unscoped' | 'attached';
+
+/** Another session's active goal, surfaced so concurrent sessions stay aware. */
+export interface GoalPeer {
+  sessionId: string;
+  objective: string;
+  status: GoalStatus;
+  ownerAlive: boolean;
+}
+
+/** Per-session view of the workspace goal state (what `get_goal` returns). */
+export interface GoalSessionSnapshot {
+  version: 2;
+  /** This session's active goal, if any. */
   goal: GoalState | null;
   queue: QueuedGoal[];
   completed: CompletedGoal[];
   updatedAt: number;
-  /** Session currently authorized to continue and account usage to the active goal. */
-  activeSessionId?: string;
-}
-
-export type GoalSessionAttachment = 'none' | 'unscoped' | 'attached' | 'detached';
-
-export interface GoalSessionSnapshot extends Omit<GoalSnapshot, 'activeSessionId'> {
   sessionAttachment: GoalSessionAttachment;
-  detachedGoal?: Pick<GoalState, 'goalId' | 'status' | 'createdAt' | 'updatedAt'>;
+  /** Active goals owned by other sessions in this workspace. */
+  peers: GoalPeer[];
   message?: string;
 }
 

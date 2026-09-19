@@ -11,7 +11,7 @@ import type {
   CerebrasSettings,
   NetworkSettings,
   FunctionDefinition,
-  LLMMessage,
+  MultimodalMessage,
 } from "../types.js";
 
 /**
@@ -23,7 +23,7 @@ import type {
  * - name (for function messages, optional)
  * Excludes internal fields like priority, metadata.
  */
-function sanitizeMessages(messages: LLMMessage[]): Record<string, unknown>[] {
+function sanitizeMessages(messages: MultimodalMessage[]): Record<string, unknown>[] {
   return messages.map((msg) => {
     const sanitized: Record<string, unknown> = {
       role: msg.role,
@@ -157,6 +157,9 @@ export class CerebrasClient {
         );
         return response;
       } catch (error) {
+        if (request.signal?.aborted) {
+          throw new DOMException("Request cancelled.", "AbortError");
+        }
         lastError = error as Error;
 
         // Don't retry if user cancelled or if it's a non-retryable error
@@ -191,7 +194,7 @@ export class CerebrasClient {
 
     // Combine user signal with timeout if provided
     const combinedSignal = signal
-      ? this.combineSignals(signal, timeoutController.signal)
+      ? AbortSignal.any([signal, timeoutController.signal])
       : timeoutController.signal;
 
     let response: Response;
@@ -307,27 +310,6 @@ export class CerebrasClient {
       finishReason: finishReason || "stop",
       raw: { content, finishReason },
     };
-  }
-
-  private combineSignals(
-    userSignal: AbortSignal,
-    timeoutSignal: AbortSignal
-  ): AbortSignal {
-    const controller = new AbortController();
-
-    const onAbort = () => {
-      controller.abort();
-    };
-
-    userSignal.addEventListener("abort", onAbort);
-    timeoutSignal.addEventListener("abort", onAbort);
-
-    // If already aborted, abort immediately
-    if (userSignal.aborted || timeoutSignal.aborted) {
-      controller.abort();
-    }
-
-    return controller.signal;
   }
 
   private async buildApiError(

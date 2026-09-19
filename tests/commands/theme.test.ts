@@ -112,4 +112,28 @@ describe('/theme command', () => {
     expect(config.ui?.theme).toBe('light');
     expect(mockSaveConfig).toHaveBeenCalledWith(config);
   });
+
+  it.each([
+    { name: 'tuatara', accent: '#b7c98a', description: 'Tuatara-inspired lichen, warm stone, and soft amber' },
+    { name: 'aurora', accent: '#9b9ef5', description: 'Default theme with charcoal, cool neutrals, and soft periwinkle' },
+  ])('offers $name and persists it before resuming the composer', async ({ name, accent, description }) => {
+    const config = { ui: { theme: 'tui' } } as LoadedConfig;
+    initTheme('tui');
+    mockShowModal.mockResolvedValue({ label: name, value: name });
+    const onAfterModal = vi.fn(() => {
+      expect(getTheme().name).toBe(name);
+      expect(getTheme().colors.accent).toBe(accent);
+      expect(mockSaveConfig).toHaveBeenCalledWith(config);
+    });
+
+    await theme({ config, onAfterModal });
+
+    expect(mockShowModal).toHaveBeenCalledWith(expect.objectContaining({
+      options: expect.arrayContaining([expect.objectContaining({
+        value: name, description,
+      })]),
+    }));
+    expect(config.ui?.theme).toBe(name);
+    expect(onAfterModal).toHaveBeenCalledOnce();
+  });
 });

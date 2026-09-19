@@ -62,6 +62,8 @@ export interface TelemetryConfig {
   companySecret: string;
   /** Authenticated Autohand session token for user-scoped features */
   authToken?: string;
+  /** Skip every network request and keep events and session snapshots in the durable queues */
+  offline?: boolean;
   /** Client type (cli, vscode, zed) */
   clientType: ClientType;
   /** Client/extension version (for non-CLI clients) */
@@ -93,8 +95,13 @@ export interface ErrorData {
 
 export interface CommandUseData {
   command: string;
+  /** @deprecated Free-form arguments are never emitted. */
   args?: string[];
+  subcommand?: string;
+  surface?: CommandUseSurface;
 }
+
+export type CommandUseSurface = 'interactive' | 'cli' | 'acp' | 'json_rpc' | 'mobile';
 
 export interface ProviderModelMetadata {
   providerDisplayName?: string;

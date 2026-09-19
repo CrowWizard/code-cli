@@ -500,7 +500,7 @@ cd ~/projects/my-app && autohand
 ```json
 {
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "customThemes": {
       "company": {
         "colors": {
@@ -536,7 +536,7 @@ cd ~/projects/my-app && autohand
 ```
 | Поле | Тип | По умолчанию | Описание |
 | ---------------------------- | ------ | ------- | --------------------------------------------------------------------------------------------- |
-| `theme` | строка | `"dark"` | Цветовая тема для вывода через терминал. Встроенные модули включают `dark`, `light`, `dracula`, `sandy`, `tui`, `github-dark`, `cappadocia`, `rio` и `australia`. Устаревшие значения `turkey` и `brazil` по-прежнему загружаются как псевдонимы. |
+| `theme` | строка | `"aurora"` | Цветовая тема для вывода через терминал. Встроенные модули включают `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, `rio` и `australia`. Устаревшие значения `turkey` и `brazil` по-прежнему загружаются как псевдонимы. |
 | `customThemes` | объект | `{}` | Встроенные определения пользовательских тем, привязанные к имени темы. Установите для `theme` тот же ключ, чтобы использовать его.   |
 | `autoConfirm` | логическое | `false` | Пропускайте запросы на подтверждение для безопасной работы |
 | `readFileCharLimit` | номер | `300` | Максимальное количество символов для отображения в выходных данных инструмента чтения/поиска (полное содержимое по-прежнему отправляется в модель) |
@@ -1619,7 +1619,7 @@ autohand --no-browser       # Start with browser bridge disabled
     "allowDangerousOps": false
   },
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "autoConfirm": false,
     "showCompletionNotification": true,
     "showThinking": true,
@@ -1704,7 +1704,7 @@ workspace:
   allowDangerousOps: false
 
 ui:
-  theme: dark
+  theme: aurora
   autoConfirm: false
   showCompletionNotification: true
   showThinking: true
@@ -1789,7 +1789,7 @@ defaultRoot = "~/projects"
 allowDangerousOps = false
 
 [ui]
-theme = "dark"
+theme = "aurora"
 autoConfirm = false
 showCompletionNotification = true
 showThinking = true
@@ -2012,7 +2012,7 @@ Autohand предоставляет богатый набор косых ком�
 | `/sessions` | Список прошлых сессий |
 | `/resume` | Возобновить предыдущую сессию |
 | `/history` | Просмотр истории сеансов с нумерацией страниц |
-| `/undo` | Отменить изменения git и последний ход |
+| `/undo` | Отменить последнее записанное изменение файла агентом и последний ход |
 | `/export` | Экспортировать сессию в уценку/JSON/HTML |
 | `/share` | Поделиться текущей сессией |
 | `/status` | Показать статус сеанса |

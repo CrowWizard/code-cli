@@ -356,4 +356,77 @@ describe('SessionManager', () => {
     expect(await fs.readFile(path.join(tmpDir, '.index.json.crashed.tmp'), 'utf8'))
       .toBe('{"sessions":');
   });
+
+  it('matches project aliases without including unrelated project sessions', async () => {
+    const project = path.join(tmpDir, 'project');
+    const alias = path.join(tmpDir, 'alias');
+    await fs.ensureDir(project);
+    await fs.ensureSymlink(project, alias, 'junction');
+    const manager = new SessionManager(path.join(tmpDir, 'sessions'));
+    const first = await manager.createSession(project, 'test-model');
+    const second = await manager.createSession(alias, 'test-model');
+    await manager.createSession(path.join(tmpDir, 'other'), 'test-model');
+
+    const page = await manager.listRecentSessions({ project });
+    expect(page.sessions.map((session) => session.sessionId).sort()).toEqual([
+      first.metadata.sessionId, second.metadata.sessionId,
+    ].sort());
+    expect((await manager.listSessions({ project: alias }))).toHaveLength(2);
+  });
+
+  it('selects the last active session with legacy timestamp fallback and project filtering', async () => {
+    const manager = new SessionManager(tmpDir);
+    const old = await manager.createSession('/project', 'test-model');
+    Object.assign(old.metadata, { createdAt: '2026-01-01', lastActiveAt: '2026-01-05' });
+    await old.save();
+    const newer = await manager.createSession('/project', 'test-model');
+    Object.assign(newer.metadata, { createdAt: '2026-01-03', lastActiveAt: 'invalid' });
+    await newer.save();
+    const other = await manager.createSession('/other', 'test-model');
+    Object.assign(other.metadata, { createdAt: '2026-01-06', lastActiveAt: undefined });
+    await other.save();
+
+    expect((await manager.getLastSession('/project'))?.sessionId).toBe(old.metadata.sessionId);
+    expect((await manager.getLastSession())?.sessionId).toBe(other.metadata.sessionId);
+    expect(await manager.getLastSession('/empty')).toBeNull();
+  });
+
+  it('loads only the newest indexed metadata page for the resume picker', async () => {
+    const projectPath = '/workspace/recent-sessions';
+    const entries = [
+      { id: 'oldest', createdAt: '2026-01-01T00:00:00.000Z' },
+      { id: 'middle', createdAt: '2026-01-02T00:00:00.000Z' },
+      { id: 'newest', createdAt: '2026-01-03T00:00:00.000Z' },
+    ];
+
+    await fs.writeJson(path.join(tmpDir, 'index.json'), {
+      sessions: entries.map((entry) => ({ ...entry, projectPath })),
+      byProject: { [projectPath]: entries.map((entry) => entry.id) },
+    });
+    await Promise.all(entries.map(async (entry) => {
+      const sessionDir = path.join(tmpDir, entry.id);
+      await fs.ensureDir(sessionDir);
+      await fs.writeJson(path.join(sessionDir, 'metadata.json'), {
+        sessionId: entry.id,
+        createdAt: entry.createdAt,
+        lastActiveAt: entry.createdAt,
+        projectPath,
+        projectName: 'recent-sessions',
+        model: 'openrouter/test-model',
+        messageCount: 0,
+        status: 'active',
+        client: 'terminal',
+      });
+    }));
+
+    const manager = new SessionManager(tmpDir);
+    await manager.initialize();
+
+    const page = await manager.listRecentSessions(undefined, 2);
+
+    expect(page.total).toBe(3);
+    expect(page.sessions.map((session) => session.sessionId)).toEqual(['newest', 'middle']);
+    const nextPage = await manager.listRecentSessions(undefined, 2, 2);
+    expect(nextPage.sessions.map((session) => session.sessionId)).toEqual(['oldest']);
+  });
 });

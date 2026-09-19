@@ -26,6 +26,9 @@ Localized references:
 
 ## Table of Contents
 
+For local repository scanning and credential reuse during workflow uploads, see
+[Repository discovery](./discovery.md).
+
 - [Configuration File Location](#configuration-file-location)
 - [Environment Variables](#environment-variables)
 - [Bare Mode](#bare-mode)
@@ -667,7 +670,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 ```json
 {
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "customThemes": {
       "company": {
         "colors": {
@@ -679,6 +682,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
     "autoConfirm": false,
     "readFileCharLimit": 300,
     "silentToolOutput": false,
+    "taskListPosition": "above-composer",
     "activityVerbs": ["Compiling", "Parsing", "Reviewing"],
     "activityVerbsEnabled": true,
     "activitySymbol": "✳",
@@ -705,11 +709,12 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 
 | Field                        | Type   | Default | Description                                                                                    |
 | ---------------------------- | ------ | ------- | ---------------------------------------------------------------------------------------------- |
-| `theme`                      | string | `"dark"` | Color theme for terminal output. Built-ins include `dark`, `light`, `dracula`, `sandy`, `tui`, `github-dark`, `cappadocia`, `rio`, and `australia`. Legacy `turkey` and `brazil` values still load as aliases. |
+| `theme`                      | string | `"aurora"` | Color theme for terminal output. Built-ins include `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, `rio`, and `australia`. Legacy `turkey` and `brazil` values still load as aliases. |
 | `customThemes`               | object | `{}`    | Inline custom theme definitions keyed by theme name. Set `theme` to the same key to use one.   |
 | `autoConfirm`                | boolean | `false` | Skip confirmation prompts for safe operations                                                  |
 | `readFileCharLimit`          | number | `300`   | Max characters to display from read/find tool output (full content is still sent to the model) |
 | `silentToolOutput`           | boolean | `false` | Hide tool output blocks in the terminal while still preserving tool results for the model/session |
+| `taskListPosition`           | `"up"` or `"above-composer"` | `"above-composer"` | Place the live task list above the status line or directly above the composer |
 | `activityVerbs`              | string or string[] | built-in pool | Custom activity verb or verb pool for the working indicator, rendered as `Verb...` |
 | `activityVerbsEnabled`       | boolean | `true`  | Show rotating activity verbs like `Compiling...` while the agent is working |
 | `activitySymbol`             | string | `"✳"`   | Symbol shown before the activity verb in activity indicator output |
@@ -729,6 +734,48 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `terminalBell`               | boolean | `true`  | Ring terminal bell when task completes (shows badge on terminal tab/dock)                      |
 | `checkForUpdates`            | boolean | `true`  | Check for CLI updates on startup                                                               |
 | `updateCheckInterval`        | number | `24`    | Hours between update checks (uses cached result within interval)                               |
+
+### Aurora theme
+
+Aurora is the default theme for new configurations and when no theme is selected. It combines charcoal surfaces, cool off-white text, soft periwinkle accents, and restrained mint, rose, and amber status colours. Existing saved theme selections are preserved.
+
+![Aurora in the built CLI, showing a sample response, coloured diff, and charcoal composer.](./images/aurora-theme.png)
+
+Select `aurora` from `/theme`, or set `"ui": { "theme": "aurora" }` in your config. Switching takes effect immediately and persists across sessions.
+
+| Role | Colour |
+| --- | --- |
+| Focus and headings | `#9b9ef5` periwinkle |
+| Main text | `#e4e5ec` cool pearl |
+| Secondary text and comments | `#a4a6b2` slate |
+| Input background | `#222326` charcoal |
+| Success and additions | `#86cfa3` mint |
+| Errors and removals | `#ed9a9a` rose |
+| Warnings and numbers | `#e2be80` amber |
+
+Use a dark terminal background; `#111216` is the reference background. Autohand styles its input and tool surfaces while leaving the terminal background setting to you. Text, syntax, and status colours are tested for at least 4.5:1 contrast on the reference background and theme surfaces; input text exceeds 7:1. Truecolor preserves the palette, with fallback conversion for 256-colour and 16-colour terminals. Status labels and diff markers also work without colour.
+
+### Tuatara theme
+
+Select `tuatara` from `/theme`, or set `"ui": { "theme": "tuatara" }` in your config. The selection takes effect immediately and persists across sessions.
+
+Tuatara uses lichen green for focus, warm stone for text, mist blue for functions and links, amber for warnings and numbers, and clay red for errors and removed lines. Its restrained palette draws on the [olive, brown, and orange-red colouring of New Zealand's tuatara](https://www.doc.govt.nz/nature/native-animals/reptiles-and-frogs/tuatara/).
+
+![Tuatara in the built CLI, showing a sample response, coloured diff, and dark olive composer.](./images/tuatara-theme.png)
+
+| Role | Colour |
+| --- | --- |
+| Focus and headings | `#b7c98a` lichen |
+| Main text | `#dfdfcf` warm stone |
+| Secondary text and comments | `#9da992` sage grey |
+| Input background | `#303c2d` dark olive |
+| Success and additions | `#9cba91` fern |
+| Errors and removals | `#e69a83` clay |
+| Warnings and numbers | `#d9bd7b` amber |
+
+Use a dark terminal background; `#171c17` is the reference background. Autohand styles its own input and tool surfaces but leaves the terminal's background setting to you. Tests check at least 4.5:1 contrast for text, syntax, and status colours against the reference background and these surfaces, and at least 7:1 for input text. These use the [W3C contrast calculation](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html); terminal palettes, transparency, and font rendering can affect the displayed result. Truecolor preserves the full palette; 256-colour and 16-colour terminals use the existing fallback conversion. Status labels and diff `+`/`-` markers remain readable when colour output is disabled.
+
+### Custom themes
 
 Custom themes can override any semantic color token. Missing tokens are inherited from the dark theme:
 
@@ -760,6 +807,26 @@ You can toggle silent tool output without editing the file:
 ```bash
 autohand config set silent_tool_output true
 autohand config set silent_tool_output false
+```
+
+### Task List Position
+
+Choose **UI & Display → Task list position** in `/settings`. `up` places live tasks above the working status line; `above-composer` keeps them directly above the composer and is the default.
+
+Set it directly during an interactive session:
+
+```text
+/settings task_list position up
+/settings task_list position above-composer
+```
+
+`above composer` is also accepted. Omit the value to open the position picker directly. The preference is saved and takes effect when the composer returns, without restarting.
+
+You can also set the position from the command line:
+
+```bash
+autohand config set task_list position up
+autohand config set task_list position above-composer
 ```
 
 You can toggle rotating activity verbs without editing the file:
@@ -852,7 +919,7 @@ This lets you place the blinking composer cursor by clicking text, including wra
 autohand config set ui.mouseComposerCursor false
 ```
 
-Terminal mouse reporting can change native selection and scroll-wheel behavior. Mouse reporting is disabled while the agent owns the screen for active work and is always restored when Autohand exits. Terminal-specific modifier keys, commonly Shift, may bypass mouse reporting for native selection.
+Terminal mouse reporting can change native selection and scroll-wheel behavior. During active work, click a live command to expand or compact its output; clicks in the composer continue to position its cursor. Mouse reporting is always restored when Autohand exits. Terminal-specific modifier keys, commonly Shift, may bypass mouse reporting for native selection.
 
 ### Update Check
 
@@ -978,6 +1045,15 @@ A goal is a standing instruction to keep working, so starting one switches the
 session into auto mode: the agent drives its own turns and stops asking for tool
 approval until the goal is complete. Setting a new goal while one is active
 queues it, and the queue advances automatically as each goal completes.
+If a migration or interrupted session leaves queued work without a live owner,
+bare `/goal` starts the next item instead of leaving the backlog stranded.
+
+Use `/goals` or `/goals view` (`/goal view` also works) to inspect compact goal
+summaries and edit full objectives. Close the panel with `Ctrl+G` (`Cmd+G` on
+macOS). `Esc` clears a goal selection or cancels its unsaved edit; it does not
+close the panel. Closing the view does not pause the goal; use `/goals pause`
+for that. See [viewing and managing goals](features.md#viewing-and-managing-goals)
+for keyboard controls and the queue, edit, resume, complete, and clear commands.
 
 To keep the normal turn-by-turn loop while goals are active:
 
@@ -1476,6 +1552,60 @@ Detected patterns include:
 
 ---
 
+## Multi-agent Session Limits
+
+`features.multi_agent_v2.max_concurrent_threads_per_session` sets the total number of simultaneous threads in a session, including the main agent. The default is `9`: one main agent plus up to eight subagents. Choose an integer from `1` to `64`. Setting `1` keeps the main agent available and disables delegation.
+
+Open `/settings` → **Teams** → **Session thread limit (main agent included)**, or set it directly:
+
+```text
+/settings features.multi_agent_v2.max_concurrent_threads_per_session 4
+/settings max_agents 4
+```
+
+The non-interactive equivalent is `autohand config set features.multi_agent_v2.max_concurrent_threads_per_session 4`. Settings are persisted in the existing configuration format:
+
+```json
+{
+  "features": {
+    "multi_agent_v2": {
+      "max_concurrent_threads_per_session": 4
+    }
+  }
+}
+```
+
+```yaml
+features:
+  multi_agent_v2:
+    max_concurrent_threads_per_session: 4
+```
+
+```toml
+[features.multi_agent_v2]
+max_concurrent_threads_per_session = 4
+```
+
+`teams.maxTeammates` remains a separate, narrower teammate limit. Raising it does not bypass the session-wide thread budget. Lower limits can reduce simultaneous provider usage, but this setting is not a token or spending cap.
+
+Teammate tools are authorized by the lead session's current tool capabilities, permission rules, and hooks. Headless teammates never silently approve an unresolved interactive request: authorize a specific rule in the lead session or perform that operation in the lead. Existing explicit automatic-approval settings remain subject to policy and hook denials. Missing authorization, a disconnected lead, or a stale task attempt fails closed.
+
+Background processes belong to the teammate task that started them. Failed or cancelled attempts stop their owned processes before reassignment; successful background servers may remain available until teammate shutdown. Shutdown stops all remaining teammate-owned processes without stopping unrelated processes.
+
+Selecting maximum reasoning shows a usage warning when the configured limit is eight or more. At the default, it identifies nine concurrent threads including up to eight subagents and recommends setting `features.multi_agent_v2.max_concurrent_threads_per_session` below eight. Reducing the limit blocks new children once capacity is exhausted; it does not interrupt existing work.
+
+Use `/agents view` to inspect direct and team runs, their live activity, parentage, model/provider, usage, output, and errors. The list updates as workers wait for model responses, read files, search, or run commands. Worker summaries no longer appear on the main screen; `ui.taskListPosition` continues to control ordinary task lists.
+
+Arrow keys select a run, Enter opens details, `m` opens its message editor, and `c` requests cancellation with confirmation. Enter queues a message for that exact worker's next model step; it does not mean the worker has already read it. Escape closes the message editor or returns from details/confirmation to the list; unsent drafts are discarded, but submitted messages are not recalled. Escape from the list restores the main composer and its draft. Finished, stopping, and unavailable workers cannot receive new messages. `/squad view` displays the native daemon's recorded runs for this workspace; these are independent, read-only sessions with their own budgets, not children charged against this CLI session's limit.
+
+Run details distinguish the execution workspace, original user request (when available), and delegated task. New workers use the currently selected workspace, including worktrees; nested workers and queued team tasks retain the initiating request and its constraints. Queued team tasks are bound to the workspace where they were created and remain pending when no matching worker is available; `task_get` includes that workspace. Finish or stop existing workers before switching workspaces. New workers cannot start while a workspace switch is in progress. `/agents definitions` uses the active session configuration, and `/squad view` follows the selected workspace.
+
+Workers receive a bounded set of saved project lessons from `<selected workspace>/.autohand/memory`. Lessons are reference data to verify against the current task, not instructions that override it. An authorized worker with `save_memory` can save a concise, evidence-backed lesson with `level="project"`; read-only workers and workers without that tool report lesson candidates to the lead. Worker tool allowlists are not expanded, and raw responses, logs, credentials, and speculative conclusions are not automatically stored. Bare mode disables project-memory bootstrap; `agent.autoMemory=false` does not authorize automatic lesson saving.
+
+For the evidence-driven review, cleanup, and testing commands, see [Lifecycle workflows](guides/lifecycle-workflows.md).
+
+---
+
 ## API Settings
 
 Backend API configuration for team features.
@@ -1805,7 +1935,7 @@ Configure MCP (Model Context Protocol) servers to extend Autohand with external 
 
 ## Hooks Settings
 
-Configuration for lifecycle hooks that run shell commands on agent events. See [Hooks Documentation](./hooks.md) for full details.
+Configuration for lifecycle hooks that run shell commands on agent events. Open `/hooks` to browse all events and create a workspace-scoped script in plain English, or `/hooks manage` for manual controls. Autohand AI also exposes `list_hooks`, `create_hook`, and `set_hook_enabled`. See [Hooks Documentation](./hooks.md) for the workflow, plugin counts, approval behavior, and script storage.
 
 ```json
 {
@@ -1825,8 +1955,8 @@ Configuration for lifecycle hooks that run shell commands on agent events. See [
         "filter": { "path": ["src/**/*.ts"] }
       },
       {
-        "event": "post-response",
-        "command": "curl -X POST https://api.example.com/webhook -d '{\"tokens\": $HOOK_TOKENS}'",
+        "event": "stop",
+        "command": "printf '%s\\n' \"$HOOK_TOKENS\" >> token-usage.log",
         "description": "Track token usage",
         "async": true
       }
@@ -1852,7 +1982,24 @@ Configuration for lifecycle hooks that run shell commands on agent events. See [
 | `enabled`     | boolean | No       | `true`  | Whether hook is active           |
 | `timeout`     | number  | No       | `5000`  | Timeout in milliseconds          |
 | `async`       | boolean | No       | `false` | Run without blocking             |
+| `matcher`     | string  | No       | -       | Regular expression for the event's tool name, session type, notification type, or other supported context |
 | `filter`      | object  | No       | -       | Filter by tool or path           |
+| `importedFrom` | object | No       | -       | Import-generated source metadata used for compatibility, workspace scope, and deduplication |
+
+`filter.tool` accepts an array of Autohand tool names, and `filter.path` accepts an array of path globs. Imported hooks also apply their source event's matching rules and success/failure filters. See [Matchers](./hooks.md#matcher-regex-filtering) for event-specific matching.
+
+### Imported Hook Metadata
+
+The import feature writes `importedFrom` on each imported definition. Keep this metadata when editing a definition: it selects the source payload adapter and preserves project scope and duplicate detection.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | string | Generated identifier used to skip unchanged definitions on repeat imports |
+| `source` | string | `claude`, `codex`, `cursor`, or `grok` |
+| `event` | string | Original source event name, such as `PreToolUse` or `preToolUse` |
+| `configPath` | string | Path of the source configuration file |
+| `workspaceRoot` | string, optional | Restricts a project hook to its original workspace |
+| `workingDirectory` | string, optional | Retains a source-specific working directory, including Cursor user hooks |
 
 ### Hook Events
 
@@ -1861,10 +2008,27 @@ Configuration for lifecycle hooks that run shell commands on agent events. See [
 | `pre-tool`      | Before any tool executes              |
 | `post-tool`     | After tool completes                  |
 | `file-modified` | When file is created/modified/deleted |
-| `pre-prompt`    | Before sending to LLM                 |
-| `post-response` | After LLM responds                    |
+| `pre-prompt`    | Before prompt preparation and model calls in interactive, command, ACP, and JSON-RPC turns |
+| `stop`         | After the agent finishes a turn, including configured ACP stop hooks |
+| `post-response` | Backward-compatible alias for `stop` |
+| `session-start` | When a session starts, resumes, or is cleared |
+| `session-end`   | When a session ends |
+| `pre-clear`     | Before memory extraction on `/clear` or `/new` |
+| `permission-request` | Before a permission prompt |
+| `notification` | When a notification is sent to the user |
 | `session-error` | When error occurs                     |
 | `rate-limit`    | When a rate limit ends the turn       |
+| `mode-change`   | When permission mode changes, with previous and current modes |
+| `pre-learn`     | Before a learn operation, including `/learn` analysis |
+| `post-learn`    | After a learn operation, with its success state |
+| `autoresearch:decision` | When an experiment decision is persisted |
+| `autoresearch:replay` | When an isolated candidate replay completes |
+| `autoresearch:rescore` | When stored measurements are rescored |
+| `autoresearch:prune` | When artifact retention is previewed or applied |
+
+This table lists common events and the recent wiring additions. Use `/hooks list` or the [complete event catalog](./hooks.md#hook-events) for all automode, autoresearch, team, review, and context events. Autoresearch decision, replay, rescore, and prune hooks also support matchers.
+
+A `pre-prompt` hook can prevent model work with a JSON `decision` of `deny` or `block`, `continue: false`, or exit code 2. Supported `additionalContext` is added to the conversation. Running prompt hooks can be canceled with Escape in the interactive CLI or through protocol cancellation. See [control flow responses](./hooks.md#control-flow-responses) for response fields and event-specific behavior.
 
 ### Environment Variables
 
@@ -1878,7 +2042,30 @@ When hooks execute, these environment variables are available:
 | `HOOK_ARGS`      | JSON-encoded tool args      |
 | `HOOK_SUCCESS`   | true/false (post-tool)      |
 | `HOOK_PATH`      | File path (file-modified)   |
-| `HOOK_TOKENS`    | Tokens used (post-response) |
+| `HOOK_TOKENS`    | Tokens used (`stop`) |
+| `HOOK_PREVIOUS_MODE` | Previous permission mode (`mode-change`) |
+| `HOOK_MODE` | Current permission mode (`mode-change`) |
+
+Hooks also receive JSON on stdin. Mode changes include `previous_mode` and `mode`. See the [complete environment-variable reference](./hooks.md#environment-variables) and source adapter notes for imported hooks.
+
+### Import Hooks from Another Coding Agent
+
+```sh
+autohand import claude --categories hooks
+autohand import codex --categories hooks
+autohand import cursor --categories hooks
+autohand import grok --categories hooks
+```
+
+Inside a session, use `/import claude --categories hooks` (or another source name). The slash command persists definitions and updates the current hook manager. The standalone CLI respects `--path`, `--config`, and `AUTOHAND_CONFIG`, including JSON, TOML, and YAML destination configs. Use `--dry-run` to scan without writing, or `--all --categories hooks` to restrict an all-source import to hooks.
+
+Imported command hooks are **saved with `enabled: false`**. Review their scripts, then enable selected entries through `/hooks manage`. The global `hooks.enabled` switch still applies. Importing does not execute commands, copy scripts, install dependencies, or inherit another agent's trust approvals. Unchanged repeat imports are skipped and preserve the enabled state of existing definitions.
+
+The importer reads user and current-project configurations for Claude Code, Codex, Cursor, and Grok. Codex supports both `hooks.json` and nested TOML hook definitions; Grok import currently handles hooks only. Project hooks retain their workspace scope. Source timeout values are converted from seconds to Autohand's milliseconds.
+
+Only compatible command hooks are translated. Unsupported source HTTP, prompt/agent, async, and `failClosed` handlers are reported as skipped, along with events that require unavailable behavior such as turn continuation or pre-compaction. Legacy Codex `notify` commands are detected and reported for manual porting because they receive JSON in argv. Source-specific payloads and tool schemas are not fully reproduced.
+
+See [hook import compatibility](./hooks.md#import-hooks-from-another-coding-agent) for source file locations, event mappings, timeout defaults, supported responses, and manual-porting limits.
 
 ---
 
@@ -1945,7 +2132,7 @@ autohand --no-browser       # Start with browser bridge disabled
     "allowDangerousOps": false
   },
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "autoConfirm": false,
     "showCompletionNotification": true,
     "showThinking": true,
@@ -2032,7 +2219,7 @@ workspace:
   allowDangerousOps: false
 
 ui:
-  theme: dark
+  theme: aurora
   autoConfirm: false
   showCompletionNotification: true
   showThinking: true
@@ -2119,7 +2306,7 @@ defaultRoot = "~/projects"
 allowDangerousOps = false
 
 [ui]
-theme = "dark"
+theme = "aurora"
 autoConfirm = false
 showCompletionNotification = true
 showThinking = true
@@ -2230,6 +2417,7 @@ These flags override config file settings:
 | ----------------------------- | ---------------------------------------------------------------------------------------------- |
 | `--unrestricted`              | No approval prompts                                                                            |
 | `--restricted`                | Deny dangerous operations                                                                      |
+| `--plan`                      | Start in read-only plan mode before the first interactive or command prompt                     |
 | `--permissions`               | Display current permission settings and exit                                                   |
 | `--no-idle-logout`            | Keep authenticated sessions alive past the idle timeout for long-running agents                |
 | `--yolo [pattern]`            | Auto-approve tool calls matching pattern (e.g., `allow:read,write` or `deny:delete`)           |
@@ -2367,9 +2555,19 @@ Enable an increment with `autohand experiments enable <feature>`. Partial, clamp
 
 ## Slash Commands
 
+Start directly in planning mode with `autohand --plan`, or generate a one-shot plan with `autohand --plan --prompt "Plan the migration"`. Planning instructions and read-only tool gating apply from the first model request. Interactive plan acceptance requires a user decision even with `--yes` or `--unrestricted`; command and unattended runs leave the plan pending review. Use `/plan off` or Shift+Tab to change modes interactively.
+
+`--plan` conflicts with `--yolo`, `--auto-mode`, and `--auto-commit`. It does not change the `--mode rpc|acp` transport selector.
+
 Autohand provides a rich set of slash commands for interactive use. Type `/` in the REPL to see suggestions.
 
 ### Session Management
+
+From the shell, `autohand resume` opens a picker scoped to the current working directory. Use `--path <path>` to select another workspace, `--all` to browse every project, or `--last` to resume the most recently active session. `--last --all` selects the most recently active session across projects. Older metadata without a valid activity timestamp falls back to creation time.
+
+`autohand resume <reference>` accepts a full session ID, a unique ID prefix, or a saved session directory/file. Ambiguous or missing references exit with an error. Explicit references cannot be combined with `--last` or `--all`. `--config`, `--model`, and `--offline` remain available; `-c` continues to mean auto-commit.
+
+The picker loads twenty sessions per page and provides **More sessions** and **Previous sessions** navigation. Escape or Ctrl+C cancels without starting an agent. Non-interactive invocations require `--last` or an explicit reference when saved sessions exist. Empty history exits successfully without starting a session.
 
 | Command       | Description                                           |
 | ------------- | ----------------------------------------------------- |
@@ -2381,11 +2579,13 @@ Autohand provides a rich set of slash commands for interactive use. Type `/` in 
 | `/sessions`   | List past sessions                                    |
 | `/resume`     | Resume a previous session                             |
 | `/history`    | Browse session history with pagination                |
-| `/undo`       | Revert git changes and last turn                      |
+| `/undo`       | Revert the last recorded agent file mutation and turn |
 | `/export`     | Export session to markdown/JSON/HTML                  |
 | `/share`      | Share current session                                 |
 | `/status`     | Show session status and the signed-in Autohand plan   |
 | `/usage`      | Show Autohand plan limits and project token activity  |
+
+`/undo` never resets or cleans the Git worktree. It preserves unrelated tracked and untracked work, and refuses to overwrite a file that changed after the recorded agent mutation.
 
 ### Model & Provider
 
@@ -2406,7 +2606,9 @@ Autohand provides a rich set of slash commands for interactive use. Type `/` in 
 
 | Command       | Description                                           |
 | ------------- | ----------------------------------------------------- |
-| `/agents`     | List available sub-agents                             |
+| `/agents`     | Watch active Autohand sessions                         |
+| `/agents definitions` | List installed sub-agent definitions          |
+| `/agents view` | Inspect direct and team runs                          |
 | `/agents provider [agent]` | Choose and confirm the provider/model default for new teammates, or an override for one sub-agent definition |
 | `/agents-new` | Create a new agent via wizard                         |
 | `/squad`      | Open/manage the standalone Autohand Squad runtime     |

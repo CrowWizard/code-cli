@@ -63,6 +63,7 @@ const TOOL_CATEGORIES: Record<string, ToolCategory> = {
   orchestrate_specialists: 'meta',
   install_specialist_roster: 'create',
   create_team: 'meta',
+  compose_team: 'meta',
   add_teammate: 'meta',
   create_task: 'meta',
   task_get: 'meta',
@@ -115,6 +116,7 @@ const TOOL_CATEGORIES: Record<string, ToolCategory> = {
   copy_path: 'create',
   rename_path: 'create',
   add_dependency: 'create',
+  capture_test_evidence: 'create',
 
   // Delete operations
   delete_path: 'delete',
@@ -565,6 +567,7 @@ const RELEVANCE_CATEGORIES: Record<string, RelevanceCategory> = {
   delegate_task: 'meta',
   delegate_parallel: 'meta',
   create_team: 'meta',
+  compose_team: 'meta',
   add_teammate: 'meta',
   create_task: 'meta',
   task_get: 'meta',

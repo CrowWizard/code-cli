@@ -26,7 +26,7 @@ import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { execSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { getProviderConfig, loadConfig, resolveWorkspaceRoot, saveConfig } from './config.js';
 import { runStartupChecks, printStartupCheckResults, validateWorkspacePath } from './startup/checks.js';
 import { checkWorkspaceSafety, printDangerousWorkspaceWarning } from './startup/workspaceSafety.js';
@@ -50,6 +50,10 @@ import { AUTOHAND_PATHS, PROJECT_DIR_NAME } from './constants.js';
 import { isSessionWorktreeEnabled, prepareSessionWorktree } from './utils/sessionWorktree.js';
 import { buildTmuxLaunchCommand, createTmuxSessionName, isTmuxEnabled } from './utils/tmux.js';
 import { registerBrowserCommand, registerBrowserOptions } from './browser/cliCommand.js';
+import { registerReviewCommand } from './review/reviewCliCommand.js';
+import { registerTransferCommand } from './startup/transferCommand.js';
+import { registerResumeCommand } from './startup/resumeCommand.js';
+import type { ReviewCliExecution } from './review/reviewCliRuntime.js';
 import { formatDeprecatedBrowserOptionWarning } from './browser/compatibility.js';
 import {
   normalizeContextCompactOption,
@@ -91,7 +95,7 @@ import { AgentsGenerator } from './onboarding/agentsGenerator.js';
 import { buildAutomodeIterationPrompt } from './core/automodePrompt.js';
 import { looksLikeInlineAgents, parseInlineAgents } from './core/agents/AgentRegistry.js';
 import { getCustomProviderConfig, isCustomProviderName } from './providers/customProviders.js';
-import { runtimeVersion } from './utils/runtimeVersion.js';
+import { GIT_VERSION_LOOKUP_TIMEOUT_MS, runtimeVersion } from './utils/runtimeVersion.js';
 import {
   getAnnouncementManager,
   renderLaunchAnnouncement,
@@ -160,7 +164,12 @@ function getGitCommit(): string {
   }
   // Fallback for development (running from source)
   try {
-    return execSync('git rev-parse --short HEAD', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+    return execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: GIT_VERSION_LOOKUP_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    }).trim();
   } catch {
     return 'unknown';
   }
@@ -220,7 +229,7 @@ async function syncAccountManagedMcpConfig(
   }
   try {
     const { syncCodingAgentControlPlane } = await import('./sync/CodingAgentControlPlane.js');
-    await syncCodingAgentControlPlane(config, config.auth.token);
+    await syncCodingAgentControlPlane(config, config.auth.token, { publishLocalConnectors: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.log(chalk.yellow(`Saved locally. Connector sync will retry when Code is running: ${message}`));
@@ -231,6 +240,7 @@ import { normalizeMcpCommandForConfig } from './mcp/commandNormalization.js';
 import type { CLIOptions, AgentRuntime } from './types.js';
 import type { AutohandAgent } from './core/agent.js';
 import { registerExtensionsCommand } from './extensions/cli.js';
+import { isDiscoveryInvocation, registerDiscoveryCommand } from './discovery/cli.js';
 
 installProcessErrorHandlers();
 
@@ -238,6 +248,7 @@ const program = new Command();
 registerBrowserCommand(program);
 registerBrowserOptions(program);
 registerExtensionsCommand(program);
+registerDiscoveryCommand(program);
 
 program
   .name('autohand')
@@ -262,6 +273,8 @@ program
   .option('-c, --auto-commit', 'Auto-commit with LLM-generated message (runs lint & test first)', false)
   .option('--unrestricted', 'Run without any approval prompts (use with caution)', false)
   .option('--restricted', 'Deny all dangerous operations automatically', false)
+  .addOption(new Option('--plan', 'Start in read-only plan mode; require approval before execution')
+    .conflicts(['autoMode', 'yolo', 'autoCommit']))
   .option('--answer-only', 'Run the classified, tool-free Blueprint answer RPC profile', false)
   .option('--setup-only', 'Run only the scoped Autohand device-authorization RPC profile', false)
   .option('--client-context <context>', 'RPC client context: cli, vscode, browser, slack, api, restricted, or blueprint (default: cli)')
@@ -640,13 +653,46 @@ program
     await runCLI(opts);
   });
 
-program
-  .command('resume <sessionId>')
-  .description('Resume a previous session')
-  .option('--path <path>', 'Workspace path to operate in')
-  .option('--model <model>', 'Override the configured LLM model')
-  .option('--offline', 'Disable the model catalog refresh for this resumed session', false)
-  .action(async (sessionId: string, opts: CLIOptions & { offline?: boolean }) => {
+registerReviewCommand(program, {
+  run: async (invocation) => {
+    const { executeReviewCliInvocation } = await import('./review/reviewCliRuntime.js');
+    await executeReviewCliInvocation(invocation, {
+      cwd: () => process.cwd(),
+      refreshModelCatalog: refreshModelCatalogBeforeAgentStart,
+      loadConfig,
+      resolveWorkspaceRoot,
+      validateWorkspacePath,
+      checkWorkspaceSafety,
+      authenticate: ensureAuthenticated,
+      buildInstruction: async (workspaceRoot, request) => {
+        const { buildReviewCommandInstruction } = await import('./commands/review.js');
+        return buildReviewCommandInstruction(workspaceRoot, request);
+      },
+      run: async (execution) => {
+        await runCLI({
+          ...execution.options,
+          _authConfig: execution.authenticatedConfig,
+          reviewExecution: execution.review,
+        });
+      },
+    });
+  },
+  serve: async (invocation) => {
+    const { serveReviewReport } = await import('./review/reviewReportServer.js');
+    await serveReviewReport(invocation);
+  },
+});
+
+registerTransferCommand(program, {
+  run: async ({ provider, ...opts }) => {
+    await refreshModelCatalogBeforeAgentStart(opts);
+    const authConfig = await ensureAuthenticated(await loadConfig(opts.config, opts.path));
+    await runCLI({ ...opts, _authConfig: { ...authConfig, provider, autohandai: { plan: 'cloud', authMode: 'account', accountToken: authConfig.auth?.token, model: opts.model } } });
+  },
+});
+
+registerResumeCommand(program, {
+  run: async (opts) => {
     await refreshModelCatalogBeforeAgentStart(opts);
 
     // Account-backed providers require a valid login; configured BYOK and local
@@ -655,10 +701,9 @@ program
     if (!canUseProviderWithoutAccountAuth(authConfig)) {
       authConfig = await ensureAuthenticated(authConfig);
     }
-    (opts as any)._authConfig = authConfig;
-
-    await runCLI({ ...opts, resumeSessionId: sessionId });
-  });
+    await runCLI({ ...opts, _authConfig: authConfig });
+  },
+});
 
 program
   .command('login')
@@ -1245,7 +1290,7 @@ function hasFlag(args: string[], flagName: string): boolean {
 // ── Import subcommand ─────────────────────────────────────────────────
 program
   .command('import [source]')
-  .description('Import data from other coding agents (claude, codex, gemini, cursor, cline, continue, augment, opencode, kimi)')
+  .description('Import data from other coding agents (claude, codex, gemini, cursor, cline, continue, augment, opencode, kimi, grok)')
   .option('--all', 'Import all available categories without prompting')
   .option('--categories <list>', 'Comma-separated list of categories to import (sessions,settings,skills,memory,mcp,hooks)', (val: string) => val.split(','))
   .option('--dry-run', 'Preview what would be imported without making changes')
@@ -1253,6 +1298,8 @@ program
   .action(async (source: string | undefined, opts: { all?: boolean; categories?: string[]; dryRun?: boolean; retryFailed?: boolean }) => {
     const { runImport } = await import('./import/index.js');
     await runImport({
+      workspaceRoot: path.resolve(program.opts<CLIOptions>().path ?? process.cwd()),
+      configPath: program.opts<CLIOptions>().config,
       source: source as any,
       categories: opts.categories as any,
       all: opts.all,
@@ -1262,15 +1309,21 @@ program
     process.exit(0);
   });
 
-async function runCLI(options: CLIOptions): Promise<void> {
+interface InternalCLIOptions extends CLIOptions {
+  _authConfig?: LoadedConfig;
+  reviewExecution?: ReviewCliExecution['review'];
+}
+
+async function runCLI(options: InternalCLIOptions): Promise<void> {
   const agentHolder: { current: AutohandAgent | null } = { current: null };
   const commandLifecycleController = new AbortController();
   let agent: AutohandAgent | null = null;
   const structuredOutput = isStructuredCommandOutput(options.commandOutputFormat);
-  const commandOutputWriter = structuredOutput
+  const captureCommandOutput = structuredOutput || options.reviewExecution !== undefined;
+  const commandOutputWriter = captureCommandOutput
     ? new CommandOutputWriter(options.commandOutputFormat ?? 'text')
     : undefined;
-  const restoreConsoleOutput = structuredOutput ? redirectConsoleOutputToStderr() : undefined;
+  const restoreConsoleOutput = captureCommandOutput ? redirectConsoleOutputToStderr() : undefined;
   let commandOutputCompleted = false;
   const runtimeResourceOwner = new CliRuntimeResourceOwner<
     AuthUser,
@@ -1292,7 +1345,7 @@ async function runCLI(options: CLIOptions): Promise<void> {
     },
   });
   try {
-    let config = (options as any)._authConfig ?? await awaitCliLifecycleStep(
+    let config = options._authConfig ?? await awaitCliLifecycleStep(
       loadConfig(options.config, process.cwd()),
       commandLifecycleController.signal,
     );
@@ -1471,6 +1524,7 @@ async function runCLI(options: CLIOptions): Promise<void> {
       config,
       workspaceRoot,
       options,
+      commandOutputCaptured: captureCommandOutput,
       additionalDirs: additionalDirs.length > 0 ? additionalDirs : undefined
     };
 
@@ -1577,10 +1631,12 @@ async function runCLI(options: CLIOptions): Promise<void> {
           && config.sync?.enabled !== false
         ),
         createSyncService: async (authUser) => {
-          const { createSyncService, DEFAULT_SYNC_CONFIG } = await import('./sync/index.js');
+          const { createSyncService, DEFAULT_SYNC_CONFIG, SyncApiClient } = await import('./sync/index.js');
           return createSyncService({
+            controlPlaneConfigPath: config.configPath,
             authToken: config.auth?.token ?? '',
             userId: authUser.id,
+            apiClient: new SyncApiClient({ baseUrl: config.api?.baseUrl }),
             config: {
               ...DEFAULT_SYNC_CONFIG,
               ...config.sync,
@@ -1609,10 +1665,7 @@ async function runCLI(options: CLIOptions): Promise<void> {
 
     // Override model from CLI if provided
     if (options.model) {
-      const providerName = config.provider ?? 'openrouter';
-      if (config[providerName]) {
-        (config as any)[providerName].model = options.model;
-      }
+      applyCliModelOverride(config, options.model);
     }
 
     // Override debug mode from CLI if provided
@@ -1772,7 +1825,7 @@ async function runCLI(options: CLIOptions): Promise<void> {
     if (agentLaunchMode === 'fork' && options.fork) {
         const forkEnabled = getFeatureState(config, 'experimental_fork')?.enabled === true;
         if (!forkEnabled) {
-          console.error(chalk.red('The --fork flag is behind experimental_fork. Run /features enable experimental_fork, then try again.'));
+          console.error(chalk.red('The --fork flag is behind experimental_fork. Run /experiments enable experimental_fork, then try again.'));
           process.exitCode = 1;
           return;
         }
@@ -1788,10 +1841,15 @@ async function runCLI(options: CLIOptions): Promise<void> {
       if (commandOutputWriter) {
         agent.setOutputListener((event) => commandOutputWriter.handleEvent(event));
       }
-      const succeeded = await agent.runCommandMode(
-        options.prompt,
-        commandLifecycleController.signal,
-      );
+      const succeeded = options.reviewExecution
+        ? await agent.runCommandMode(options.prompt, {
+            signal: commandLifecycleController.signal,
+            review: options.reviewExecution,
+          })
+        : await agent.runCommandMode(
+            options.prompt,
+            commandLifecycleController.signal,
+          );
       commandOutputWriter?.finish(succeeded);
       commandOutputCompleted = true;
       agent.setOutputListener(undefined);
@@ -2712,7 +2770,15 @@ function isCliEntrypoint(): boolean {
     return false;
   }
 
-  return import.meta.url === pathToFileURL(entryPath).href;
+  if (import.meta.url === pathToFileURL(entryPath).href) {
+    return true;
+  }
+
+  try {
+    return import.meta.url === pathToFileURL(fs.realpathSync(entryPath)).href;
+  } catch {
+    return false;
+  }
 }
 
 if (isCliEntrypoint()) {
@@ -2742,7 +2808,7 @@ function argvOptionValue(argv: string[], option: string): string | undefined {
 }
 
 async function prepareRuntimeExtensionsForCli(command: Command, argv: string[]): Promise<void> {
-  if (argv.includes('--bare')) {
+  if (argv.includes('--bare') || isDiscoveryInvocation(command, argv)) {
     return;
   }
   const workspaceRoot = path.resolve(argvOptionValue(argv, '--path') ?? argvOptionValue(argv, '--dir') ?? process.cwd());

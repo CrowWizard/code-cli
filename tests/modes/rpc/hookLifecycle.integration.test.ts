@@ -3,6 +3,7 @@
  * Copyright 2026 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import { InstructionRunner, type AgentInstructionHost, type RunInstructionOptions } from '../../../src/core/agent/InstructionRunner.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../src/modes/rpc/protocol.js', () => ({
@@ -48,7 +49,7 @@ function createHarness() {
     parseSlashCommand: vi.fn(),
     isSlashCommandSupported: vi.fn().mockReturnValue(false),
     handleSlashCommand: vi.fn(),
-    runInstruction: vi.fn().mockResolvedValue(true),
+    runInstruction: vi.fn<AutohandAgent['runInstruction']>().mockResolvedValue(true),
   };
   const conversation = {
     history: vi.fn().mockReturnValue([]),
@@ -234,12 +235,34 @@ describe('HookManager to RPC lifecycle integration', () => {
     ]);
   });
 
+  it('publishes subagent progress and user controls with exact run identifiers', async () => {
+    const { hookManager } = createHarness();
+    vi.mocked(writeNotification).mockClear();
+    const context = { subagentId: 'child', subagentName: 'reader', subagentType: 'builtin',
+      subagentParentId: 'lead', subagentSource: 'delegate', subagentStatus: 'running',
+      subagentActivity: 'Reading files', subagentMessage: 'Check tests', subagentWorkspace: '/workspace' };
+    for (const event of ['subagent-start', 'subagent-progress', 'subagent-message', 'subagent-cancel-requested'] as const) {
+      await hookManager.executeHooks(event, context);
+    }
+    expect(hookNotifications()).toEqual([
+      'autohand.hook.subagentStart', 'autohand.hook.subagentProgress',
+      'autohand.hook.subagentMessage', 'autohand.hook.subagentCancelRequested',
+    ].map(method => [method, {
+      subagentId: 'child', subagentName: 'reader', subagentType: 'builtin', parentId: 'lead',
+      source: 'delegate', status: 'running', activity: 'Reading files', message: 'Check tests',
+      workspace: '/workspace', timestamp,
+    }]));
+  });
+
   it('emits pre-prompt and session-error from the real accepted-prompt path', async () => {
-    const { adapter, agent, emitOutput } = createHarness();
-    agent.runInstruction.mockImplementationOnce(async () => {
-      emitOutput({ type: 'error', content: 'provider failed' });
-      return false;
-    });
+    const { adapter, agent, hookManager, emitOutput } = createHarness();
+    hookManager.setWorkspaceRoot(process.cwd());
+    await hookManager.updateSettings({ enabled: true, hooks: [{ event: 'pre-prompt', command: `printf '%s' '{"decision":"block","reason":"provider failed"}'` }] });
+    const host = {
+      runtime: { workspaceRoot: process.cwd(), options: {}, config: {}, isRpcMode: true },
+      hookManager, activeAbortController: null, isInstructionActive: false, emitOutput,
+    } as unknown as AgentInstructionHost;
+    agent.runInstruction.mockImplementationOnce(async (instruction: string, options?: RunInstructionOptions) => new InstructionRunner(host).run(instruction, options));
     vi.mocked(writeNotification).mockClear();
 
     await adapter.handlePrompt('request-1', {

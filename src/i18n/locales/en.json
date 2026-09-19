@@ -203,6 +203,8 @@
         "autoConfirmDesc": "Skip confirmation prompts for tool actions",
         "silentToolOutput": "Silent tool output",
         "silentToolOutputDesc": "Hide tool output blocks in the terminal while preserving model context",
+        "taskListPosition": "Task list position",
+        "taskListPositionDesc": "Place active tasks above status or directly above the composer",
         "showThinking": "Show LLM thinking",
         "showThinkingDesc": "Display the model reasoning process",
         "terminalBell": "Terminal bell",
@@ -277,6 +279,8 @@
         "useWorktreeDesc": "Use git worktree by default"
       },
       "teams": {
+        "sessionThreadLimit": "Session thread limit (main agent included)",
+        "sessionThreadLimitDesc": "1–64 total threads; default 9 = main agent + up to 8 subagents. Set 1 to disable delegation.",
         "enabled": "Teams enabled",
         "enabledDesc": "Enable team coordination features",
         "teammateMode": "Teammate mode",
@@ -421,7 +425,7 @@
       "failed": "Failed to submit feedback: {{error}}"
     },
     "hooks": {
-      "description": "manage git hooks",
+      "description": "browse and create lifecycle hooks",
       "title": "Git Hooks",
       "installed": "Installed hooks:",
       "available": "Available hooks:",

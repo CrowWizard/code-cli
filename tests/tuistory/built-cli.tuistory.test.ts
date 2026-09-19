@@ -16,6 +16,9 @@ import stripAnsi from 'strip-ansi';
 import packageJson from '../../package.json' with { type: 'json' };
 import { SLASH_COMMANDS } from '../../src/core/slashCommands.js';
 import { hasTerminalProcessPid } from '../../src/testing/assertions/terminalOutput.js';
+import { openGoalsPanel } from '../../src/testing/scenarios/goalsCommandScenario.js';
+import { selectTheme } from '../../src/testing/scenarios/themeScenario.js';
+import { createStalledGitVersionPreload } from '../../src/testing/scenarios/gitVersionScenario.js';
 import { getHelpOrderedSlashCommands } from '../../src/ui/inputPrompt.js';
 import {
   clearComposerInput,
@@ -130,6 +133,20 @@ function expectCursorAfterTypedText(screen: string, typedText: string): void {
   const cursorColumn = typedLine?.indexOf(CURSOR_CHAR) ?? -1;
 
   expect(cursorColumn, screen).toBeGreaterThanOrEqual(textColumn + typedText.length);
+}
+
+const CURSOR_POSITION_QUERY = '\x1b[6n';
+
+// The click travels PTY -> CLI stdin -> Ink handler -> stdout -> PTY before the
+// query can appear in the captured output, so poll instead of asserting at once.
+async function waitForCursorPositionQuery(session: Session, outputStart = 0): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!session.getRawOutput().slice(outputStart).includes(CURSOR_POSITION_QUERY)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for the cursor position query after a click. Raw output tail:\n${JSON.stringify(session.getRawOutput().slice(-2_000))}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 function composerLineIncludes(screen: string, text: string): boolean {
@@ -569,6 +586,26 @@ describe('built CLI Tuistory smoke tests', () => {
 
     expect(output).not.toContain('missing contextWindow');
     await waitForExit(session);
+    expectCleanExit(session);
+  });
+
+  it('renders the packaged version when the Git metadata subprocess stalls', async () => {
+    const state = await createTempAutohandHome({ initializeGit: false });
+    tempStates.push(state);
+    const session = await trackSession(launchBuiltAutohand(['--version'], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: {
+        NODE_OPTIONS: await createStalledGitVersionPreload(state.autohandHome),
+        AUTOHAND_VERSION_SOURCE: 'git',
+      },
+      waitForDataTimeout: 15_000,
+    }));
+
+    await waitForExit(session, 15_000);
+    const output = session.readAll();
+    expect(output).toContain(`${packageJson.version} (`);
+    expect(output).not.toContain('999.0.0');
     expectCleanExit(session);
   });
 
@@ -1280,6 +1317,164 @@ describe('interactive built CLI Tuistory tests', () => {
     await exitInteractive(session);
   }, 45_000);
 
+  it('starts a stranded queued goal from bare /goal without dumping the failure transcript', async () => {
+    const queuedObjective = [
+      'fix the failing Windows installer test and commit the repair',
+      'Process completed with exit code 1.',
+      'tests/windowsInstaller.spec.ts:208 AssertionError',
+      'FULL_FAILURE_TRANSCRIPT_MUST_NOT_RENDER',
+    ].join('\n');
+    const openRouterServer = await createMockOpenRouterSequenceServer([
+      JSON.stringify({
+        toolCalls: [],
+        finalResponse: 'STRANDED_QUEUED_GOAL_STARTED',
+      }),
+    ]);
+    mockServers.push(openRouterServer);
+    const state = await createTempAutohandHome({
+      config: {
+        openrouter: { baseUrl: openRouterServer.baseUrl },
+        features: { slashGoal: true },
+        agent: {
+          autoMemory: false,
+          goalAutoMode: false,
+          maxIterations: 2,
+          sessionRetryLimit: 0,
+        },
+        network: { maxRetries: 0, retryDelay: 0 },
+        ui: {
+          promptSuggestions: false,
+          showCompletionNotification: false,
+          terminalBell: false,
+        },
+      },
+    });
+    tempStates.push(state);
+    const now = Date.now();
+    await fs.outputJson(path.join(state.workspaceRoot, '.autohand', 'goals.local.json'), {
+      version: 1,
+      goal: {
+        goalId: 'offline-peer-goal',
+        objective: 'work owned by an offline session',
+        status: 'active',
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: now,
+        updatedAt: now,
+      },
+      queue: [{
+        queueId: 'queued-failing-test',
+        objective: queuedObjective,
+        source: 'command',
+        createdAt: now,
+      }],
+      completed: [],
+      updatedAt: now,
+      activeSessionId: 'offline-session',
+    });
+    const session = await trackSession(
+      launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
+        autohandHome: state.autohandHome,
+        cwd: state.workspaceRoot,
+        waitForDataTimeout: 15_000,
+      }),
+    );
+
+    await waitForComposer(session);
+    await session.type('/goal');
+    await session.press('enter');
+    await session.waitForText('Started queued goal.', { timeout: 5_000 });
+    await session.waitForText('STRANDED_QUEUED_GOAL_STARTED', { timeout: 15_000 });
+
+    const output = session.readAll();
+    expect(output).toContain('fix the failing Windows installer test');
+    expect(output).not.toContain('FULL_FAILURE_TRANSCRIPT_MUST_NOT_RENDER');
+
+    await exitInteractive(session);
+  }, 45_000);
+
+  it('enables slash_goals, opens /goals, and edits a chained goal with the mouse', async () => {
+    const openRouterServer = await createMockOpenRouterSequenceServer([
+      JSON.stringify({
+        toolCalls: [],
+        finalResponse: 'FIRST_GOAL_TURN_IDLE',
+      }),
+    ]);
+    mockServers.push(openRouterServer);
+    const session = await launchInteractive({
+      config: {
+        openrouter: { baseUrl: openRouterServer.baseUrl },
+        agent: {
+          autoMemory: false,
+          goalAutoMode: false,
+          maxIterations: 2,
+          sessionRetryLimit: 0,
+        },
+        network: { maxRetries: 0, retryDelay: 0 },
+        ui: {
+          promptSuggestions: false,
+          showCompletionNotification: false,
+          terminalBell: false,
+        },
+      },
+    });
+
+    await waitForComposer(session);
+    await session.type('/experiments enable slash_goals');
+    await session.press('enter');
+    await session.waitForText('Enabled slash_goal.', { timeout: 5_000 });
+
+    await waitForComposer(session);
+    await session.type('/goal ship the first queue item');
+    await session.press('enter');
+    await session.waitForText('Goal created.', { timeout: 5_000 });
+    await session.waitForText('FIRST_GOAL_TURN_IDLE', { timeout: 15_000 });
+
+    await waitForComposer(session);
+    await session.type('/goal ship the second queue item');
+    await session.press('enter');
+    await session.waitForText('Queued goal.', { timeout: 5_000 });
+
+    await openGoalsPanel(session);
+    await session.waitForText('Goals · 2 total', { timeout: 5_000 });
+    await session.waitForText('ship the first queue item', { timeout: 5_000 });
+    await session.waitForText('ship the second queue item', { timeout: 5_000 });
+
+    const terminalData = session.getTerminalData();
+    const queueRow = terminalData.lines
+      .map((line, row) => ({
+        row,
+        text: line.spans.map((span) => span.text).join(''),
+      }))
+      .find((line) => line.text.includes('2. ship the second queue item queued'));
+    if (!queueRow) {
+      throw new Error('expected the queued goal row to be visible');
+    }
+    const viewportStart = Math.max(0, terminalData.totalLines - terminalData.rows);
+    expect(queueRow.row).toBeGreaterThanOrEqual(viewportStart);
+    await session.clickAt(
+      queueRow.text.indexOf('ship the second queue item'),
+      queueRow.row - viewportStart,
+    );
+    await waitForCursorPositionQuery(session);
+    const [terminalCursorColumn, terminalCursorRow] = session.getTerminalData().cursor;
+    session.writeRaw(`\x1b[${terminalCursorRow + 1};${terminalCursorColumn + 1}R`);
+    await session.text({
+      timeout: 5_000,
+      waitFor: (text) => composerLineIncludes(text, 'ship the second queue item'),
+    });
+
+    await session.type(' after review');
+    await session.press('enter');
+    await session.waitForText('ship the second queue item after review', { timeout: 5_000 });
+
+    const output = session.readAll();
+    expect(output).toContain('Goals · 2 total');
+    expect(output).toContain('enter edit · click edit');
+
+    await exitInteractive(session);
+  }, 45_000);
+
   it('starts device auth from the startup auth gate', async () => {
     const state = await createTempAutohandHome({
       config: {
@@ -1430,7 +1625,7 @@ describe('interactive built CLI Tuistory tests', () => {
     expect(promptRow).toBeGreaterThan(0);
     expect(screenLines[promptRow - 1]).toContain('▔');
     expect(screenLines[promptRow + 1]).toContain('▁');
-    expect(screenLines[promptRow + 2]).toContain('autohand (');
+    expect(screenLines[promptRow + 2]).toContain('Autohand (');
 
     await exitInteractive(session);
   });
@@ -1515,7 +1710,7 @@ describe('interactive built CLI Tuistory tests', () => {
     expect(composerLineIncludes(cursorScreen, 'hello')).toBe(true);
 
     await session.click('llo');
-    expect(session.getRawOutput()).toContain('\x1b[6n');
+    await waitForCursorPositionQuery(session);
     const [terminalCursorColumn, terminalCursorRow] = session.getTerminalData().cursor;
     session.writeRaw(`\x1b[${terminalCursorRow + 1};${terminalCursorColumn + 1}R`);
     await session.waitIdle();
@@ -1555,7 +1750,7 @@ describe('interactive built CLI Tuistory tests', () => {
     // Click, but the terminal never answers the DSR query (e.g. tmux without
     // passthrough). The user keeps typing instead.
     await session.click('llo');
-    expect(session.getRawOutput()).toContain('\x1b[6n');
+    await waitForCursorPositionQuery(session);
     await session.type('Y');
     await session.waitIdle();
 
@@ -1968,14 +2163,14 @@ describe('interactive built CLI Tuistory tests', () => {
       timeout: 10_000,
       waitFor: (text) => (
         text.includes('❯') &&
-        text.includes('autohand (') &&
+        text.includes('Autohand (') &&
         !text.includes('Wandering')
       ),
       trimEnd: true,
     });
 
     expect(linesContaining(screen, '❯'), screen).toHaveLength(1);
-    expect(linesContaining(screen, 'autohand ('), screen).toHaveLength(1);
+    expect(linesContaining(screen, 'Autohand ('), screen).toHaveLength(1);
     expect(screen).not.toContain('Wandering');
 
     await exitInteractive(session);
@@ -2266,7 +2461,7 @@ describe('interactive built CLI Tuistory tests', () => {
     await exitInteractive(session);
   }, 90_000);
 
-  it('streams and expands background shell output with Ctrl+O', async () => {
+  it('streams compact background shell output and expands it with a mouse click', async () => {
     const backgroundScript = [
       'let line = 1',
       'const parentPid = process.ppid',
@@ -2333,7 +2528,10 @@ describe('interactive built CLI Tuistory tests', () => {
     await session.waitForText('Ctrl+O expand', { timeout: 10_000 });
     expect(session.readAll()).not.toContain('background-line-01');
 
-    await session.press(['ctrl', 'o']);
+    await session.click('background-line-16');
+    await waitForCursorPositionQuery(session);
+    const [terminalCursorColumn, terminalCursorRow] = session.getTerminalData().cursor;
+    session.writeRaw(`\x1b[${terminalCursorRow + 1};${terminalCursorColumn + 1}R`);
     await session.waitForText('Ctrl+O collapse', { timeout: 5_000 });
     await session.waitForText('background-line-01', { timeout: 5_000 });
     await session.waitForText('Background task started.', { timeout: 30_000 });
@@ -2855,12 +3053,7 @@ describe('interactive built CLI Tuistory tests', () => {
       },
     });
 
-    await waitForComposer(session);
-    await session.type('/theme');
-    await session.press('enter');
-    await session.waitForText('Select a theme:', { timeout: 10_000 });
-    await session.press('8');
-    await session.waitForText("Theme changed to 'sandy'", { timeout: 10_000 });
+    await selectTheme(session, 'sandy');
     await session.waitForText('Theme preview:', { timeout: 10_000 });
 
     const output = session.readAll();
@@ -2873,6 +3066,92 @@ describe('interactive built CLI Tuistory tests', () => {
     expect(rawOutput).toContain('[38;2;245;240;232m');
 
     await exitInteractive(session);
+  });
+
+  it('defaults to Aurora and restores an explicit Aurora selection after restart', async () => {
+    const authServer = await createMockAuthServer();
+    mockAuthServers.push(authServer);
+    const state = await createTempAutohandHome({ config: { ui: { promptSuggestions: false } } });
+    tempStates.push(state);
+    expect((await fs.readJson(state.configPath)).ui.theme).toBeUndefined();
+    const launch = () => trackSession(launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: {
+        NO_COLOR: undefined, FORCE_COLOR: '3', COLORTERM: 'truecolor', TERM: 'xterm-256color',
+        AUTOHAND_API_URL: authServer.baseUrl,
+        AUTOHAND_AUTH_URL: authServer.baseUrl,
+        AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
+      },
+    }));
+    const session = await launch();
+    await waitForComposer(session);
+    await session.type('A calm place to build');
+    expect(await session.text({ only: { foreground: '#e4e5ec', background: '#222326' } }))
+      .toContain('A calm place to build');
+    expect(await session.text({ only: { foreground: '#9b9ef5' } })).toContain('▔');
+    await clearComposerInput(session);
+    await selectTheme(session, 'tuatara');
+    await selectTheme(session, 'aurora');
+    expect((await fs.readJson(state.configPath)).ui.theme).toBe('aurora');
+    await exitInteractive(session);
+
+    const restarted = await launch();
+    await waitForComposer(restarted);
+    await restarted.type('Aurora survives restart');
+    expect(await restarted.text({ only: { foreground: '#e4e5ec', background: '#222326' } }))
+      .toContain('Aurora survives restart');
+    expect(await restarted.text({ only: { foreground: '#9b9ef5' } })).toContain('▔');
+    await clearComposerInput(restarted);
+    await restarted.type('/theme');
+    await restarted.press('enter');
+    await restarted.waitForText('aurora (current)');
+    await restarted.press('escape');
+    await restarted.waitForText('Theme selection cancelled.');
+    expect((await fs.readJson(state.configPath)).ui.theme).toBe('aurora');
+    await exitInteractive(restarted);
+  });
+
+  it('selects Tuatara, renders its composer, and restores it after restart', async () => {
+    const authServer = await createMockAuthServer();
+    mockAuthServers.push(authServer);
+    const state = await createTempAutohandHome({ config: { ui: { theme: 'tui', promptSuggestions: false } } });
+    tempStates.push(state);
+    const launch = () => trackSession(launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: {
+        NO_COLOR: undefined, FORCE_COLOR: '3', COLORTERM: 'truecolor', TERM: 'xterm-256color',
+        AUTOHAND_API_URL: authServer.baseUrl,
+        AUTOHAND_AUTH_URL: authServer.baseUrl,
+        AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
+      },
+    }));
+    const session = await launch();
+    await selectTheme(session, 'tuatara');
+    expect((await fs.readJson(state.configPath)).ui.theme).toBe('tuatara');
+    await waitForComposer(session);
+    await session.type('Review the Tuatara palette');
+    expect(await session.text({ only: { foreground: '#dfdfcf', background: '#303c2d' } }))
+      .toContain('Review the Tuatara palette');
+    expect(await session.text({ only: { foreground: '#b7c98a' } })).toContain('▔');
+    expect(session.getRawOutput()).toContain('[38;2;230;154;131m');
+    await clearComposerInput(session);
+    await session.type('/theme');
+    await session.press('enter');
+    await session.waitForText('tuatara (current)');
+    await session.press('escape');
+    await waitForComposer(session);
+    expect((await fs.readJson(state.configPath)).ui.theme).toBe('tuatara');
+    await exitInteractive(session);
+
+    const restarted = await launch();
+    await waitForComposer(restarted);
+    await restarted.type('Tuatara survives restart');
+    expect(await restarted.text({ only: { foreground: '#dfdfcf', background: '#303c2d' } }))
+      .toContain('Tuatara survives restart');
+    expect(await restarted.text({ only: { foreground: '#b7c98a' } })).toContain('▔');
+    await exitInteractive(restarted);
   });
 
   it('preserves one visible copy of chat history across repeated slash menu cycles', async () => {
@@ -2993,11 +3272,11 @@ describe('interactive built CLI Tuistory tests', () => {
     await session.waitForText(`Using ollama model ${selectedModel}`, { timeout: 10_000 });
     await session.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes(`autohand (Ollama, ${selectedModel})`),
+      waitFor: (text) => text.includes(`(Ollama, ${selectedModel})`),
     });
 
     const screen = await session.text({ trimEnd: true });
-    expect(screen).toContain(`autohand (Ollama, ${selectedModel})`);
+    expect(screen).toContain(`(Ollama, ${selectedModel})`);
 
     await exitInteractive(session);
 
@@ -3012,10 +3291,10 @@ describe('interactive built CLI Tuistory tests', () => {
     await waitForComposer(restartedSession);
     const restartedScreen = await restartedSession.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes(`autohand (Ollama, ${selectedModel})`),
+      waitFor: (text) => text.includes(`(Ollama, ${selectedModel})`),
       trimEnd: true,
     });
-    expect(restartedScreen).toContain(`autohand (Ollama, ${selectedModel})`);
+    expect(restartedScreen).toContain(`(Ollama, ${selectedModel})`);
     await exitInteractive(restartedSession);
   });
 
@@ -3059,10 +3338,10 @@ describe('interactive built CLI Tuistory tests', () => {
     await session.waitForText('Anthropic configured successfully!', { timeout: 10_000 });
     const screen = await session.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes(`autohand (Anthropic, ${selectedModel})`),
+      waitFor: (text) => text.includes(`(Anthropic, ${selectedModel})`),
       trimEnd: true,
     });
-    expect(screen).toContain(`autohand (Anthropic, ${selectedModel})`);
+    expect(screen).toContain(`(Anthropic, ${selectedModel})`);
 
     await exitInteractive(session);
 
@@ -3080,10 +3359,10 @@ describe('interactive built CLI Tuistory tests', () => {
     await waitForComposer(restartedSession);
     const restartedScreen = await restartedSession.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes(`autohand (Anthropic, ${selectedModel})`),
+      waitFor: (text) => text.includes(`(Anthropic, ${selectedModel})`),
       trimEnd: true,
     });
-    expect(restartedScreen).toContain(`autohand (Anthropic, ${selectedModel})`);
+    expect(restartedScreen).toContain(`(Anthropic, ${selectedModel})`);
     await exitInteractive(restartedSession);
   });
 
@@ -3140,11 +3419,11 @@ describe('interactive built CLI Tuistory tests', () => {
     await session.waitForText('Autohand AI configured successfully!', { timeout: 10_000 });
     await session.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes(`autohand (Autohand AI, ${selectedModel})`),
+      waitFor: (text) => text.includes(`(Autohand AI, ${selectedModel})`),
     });
 
     const screen = await session.text({ trimEnd: true });
-    expect(screen).toContain(`autohand (Autohand AI, ${selectedModel})`);
+    expect(screen).toContain(`(Autohand AI, ${selectedModel})`);
 
     await exitInteractive(session);
 
@@ -3159,10 +3438,10 @@ describe('interactive built CLI Tuistory tests', () => {
     await waitForComposer(restartedSession);
     const restartedScreen = await restartedSession.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes(`autohand (Autohand AI, ${selectedModel})`),
+      waitFor: (text) => text.includes(`(Autohand AI, ${selectedModel})`),
       trimEnd: true,
     });
-    expect(restartedScreen).toContain(`autohand (Autohand AI, ${selectedModel})`);
+    expect(restartedScreen).toContain(`(Autohand AI, ${selectedModel})`);
     await exitInteractive(restartedSession);
   });
 });

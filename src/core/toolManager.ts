@@ -30,6 +30,7 @@ import {
 } from './toolFilter.js';
 import { getPlanModeManager } from '../commands/plan.js';
 import { randomUUID } from 'node:crypto';
+import { HOOK_TOOL_NAMES } from './hookTools.js';
 
 type ReadyToolExecutionTask = {
   call: ToolCallRequest;
@@ -56,6 +57,7 @@ const SEQUENTIAL_TOOL_CATEGORIES = new Set<ToolCategory>([
 const SPECIALIST_BUILTIN_TOOL_NAMES = new Set<AgentAction['type']>([
   'orchestrate_specialists',
   'install_specialist_roster',
+  'compose_team',
 ]);
 
 export function shouldPromptForToolPermission(
@@ -122,6 +124,7 @@ export interface ToolDefinition {
 }
 
 export interface ToolManagerOptions {
+  getActiveProvider?: () => string;
   executor: (action: AgentAction, context?: ToolExecutionContext) => Promise<ToolActionOutcome>;
   confirmApproval: (message: string, context?: { tool?: string; path?: string; command?: string }) => Promise<PermissionPromptResponse>;
   definitions?: ToolDefinition[];
@@ -231,6 +234,10 @@ export function buildToolPermissionContexts(action: AgentAction): PermissionCont
 
   if (action.type === 'add_dependency' || action.type === 'remove_dependency') {
     return [{ ...context, path: 'package.json' }];
+  }
+
+  if (action.type === 'capture_test_evidence') {
+    return [{ ...context, path: '.autohand/test-evidence', command: action.url }];
   }
 
   if (action.type === 'rename_path' || action.type === 'copy_path') {
@@ -1250,6 +1257,18 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
   {
+    name: 'compose_team',
+    description: 'Analyze a task, rank candidate sub-agents by role fit and repository context, and produce a recommended roster with a dependency-linked task graph.',
+    parameters: {
+      type: 'object',
+      properties: {
+        objective: { type: 'string', description: 'The concrete objective the team should accomplish' },
+        team_name: { type: 'string', description: 'Optional short team name' }
+      },
+      required: ['objective']
+    }
+  },
+  {
     name: 'add_teammate',
     description: 'Add a teammate process to the active team using a registered agent.',
     parameters: {
@@ -1299,7 +1318,7 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: {
-        status: { type: 'string', description: 'Optional status filter', enum: ['pending', 'in_progress', 'completed'] },
+        status: { type: 'string', description: 'Optional status filter', enum: ['pending', 'in_progress', 'completed', 'failed', 'cancelled'] },
         owner: { type: 'string', description: 'Optional owner filter' }
       }
     }
@@ -1318,14 +1337,14 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
           description: 'Updated prerequisite task IDs',
           items: { type: 'string', description: 'Task ID' }
         },
-        status: { type: 'string', description: 'Updated task status', enum: ['pending', 'in_progress', 'completed'] }
+        status: { type: 'string', description: 'Updated task status', enum: ['pending', 'in_progress', 'completed', 'failed', 'cancelled'] }
       },
       required: ['task_id']
     }
   },
   {
     name: 'task_stop',
-    description: 'Stop an active or queued team task and return it to pending state.',
+    description: 'Stop an active or queued team task and mark it cancelled.',
     parameters: {
       type: 'object',
       properties: {
@@ -1407,6 +1426,35 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
   // Web Search Operations
+  {
+    name: 'capture_test_evidence',
+    description: 'Capture actual local browser evidence using an existing project Playwright installation. Produces PNG frames, a trace, animated WebP, and a report. Only the requested localhost HTTP(S) origin is allowed; no packages or browsers are installed. Capture success is not test assertion success or visual inspection. Open retained frames before claiming visual confirmation. Interaction steps may modify the local application and require approval.',
+    requiresApproval: true,
+    approvalMessage: 'Capture browser evidence and run the requested local application interactions?',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Explicit local app URL (localhost, 127.0.0.1, or [::1]); remote/file/credentialed URLs are rejected' },
+        steps: {
+          type: 'array',
+          description: 'Up to 20 local UI interaction steps; omit for capture only. Do not include optional fields unused by an action.',
+          items: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['click', 'fill', 'press', 'waitFor'], description: 'Interaction to perform' },
+              selector: { type: 'string', description: 'Playwright locator selector' },
+              value: { type: 'string', description: 'Required only for fill' },
+              key: { type: 'string', description: 'Required only for press' },
+            },
+            required: ['action', 'selector'],
+          },
+        },
+        max_frames: { type: 'number', description: 'Maximum PNG frames (2–24, default 6)' },
+        timeout_ms: { type: 'number', description: 'Total capture duration limit (1000–60000 milliseconds, default 30000)' },
+      },
+      required: ['url'],
+    },
+  },
   {
     name: 'web_search',
     description: 'Search the web for up-to-date information about packages, libraries, frameworks, documentation, changelogs, and more. Use this when you need current information that may have changed after your training data.',
@@ -1529,6 +1577,35 @@ Actions:
       },
       required: ['name'],
     },
+  },
+  // Official MCP Registry discovery
+  {
+    name: 'find_mcp_servers',
+    description: 'Search config-compatible entries in the Official MCP Registry. Returns exact server IDs and prerequisites without exposing executable configuration. Use this before requesting an MCP installation when the user has not named a server ID.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'MCP capability or server name to search for, such as "PostgreSQL" or "browser automation"' },
+        category: { type: 'string', description: 'Optional exact catalog category filter' },
+        limit: { type: 'number', description: 'Maximum results to return (default: 10, max: 20)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'install_mcp_server',
+    description: 'Install one exact, config-compatible server from the Official MCP Registry. This saves catalog-controlled configuration and attempts to start or connect a third-party MCP server. It never accepts arbitrary commands, URLs, headers, or secret values.',
+    parameters: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'string', description: 'Exact ID returned by find_mcp_servers or explicitly requested by the user' },
+        required_args: { type: 'array', description: 'Values for the catalog-declared required arguments, in catalog order', items: { type: 'string' } },
+        overwrite: { type: 'boolean', description: 'Replace an existing configuration with the same catalog server ID' },
+      },
+      required: ['server_id'],
+    },
+    requiresApproval: true,
+    approvalMessage: 'Allow the agent to install and connect this third-party Official MCP Registry server?',
   },
   // Sub-agent Catalog
   {
@@ -2328,6 +2405,7 @@ export const EXIT_PLAN_MODE_TOOL_DEFINITION: ToolDefinition = {
 };
 
 export class ToolManager {
+  private readonly getActiveProvider?: () => string;
   private readonly definitions = new Map<AgentAction['type'], ToolDefinition>();
   private readonly runtimeMetaToolNames = new Set<AgentAction['type']>();
   private readonly executor: ToolManagerOptions['executor'];
@@ -2341,6 +2419,7 @@ export class ToolManager {
   private readonly onAdditionalContext?: ToolAuthorizationOptions['onAdditionalContext'];
 
   constructor(options: ToolManagerOptions) {
+    this.getActiveProvider = options.getActiveProvider;
     this.executor = options.executor;
     this.confirmApproval = options.confirmApproval;
     this.toolFilter = new ToolFilter(options.clientContext ?? 'cli', options.customPolicy);
@@ -2419,13 +2498,14 @@ export class ToolManager {
    */
   isBuiltInTool(name: string): boolean {
     return DEFAULT_TOOL_DEFINITIONS.some(d => d.name === name)
+      || HOOK_TOOL_NAMES.has(name)
       || GOAL_TOOL_DEFINITIONS.some(d => d.name === name)
       || SPECIALIST_BUILTIN_TOOL_NAMES.has(name as AgentAction['type']);
   }
 
   listToolNames(): AgentAction['type'][] {
     return Array.from(this.definitions.keys())
-      .filter(name => this.toolFilter.isAllowed(name));
+      .filter(name => this.isToolAllowed(name));
   }
 
   /**
@@ -2440,7 +2520,7 @@ export class ToolManager {
    */
   listDefinitions(): ToolDefinition[] {
     return this.toolFilter.filterDefinitions(
-      Array.from(this.definitions.values()).filter((definition) => definition.modelVisible !== false),
+      Array.from(this.definitions.values()).filter((definition) => definition.modelVisible !== false && this.isProviderAllowed(definition.name)),
     );
   }
 
@@ -2455,7 +2535,11 @@ export class ToolManager {
    * Check if a specific tool is allowed in the current context
    */
   isToolAllowed(toolName: string): boolean {
-    return this.toolFilter.isAllowed(toolName);
+    return this.isProviderAllowed(toolName) && this.toolFilter.isAllowed(toolName);
+  }
+
+  private isProviderAllowed(toolName: string): boolean {
+    return !HOOK_TOOL_NAMES.has(toolName) || this.getActiveProvider?.() === 'autohandai';
   }
 
   /**
@@ -2589,7 +2673,7 @@ export class ToolManager {
       }
 
       // Check if tool is allowed in current context
-      if (!this.toolFilter.isAllowed(call.tool)) {
+      if (!this.isToolAllowed(call.tool)) {
         reject(`Tool '${call.tool}' is not available in the current context (${this.toolFilter.getContext()})`, 'authorization');
         continue;
       }
@@ -3136,6 +3220,10 @@ export class ToolManager {
 
   private buildApprovalMessage(call: ToolCallRequest, definition: ToolDefinition): string {
     const args = this.getCallArgs(call);
+    if (call.tool === 'capture_test_evidence') {
+      const interactions = Array.isArray(args.steps) ? args.steps.length : 0;
+      return `Capture local browser evidence at ${String(args.url ?? '')} with ${interactions} interaction${interactions === 1 ? '' : 's'}?\nInteractions may change the local app. Frames and traces may contain visible test data.`;
+    }
     if (call.tool === 'install_specialist_roster' && Array.isArray(args.agent_names)) {
       return `Install these resolved specialists from the default Autohand catalog?\n  ${args.agent_names.join(', ')}`;
     }
@@ -3249,7 +3337,7 @@ export class ToolManager {
   }
 
   private shouldExecuteSequentially(call: ToolCallRequest): boolean {
-    return SEQUENTIAL_TOOL_CATEGORIES.has(getToolCategory(call.tool));
+    return HOOK_TOOL_NAMES.has(call.tool) || SEQUENTIAL_TOOL_CATEGORIES.has(getToolCategory(call.tool));
   }
 
   /**
@@ -3273,6 +3361,7 @@ export class ToolManager {
         const { call, index } = tasks[taskIndex];
         let result: ToolExecutionResult;
         try {
+          if (!this.isProviderAllowed(call.tool)) throw new Error('Lifecycle hook tools are available only with the Autohand AI provider.');
           const action = this.toAction(call);
           const outcome = this.normalizeToolOutcome(await this.executor(action, {
             toolCallId: call.id,
@@ -3317,13 +3406,21 @@ export class ToolManager {
     if (!this.isPlainObject(outcome) || typeof outcome.success !== 'boolean') {
       throw new Error('Tool executor returned a malformed outcome.');
     }
+    if (outcome.imagePaths !== undefined && (!Array.isArray(outcome.imagePaths)
+      || outcome.imagePaths.some(value => typeof value !== 'string' || !value.trim() || value.includes('\0')
+        || (/^[a-z][a-z\d+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value))))) {
+      throw new Error('Tool executor returned malformed image file references.');
+    }
+    const images = outcome.imagePaths === undefined ? {} : { imagePaths: [...outcome.imagePaths] };
     if (outcome.success) {
       if (outcome.output !== undefined && typeof outcome.output !== 'string') {
         throw new Error('Tool executor returned malformed success output.');
       }
-      return outcome.output === undefined
-        ? { success: true }
-        : { success: true, output: outcome.output };
+      return {
+        success: true,
+        ...(outcome.output === undefined ? {} : { output: outcome.output }),
+        ...images,
+      };
     }
 
     const validKinds: ToolFailureKind[] = [
@@ -3353,6 +3450,7 @@ export class ToolManager {
       error: outcome.error,
       ...(outcome.output === undefined ? {} : { output: outcome.output }),
       ...(outcome.exitCode === undefined ? {} : { exitCode: outcome.exitCode }),
+      ...images,
     };
   }
 

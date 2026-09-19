@@ -6,8 +6,10 @@
 import chalk from 'chalk';
 import { buildGoalContinuationInstruction, GoalManager } from '../goals/GoalManager.js';
 import type { SlashCommand, SlashCommandContext } from '../core/slashCommandTypes.js';
-import type { GoalMutationResult, GoalSnapshot } from '../goals/types.js';
+import type { GoalMutationResult, GoalSessionSnapshot, GoalState } from '../goals/types.js';
 import { GOAL_FEATURE_DISABLED_MESSAGE, resolveGoalFeatureEnabled } from '../goals/feature.js';
+
+const GOAL_OBJECTIVE_PREVIEW_LENGTH = 160;
 
 export const metadata: SlashCommand = {
   command: '/goal',
@@ -15,6 +17,8 @@ export const metadata: SlashCommand = {
   implemented: true,
   subcommands: [
     { name: 'writer', description: 'Interview the user and draft a stronger goal before creating it' },
+    { name: 'view', description: 'Open the live goal queue view' },
+    { name: 'edit', description: 'Edit an active or queued goal by ID' },
     { name: 'queue', description: 'List queued goals or enqueue a goal' },
     { name: 'pause', description: 'Pause the current goal' },
     { name: 'resume', description: 'Resume a paused or queued goal' },
@@ -22,6 +26,12 @@ export const metadata: SlashCommand = {
     { name: 'clear', description: 'Clear the current goal' },
     { name: 'templates', description: 'List reusable .pi-goals templates' },
   ],
+};
+
+export const goalsMetadata: SlashCommand = {
+  ...metadata,
+  command: '/goals',
+  description: 'Open the live goals queue and manage persistent goals',
 };
 
 export async function goal(ctx: SlashCommandContext, args: string[] = []): Promise<string> {
@@ -35,8 +45,21 @@ export async function goal(ctx: SlashCommandContext, args: string[] = []): Promi
   });
   const input = args.join(' ').trim();
   if (!input) {
-    const snapshot = await manager.getSnapshot();
-    if (!snapshot.goal && snapshot.queue.length === 0) {
+    const snapshot = await manager.getSessionSnapshot();
+    const hasLivePeer = snapshot.peers.some((peer) => peer.ownerAlive);
+    if (!snapshot.goal && snapshot.queue.length > 0 && !hasLivePeer) {
+      const started = await manager.startQueuedGoal();
+      if (started.ok && started.goal) {
+        queueGoalContinuation(ctx, started.goal.objective);
+      }
+      return formatMutation(started);
+    }
+    if (
+      !snapshot.goal
+      && snapshot.queue.length === 0
+      && snapshot.completed.length === 0
+      && snapshot.peers.length === 0
+    ) {
       return startGoalWriter(ctx);
     }
     return formatSnapshot(snapshot);
@@ -50,12 +73,27 @@ export async function goal(ctx: SlashCommandContext, args: string[] = []): Promi
     case 'write':
     case 'refine':
       return startGoalWriter(ctx, rest);
+    case 'view': {
+      if (!ctx.onToggleGoalView || ctx.isNonInteractive) {
+        return formatSnapshot(await manager.getSessionSnapshot());
+      }
+      ctx.onToggleGoalView(true);
+      return 'Opened the live goals view. Press Cmd+G or Ctrl+G to close it.';
+    }
+    case 'edit': {
+      const goalOrQueueId = restArgs[0];
+      const objective = restArgs.slice(1).join(' ').trim();
+      if (!goalOrQueueId || !objective) {
+        return 'Usage: /goal edit <goal-or-queue-id> <objective>';
+      }
+      return formatMutation(await manager.editGoalObjective(goalOrQueueId, objective));
+    }
     case 'queue':
       return handleQueue(manager, rest);
     case 'pause':
       return formatMutation(await manager.updateGoal({ status: 'paused' }));
     case 'resume': {
-      const snapshot = await manager.getSnapshot();
+      const snapshot = await manager.getSessionSnapshot();
       if (!snapshot.goal && snapshot.queue.length > 0) {
         const started = await manager.startQueuedGoal();
         if (started.ok && started.goal) {
@@ -115,7 +153,7 @@ export async function runGoalCli(workspaceRoot: string, rawInput?: string, confi
 
   const manager = new GoalManager(workspaceRoot);
   const input = rawInput?.trim() ?? '';
-  if (!input) return formatSnapshot(await manager.getSnapshot());
+  if (!input) return formatSnapshot(await manager.getSessionSnapshot());
 
   const args = input.match(/"[^"]*"|'[^']*'|\S+/g)?.map(unquote) ?? [];
   return goal({ workspaceRoot } as SlashCommandContext, args);
@@ -142,7 +180,7 @@ function startGoalWriter(ctx: SlashCommandContext, roughGoal?: string): string {
 
 async function emitGoalWrittenCompleted(
   ctx: SlashCommandContext,
-  goalState: NonNullable<GoalSnapshot['goal']>,
+  goalState: GoalState,
   source: string
 ): Promise<void> {
   await ctx.hookManager?.executeHooks('goal-written:completed', {
@@ -188,7 +226,7 @@ function formatMutation(result: GoalMutationResult): string {
     lines.push('');
     lines.push(`Queued ${result.queued.length} goal${result.queued.length === 1 ? '' : 's'}:`);
     for (const item of result.queued) {
-      lines.push(`- [${item.queueId}] ${item.objective}`);
+      lines.push(`- [${item.queueId}] ${formatObjectivePreview(item.objective)}`);
     }
   }
   if (result.started) {
@@ -205,8 +243,13 @@ function formatMutation(result: GoalMutationResult): string {
   return lines.join('\n');
 }
 
-function formatSnapshot(snapshot: GoalSnapshot): string {
-  if (!snapshot.goal && snapshot.queue.length === 0 && snapshot.completed.length === 0) {
+function formatSnapshot(snapshot: GoalSessionSnapshot): string {
+  if (
+    !snapshot.goal
+    && snapshot.queue.length === 0
+    && snapshot.completed.length === 0
+    && snapshot.peers.length === 0
+  ) {
     return [
       'No goal is currently set.',
       'Use /goal <objective> to create one, or /goal queue <objective> to queue later work.',
@@ -223,12 +266,21 @@ function formatSnapshot(snapshot: GoalSnapshot): string {
     parts.push('');
     parts.push(formatCompletedRun(snapshot.completed));
   }
+  if (snapshot.peers.length > 0) {
+    parts.push('');
+    parts.push([
+      `Other active sessions (${snapshot.peers.length}):`,
+      ...snapshot.peers.map((peer) => (
+        `- ${formatObjectivePreview(peer.objective)} (${peer.status}${peer.ownerAlive ? '' : ', session offline'})`
+      )),
+    ].join('\n'));
+  }
   return parts.join('\n');
 }
 
-function formatGoal(goalState: NonNullable<GoalSnapshot['goal']>): string {
+function formatGoal(goalState: GoalState): string {
   const lines = [
-    `Goal: ${goalState.objective}`,
+    `Goal: ${formatObjectivePreview(goalState.objective)}`,
     `Status: ${goalState.status}`,
     `ID: ${goalState.goalId}`,
     `Elapsed: ${formatDuration(goalState.timeUsedSeconds)}`,
@@ -240,19 +292,29 @@ function formatGoal(goalState: NonNullable<GoalSnapshot['goal']>): string {
   return lines.join('\n');
 }
 
-function formatQueue(snapshot: Pick<GoalSnapshot, 'queue'>): string {
+function formatQueue(snapshot: Pick<GoalSessionSnapshot, 'queue'>): string {
   if (snapshot.queue.length === 0) return 'No queued goals.';
   return [
     `Queued goals (${snapshot.queue.length}):`,
-    ...snapshot.queue.map((item, index) => `${index + 1}. [${item.queueId}] ${item.objective}`),
+    ...snapshot.queue.map((item, index) => (
+      `${index + 1}. [${item.queueId}] ${formatObjectivePreview(item.objective)}`
+    )),
   ].join('\n');
 }
 
 function formatCompletedRun(completed: NonNullable<GoalMutationResult['completedRun']>): string {
   return [
     `Completed goals this session (${completed.length}):`,
-    ...completed.map((item, index) => `${index + 1}. ${item.objective}`),
+    ...completed.map((item, index) => `${index + 1}. ${formatObjectivePreview(item.objective)}`),
   ].join('\n');
+}
+
+function formatObjectivePreview(objective: string): string {
+  const normalized = objective.replace(/\s+/gu, ' ').trim();
+  if (normalized.length <= GOAL_OBJECTIVE_PREVIEW_LENGTH) {
+    return normalized;
+  }
+  return `${normalized.slice(0, GOAL_OBJECTIVE_PREVIEW_LENGTH - 1).trimEnd()}…`;
 }
 
 function formatDuration(seconds: number): string {

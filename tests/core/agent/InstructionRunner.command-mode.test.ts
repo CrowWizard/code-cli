@@ -13,6 +13,7 @@ import {
   isAgentRetryableSessionError,
   shouldUsePassiveAgentSessionRetry,
 } from '../../../src/core/agent/InputTurnCoordinator.js';
+import { HookManager } from '../../../src/core/HookManager.js';
 import { ApiError, classifyApiError } from '../../../src/providers/errors.js';
 import { ProviderNotConfiguredError } from '../../../src/providers/ProviderFactory.js';
 
@@ -75,6 +76,7 @@ function createHost(): AgentInstructionHost {
       setStatusLine: vi.fn(),
     },
     conversation: {
+      addSystemNote: vi.fn(),
       addMessage: vi.fn(),
       history: vi.fn(() => []),
     },
@@ -123,6 +125,64 @@ describe('InstructionRunner command mode UI', () => {
     }
   });
 
+  it('exposes the prompt hook to cancellation and clears active state afterwards', async () => {
+    const host = createHost();
+    host.hookManager = new HookManager({ workspaceRoot: '/tmp' });
+    vi.spyOn(host.hookManager, 'executeHooks').mockImplementation(async () => {
+      expect(host.isInstructionActive).toBe(true);
+      expect(host.activeAbortController).not.toBeNull();
+      host.activeAbortController?.abort();
+      return [];
+    });
+    expect(await new InstructionRunner(host).run('cancel hook')).toBe(false);
+    expect(host.isInstructionActive).toBe(false);
+    expect(host.activeAbortController).toBeNull();
+    expect(host.runReactLoop).not.toHaveBeenCalled();
+  });
+
+  it('uses the existing Ink input owner to cancel prompt hooks', async () => {
+    restoreFns.push(overrideStreamTTY(process.stdin, true));
+    const host = Object.assign(createHost(), {
+      useInkRenderer: true,
+      inkRenderer: {},
+      currentInkAbortController: null as AbortController | null,
+      currentInkOnCancel: null as (() => void) | null,
+    });
+    host.hookManager = new HookManager({ workspaceRoot: '/tmp', settings: {
+      hooks: [{ event: 'pre-prompt', command: 'echo guarded' }],
+    } });
+    vi.spyOn(host.hookManager, 'executeHooks').mockImplementation(async () => {
+      expect(host.currentInkAbortController).toBe(host.activeAbortController);
+      expect(host.setupEscListener).not.toHaveBeenCalled();
+      host.currentInkAbortController?.abort();
+      return [];
+    });
+    expect(await new InstructionRunner(host).run('cancel from Ink')).toBe(false);
+    expect(host.currentInkAbortController).toBeNull();
+    expect(host.runReactLoop).not.toHaveBeenCalled();
+  });
+
+  it('runs pre-prompt before side effects and respects hook denial', async () => {
+    const host = createHost();
+    host.hookManager = new HookManager({ workspaceRoot: '/tmp', settings: { hooks: [{
+      event: 'pre-prompt', command: `printf '%s' '{"decision":"block","reason":"PROMPT_BLOCKED"}'`,
+    }] } });
+    expect(await new InstructionRunner(host).run('blocked prompt')).toBe(false);
+    expect(host.buildUserMessage).not.toHaveBeenCalled();
+    expect(host.runReactLoop).not.toHaveBeenCalled();
+    expect(host.runEnvironmentBootstrap).not.toHaveBeenCalled();
+    expect(host.isInstructionActive).toBe(false);
+  });
+
+  it('adds pre-prompt context once before invoking the model', async () => {
+    const host = createHost();
+    host.hookManager = new HookManager({ workspaceRoot: '/tmp', settings: { hooks: [{
+      event: 'pre-prompt', command: `printf '%s' '{"additionalContext":"IMPORTED_CONTEXT"}'`,
+    }] } });
+    expect(await new InstructionRunner(host).run('prompt')).toBe(true);
+    expect(host.conversation.addSystemNote).toHaveBeenCalledWith('IMPORTED_CONTEXT', '[Pre-prompt Hook Context]');
+  });
+
   it('returns before starting work when the external signal is already aborted', async () => {
     const host = createHost();
     const controller = new AbortController();
@@ -135,6 +195,69 @@ describe('InstructionRunner command mode UI', () => {
     expect(host.initializeUI).not.toHaveBeenCalled();
     expect(host.runReactLoop).not.toHaveBeenCalled();
     expect(host.isInstructionActive).toBe(false);
+  });
+
+  it('keeps a silent internal instruction out of the transcript without changing model context', async () => {
+    const host = createHost();
+    const instruction = 'Active goal: full objective that must remain available to the model';
+
+    await expect(new InstructionRunner(host).run(instruction, {
+      echoInTranscript: false,
+    })).resolves.toBe(true);
+
+    expect(host.printUserInstructionToChatLog).not.toHaveBeenCalled();
+    expect(host.buildUserMessage).toHaveBeenCalledWith(instruction);
+    expect(host.saveUserMessage).toHaveBeenCalledWith(instruction);
+    expect(host.conversation.addMessage).toHaveBeenCalledWith({
+      role: 'user',
+      content: instruction,
+    });
+  });
+
+  it('skips environment bootstrap for a trusted workflow while still executing the detected implementation turn', async () => {
+    const host = createHost();
+    host.intentDetector.detect = vi.fn(() => ({ intent: 'implementation', confidence: 1, reasons: [] }));
+
+    await expect(new InstructionRunner(host).run('Capture the implemented checkout journey', {
+      environmentBootstrap: 'skip',
+    })).resolves.toBe(true);
+
+    expect(host.runEnvironmentBootstrap).not.toHaveBeenCalled();
+    expect(host.runReactLoop).toHaveBeenCalledOnce();
+    expect(host.lastIntent).toBe('implementation');
+  });
+
+  it('continues to bootstrap ordinary implementation turns without trusted workflow metadata', async () => {
+    const host = createHost();
+    host.intentDetector.detect = vi.fn(() => ({ intent: 'implementation', confidence: 1, reasons: [] }));
+
+    await expect(new InstructionRunner(host).run('Implement the checkout form')).resolves.toBe(true);
+
+    expect(host.runEnvironmentBootstrap).toHaveBeenCalledOnce();
+    expect(host.runReactLoop).toHaveBeenCalledOnce();
+    expect(vi.mocked(host.runEnvironmentBootstrap).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(host.runReactLoop).mock.invocationCallOrder[0]);
+  });
+
+  it('keeps a trusted review diagnostic without bootstrap or automatic quality checks when files are marked modified', async () => {
+    const host = createHost();
+    host.filesModifiedThisSession = true;
+    host.lastIntent = 'implementation';
+    host.intentDetector.detect = vi.fn(() => ({ intent: 'implementation', confidence: 1, reasons: [] }));
+    host.runReactLoop = vi.fn(async () => {
+      host.filesModifiedThisSession = true;
+      return { status: 'completed' as const };
+    });
+
+    await expect(new InstructionRunner(host).run('Review the implementation and retain capture evidence', {
+      intent: 'diagnostic',
+      environmentBootstrap: 'skip',
+    })).resolves.toBe(true);
+
+    expect(host.lastIntent).toBe('diagnostic');
+    expect(host.displayIntentMode).toHaveBeenCalledWith(expect.objectContaining({ intent: 'diagnostic' }));
+    expect(host.runEnvironmentBootstrap).not.toHaveBeenCalled();
+    expect(host.runQualityPipeline).not.toHaveBeenCalled();
+    expect(host.runReactLoop).toHaveBeenCalledOnce();
   });
 
   it('stops after provider setup is cancelled instead of recursively rerunning the instruction', async () => {

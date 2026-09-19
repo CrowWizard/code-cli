@@ -500,7 +500,7 @@ cd ~/projects/my-app && autohand
 ```json
 {
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "customThemes": {
       "company": {
         "colors": {
@@ -536,7 +536,7 @@ cd ~/projects/my-app && autohand
 ```
 |領域 |類型 |預設 |描述 |
 | ---------------------------- | ------ | -------- |---------------------------------------------------------------------------------------------------------------- |
-| `theme` |字串| `"dark"` |終端輸出的顏色主題。內建函數包括 `dark`、`light`、`dracula`、`sandy`、`tui`、`github-dark`、`cappadocia`、`rio` 和 `australia`。舊版 `turkey` 和 `brazil` 值仍會作為別名載入。 |
+| `theme` |字串| `"aurora"` |終端輸出的顏色主題。內建函數包括 `dark`、`light`、`dracula`、`sandy`、`tui`、`tuatara`、`github-dark`、`cappadocia`、`rio` 和 `australia`。舊版 `turkey` 和 `brazil` 值仍會作為別名載入。 |
 | `customThemes` |物件| `{}` |按主題名稱鍵入的內聯自訂主題定義。將 `theme` 設定為同一鍵以使用一個。   |
 | `autoConfirm` |布林 | `false` |跳過確認提示以確保安全操作 |
 | `readFileCharLimit` |數量 | `300` |從讀取/查找工具輸出中顯示的最大字元數（完整內容仍發送到模型）|
@@ -1619,7 +1619,7 @@ autohand --no-browser       # Start with browser bridge disabled
     "allowDangerousOps": false
   },
   "ui": {
-    "theme": "dark",
+    "theme": "aurora",
     "autoConfirm": false,
     "showCompletionNotification": true,
     "showThinking": true,
@@ -1704,7 +1704,7 @@ workspace:
   allowDangerousOps: false
 
 ui:
-  theme: dark
+  theme: aurora
   autoConfirm: false
   showCompletionNotification: true
   showThinking: true
@@ -1789,7 +1789,7 @@ defaultRoot = "~/projects"
 allowDangerousOps = false
 
 [ui]
-theme = "dark"
+theme = "aurora"
 autoConfirm = false
 showCompletionNotification = true
 showThinking = true
@@ -2012,7 +2012,7 @@ Autohand 提供了一組豐富的斜線命令供互動式使用。在 REPL 中�
 | `/sessions` |列出過去的會議 |
 | `/resume` |恢復之前的會話 |
 | `/history` |使用分頁瀏覽會話歷史記錄 |
-| `/undo` |復原 git 變更與上一回合 |
+| `/undo` | 復原代理程式上次記錄的檔案變更與上一回合 |
 | `/export` |將會話匯出為 markdown/JSON/HTML |
 | `/share` |分享目前會話 |
 | `/status` |顯示會話狀態 |

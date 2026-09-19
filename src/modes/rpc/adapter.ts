@@ -7,6 +7,15 @@ import crypto from 'node:crypto';
 
 import type { AutohandAgent } from '../../core/agent.js';
 import type { HookContext } from '../../core/HookManager.js';
+import { resolveReviewCommand } from '../../commands/review.js';
+import {
+  executeReviewWithLifecycle,
+  type ReviewLifecycleContext,
+  type ReviewLifecycleEvent,
+} from '../../review/reviewLifecycle.js';
+import type { ReviewRequest } from '../../review/reviewRequest.js';
+import { REVIEW_KINDS } from '../../review/reviewRequest.js';
+import { buildCommandUseData } from '../../telemetry/commandUsage.js';
 import {
   AutomodeManager,
   type AutomodeOptions,
@@ -123,6 +132,7 @@ import type {
   HookSessionStartNotificationParams,
   HookSessionEndNotificationParams,
   HookSubagentStopNotificationParams,
+  HookSubagentActivityNotificationParams,
   HookPermissionRequestNotificationParams,
   HookNotificationNotificationParams,
   HookContextCompactedNotificationParams,
@@ -169,6 +179,14 @@ type CompleteAutoresearchBenchmarkParams = AutoresearchStartParams & {
   | { measureCommand: string }
   | { measureScript: string }
 );
+
+const REVIEW_RPC_NOTIFICATIONS = {
+  'review:start': RPC_NOTIFICATIONS.HOOK_REVIEW_START,
+  'review:end': RPC_NOTIFICATIONS.HOOK_REVIEW_END,
+  'review:paused': RPC_NOTIFICATIONS.HOOK_REVIEW_PAUSED,
+  'review:failed': RPC_NOTIFICATIONS.HOOK_REVIEW_FAILED,
+  'review:completed': RPC_NOTIFICATIONS.HOOK_REVIEW_COMPLETED,
+} as const satisfies Record<ReviewLifecycleEvent, string>;
 
 function hasCompleteAutoresearchBenchmarkParams(
   params: AutoresearchStartParams
@@ -455,7 +473,7 @@ export class RPCAdapter {
 
   async handleGoalGet(): Promise<unknown> {
     if (!this.isGoalFeatureEnabled()) return this.goalFeatureDisabledResult();
-    return new GoalManager(this.workspace).getSnapshot();
+    return new GoalManager(this.workspace).getSessionSnapshot();
   }
 
   async handleGoalCreate(params: {
@@ -891,9 +909,41 @@ export class RPCAdapter {
           `Executing instruction instructionLength=${instruction.length}, isSlashCommand=${isSlashCmd}`
         );
 
-        // Check if it's a slash command and handle it directly
-        if (isSlashCmd) {
-          const { command, args } = this.agent.parseSlashCommand(instruction);
+        const slashCommand = isSlashCmd
+          ? this.agent.parseSlashCommand(instruction)
+          : undefined;
+        let reviewRequest: ReviewRequest | undefined;
+        let reviewOutputHandled = false;
+        if (
+          slashCommand?.command === '/review'
+          && this.agent.isSlashCommandSupported(slashCommand.command)
+        ) {
+          await this.agent.trackCommandUsage(buildCommandUseData({
+            command: slashCommand.command,
+            args: slashCommand.args,
+            knownSubcommands: REVIEW_KINDS,
+            surface: 'json_rpc',
+          })).catch(() => {});
+          const resolution = await resolveReviewCommand(this.workspace, slashCommand.args);
+          if (resolution.type === 'output') {
+            this.currentMessageContent = resolution.output;
+            prompt.messageContent = resolution.output;
+            writeNotification(RPC_NOTIFICATIONS.MESSAGE_UPDATE, {
+              messageId: this.currentMessageId,
+              delta: resolution.output,
+              timestamp: createTimestamp(),
+            });
+            success = true;
+            reviewOutputHandled = true;
+          } else {
+            instruction = resolution.instruction;
+            reviewRequest = resolution.request;
+          }
+        }
+
+        // Check if it's a non-review slash command and handle it directly.
+        if (isSlashCmd && !reviewRequest && !reviewOutputHandled) {
+          const { command, args } = slashCommand!;
           writeRpcDebugLine(
             `Handling slash command commandLength=${command.length}, argumentCount=${args.length}`
           );
@@ -903,7 +953,7 @@ export class RPCAdapter {
             if (!this.canContinuePrompt(prompt)) {
               return { success: false };
             }
-            const result = await this.agent.handleSlashCommand(command, args);
+            const result = await this.agent.handleSlashCommand(command, args, 'json_rpc');
             if (!this.canContinuePrompt(prompt)) {
               return { success: false };
             }
@@ -939,8 +989,8 @@ export class RPCAdapter {
             });
             success = false;
           }
-        } else {
-          // Not a slash command - run as regular instruction via LLM
+        } else if (!reviewOutputHandled) {
+          // Regular prompts and /review both run through the LLM.
           // Enter preview mode if enabled to batch file changes
           const fileManager = this.agent.getFileManager();
           writeRpcDebugLine(
@@ -974,26 +1024,26 @@ export class RPCAdapter {
               return { success: false };
             }
             const hookManager = this.agent.getHookManager?.();
-            if (hookManager) {
-              await hookManager.executeHooks(
-                'pre-prompt',
-                {
-                  sessionId: this.sessionId ?? undefined,
-                  instruction,
-                  mentionedFiles: params.context?.files ?? [],
-                },
-                { signal: prompt.abortController.signal },
-              );
-            }
-            if (!this.canContinuePrompt(prompt)) {
-              return { success: false };
-            }
-            success = await this.agent.runInstruction(instruction, {
+            const runInstruction = (): Promise<boolean> => this.agent!.runInstruction(instruction, {
+              ...(reviewRequest ? { hookInstruction: params.message } : {}),
+              ...(params.context?.files ? { mentionedFiles: params.context.files } : {}),
               signal: prompt.abortController.signal,
               ...(params.stopWhen?.mode === 'host'
                 ? { onStepFinish: (step) => this.requestStepDecision(prompt, step) }
                 : {}),
             });
+            success = reviewRequest
+              ? await executeReviewWithLifecycle({
+                  request: reviewRequest,
+                  surface: 'json_rpc',
+                  sessionId: this.sessionId ?? undefined,
+                  signal: prompt.abortController.signal,
+                  hookManager,
+                  permissionManager: this.agent.getPermissionManager?.(),
+                  onEvent: (event, context) => this.emitHookReview(event, context),
+                  execute: runInstruction,
+                })
+              : await runInstruction();
             if (!this.canContinuePrompt(prompt)) {
               success = false;
             }
@@ -1780,6 +1830,30 @@ export class RPCAdapter {
       case 'session-end':
         this.emitHookSessionEnd(context.sessionEndReason ?? 'exit', context.duration ?? 0);
         break;
+      case 'subagent-start':
+      case 'subagent-progress':
+      case 'subagent-message':
+      case 'subagent-cancel-requested': {
+        const notifications = {
+          'subagent-start': RPC_NOTIFICATIONS.HOOK_SUBAGENT_START,
+          'subagent-progress': RPC_NOTIFICATIONS.HOOK_SUBAGENT_PROGRESS,
+          'subagent-message': RPC_NOTIFICATIONS.HOOK_SUBAGENT_MESSAGE,
+          'subagent-cancel-requested': RPC_NOTIFICATIONS.HOOK_SUBAGENT_CANCEL_REQUESTED,
+        };
+        if (!this.notificationsSealed) writeNotification(notifications[context.event], {
+          subagentId: context.subagentId ?? '',
+          subagentName: context.subagentName ?? '',
+          subagentType: context.subagentType ?? '',
+          parentId: context.subagentParentId,
+          source: context.subagentSource,
+          status: context.subagentStatus,
+          workspace: context.subagentWorkspace,
+          activity: context.subagentActivity,
+          message: context.subagentMessage,
+          timestamp: createTimestamp(),
+        } satisfies HookSubagentActivityNotificationParams);
+        break;
+      }
       case 'subagent-stop':
         this.emitHookSubagentStop(
           context.subagentId ?? '',
@@ -1831,6 +1905,30 @@ export class RPCAdapter {
 
   private normalizeUsageRatio(value: number | undefined): number {
     return value !== undefined && Number.isFinite(value) && value >= 0 ? value : 0;
+  }
+
+  private emitHookReview(
+    event: ReviewLifecycleEvent,
+    context: ReviewLifecycleContext,
+  ): void {
+    if (this.notificationsSealed) return;
+    writeNotification(REVIEW_RPC_NOTIFICATIONS[event], {
+      sessionId: context.sessionId ?? this.sessionId ?? undefined,
+      event,
+      kind: context.reviewKind,
+      audience: context.reviewAudience,
+      format: context.reviewFormat,
+      surface: context.reviewSurface,
+      status: context.reviewStatus,
+      target: context.reviewPath,
+      base: context.reviewBase,
+      head: context.reviewHead,
+      focus: context.reviewInstructions,
+      duration: context.duration,
+      success: context.success,
+      error: context.reviewError,
+      timestamp: createTimestamp(),
+    });
   }
 
   /**

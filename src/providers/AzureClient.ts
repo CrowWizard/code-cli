@@ -10,7 +10,7 @@ import type {
   AzureAuthMethod,
   NetworkSettings,
   FunctionDefinition,
-  LLMMessage,
+  MultimodalMessage,
 } from "../types.js";
 import { AzureTokenManager } from "./azure/tokenManager.js";
 import { normalizeLLMUsage } from "./usage.js";
@@ -41,7 +41,7 @@ export interface AzureClientOptions {
  * - name (for function messages, optional)
  * Excludes internal fields like priority, metadata.
  */
-function sanitizeMessages(messages: LLMMessage[]): Record<string, unknown>[] {
+function sanitizeMessages(messages: MultimodalMessage[]): Record<string, unknown>[] {
   return messages.map((msg) => {
     const sanitized: Record<string, unknown> = {
       role: msg.role,
@@ -218,6 +218,9 @@ export class AzureClient {
         );
         return response;
       } catch (error) {
+        if (request.signal?.aborted) {
+          throw new Error("Request cancelled.");
+        }
         lastError = error as Error;
 
         // Don't retry if user cancelled or if it's a non-retryable error
@@ -258,7 +261,7 @@ export class AzureClient {
       );
 
       const combinedSignal = signal
-        ? this.combineSignals(signal, timeoutController.signal)
+        ? AbortSignal.any([signal, timeoutController.signal])
         : timeoutController.signal;
 
       try {
@@ -273,10 +276,6 @@ export class AzureClient {
       }
     } catch (error) {
       const err = error as Error;
-
-      if (err.name === "AbortError" && signal?.aborted) {
-        throw new Error("Request cancelled.");
-      }
 
       if (err.name === "AbortError") {
         throw new Error(
@@ -391,23 +390,6 @@ export class AzureClient {
     }
 
     return false;
-  }
-
-  private combineSignals(
-    signal1: AbortSignal,
-    signal2: AbortSignal,
-  ): AbortSignal {
-    const controller = new AbortController();
-
-    const abort = () => controller.abort();
-    signal1.addEventListener("abort", abort);
-    signal2.addEventListener("abort", abort);
-
-    if (signal1.aborted || signal2.aborted) {
-      controller.abort();
-    }
-
-    return controller.signal;
   }
 
   private sleep(ms: number): Promise<void> {

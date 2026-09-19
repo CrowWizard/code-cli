@@ -19,7 +19,72 @@ import {
   getDefaultThemeName,
 } from '../../../src/ui/theme/themes.js';
 import { COLOR_TOKENS } from '../../../src/ui/theme/types.js';
-import type { ColorToken } from '../../../src/ui/theme/types.js';
+import type { ColorMode, ColorToken } from '../../../src/ui/theme/types.js';
+import { loadTheme, listAvailableThemes } from '../../../src/ui/theme/loader.js';
+import { Theme, hexToRgb } from '../../../src/ui/theme/Theme.js';
+import { stripVTControlCharacters } from 'node:util';
+
+function luminance(hex: string): number {
+  const rgb = hexToRgb(hex);
+  if (!rgb) throw new Error(`Expected a hex color, received ${hex}`);
+  const linear = [rgb.r, rgb.g, rgb.b].map(value => {
+    const channel = value / 255;
+    return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const light = luminance(foreground);
+  const dark = luminance(background);
+  return (Math.max(light, dark) + 0.05) / (Math.min(light, dark) + 0.05);
+}
+
+describe.each([
+  { name: 'tuatara', accent: '#b7c98a', background: '#171c17' },
+  { name: 'aurora', accent: '#9b9ef5', background: '#111216' },
+])('$name theme', ({ name, accent, background }) => {
+  it('is available as a built-in theme alongside Tui', () => {
+    expect(isBuiltInTheme(name)).toBe(true);
+    expect(getBuiltInTheme(name)?.name).toBe(name);
+    expect(listAvailableThemes()).toEqual(expect.arrayContaining(['tui', name]));
+    expect(loadTheme(name).colors.accent).toBe(accent);
+  });
+
+  it('keeps readable text and syntax contrast on its dark surfaces', () => {
+    const { colors } = loadTheme(name);
+    const foregrounds: ColorToken[] = [
+      'text', 'dim', 'muted', 'accent', 'success', 'error', 'warning',
+      'userMessageText', 'toolTitle', 'toolOutput', 'diffAdded', 'diffRemoved', 'diffContext',
+      'syntaxComment', 'syntaxKeyword', 'syntaxFunction', 'syntaxVariable', 'syntaxString',
+      'syntaxNumber', 'syntaxType', 'syntaxOperator', 'syntaxPunctuation',
+      'mdHeading', 'mdLink', 'mdLinkUrl', 'mdCode', 'mdCodeBlock', 'mdQuote', 'mdListBullet',
+    ];
+    const backgrounds = [
+      background, '#1a1a1a', colors.userMessageBg,
+      colors.toolPendingBg, colors.toolSuccessBg, colors.toolErrorBg,
+    ];
+    for (const background of backgrounds) {
+      for (const token of foregrounds) {
+        expect(contrastRatio(colors[token], background), `${token} on ${background}`).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    expect(contrastRatio(colors.userMessageText, colors.userMessageBg)).toBeGreaterThanOrEqual(7);
+    expect(new Set([colors.success, colors.error, colors.warning]).size).toBe(3);
+  });
+
+  it.each<ColorMode>(['truecolor', '256', '16', 'none'])('preserves status and diff labels in %s terminals', mode => {
+    const theme = new Theme(name, loadTheme(name).colors, mode);
+    const output = [
+      theme.fg('success', '✓ passed'), theme.fg('error', '✗ failed'),
+      theme.fg('warning', '! warning'), theme.fg('diffAdded', '+ added'), theme.fg('diffRemoved', '- removed'),
+    ].join('\n');
+    const plain = '✓ passed\n✗ failed\n! warning\n+ added\n- removed';
+    expect(stripVTControlCharacters(output)).toBe(plain);
+    if (mode === 'none') expect(output).toBe(plain);
+    else expect(output).not.toBe(plain);
+  });
+});
 
 describe('darkTheme', () => {
   it('has correct name', () => {
@@ -170,8 +235,8 @@ describe('builtInThemes', () => {
     expect(builtInThemes.australia).toBe(australiaTheme);
   });
 
-  it('has exactly 9 built-in themes', () => {
-    expect(Object.keys(builtInThemes)).toHaveLength(9);
+  it('has exactly 11 built-in themes', () => {
+    expect(Object.keys(builtInThemes)).toHaveLength(11);
   });
 
   it('all themes have unique names', () => {
@@ -253,8 +318,8 @@ describe('getBuiltInThemeNames()', () => {
 });
 
 describe('getDefaultThemeName()', () => {
-  it('returns "dark" as default', () => {
-    expect(getDefaultThemeName()).toBe('dark');
+  it('returns Aurora as default', () => {
+    expect(getDefaultThemeName()).toBe('aurora');
   });
 
   it('returns a valid built-in theme name', () => {

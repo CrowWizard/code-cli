@@ -23,6 +23,7 @@ import type {
   SessionMetadata,
   SessionUsageMetadata,
 } from '../../session/types.js';
+import type { Session } from '../../session/SessionManager.js';
 import { renderTerminalMarkdown } from '../immediateCommandRouter.js';
 import { isLikelyFilePathSlashInput } from '../slashInputDetection.js';
 import { isShellCommand, parseShellCommand } from '../../ui/shellCommand.js';
@@ -35,18 +36,25 @@ import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js'
 import type { ImageManager } from '../ImageManager.js';
 import { SessionDiffStatsTracker } from '../SessionDiffStatsTracker.js';
 import { shouldForceAgentIdleLogout } from './AgentSessionAccounting.js';
-import { consumeAgentInkSubmittedInstructionEcho } from './AgentUIRuntime.js';
+import {
+  consumeAgentInkSubmittedInstructionEcho,
+} from './AgentUIRuntime.js';
+import { renderAgentSlashCommandResult } from './AgentCommandRuntime.js';
 import {
   createQueuedAgentInstruction,
   resolveActiveGoalContinuation,
   unpackQueuedAgentInstruction,
   type PendingPostTurnAction,
+  type QueuedInstructionPolicy,
   type SequencedQueuedAgentInstruction,
   type QueuedMobileComposerCommand,
 } from './PostTurnActionCoordinator.js';
 import type { MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
 import type { MobileImageAttachment } from '../../mobile/MobileHandoffClient.js';
 import { validateMobileCommandInvocationForWorkspace } from '../../mobile/MobileCommandPolicy.js';
+import { executeReviewWithLifecycle } from '../../review/reviewLifecycle.js';
+import type { ReviewExecutionSurface } from '../../review/reviewLifecycle.js';
+import type { ReviewRequest } from '../../review/reviewRequest.js';
 
 const execFileAsync = promisify(execFile);
 const RUNTIME_RESOURCE_SHUTDOWN_TIMEOUT_MS = 2_500;
@@ -67,6 +75,53 @@ export interface AgentLifecycleHost {
 export interface RunAgentCommandModeOptions {
   signal?: AbortSignal;
   keepAlive?: boolean;
+  review?: {
+    request: ReviewRequest;
+    surface: ReviewExecutionSurface;
+  };
+}
+
+export interface ExecuteAgentInstructionTurnOptions {
+  echoInTranscript?: boolean;
+  postTurnAction?: PendingPostTurnAction;
+  mobileTurn?: MobileClaimedTurnContext;
+  executionPolicy?: QueuedInstructionPolicy;
+}
+
+export async function executeAgentInstructionTurn(
+  host: AgentLifecycleHost,
+  instruction: string,
+  options: ExecuteAgentInstructionTurnOptions = {},
+): Promise<boolean> {
+  const execute = (): Promise<boolean> => {
+    if (options.mobileTurn) {
+      return host.runInstruction(instruction, {
+        ...options.executionPolicy,
+        mobileTurn: options.mobileTurn,
+        ...(options.echoInTranscript === false ? { echoInTranscript: false } : {}),
+      });
+    }
+    if (options.echoInTranscript === false) {
+      return host.runInstruction(instruction, { ...options.executionPolicy, echoInTranscript: false });
+    }
+    if (options.executionPolicy) {
+      return host.runInstruction(instruction, options.executionPolicy);
+    }
+    return host.runInstruction(instruction);
+  };
+
+  if (options.postTurnAction?.kind !== 'review-lifecycle') {
+    return execute();
+  }
+
+  return executeReviewWithLifecycle({
+    request: options.postTurnAction.request,
+    surface: options.postTurnAction.surface,
+    sessionId: host.sessionManager.getCurrentSession()?.metadata.sessionId,
+    hookManager: host.hookManager,
+    permissionManager: host.permissionManager,
+    execute,
+  });
 }
 
 type ProviderSettingsHost = {
@@ -233,7 +288,7 @@ export interface FreshAgentSessionHost {
   resetConversationContext(): Promise<void>;
   resetAgentStateForFreshSession(startedAt: number): void;
   injectSessionBootstrap(): Promise<void>;
-  restoreSessionState?(sessionId: string): Promise<FreshAgentSessionRecord>;
+  restoreSessionState?(sessionId: string | Session): Promise<FreshAgentSessionRecord>;
 }
 
 export async function startFreshAgentSession(
@@ -653,6 +708,8 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       host.announcementUnsubscribe = null;
       callResourceCleanupSync(host.teamActivityUnsubscribe ?? undefined);
       host.teamActivityUnsubscribe = null;
+      callResourceCleanupSync(host.goalActivityUnsubscribe ?? undefined);
+      host.goalActivityUnsubscribe = null;
 
       callResourceCleanupSync(() => host.repeatManager?.shutdown());
       host.persistentInputActiveTurn = false;
@@ -942,6 +999,7 @@ function createCommandFinalizationDeadline(
 export async function initializeAgentForRPC(
   host: AgentLifecycleHost,
   signal?: AbortSignal,
+  existingSessionId?: string,
 ): Promise<void> {
     // Initialize managers in parallel for faster startup
     await awaitLifecycleStep(Promise.resolve(host.initializeManagers()), signal);
@@ -961,13 +1019,16 @@ export async function initializeAgentForRPC(
       signal,
     );
     const providerSettings = getHostProviderSettings(host);
-    const model = host.runtime.options.model ?? providerSettings?.model ?? 'unconfigured';
+    const configuredModel = host.runtime.options.model ?? providerSettings?.model ?? 'unconfigured';
     const providerTelemetryMetadata = buildProviderTelemetryMetadata(providerSettings);
     host.sessionStartedAt = Date.now();
     const [, session] = await awaitLifecycleStep(Promise.all([
       host.resetConversationContext(),
-      host.sessionManager.createSession(host.runtime.workspaceRoot, model),
+      existingSessionId
+        ? host.sessionManager.loadSession(existingSessionId)
+        : host.sessionManager.createSession(host.runtime.workspaceRoot, configuredModel),
     ]), signal);
+    const model = session?.metadata?.model ?? configuredModel;
     await awaitLifecycleStep(startHostActiveAgentHeartbeat(host), signal);
 
     await awaitLifecycleStep(Promise.resolve(host.injectSessionBootstrap()), signal);
@@ -992,7 +1053,7 @@ export async function initializeAgentForRPC(
     // Fire session-start hook
     await awaitLifecycleStep(host.hookManager.executeHooks('session-start', {
       sessionId: session?.metadata.sessionId,
-      sessionType: 'startup',
+      sessionType: existingSessionId ? 'resume' : 'startup',
     }), signal);
   }
 
@@ -1078,11 +1139,33 @@ export async function runAgentCommandMode(
       );
       initialized = true;
 
+      if (options.review) {
+        await host.telemetryManager.trackCommand({
+          command: 'review',
+          subcommand: options.review.request.kind,
+          surface: 'cli',
+        }).catch(() => {});
+      }
+
       turnStartedAt = Date.now();
-      succeeded = await awaitLifecycleStep(
-        Promise.resolve(host.runInstruction(instruction, { signal })),
+      const executeInstruction = (): Promise<boolean> => awaitLifecycleStep(
+        Promise.resolve(host.runInstruction(instruction, {
+          signal,
+          ...(options.review ? { echoInTranscript: false } : {}),
+        })),
         signal,
       );
+      succeeded = options.review
+        ? await executeReviewWithLifecycle({
+            request: options.review.request,
+            surface: options.review.surface,
+            sessionId: host.sessionManager.getCurrentSession()?.metadata.sessionId,
+            signal,
+            hookManager: host.hookManager,
+            permissionManager: host.permissionManager,
+            execute: executeInstruction,
+          })
+        : await executeInstruction();
 
       if (!succeeded) {
         finalizationDeadline.start();
@@ -1096,6 +1179,7 @@ export async function runAgentCommandMode(
       if (succeeded) {
         if (
           host.runtime.config.ui?.terminalBell !== false
+          && !options.review
           && (host.runtime.options.commandOutputFormat ?? 'text') === 'text'
         ) {
           process.stdout.write('\x07');
@@ -1164,8 +1248,10 @@ export async function runAgentCommandMode(
     }
   }
 
-export async function restoreAgentSessionState(host: AgentLifecycleHost, sessionId: string) {
-    const session = await host.sessionManager.loadSession(sessionId);
+export async function restoreAgentSessionState(host: AgentLifecycleHost, sessionOrId: string | Session) {
+    const session = typeof sessionOrId === 'string'
+      ? await host.sessionManager.loadSession(sessionOrId)
+      : sessionOrId;
 
     await host.resetConversationContext();
     await host.injectSessionBootstrap();
@@ -1204,6 +1290,10 @@ export async function restoreAgentSessionState(host: AgentLifecycleHost, session
     host.updateContextUsage(host.conversation.history());
     if (host.inkRenderer?.setChatMessages) {
       host.inkRenderer.setChatMessages(host.restoredChatMessages);
+    }
+    if (host.goalActivityManager?.getSessionSnapshot) {
+      host.goalActivitySnapshot = await host.goalActivityManager.getSessionSnapshot();
+      host.inkRenderer?.setGoalActivity?.(host.goalActivitySnapshot);
     }
     return session;
   }
@@ -1423,6 +1513,8 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
 
       try {
         let instruction: string | null = null;
+        let echoInTranscript: boolean | undefined;
+        let executionPolicy: QueuedInstructionPolicy | undefined;
         let postTurnAction: PendingPostTurnAction | undefined;
         let mobileTurn: MobileClaimedTurnContext | undefined;
         let mobileCommand: QueuedMobileComposerCommand | undefined;
@@ -1436,6 +1528,8 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         const nextQueuedWork = dequeueOldestQueuedWork(host);
         if (nextQueuedWork) {
           instruction = nextQueuedWork.queued.text ?? null;
+          echoInTranscript = nextQueuedWork.queued.echoInTranscript;
+          executionPolicy = nextQueuedWork.queued.executionPolicy;
           postTurnAction = nextQueuedWork.queued.postTurnAction;
           mobileTurn = nextQueuedWork.queued.mobileTurn;
           mobileCommand = nextQueuedWork.queued.mobileCommand;
@@ -1603,9 +1697,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
                 `[DEBUG] After runSlashCommandWithInput: inkRenderer exists=${!!host.inkRenderer}, isRunning=${host.inkRenderer?.isRunning()}`,
                 host.writeDebugLine?.bind(host)
               );
-              if (handled !== null && host.inkRenderer?.isRunning()) {
-                host.inkRenderer.addAssistantMessage(handled);
-              } else if (handled !== null) {
+              if (handled !== null && !renderAgentSlashCommandResult(host, command, handled)) {
                 console.log(renderTerminalMarkdown(handled));
               }
               // Ensure the renderer is in idle state so the Composer accepts input
@@ -1616,7 +1708,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
               );
               if (host.ui || host.inkRenderer) {
                 host.setComposerIdle();
-                host.clearComposerInput();
+                if (command !== '/whatityped') host.clearComposerInput();
                 // Return to the top of the loop so the idle-wait path can await
                 // the next Composer submission without falling through to
                 // instruction.startsWith('/') which would throw on null.
@@ -1671,11 +1763,6 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
           return;
         }
 
-        const isSlashCommand = !mobileTurn && instruction.startsWith('/');
-        if (isSlashCommand) {
-          await host.telemetryManager.trackCommand({ command: instruction.split(' ')[0] });
-        }
-
         // Reset error tracking on successful prompt
         host.lastErrorMessage = null;
         host.consecutiveErrorCount = 0;
@@ -1686,10 +1773,13 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         }
 
         const turnStartTime = Date.now();
-        const turnSucceeded = mobileTurn
-          ? await host.runInstruction(instruction, { mobileTurn })
-          : await host.runInstruction(instruction);
-        if (postTurnAction) {
+        const turnSucceeded = await executeAgentInstructionTurn(host, instruction, {
+          ...(executionPolicy ? { executionPolicy } : {}),
+          ...(mobileTurn ? { mobileTurn } : {}),
+          ...(echoInTranscript !== undefined ? { echoInTranscript } : {}),
+          ...(postTurnAction ? { postTurnAction } : {}),
+        });
+        if (postTurnAction?.kind === 'publish-research') {
           const consumedAction = postTurnAction;
           postTurnAction = undefined;
           let publicationResult: string | null = null;
@@ -1718,7 +1808,10 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
           turnSucceeded,
         );
         if (goalContinuation) {
-          host.pendingInkInstructions.push(createQueuedAgentInstruction({ text: goalContinuation }));
+          host.pendingInkInstructions.push(createQueuedAgentInstruction({
+            text: goalContinuation,
+            echoInTranscript: false,
+          }));
         }
         host.flushMcpStartupSummaryIfPending();
 

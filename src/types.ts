@@ -130,6 +130,11 @@ export interface AnthropicSettings extends ProviderSettings {
 
 export interface LLMGatewaySettings extends ProviderSettings {
   apiKey: string;
+  /**
+   * Preserve OpenAI `image_url` content parts rather than flattening them to
+   * text. This is a transport capability, not a user-configurable setting.
+   */
+  supportsImageInput?: boolean;
 }
 
 export interface OpenAIChatGPTAuth {
@@ -285,6 +290,8 @@ export interface StatusLineSettings {
   showModeLabel?: boolean;
 }
 
+export type TaskListPosition = 'up' | 'above-composer';
+
 export interface UISettings {
   /** Theme name: built-in, config-provided, Ghostty, or custom theme from ~/.autohand/themes/*.json */
   theme?: string;
@@ -295,6 +302,8 @@ export interface UISettings {
   readFileCharLimit?: number;
   /** Hide tool output blocks from terminal display while preserving transcript/model context (default: false) */
   silentToolOutput?: boolean;
+  /** Position of the active task list in the Ink composer area (default: above-composer). */
+  taskListPosition?: TaskListPosition;
   /** Show notification when work is completed (default: true) */
   showCompletionNotification?: boolean;
   /** Ask the model to include a concise completion report after action turns (default: true) */
@@ -374,6 +383,10 @@ export interface AutoReportSettings {
 }
 
 export interface FeatureFlagSettings {
+  multi_agent_v2?: {
+    /** Total session threads including the main agent. Integer 1–64; default 9. */
+    max_concurrent_threads_per_session?: number;
+  };
   /** Gate Autohand-hosted inference provider, models, setup, RPC, and ACP surfaces. */
   autohand_inference?: boolean;
   /** Remote feature flag environment (default: production) */
@@ -526,6 +539,8 @@ export interface GitHubCommunityMcp {
   tags?: string[];
   transport: 'stdio' | 'sse' | 'http';
   command?: string;
+  /** Endpoint URL for HTTP and SSE transports. */
+  url?: string;
   args?: string[];
   envVars?: string[];
   requiredArgs?: string[];
@@ -697,6 +712,10 @@ export type HookEvent =
   | 'post-response'     // Alias for 'stop' (backward compatibility)
   | 'session-error'
   | 'rate-limit'        // Provider rate limit ended the turn (no session retry)
+  | 'subagent-start'
+  | 'subagent-progress'
+  | 'subagent-message'
+  | 'subagent-cancel-requested'
   | 'subagent-stop'     // Subagent (Task tool) finished
   | 'session-start'     // Session begins (startup, resume, clear)
   | 'session-end'       // Session ends (quit, exit)
@@ -760,8 +779,20 @@ export interface HookFilter {
   path?: string[];
 }
 
+export type ImportedHookSource = 'claude' | 'codex' | 'cursor' | 'grok';
+
+export interface ImportedHookOrigin {
+  id: string;
+  source: ImportedHookSource;
+  event: string;
+  configPath: string;
+  workspaceRoot?: string;
+  workingDirectory?: string;
+}
+
 /** Hook definition for config-based hooks */
 export interface HookDefinition {
+  importedFrom?: ImportedHookOrigin;
   /** Event to hook into */
   event: HookEvent;
   /** Shell command to execute (receives context via env vars and JSON via stdin) */
@@ -886,6 +917,7 @@ export interface AutohandConfig {
   externalAgents?: ExternalAgentsConfig;
   api?: {
     baseUrl?: string;
+    accountId?: string;
     companySecret?: string;
   };
   /** Authentication settings */
@@ -976,6 +1008,7 @@ export interface CLIOptions {
   /** Disable startup network operations while retaining local cached state. */
   offline?: boolean;
   path?: string;
+  plan?: boolean;
   yes?: boolean;
   dryRun?: boolean;
   debug?: boolean;
@@ -1176,12 +1209,8 @@ export interface LLMMessage {
  * Message with multimodal content for API requests
  * Used when converting LLMMessage to API format with images
  */
-export interface MultimodalMessage {
-  role: MessageRole;
+export interface MultimodalMessage extends Omit<LLMMessage, 'content'> {
   content: string | ContentPart[];
-  name?: string;
-  tool_call_id?: string;
-  tool_calls?: LLMToolCall[];
 }
 
 /**
@@ -1236,7 +1265,7 @@ export interface PromptCacheDirective {
 }
 
 export interface LLMRequest {
-  messages: LLMMessage[];
+  messages: MultimodalMessage[];
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
@@ -1259,7 +1288,25 @@ export interface LLMRequest {
   promptCache?: PromptCacheDirective;
   /** Chat template kwargs for NVIDIA reasoning models (DeepSeek, Z.ai GLM) */
   chatTemplateKwargs?: NvidiaChatTemplateKwargs;
+  /**
+   * Called by providers that retry transient failures internally, once before each wait and
+   * once when the retry is sent, so the UI can show the pause instead of a silent stall.
+   */
+  onRetry?: (event: LLMRetryEvent) => void;
 }
+
+export type LLMRetryEvent =
+  | {
+      phase: 'waiting';
+      /** How long the provider will sleep before the next attempt. */
+      delayMs: number;
+      /** 1-based retry number. */
+      attempt: number;
+      maxAttempts: number;
+      /** Short human-readable cause, e.g. "Autohand AI uncached input-token throughput". */
+      reason: string;
+    }
+  | { phase: 'retrying'; attempt: number; maxAttempts: number };
 
 /** Token usage statistics from LLM response */
 export interface LLMUsage {
@@ -1355,6 +1402,9 @@ export type BrowserFormAssignment =
   | ({ kind: 'files'; paths: string[] } & BrowserTargetInput);
 
 export type AgentAction =
+  | { type: 'list_hooks' }
+  | { type: 'create_hook'; prompt: string; event?: HookEvent }
+  | { type: 'set_hook_enabled'; event: HookEvent; index: number; enabled: boolean }
   | { type: 'read_file'; path: string; offset?: number; limit?: number }
   | { type: 'write_file'; path: string; contents?: string; content?: string }
   | { type: 'append_file'; path: string; contents?: string; content?: string }
@@ -1544,13 +1594,14 @@ export type AgentAction =
   | { type: 'delegate_parallel'; tasks: Array<{ agent_name: string; task: string }> }
   | { type: 'orchestrate_specialists'; objective: string; requested_roles: string[] }
   | { type: 'install_specialist_roster'; plan_id: string; agent_names: string[] }
+  | { type: 'compose_team'; objective: string; team_name?: string }
   // Team coordination tools
   | { type: 'create_team'; name: string }
   | { type: 'add_teammate'; name: string; agent_name: string; provider?: ProviderName; model?: string; requested_role?: string; agent_source?: string }
   | { type: 'create_task'; subject: string; description: string; blocked_by?: string[] }
   | { type: 'task_get'; task_id: string }
-  | { type: 'task_list'; status?: 'pending' | 'in_progress' | 'completed'; owner?: string }
-  | { type: 'task_update'; task_id: string; subject?: string; description?: string; blocked_by?: string[]; status?: 'pending' | 'in_progress' | 'completed' }
+  | { type: 'task_list'; status?: 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled'; owner?: string }
+  | { type: 'task_update'; task_id: string; subject?: string; description?: string; blocked_by?: string[]; status?: 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled' }
   | { type: 'task_stop'; task_id: string }
   | { type: 'task_output'; task_id: string; output: string }
   | { type: 'team_status' }
@@ -1560,6 +1611,13 @@ export type AgentAction =
   | { type: 'enter_worktree'; name?: string }
   | { type: 'exit_worktree'; keep?: boolean }
   // Web Search Operations
+  | {
+      type: 'capture_test_evidence';
+      url: string;
+      steps?: import('./testing/visualEvidence.js').VisualEvidenceStep[];
+      max_frames?: number;
+      timeout_ms?: number;
+    }
   | { type: 'web_search'; query: string; max_results?: number; search_type?: 'general' | 'packages' | 'docs' | 'changelog' }
   | { type: 'fetch_url'; url: string; selector?: string; max_length?: number }
   | { type: 'package_info'; package_name: string; registry?: 'npm' | 'pypi' | 'crates' | 'go' | 'rubygems'; version?: string }
@@ -1580,6 +1638,9 @@ export type AgentAction =
   // Skills Discovery
   | { type: 'find_agent_skills'; query: string; category?: string; limit?: number }
   | { type: 'install_agent_skill'; name: string; scope?: 'project' | 'user'; activate?: boolean }
+  // Community MCP discovery and installation
+  | { type: 'find_mcp_servers'; query: string; category?: string; limit?: number }
+  | { type: 'install_mcp_server'; server_id: string; required_args?: string[]; overwrite?: boolean }
   // Sub-agent catalog
   | { type: 'find_sub_agents'; query: string; category?: string; limit?: number }
   | { type: 'install_sub_agent'; name: string; overwrite?: boolean }
@@ -1723,6 +1784,8 @@ export type ToolActionOutcome =
   | {
       success: true;
       output?: string;
+      /** Local artifact paths for runtime-only multimodal handoff; never image bytes or URLs. */
+      imagePaths?: string[];
     }
   | {
       success: false;
@@ -1730,6 +1793,7 @@ export type ToolActionOutcome =
       error: string;
       output?: string;
       exitCode?: number | null;
+      imagePaths?: string[];
     };
 
 export type ToolExecutionResult = {
@@ -1765,6 +1829,8 @@ export interface AgentRuntime {
   isRpcMode?: boolean;
   /** True when running one-shot command mode via --prompt/positional prompt */
   isCommandMode?: boolean;
+  /** True when final command output is emitted by a transport writer. */
+  commandOutputCaptured?: boolean;
 }
 
 export interface AgentStatusSnapshot {

@@ -36,6 +36,10 @@ export class SlashCommandHandler {
     return this.commandMap.has(command) || this.extensionRuntime?.getCommand(command) !== undefined;
   }
 
+  getKnownSubcommands(command: string): string[] {
+    return this.commandMap.get(command)?.subcommands?.map(({ name }) => name) ?? [];
+  }
+
   async handle(command: string, args: string[] = []): Promise<string | null> {
     if (command === LEGACY_BROWSER_SLASH_COMMAND) {
       if (!this.commandMap.has(BROWSER_SLASH_COMMAND)) {
@@ -108,7 +112,7 @@ export class SlashCommandHandler {
       '/model', '/cc', '/search', '/theme', '/language', '/feedback', '/skills new', '/skills-new',
       '/squad', '/statusline',
       '/publish-research', '/ps', '/stop',
-      '/whatsnew',
+      '/whatsnew', '/whatityped',
     ]);
     if (this.ctx.isNonInteractive && INTERACTIVE_ONLY.has(command)) {
       usageOutcome = 'failed';
@@ -171,14 +175,20 @@ export class SlashCommandHandler {
         }
         case '/agents': {
           const { handler } = await import('../commands/agents.js');
-          await this.ctx.onBeforeModal?.();
+          const isLiveView = args[0]?.toLowerCase() === 'view';
+          if (!isLiveView) await this.ctx.onBeforeModal?.();
           try {
-            const output = await handler(args, { config: this.ctx.config });
+            const output = await handler(args, {
+              config: this.ctx.config,
+              onToggleAgentRunsView: this.ctx.onToggleAgentRunsView
+                ? () => this.ctx.onToggleAgentRunsView?.(true)
+                : undefined,
+            });
             if (output) {
               console.log(output);
             }
           } finally {
-            await this.ctx.onAfterModal?.();
+            if (!isLiveView) await this.ctx.onAfterModal?.();
           }
           return null;
         }
@@ -210,6 +220,7 @@ export class SlashCommandHandler {
             onBeforeModal: this.ctx.onBeforeModal,
             onAfterModal: this.ctx.onAfterModal,
             restoreSession: this.ctx.restoreSession,
+            restoreLoadedSession: this.ctx.restoreLoadedSession,
           });
         }
         case '/sessions': {
@@ -223,7 +234,6 @@ export class SlashCommandHandler {
         case '/undo': {
           const { undo } = await import('../commands/undo.js');
           return undo({
-            workspaceRoot: this.ctx.workspaceRoot,
             undoFileMutation: this.ctx.undoFileMutation ?? (async () => {}),
             removeLastTurn: this.ctx.removeLastTurn ?? (() => {})
           });
@@ -263,10 +273,14 @@ export class SlashCommandHandler {
           });
         }
         case '/settings': {
-          const { settings } = await import('../commands/settings.js');
+          const { settings, normalizeSettingKey } = await import('../commands/settings.js');
           if (!this.ctx.config) {
             console.log(chalk.yellow('Config not available.'));
             return null;
+          }
+          const opensPositionPicker = normalizeSettingKey(args.join(' ')) === 'ui.taskListPosition';
+          if (args.length > 0 && !opensPositionPicker) {
+            return await settings({ config: this.ctx.config }, args);
           }
           // Pause the InkRenderer for the entire /settings session.
           // settings() runs its own while(true) loop with multiple showModal
@@ -274,7 +288,7 @@ export class SlashCommandHandler {
           // modal's useInput for stdin and ESC events get dropped.
           await this.ctx.onBeforeModal?.();
           try {
-            return await settings({ config: this.ctx.config });
+            return await settings({ config: this.ctx.config }, args);
           } finally {
             await this.ctx.onAfterModal?.();
           }
@@ -357,6 +371,17 @@ export class SlashCommandHandler {
             applyPermissionMode: this.ctx.applyMobilePermissionMode,
           }, args);
         }
+        case '/handoff web': {
+          const { handoffWeb } = await import('../commands/handoff-web.js');
+          return handoffWeb({
+            sessionManager: this.ctx.sessionManager,
+            currentSession: this.ctx.currentSession,
+            workspaceRoot: this.ctx.workspaceRoot,
+            model: this.ctx.model,
+            provider: this.ctx.provider,
+            config: this.ctx.config,
+          }, args);
+        }
         case '/handoff session': {
           const { handoffSession } = await import('../commands/go.js');
           return handoffSession({
@@ -409,6 +434,14 @@ export class SlashCommandHandler {
           const { prReview } = await import('../commands/pr-review.js');
           return prReview(this.ctx, args);
         }
+        case '/deslop': {
+          const { deslop } = await import('../commands/deslop.js');
+          return deslop(this.ctx, args);
+        }
+        case '/tester': {
+          const { tester } = await import('../commands/tester.js');
+          return tester(this.ctx, args);
+        }
         case '/status': {
           const { status } = await import('../commands/status.js');
           await this.ctx.onBeforeModal?.();
@@ -459,7 +492,7 @@ export class SlashCommandHandler {
           }
           await this.ctx.onBeforeModal?.();
           try {
-            return await hooks({ hookManager: this.ctx.hookManager });
+            return await hooks({ hookManager: this.ctx.hookManager, authoring: this.ctx.hookAuthoring, isNonInteractive: this.ctx.isNonInteractive }, args.join(' '));
           } finally {
             await this.ctx.onAfterModal?.();
           }
@@ -571,6 +604,10 @@ export class SlashCommandHandler {
           const { history } = await import('../commands/history.js');
           return history({ ...this.ctx, args });
         }
+        case '/whatityped': {
+          const { whatityped } = await import('../commands/whatityped.js');
+          return whatityped(this.ctx);
+        }
         case '/mcp': {
           const { mcp } = await import('../commands/mcp.js');
           return mcp({
@@ -670,7 +707,12 @@ export class SlashCommandHandler {
         }
         case '/import': {
           const { execute } = await import('../commands/import.js');
-          return execute(args);
+          await this.ctx.onBeforeModal?.();
+          try {
+            return await execute(args, { workspaceRoot: this.ctx.workspaceRoot, configPath: this.ctx.config?.configPath, hookManager: this.ctx.hookManager });
+          } finally {
+            await this.ctx.onAfterModal?.();
+          }
         }
         case '/repeat': {
           const { repeat } = await import('../commands/repeat.js');
@@ -727,9 +769,17 @@ export class SlashCommandHandler {
           const { goal } = await import('../commands/goal.js');
           return goal(this.ctx, args);
         }
+        case '/goals': {
+          const { goal } = await import('../commands/goal.js');
+          return goal(this.ctx, args.length > 0 ? args : ['view']);
+        }
         case '/squad': {
           const { squad } = await import('../commands/squad.js');
-          return squad({ workspaceRoot: this.ctx.workspaceRoot, config: this.ctx.config }, args);
+          return squad({
+            workspaceRoot: this.ctx.workspaceRoot,
+            config: this.ctx.config,
+            onToggleAgentRunsView: this.ctx.onToggleAgentRunsView,
+          }, args);
         }
         default:
           usageOutcome = 'failed';

@@ -13,7 +13,9 @@ import type { SlashCommand } from '../core/slashCommandTypes.js';
 import type { SkillMentionInfo } from './mentionFilter.js';
 import type { ExtensionKeybinding } from '../extensions/ExtensionRuntimeHost.js';
 import type { AgentUILineExtensions } from './ink/AgentUI.js';
+import type { GoalEditRequest } from './ink/GoalPanel.js';
 import type { InteractionMode } from '../core/agent/InteractionModeController.js';
+import type { TaskListPosition } from '../types.js';
 
 export interface InkUIManagerOptions {
   onInstruction: (text: string) => void;
@@ -33,6 +35,10 @@ export interface InkUIManagerOptions {
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
   mouseComposerCursor?: boolean;
+  taskListPositionProvider?: () => TaskListPosition;
+  onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
+  onCancelAgentRun?: (id: string) => void | Promise<unknown>;
+  onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
   rendererFactory?: (options: InkRendererOptions) => InkRenderer;
 }
 

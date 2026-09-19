@@ -19,18 +19,21 @@ const {
   mockPersistentSessionManager,
   MockPersistentSessionManagerClass,
   mockConversation,
+  mockImageManager,
   mockLoadConfig,
   mockPrepareSessionWorktree,
   mockIsSessionWorktreeEnabled,
   mockFileActionManager,
+  mockPersistedSessionSave,
   SessionManagerMockClass,
 } = vi.hoisted(() => {
   const mockSessionManager = {
-    createSession: vi.fn(),
+    getCurrentSession: vi.fn(),
     loadSession: vi.fn(),
     listSessions: vi.fn(),
   };
   const mockPersistentSessionManager = {
+    branchSession: vi.fn(),
     initialize: vi.fn(),
     listSessions: vi.fn(),
   };
@@ -43,6 +46,15 @@ const {
     addSystemNote: vi.fn(),
     addMessage: vi.fn(),
   };
+  const mockImageManager = {
+    clear: vi.fn(),
+    add: vi.fn().mockReturnValue(1),
+    formatPlaceholder: vi.fn().mockReturnValue("[Image #1]"),
+  };
+  const mockPermissionManager = {
+    getMode: vi.fn().mockReturnValue("external"),
+    setMode: vi.fn(),
+  };
 
   const mockAgent = {
     initializeForRPC: vi.fn().mockResolvedValue(undefined),
@@ -54,10 +66,14 @@ const {
     applyAcpConfigOption: vi.fn(),
     cancelCurrentInstruction: vi.fn(),
     getSessionManager: vi.fn().mockReturnValue(mockSessionManager),
+    getImageManager: vi.fn().mockReturnValue(mockImageManager),
+    getHookManager: vi.fn(),
+    getPermissionManager: vi.fn().mockReturnValue(mockPermissionManager),
     runInstruction: vi.fn().mockResolvedValue(true),
     isSlashCommand: vi.fn().mockReturnValue(false),
     isSlashCommandSupported: vi.fn().mockReturnValue(false),
     handleSlashCommand: vi.fn().mockResolvedValue(null),
+    trackCommandUsage: vi.fn().mockResolvedValue(undefined),
     parseSlashCommand: vi.fn().mockImplementation((input: string) => {
       const parts = input.trim().split(/\s+/);
       return { command: parts[0], args: parts.slice(1) };
@@ -74,6 +90,7 @@ const {
     );
 
   const mockFileActionManager = vi.fn();
+  const mockPersistedSessionSave = vi.fn().mockResolvedValue(undefined);
 
   const SessionManagerMockClass = class {
     constructor() {
@@ -87,10 +104,12 @@ const {
     mockPersistentSessionManager,
     MockPersistentSessionManagerClass,
     mockConversation,
+    mockImageManager,
     mockLoadConfig,
     mockPrepareSessionWorktree,
     mockIsSessionWorktreeEnabled,
     mockFileActionManager,
+    mockPersistedSessionSave,
     SessionManagerMockClass,
   };
 });
@@ -232,12 +251,22 @@ describe("AutohandAcpAdapter", () => {
     MockPersistentSessionManagerClass.mockImplementation(
       () => mockPersistentSessionManager,
     );
-    mockAgent.initializeForRPC.mockResolvedValue(undefined);
+    mockAgent.initializeForRPC.mockImplementation(
+      async (_signal?: AbortSignal, existingSessionId?: string) => {
+        if (!existingSessionId) {
+          return;
+        }
+        const loadedSession = await mockSessionManager.loadSession(existingSessionId);
+        mockSessionManager.getCurrentSession.mockReturnValue(loadedSession);
+      },
+    );
     mockAgent.getSessionManager.mockReturnValue(mockSessionManager);
+    mockAgent.getHookManager.mockReset().mockReturnValue(undefined);
     mockAgent.runInstruction.mockResolvedValue(true);
     mockAgent.isSlashCommand.mockReturnValue(false);
     mockAgent.isSlashCommandSupported.mockReturnValue(false);
     mockAgent.handleSlashCommand.mockResolvedValue(null);
+    mockAgent.trackCommandUsage.mockReset().mockResolvedValue(undefined);
     mockAgent.connectAcpMcpServers.mockResolvedValue(undefined);
     mockAgent.applyAcpMode.mockImplementation(() => {});
     mockAgent.applyAcpModel.mockImplementation(() => {});
@@ -257,8 +286,14 @@ describe("AutohandAcpAdapter", () => {
       createdBranch: true,
     });
     mockSessionManager.listSessions.mockResolvedValue([]);
-    mockSessionManager.createSession.mockResolvedValue({
-      metadata: { sessionId: "persisted-acp-session" },
+    mockSessionManager.getCurrentSession.mockReturnValue({
+      metadata: {
+        sessionId: "persisted-session-123",
+        model: "your-modelcard-id-here",
+        projectPath: "/workspace",
+      },
+      getMessages: () => [],
+      save: mockPersistedSessionSave,
     });
     mockPersistentSessionManager.initialize.mockResolvedValue(undefined);
     mockPersistentSessionManager.listSessions.mockResolvedValue([]);
@@ -270,6 +305,8 @@ describe("AutohandAcpAdapter", () => {
       getMessages: () => [],
     });
     mockConversation.isInitialized.mockReturnValue(true);
+    mockImageManager.add.mockReturnValue(1);
+    mockImageManager.formatPlaceholder.mockReturnValue("[Image #1]");
 
     connection = makeConnection();
     config = makeConfig();
@@ -448,14 +485,10 @@ describe("AutohandAcpAdapter", () => {
       expect(result.sessionId.length).toBeGreaterThan(0);
     });
 
-    it("returns the durable session identifier created by SessionManager", async () => {
+    it("returns the persisted agent session ID", async () => {
       const result = await adapter.newSession(makeNewSessionRequest());
 
-      expect(mockSessionManager.createSession).toHaveBeenCalledWith(
-        "/workspace",
-        "your-modelcard-id-here",
-      );
-      expect(result.sessionId).toBe("persisted-acp-session");
+      expect(result.sessionId).toBe("persisted-session-123");
     });
 
     it("returns available modes matching DEFAULT_ACP_MODES", async () => {
@@ -514,6 +547,21 @@ describe("AutohandAcpAdapter", () => {
       expect(cmdNames).toContain("learn");
       expect(cmdNames).toContain("autoresearch");
       expect(cmdNames).not.toContain("goal");
+    });
+
+    it("publishes commands through the standard ACP session update", async () => {
+      const result = await adapter.newSession(makeNewSessionRequest());
+
+      expect(connection.sessionUpdate).toHaveBeenCalledWith({
+        sessionId: result.sessionId,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: expect.arrayContaining([
+            expect.objectContaining({ name: "help" }),
+            expect.objectContaining({ name: "model" }),
+          ]),
+        },
+      });
     });
 
     it("includes goal command metadata when slash_goal is enabled", async () => {
@@ -684,8 +732,73 @@ describe("AutohandAcpAdapter", () => {
 
       expect(result.stopReason).toBe("end_turn");
       expect(mockAgent.isSlashCommand).toHaveBeenCalledWith("/help");
-      expect(mockAgent.handleSlashCommand).toHaveBeenCalledWith("/help", []);
+      expect(mockAgent.handleSlashCommand).toHaveBeenCalledWith("/help", [], "acp");
       expect(connection.sessionUpdate).toHaveBeenCalled();
+    });
+
+    it("executes /review through the model and review lifecycle", async () => {
+      const hookManager = {
+        executeHooks: vi.fn().mockResolvedValue([]),
+      };
+      mockAgent.getHookManager.mockReturnValue(hookManager);
+      mockAgent.isSlashCommand.mockReturnValue(true);
+      mockAgent.isSlashCommandSupported.mockReturnValue(true);
+
+      const result = await adapter.prompt({
+        sessionId,
+        prompt: [{
+          type: "text",
+          text: "/review architecture packages/api --audience technical",
+        }],
+      } as any);
+
+      expect(result.stopReason).toBe("end_turn");
+      expect(mockAgent.handleSlashCommand).not.toHaveBeenCalled();
+      expect(mockAgent.trackCommandUsage).toHaveBeenCalledWith({
+        command: "/review",
+        subcommand: "architecture",
+        surface: "acp",
+      });
+      expect(mockAgent.runInstruction).toHaveBeenCalledWith(
+        expect.stringContaining("# Autohand Review invocation"),
+        { signal: expect.any(AbortSignal), hookInstruction: '/review architecture packages/api --audience technical' },
+      );
+      expect(mockAgent.runInstruction.mock.calls[0]?.[0]).toContain(
+        '"kind": "architecture"',
+      );
+      expect(hookManager.executeHooks.mock.calls.map(([event]) => event)).toEqual([
+        "review:start",
+        "review:completed",
+        "review:end",
+        "stop",
+      ]);
+      expect(mockAgent.getPermissionManager().setMode.mock.calls).toEqual([
+        ["restricted"],
+        ["external"],
+      ]);
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.reviewStart",
+        expect.objectContaining({
+          event: "review:start",
+          kind: "architecture",
+          surface: "acp",
+          status: "running",
+        }),
+      );
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.reviewCompleted",
+        expect.objectContaining({ event: "review:completed", success: true }),
+      );
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.reviewEnd",
+        expect.objectContaining({ event: "review:end", status: "completed" }),
+      );
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.prePrompt",
+        expect.objectContaining({
+          instruction: "/review architecture packages/api --audience technical",
+        }),
+      );
     });
 
     it("calls agent.runInstruction for regular prompts", async () => {
@@ -725,6 +838,75 @@ describe("AutohandAcpAdapter", () => {
           content: { type: "text", text: "First response" },
         }),
       }));
+    });
+
+    it("keeps adjacent ACP text blocks separated", async () => {
+      await adapter.prompt({
+        sessionId,
+        prompt: [
+          { type: "text", text: "<autohand_host_context>policy</autohand_host_context>" },
+          { type: "text", text: "Fix the ACP reload path." },
+        ],
+      });
+
+      expect(mockAgent.runInstruction).toHaveBeenCalledWith(
+        "<autohand_host_context>policy</autohand_host_context>\nFix the ACP reload path.",
+        { signal: expect.any(AbortSignal) },
+      );
+    });
+
+    it("forwards ACP image blocks to the agent's multimodal input", async () => {
+      const imageBytes = Buffer.from("test-image-bytes");
+
+      const result = await adapter.prompt({
+        sessionId,
+        prompt: [
+          {
+            type: "image",
+            data: imageBytes.toString("base64"),
+            mimeType: "image/png",
+          },
+        ],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+      expect(mockImageManager.clear).toHaveBeenCalledTimes(1);
+      expect(mockImageManager.add).toHaveBeenCalledWith(
+        imageBytes,
+        "image/png",
+      );
+      expect(mockAgent.runInstruction).toHaveBeenCalledWith("[Image #1]", {
+        signal: expect.any(AbortSignal),
+      });
+    });
+
+    it("includes embedded ACP text resource contents in the agent instruction", async () => {
+      const result = await adapter.prompt({
+        sessionId,
+        prompt: [
+          {
+            type: "resource",
+            resource: {
+              uri: "file:///workspace/CONTEXT.md",
+              mimeType: "text/markdown",
+              text: "Use the persisted ACP session contract.",
+            },
+          },
+        ],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+      expect(mockAgent.runInstruction).toHaveBeenCalledWith(
+        "[Resource: file:///workspace/CONTEXT.md]\nUse the persisted ACP session contract.",
+        { signal: expect.any(AbortSignal) },
+      );
+    });
+
+    it("executes configured stop hooks after an ACP turn", async () => {
+      const executeHooks = vi.fn().mockResolvedValue([]);
+      mockAgent.getHookManager.mockReturnValue({ executeHooks });
+      await adapter.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] });
+      expect(executeHooks).toHaveBeenCalledWith('stop', expect.objectContaining({ sessionId }), { signal: expect.any(AbortSignal) });
     });
 
     it("throws for invalid session ID", async () => {
@@ -930,6 +1112,7 @@ describe("AutohandAcpAdapter", () => {
         response.configOptions?.find((option) => option.id === "model")
           ?.currentValue,
       ).toBe("openai/gpt-4o");
+      expect(mockAgent.applyAcpModel).toHaveBeenCalledWith("openai/gpt-4o");
       expect(mockConversation.addSystemNote).toHaveBeenCalledWith(
         "System note",
       );
@@ -975,6 +1158,62 @@ describe("AutohandAcpAdapter", () => {
           cwd: "/workspace",
         } as any),
       ).rejects.toThrow();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // unstable_forkSession()
+  // -------------------------------------------------------------------------
+
+  describe("unstable_forkSession()", () => {
+    it("forks persisted history into the requested workspace and forwards MCP servers", async () => {
+      await adapter.initialize(makeInitRequest());
+      const source = await adapter.newSession(makeNewSessionRequest());
+      const forkedSession = {
+        metadata: {
+          sessionId: "persisted-fork-456",
+          model: "your-modelcard-id-here",
+          projectPath: "/fork-workspace",
+        },
+        getMessages: () => [],
+      };
+      mockPersistentSessionManager.branchSession.mockResolvedValue(forkedSession);
+      mockSessionManager.loadSession.mockResolvedValue(forkedSession);
+
+      const response = await adapter.unstable_forkSession({
+        sessionId: source.sessionId,
+        cwd: "/fork-workspace",
+        mcpServers: [
+          {
+            type: "http",
+            name: "fork-mcp",
+            url: "https://mcp.example/fork",
+            headers: [],
+          },
+        ],
+      });
+
+      expect(mockPersistentSessionManager.branchSession).toHaveBeenCalledWith(
+        source.sessionId,
+        {
+          type: "fork",
+          projectPath: "/fork-workspace",
+        },
+      );
+      expect(mockAgent.initializeForRPC).toHaveBeenLastCalledWith(
+        undefined,
+        "persisted-fork-456",
+      );
+      expect(mockAgent.connectAcpMcpServers).toHaveBeenLastCalledWith([
+        {
+          name: "fork-mcp",
+          transport: "http",
+          url: "https://mcp.example/fork",
+          headers: {},
+          autoConnect: true,
+        },
+      ]);
+      expect(response.sessionId).toBe("persisted-fork-456");
     });
   });
 
@@ -1329,6 +1568,10 @@ describe("AutohandAcpAdapter", () => {
       });
 
       expect(mockAgent.applyAcpModel).toHaveBeenCalledWith("openai/gpt-5");
+      expect(mockSessionManager.getCurrentSession().metadata.model).toBe(
+        "openai/gpt-5",
+      );
+      expect(mockPersistedSessionSave).toHaveBeenCalledTimes(1);
       expect(mockAgent.applyAcpConfigOption).not.toHaveBeenCalledWith(
         "model",
         "openai/gpt-5",
@@ -1465,12 +1708,69 @@ describe("AutohandAcpAdapter", () => {
             _meta: {
               teamName: "release-readiness",
               taskId: "task-1",
+              taskStatus: "completed",
               owner: "planner",
             },
           }],
           _meta: {
             teamName: "release-readiness",
             memberCount: 1,
+          },
+        },
+      });
+    });
+
+    it.each([
+      { taskStatus: "pending", planStatus: "pending", prefix: "" },
+      { taskStatus: "in_progress", planStatus: "in_progress", prefix: "" },
+      { taskStatus: "completed", planStatus: "completed", prefix: "" },
+      { taskStatus: "failed", planStatus: "pending", prefix: "[failed] " },
+      { taskStatus: "cancelled", planStatus: "pending", prefix: "[cancelled] " },
+    ] as const)("preserves $taskStatus team tasks in ACP plan content and metadata", async ({ taskStatus, planStatus, prefix }) => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      connection.sessionUpdate.mockClear();
+
+      await outputListener({
+        type: "team_update",
+        teamActivity: {
+          team: {
+            name: "release-readiness",
+            createdAt: "2026-08-17T00:00:00.000Z",
+            leadSessionId: "lead-1",
+            status: "active",
+            members: [],
+          },
+          tasks: [undefined, "planner"].map((owner, index) => ({
+            id: `task-${index}`,
+            subject: "Plan the rollout",
+            description: "Produce the implementation sequence.",
+            status: taskStatus,
+            owner,
+            blockedBy: [],
+            createdAt: "2026-08-17T00:00:01.000Z",
+          })),
+        },
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(connection.sessionUpdate).toHaveBeenCalledExactlyOnceWith({
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [undefined, "planner"].map((owner, index) => ({
+            content: `${prefix}Plan the rollout${owner ? ` → ${owner}` : ""}`,
+            priority: "medium",
+            status: planStatus,
+            _meta: {
+              teamName: "release-readiness",
+              taskId: `task-${index}`,
+              taskStatus,
+              ...(owner ? { owner } : {}),
+            },
+          })),
+          _meta: {
+            teamName: "release-readiness",
+            memberCount: 0,
           },
         },
       });

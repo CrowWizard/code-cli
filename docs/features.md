@@ -65,10 +65,12 @@ The `/settings` command opens an interactive settings editor directly in the ter
 | `/resume` | Resume a previous session |
 | `/new` | Start fresh conversation (with memory extraction) |
 | `/clear` | Clear conversation with automatic memory extraction |
-| `/undo` | Revert git changes and last turn |
+| `/undo` | Revert the last recorded agent file mutation and conversation turn |
 | `/memory` | View stored memories |
 | `/init` | Create `AGENTS.md` file |
-| `/agents` | List sub-agents |
+| `/agents` | Watch active Autohand sessions |
+| `/agents definitions` | List installed sub-agent definitions |
+| `/agents view` | Inspect direct and team runs |
 | `/agents-new` | Create new agent via wizard |
 | `/feedback` | Send feedback |
 | `/help` | Display help |
@@ -97,19 +99,72 @@ The `/settings` command opens an interactive settings editor directly in the ter
 | `/skills install` | Install community skills |
 | `/skills new` | Create new skill |
 | `/mcp` | Interactive MCP server manager (toggle enable/disable) |
-| `/mcp install` | Browse and install community MCP servers |
+| `/mcp install` | Browse and install compatible Official MCP Registry entries (stdio and HTTP) |
 | `/share` | Share current session |
 | `/sync` | Sync settings |
 | `/add-dir` | Add directories to workspace |
 | `/goal` | Set a session-attached persistent goal and continue successful auto-mode turns until it reaches a terminal state |
 | `/goal writer` | Draft one or more well-specified goals with the built-in `$goal-writer` skill |
+| `/goals`, `/goals view` | Open the live goals view with compact summaries and statuses |
+| `/goal view` | Alias for `/goals view` |
 | `/automode` | Start autonomous coding mode |
 | `/autoresearch` | Run replayable benchmark loops with adaptive decisions, history, replay, comparison, and Pareto analysis |
 | `/cc` | Context compaction |
 | `/search` | Search codebase |
 | `/settings` | Interactive settings editor — browse categories, edit values inline |
 
-Persistent goal files survive between conversations, while execution and usage accounting stay attached to the session that created or resumed the goal. A new session can inspect old state with `/goal`, but it must run `/goal resume` before continuing that work.
+Persistent goal files survive between conversations, while execution and usage accounting stay attached to the session that created or resumed the goal. A new session never takes work from another live session. When only queued work remains and no live peer owns it, bare `/goal` starts the next item; `/goal resume` remains the explicit control for paused or queued work.
+
+## Viewing and managing goals
+
+If goals are disabled, run `/experiments enable slash_goal`. Open the panel with
+`/goals`, `/goals view`, or `/goal view`. Opening the view does not start queued work.
+Without an interactive panel, the view command returns a read-only text snapshot.
+
+The panel groups the current goal, queued goals, and goals from other sessions.
+Each row shows a short, single-line preview and its status, keeping long objectives
+and pasted logs out of the overview. Editing loads the complete objective.
+Other-session rows are informational; this session's goal and shared queue are editable.
+
+**Close the panel with `Ctrl+G` (`Cmd+G` on macOS).** The same shortcut opens it
+again, and the footer displays `Ctrl+G close` beside the editing controls.
+Closing the panel does not pause the goal.
+
+| Control | Action |
+|---------|--------|
+| `Up` / `Down`, with an empty composer | Select this session's goal or a queued goal |
+| `Enter` on a selected row, or click its row | Load the full objective into the composer |
+| `Enter` while editing | Save the updated objective without changing its queue position |
+| `Esc` with a goal selected or being edited | Clear the selection or cancel the unsaved edit |
+
+`Esc` does not close the goals view. When no goal selection or edit is active,
+it retains the normal composer and request-cancellation behavior.
+
+| Command | Action |
+|---------|--------|
+| `/goal <objective>` | Start a goal, or queue it if this session already has an active goal |
+| `/goal writer [rough objective]` | Draft goals with the built-in goal writer before creating them |
+| `/goals queue` | List queued goals and their IDs |
+| `/goals queue <objective>` | Add work to the queue |
+| `/goals edit <id> <objective>` | Update this session's goal or a queued goal by ID |
+| `/goals pause` | Pause this session's current goal |
+| `/goals resume` | Resume this session's goal, or start queued work when it has no current goal |
+| `/goals complete` | Complete the current goal and advance queued work when completion requirements are met |
+| `/goals clear` | Clear this session's current goal while retaining the queue and other sessions' goals |
+| `/goals templates` | List reusable goal templates |
+
+All subcommands accept either `/goal` or `/goals`. Bare `/goals` opens the view;
+bare `/goal` inspects or starts work according to the session state described above.
+For example, queue a follow-up task, inspect the queue, and reopen the panel:
+
+```text
+/goals queue Review the release documentation
+/goals queue
+/goals view
+```
+
+Starting or resuming a goal uses the configured
+[goal auto-mode behavior](config-reference.md#goals-and-auto-mode).
 
 ## Experiment Switches
 - [x] `autohand experiments list` prints a Codex-style table of feature id, lifecycle stage, and enabled state
@@ -215,8 +270,8 @@ effect immediately — no restart required.
 ## Sub-Agent Architecture
 - [x] Agent registry from `~/.autohand/agents/`
 - [x] Task delegation (`delegate_task`)
-- [x] Parallel execution up to 5 agents (`delegate_parallel`)
-- [x] `/agents` command for discovery
+- [x] Parallel execution within the session thread budget (`delegate_parallel`); eight child threads by default, shared with teams and nested agents
+- [x] `/agents definitions` for installed specialists and `/agents view` for runtime inspection
 
 ## Tool System
 - [x] File system: read, write, edit, create, delete, move, copy
@@ -260,7 +315,8 @@ effect immediately — no restart required.
 - [x] Server lifecycle management
 - [x] **Non-blocking startup**: servers connect in background without delaying the prompt
 - [x] **Interactive `/mcp` manager**: toggle servers on/off with arrow keys + space
-- [x] **`/mcp install`**: browse and install from community MCP registry (12 curated servers)
+- [x] **`/mcp install`**: browse and install validated stdio and HTTP entries from the Official MCP Registry
+- [x] **Agent MCP installation**: search the catalog and request approval-gated installation by exact server ID
 - [x] **`/mcp add/remove`**: manage servers from the command line
 - [x] **`/mcp list`**: view all tools from connected servers
 

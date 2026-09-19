@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as inputPrompt from '../../../src/ui/inputPrompt.js';
 import { AutohandAgent } from '../../../src/core/agent.js';
 import type { FileActionManager } from '../../../src/actions/filesystem.js';
 import {
@@ -15,6 +16,14 @@ import { GitHubRegistryFetcher } from '../../../src/skills/GitHubRegistryFetcher
 import * as communityInstaller from '../../../src/skills/communityInstaller.js';
 import { getPlanModeManager } from '../../../src/commands/plan.js';
 import { getAuthClient } from '../../../src/auth/index.js';
+import * as configModule from '../../../src/config.js';
+import * as communityMcpInstaller from '../../../src/commands/mcp-install.js';
+import type { AgentRunStore } from '../../../src/core/agents/AgentRunStore.js';
+import type { SessionThreadBudget } from '../../../src/core/agents/SessionThreadBudget.js';
+import type { SlashCommandHandler } from '../../../src/core/slashCommandHandler.js';
+import type { SubagentStartContext, SubagentStopContext } from '../../../src/core/agents/AgentDelegator.js';
+import { TeamManager } from '../../../src/core/teams/TeamManager.js';
+import { TeammateProcess } from '../../../src/core/teams/TeammateProcess.js';
 import type {
   AgentAction,
   AgentOutputEvent,
@@ -25,6 +34,11 @@ import type {
 } from '../../../src/types.js';
 
 interface AgentOutcomeInternals {
+  modalActive: boolean;
+  activeAbortController?: AbortController;
+  agentRunStore: AgentRunStore;
+  sessionThreadBudget: SessionThreadBudget;
+  slashHandler: SlashCommandHandler;
   conversation: {
     addSystemNote: ReturnType<typeof vi.fn>;
   };
@@ -38,14 +52,10 @@ interface AgentOutcomeInternals {
     trackToolUse: ReturnType<typeof vi.fn>;
   };
   delegator: {
+    onSubagentStop?: (context: SubagentStopContext) => Promise<void>;
     delegateTask: ReturnType<typeof vi.fn>;
     delegateTaskForTool: ReturnType<typeof vi.fn>;
-    onSubagentStart?: (context: {
-      subagentId: string;
-      subagentName: string;
-      subagentType: string;
-      task: string;
-    }) => Promise<void>;
+    onSubagentStart?: (context: SubagentStartContext) => Promise<void>;
   };
   getInteractionMode(): string;
   inkRenderer?: {
@@ -60,6 +70,10 @@ interface AgentOutcomeInternals {
   teamManager: {
     getTeam: ReturnType<typeof vi.fn>;
     shutdown: ReturnType<typeof vi.fn>;
+    createTeam?: ReturnType<typeof vi.fn>;
+    addTeammate?: ReturnType<typeof vi.fn>;
+    tasks?: { createTask: ReturnType<typeof vi.fn> };
+    tryAssignIdleTeammate?: ReturnType<typeof vi.fn>;
   };
   mcpManager: {
     callTool: ReturnType<typeof vi.fn>;
@@ -112,6 +126,114 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getPlanModeManager().restore({ enabled: false, plan: null, phase: 'planning' });
+  });
+
+  it.each([{}, { yes: true }, { unrestricted: true }])('starts in read-only plan mode with permission options %j', async (permissions) => {
+    const { internals } = createAgent({ ...permissions, plan: true });
+    internals.actionExecutor.executeForTool = vi.fn();
+
+    expect(internals.getInteractionMode()).toBe('plan');
+    expect(getPlanModeManager().getPhase()).toBe('planning');
+    const [result] = await internals.toolManager.execute([{
+      id: 'startup-write', tool: 'write_file', args: { path: 'blocked.txt', contents: 'blocked' },
+    }]);
+    expect(result).toMatchObject({ success: false, kind: 'authorization' });
+    expect(internals.actionExecutor.executeForTool).not.toHaveBeenCalled();
+  });
+
+  it('starts a new planning phase even when an earlier plan was accepted', () => {
+    getPlanModeManager().restore({ enabled: true, plan: null, phase: 'executing' });
+    const { internals } = createAgent({ plan: true });
+
+    expect(internals.getInteractionMode()).toBe('plan');
+    expect(getPlanModeManager().getPhase()).toBe('planning');
+  });
+
+  it.each([{}, { yes: true }, { unrestricted: true }])('keeps an explicit command-line plan pending review with %j', async (permissions) => {
+    const { internals } = createAgent({ ...permissions, plan: true, prompt: 'Plan a refactor' });
+    getPlanModeManager().restore({
+      enabled: true, phase: 'planning',
+      plan: {
+        id: 'startup-plan', rawText: '1. Refactor the module', createdAt: Date.now(),
+        steps: [{ number: 1, description: 'Refactor the module', status: 'pending' }],
+      },
+    });
+    internals.toolManager.register(EXIT_PLAN_MODE_TOOL_DEFINITION);
+    internals.conversation = { addSystemNote: vi.fn() };
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+
+    const [result] = await internals.toolManager.execute([{ id: 'plan-ready', tool: 'exit_plan_mode', args: {} }]);
+
+    expect(result).toMatchObject({ success: true, output: expect.stringContaining('Plan ready for review') });
+    expect(getPlanModeManager().getPhase()).toBe('planning');
+    expect(internals.conversation.addSystemNote).toHaveBeenCalledWith(expect.stringContaining('Do not execute'));
+  });
+
+  it('brokers teammate authorization through live lead hooks without executing the tool', async () => {
+    const { agent, internals } = createAgent({ yes: true }, 'interactive');
+    const host = agent as unknown as { teamManager: TeamManager; sessionManager: { getCurrentSession(): unknown } };
+    const session = vi.spyOn(host.sessionManager, 'getCurrentSession').mockReturnValue({ metadata: { sessionId: 'lead-session' } });
+    let incoming: Parameters<TeammateProcess['spawn']>[0] = () => {};
+    let exited: Parameters<TeammateProcess['spawn']>[1] = () => {};
+    const spawn = vi.spyOn(TeammateProcess.prototype, 'spawn').mockImplementation((onMessage, onExit) => { incoming = onMessage; exited = onExit; });
+    const send = vi.spyOn(TeammateProcess.prototype, 'send').mockImplementation(() => {});
+    const execute = vi.spyOn(internals.actionExecutor, 'executeForTool');
+    internals.hookManager.executeHooks = vi.fn(async (event) => event === 'pre-tool' ? [{
+      hook: { event: 'pre-tool', command: 'lead-policy' }, success: true, duration: 0,
+      response: { decision: 'block', reason: 'Lead hook forbids this write' },
+    }] : []);
+    try {
+      host.teamManager.createTeam('auth-team');
+      host.teamManager.addTeammate({ name: 'worker', agentName: 'tester' });
+      incoming({ method: 'team.ready', params: {} });
+      const task = host.teamManager.tasks.createTask({ subject: 'Write', description: 'Write a file' });
+      host.teamManager.tryAssignIdleTeammate();
+      incoming({ method: 'team.authorizeTool', params: { requestId: 'request', taskId: task.id, runId: task.runId,
+        call: { id: 'write', tool: 'write_file', args: { path: 'a.txt', contents: 'x' } } } });
+      await vi.waitFor(() => expect(send).toHaveBeenCalledWith({ method: 'team.authorizationResult', params: {
+        requestId: 'request', result: { allowed: false, error: 'Lead hook forbids this write' },
+      } }));
+      expect(execute).not.toHaveBeenCalled();
+      expect(internals.hookManager.executeHooks.mock.calls.map(([event]) => event)).not.toContain('post-tool');
+    } finally {
+      exited(0);
+      session.mockRestore(); spawn.mockRestore(); send.mockRestore(); execute.mockRestore();
+    }
+  });
+
+  it('applies thread settings to the live config after a provider replaces it', async () => {
+    const { internals, runtime } = createAgent();
+    const originalConfig = runtime.config;
+    runtime.config = {
+      ...originalConfig,
+      provider: 'autohandai',
+      autohandai: { model: 'moa' },
+      features: {
+        ...originalConfig.features,
+        multi_agent_v2: { max_concurrent_threads_per_session: 4 },
+      },
+    };
+    const saveConfig = vi.spyOn(configModule, 'saveConfig').mockResolvedValue();
+
+    try {
+      const result = await internals.slashHandler.handle('/settings', ['max_agents', '1']);
+
+      expect(result).toContain('features.multi_agent_v2.max_concurrent_threads_per_session = 1');
+      expect(saveConfig).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'autohandai',
+        autohandai: { model: 'moa' },
+        features: expect.objectContaining({
+          multi_agent_v2: { max_concurrent_threads_per_session: 1 },
+        }),
+      }));
+      expect(runtime.config.features?.multi_agent_v2?.max_concurrent_threads_per_session).toBe(1);
+      expect(internals.sessionThreadBudget.maxThreads).toBe(1);
+      expect(() => internals.sessionThreadBudget.tryAcquire('disallowed-child')).toThrow('Delegation is disabled');
+      expect(originalConfig.features?.multi_agent_v2).toBeUndefined();
+    } finally {
+      saveConfig.mockRestore();
+    }
   });
 
   it('uses the current sign-in token for account entitlement before a stale provider-local token', async () => {
@@ -203,6 +325,7 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     expect(internals.delegator.delegateTaskForTool).toHaveBeenCalledWith(
       'reviewer',
       'Review this change',
+      { signal: undefined },
     );
     expect(result).toEqual({
       tool: 'delegate_task',
@@ -210,6 +333,20 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
       kind: 'operational',
       error: 'Agent reviewer was not found.',
     });
+  });
+
+  it('forwards foreground cancellation through the delegation tool boundary', async () => {
+    const { internals } = createAgent();
+    const controller = new AbortController();
+    internals.delegator.delegateTaskForTool = vi.fn().mockResolvedValue({ success: true, output: 'Verified.' });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    await internals.toolManager.execute([{
+      id: 'delegate-signal', tool: 'delegate_task', args: { agent_name: 'reviewer', task: 'Review source.' },
+    }], undefined, { signal: controller.signal });
+
+    expect(internals.delegator.delegateTaskForTool).toHaveBeenCalledWith(
+      'reviewer', 'Review source.', { signal: controller.signal },
+    );
   });
 
   it('switches default interactive sessions to auto mode when a subagent starts', async () => {
@@ -231,6 +368,59 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
       status: 'in_progress',
       detail: 'builtin',
     });
+  });
+
+  it('connects subagent lifecycle and cancellation to the live run inspector', async () => {
+    const { internals } = createAgent();
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    const cancel = vi.fn();
+    const sendMessage = vi.fn(() => true);
+    const context: SubagentStartContext = {
+      subagentId: 'observed-reader', subagentName: 'reader', subagentType: 'builtin',
+      task: 'Inspect source.', parentId: 'lead', depth: 1, provider: 'autohandai', model: 'moa', cancel, sendMessage,
+    };
+    await internals.delegator.onSubagentStart?.(context);
+    expect(internals.agentRunStore.getSnapshot().runs).toEqual([expect.objectContaining({
+      id: 'observed-reader', source: 'delegate', parentId: 'lead', provider: 'autohandai', model: 'moa',
+    })]);
+    expect(await internals.agentRunStore.sendMessage('observed-reader', 'Check tests.')).toBe(true);
+    expect(sendMessage).toHaveBeenCalledWith('Check tests.');
+    await internals.agentRunStore.requestCancel('observed-reader');
+    expect(cancel).toHaveBeenCalledOnce();
+    await internals.delegator.onSubagentStop?.({
+      ...context, success: false, status: 'cancelled', duration: 10,
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    });
+    expect(internals.agentRunStore.getSnapshot().runs[0]).toMatchObject({
+      status: 'cancelled', cancellable: false, usage: { totalTokens: 2 },
+    });
+    expect(await internals.agentRunStore.sendMessage('observed-reader', 'Too late.')).toBe(false);
+    expect(internals.hookManager.executeHooks.mock.calls.filter(([event]) => event === 'subagent-stop')).toHaveLength(1);
+  });
+
+  it('applies lifecycle hook instructions and cancellation to only the emitting subagent', async () => {
+    const { internals } = createAgent();
+    const sendMessage = vi.fn(() => true);
+    const cancel = vi.fn();
+    internals.hookManager.executeHooks = vi.fn(async event => [{
+      hook: { event, command: 'local-worker-policy' }, success: true, duration: 0,
+      response: event === 'subagent-start' ? { additionalContext: 'Stay read-only.' }
+        : event === 'subagent-progress' ? { continue: false }
+          : { additionalContext: 'Must not recursively trigger actions.' },
+    }]);
+    await internals.delegator.onSubagentStart?.({
+      subagentId: 'controlled-worker', subagentName: 'reader', subagentType: 'builtin',
+      task: 'Read source.', sendMessage, cancel,
+    });
+    expect(sendMessage).toHaveBeenCalledExactlyOnceWith('Stay read-only.');
+    expect(cancel).not.toHaveBeenCalled();
+    internals.agentRunStore.progress('controlled-worker', { activity: 'read_file' });
+    await internals.agentRunStore.waitForLifecycle('controlled-worker');
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(internals.hookManager.executeHooks).toHaveBeenCalledWith('subagent-start', expect.objectContaining({
+      subagentId: 'controlled-worker', subagentType: 'builtin',
+    }));
   });
 
   it('maps an MCP protocol error result to an operational failure', async () => {
@@ -356,6 +546,69 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     expect(result).toMatchObject({ success: true });
   });
 
+  it('discovers community MCP servers without executing catalog configuration', async () => {
+    const { internals } = createAgent();
+    const findServers = vi.spyOn(communityMcpInstaller, 'findCommunityMcpServers').mockResolvedValue([{
+      id: 'filesystem',
+      name: 'Filesystem',
+      description: 'Read approved files.',
+      category: 'developer-tools',
+      transport: 'stdio',
+      requiredArgs: ['directory'],
+      requiredEnvironmentVariables: [],
+    }]);
+
+    const [result] = await internals.toolManager.execute([{
+      tool: 'find_mcp_servers',
+      args: { query: 'file access' },
+    }]);
+
+    expect(findServers).toHaveBeenCalledWith('file access', undefined, undefined);
+    expect(result).toMatchObject({ success: true });
+    expect(result.output).toContain('filesystem');
+    findServers.mockRestore();
+  });
+
+  it('approval-gates catalog MCP installation and refreshes tools after connection', async () => {
+    const { agent, internals } = createAgent({}, 'interactive');
+    const confirmApproval = vi.fn().mockResolvedValue({ decision: 'allow_once' });
+    agent.setConfirmationCallback(confirmApproval);
+    const syncMcpTools = vi.fn();
+    (internals as unknown as { syncMcpTools: () => void }).syncMcpTools = syncMcpTools;
+    const resolveServer = vi.spyOn(communityMcpInstaller, 'resolveCommunityMcpServer').mockResolvedValue({
+      id: 'filesystem',
+      name: 'Filesystem',
+      description: 'Read approved files.',
+      category: 'developer-tools',
+      transport: 'stdio',
+      command: 'npx',
+      directory: 'developer-tools/filesystem',
+      files: ['README.md'],
+    });
+    const installServer = vi.spyOn(communityMcpInstaller, 'installCommunityMcpServer').mockResolvedValue({
+      success: true,
+      connected: true,
+      message: 'MCP server "Filesystem" installed and connected (1 tools available).',
+    });
+
+    const [result] = await internals.toolManager.execute([{
+      tool: 'install_mcp_server',
+      args: { server_id: 'filesystem', required_args: ['/workspace'] },
+    }]);
+
+    expect(confirmApproval).toHaveBeenCalledOnce();
+    expect(resolveServer).toHaveBeenCalledWith('filesystem');
+    expect(installServer).toHaveBeenCalledWith(
+      expect.objectContaining({ mcpManager: internals.mcpManager }),
+      expect.objectContaining({ id: 'filesystem' }),
+      { requiredArgs: ['/workspace'], overwrite: undefined },
+    );
+    expect(syncMcpTools).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ success: true, output: expect.stringContaining('installed and connected') });
+    resolveServer.mockRestore();
+    installServer.mockRestore();
+  });
+
   it('exposes only the high-level specialist tool to the model when the feature is enabled', () => {
     const enabled = createAgent({}, 'unrestricted', true).internals.toolManager;
     const disabled = createAgent({}, 'unrestricted', false).internals.toolManager;
@@ -370,18 +623,47 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
       .not.toContain('orchestrate_specialists');
   });
 
+  it('exposes compose_team as a model-visible team composition tool', () => {
+    const enabled = createAgent({}, 'unrestricted', true).internals.toolManager;
+    expect(enabled.listDefinitions().map((definition) => definition.name))
+      .toContain('compose_team');
+  });
+
+  it('composes a team from a task objective with a ranked roster and task graph', async () => {
+    const { internals } = createAgent({}, 'unrestricted', true);
+    internals.teamManager = {
+      getTeam: vi.fn().mockReturnValue(null),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      createTeam: vi.fn().mockReturnValue({ name: 'composed-team', status: 'active', members: [] }),
+      addTeammate: vi.fn().mockReturnValue({}),
+      tasks: { createTask: vi.fn().mockReturnValue({ id: 'task-1', subject: 'Testing: add tests for the auth middleware' }) },
+      tryAssignIdleTeammate: vi.fn(),
+    } as unknown as AgentOutcomeInternals['teamManager'];
+
+    const [result] = await internals.toolManager.execute([{
+      tool: 'compose_team',
+      args: { objective: 'add tests for the auth middleware', team_name: 'composed-team' },
+    }]);
+
+    expect(result.success).toBe(true);
+    expect(result.output).toContain('Recommended roster');
+    expect(result.output).toContain('composed-team');
+  });
+
   it('runs model-discovered specialists through the high-level tool', async () => {
     const { internals } = createAgent({}, 'unrestricted', true);
     internals.orchestrateSpecialistsFromTool = vi.fn().mockResolvedValue('STRUCTURED_SPECIALIST_RESULTS');
+    const controller = new AbortController();
 
     const [result] = await internals.toolManager.execute([{
       tool: 'orchestrate_specialists',
       args: { objective: 'Inspect auth.', requested_roles: ['security', 'review'] },
-    }]);
+    }], undefined, { signal: controller.signal });
 
     expect(internals.orchestrateSpecialistsFromTool).toHaveBeenCalledWith(
       'Inspect auth.',
       ['security', 'review'],
+      controller.signal,
     );
     expect(result).toMatchObject({ success: true, output: 'STRUCTURED_SPECIALIST_RESULTS' });
   });
@@ -407,6 +689,7 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
 
   it('routes a later user answer through the active specialist interview', async () => {
     const { internals } = createAgent({}, 'unrestricted', true);
+    internals.activeAbortController = new AbortController();
     internals.specialistOrchestrator.continueInterview = vi.fn().mockResolvedValue({
       plan: {
         objective: 'Continue interview',
@@ -433,6 +716,7 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
 
     expect(internals.specialistOrchestrator.continueInterview).toHaveBeenCalledWith(
       'The primary user is an engineer.',
+      { signal: internals.activeAbortController.signal },
     );
     expect(result).toContain('product-interviewer');
     expect(result).toContain('What is the deadline?');
@@ -698,5 +982,72 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
       tool: 'install_agent_skill',
       success: true,
     }));
+  });
+});
+
+
+describe('hook context delivery', () => {
+  it.each([
+    { event: 'subagent-start', async: false },
+    { event: 'subagent-start', async: true },
+    { event: 'subagent-progress', async: false },
+    { event: 'subagent-progress', async: true },
+  ] as const)('keeps $event context out of the lead conversation (async: $async)', async hook => {
+    const { agent, internals, runtime } = createAgent();
+    runtime.isRpcMode = true;
+    internals.conversation.addSystemNote = vi.fn();
+    const manager = agent.getHookManager();
+    manager.setWorkspaceRoot(process.cwd());
+    manager.getSettings().hooks!.push({
+      ...hook, command: `printf '%s' '{"additionalContext":"WORKER_CONTEXT"}'`,
+    });
+    const sendMessage = vi.fn(() => true);
+    const context: SubagentStartContext = {
+      subagentId: 'context-worker', subagentName: 'reader', subagentType: 'builtin',
+      task: 'Read source.', sendMessage,
+    };
+
+    try {
+      await internals.delegator.onSubagentStart?.(context);
+      if (hook.event === 'subagent-progress') {
+        internals.agentRunStore.progress(context.subagentId, { activity: 'read_file' });
+        await internals.agentRunStore.waitForLifecycle(context.subagentId);
+      }
+
+      if (hook.async) expect(sendMessage).not.toHaveBeenCalled();
+      else expect(sendMessage).toHaveBeenCalledExactlyOnceWith('WORKER_CONTEXT');
+      expect(internals.conversation.addSystemNote).not.toHaveBeenCalled();
+    } finally {
+      await internals.delegator.onSubagentStop?.({ ...context, success: true, duration: 0 });
+    }
+  });
+
+  it('suppresses actual hook output while a modal is open and restores it afterwards', async () => {
+    const { agent, internals } = createAgent();
+    const notify = vi.spyOn(inputPrompt, 'promptNotify').mockImplementation(() => {});
+    try {
+      const manager = agent.getHookManager();
+      manager.setWorkspaceRoot(process.cwd());
+      manager.getSettings().hooks!.push({ event: 'session-start', command: 'printf modal-output' });
+      internals.modalActive = true;
+      await manager.executeHooks('session-start', {});
+      expect(notify).not.toHaveBeenCalled();
+      internals.modalActive = false;
+      await manager.executeHooks('session-start', {});
+      expect(notify).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('modal-output'));
+    } finally {
+      notify.mockRestore();
+    }
+  });
+
+  it('injects session hook context even when protocol output is suppressed', async () => {
+    const { agent, internals, runtime } = createAgent();
+    runtime.isRpcMode = true;
+    internals.conversation.addSystemNote = vi.fn();
+    const manager = agent.getHookManager();
+    manager.setWorkspaceRoot(process.cwd());
+    manager.getSettings().hooks!.push({ event: 'session-start', command: `printf '%s' '{"additionalContext":"SESSION_CONTEXT"}'` });
+    await manager.executeHooks('session-start', {});
+    expect(internals.conversation.addSystemNote).toHaveBeenCalledWith('SESSION_CONTEXT', '[Hook Context]');
   });
 });

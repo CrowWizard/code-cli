@@ -5,6 +5,7 @@
  */
 import type {
   LLMRequest,
+  MultimodalMessage,
   LLMResponse,
   LLMToolCall,
   NvidiaAISettings,
@@ -14,15 +15,16 @@ import type {
 } from "../types.js";
 import { ApiError, FRIENDLY_MESSAGES, classifyApiError } from "./errors.js";
 import { normalizeLLMUsage } from "./usage.js";
+import { toTextOnlyContent } from "./messagePayload.js";
 
 /**
  * Sanitize messages for API consumption.
  * Only includes fields expected by OpenAI-compatible APIs.
  */
-function sanitizeMessages(messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string; tool_calls?: LLMToolCall[] }>): Record<string, unknown>[] {
+function sanitizeMessages(messages: MultimodalMessage[]): Record<string, unknown>[] {
   const systemContent = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content.trim())
+    .map((message) => toTextOnlyContent(message.content).trim())
     .filter(Boolean)
     .join("\n\n");
   const orderedMessages = messages.filter((message) => message.role !== "system");
@@ -188,6 +190,9 @@ export class NVIDIAClient {
         );
         return response;
       } catch (error) {
+        if (request.signal?.aborted) {
+          throw new Error("Request cancelled.");
+        }
         lastError = error as Error;
 
         if (this.isNonRetryableError(error as Error)) {
@@ -241,7 +246,7 @@ export class NVIDIAClient {
       const timeoutId = setTimeout(() => timeoutController.abort(), this.timeout);
 
       const combinedSignal = signal
-        ? this.combineSignals(signal, timeoutController.signal)
+        ? AbortSignal.any([signal, timeoutController.signal])
         : timeoutController.signal;
 
       try {
@@ -256,10 +261,6 @@ export class NVIDIAClient {
       }
     } catch (error) {
       const err = error as Error;
-
-      if (err.name === "AbortError" && signal?.aborted) {
-        throw new Error("Request cancelled.");
-      }
 
       if (err.name === "AbortError") {
         throw new Error("Request timed out. The NVIDIA service may be experiencing high load.");
@@ -480,20 +481,6 @@ export class NVIDIAClient {
     }
 
     return false;
-  }
-
-  private combineSignals(signal1: AbortSignal, signal2: AbortSignal): AbortSignal {
-    const controller = new AbortController();
-
-    const abort = () => controller.abort();
-    signal1.addEventListener("abort", abort);
-    signal2.addEventListener("abort", abort);
-
-    if (signal1.aborted || signal2.aborted) {
-      controller.abort();
-    }
-
-    return controller.signal;
   }
 
   private sleep(ms: number): Promise<void> {

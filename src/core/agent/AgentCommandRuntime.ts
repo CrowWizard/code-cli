@@ -23,9 +23,53 @@ import { normalizePermissionPromptResponse, type PermissionPromptResult } from '
 import type { Plan } from '../../modes/planMode/types.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js';
+import { buildCommandUseData } from '../../telemetry/commandUsage.js';
+import type { CommandUseSurface } from '../../telemetry/types.js';
+import type { ThreadLease } from '../agents/SessionThreadBudget.js';
 
 export interface AgentCommandRuntimeHost {
   [key: string]: any;
+}
+
+export interface CancellableCommandHost {
+  activeAbortController: AbortController | null;
+  currentInkAbortController: AbortController | null;
+  currentInkOnCancel: (() => void) | null;
+  runtimeResourceShutdownController: AbortController;
+  inkRenderer?: { isRunning(): boolean } | null;
+  setupEscListener(controller: AbortController, onCancel: () => void, ctrlCInterrupt?: boolean): () => void;
+}
+
+export async function runCancellableAgentCommand<T>(
+  host: CancellableCommandHost,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const previous = {
+    active: host.activeAbortController,
+    ink: host.currentInkAbortController,
+    onCancel: host.currentInkOnCancel,
+  };
+  const controller = new AbortController();
+  const signal = AbortSignal.any([
+    controller.signal,
+    host.runtimeResourceShutdownController.signal,
+    ...(previous.active ? [previous.active.signal] : []),
+  ]);
+  signal.throwIfAborted();
+  const cancel = () => controller.abort();
+  let cleanup = () => {};
+  host.activeAbortController = controller;
+  host.currentInkAbortController = controller;
+  host.currentInkOnCancel = cancel;
+  try {
+    if (!host.inkRenderer?.isRunning()) cleanup = host.setupEscListener(controller, cancel, true);
+    return await operation(signal);
+  } finally {
+    cleanup();
+    if (host.activeAbortController === controller) host.activeAbortController = previous.active;
+    if (host.currentInkAbortController === controller) host.currentInkAbortController = previous.ink;
+    if (host.currentInkOnCancel === cancel) host.currentInkOnCancel = previous.onCancel;
+  }
 }
 
 interface SkillSummary {
@@ -48,8 +92,35 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
   '/agents-new', '/agents new', '/resume', '/theme', '/language',
   '/model', '/skills', '/skills install', '/skills-install',
   '/skills new', '/skills-new', '/mcp', '/mcp install', '/mcp-install',
-  '/squad', '/peers',
+  '/squad', '/peers', '/whatityped',
 ]);
+
+/** Operational command results that belong with the fixed composer controls. */
+const FIXED_COMPOSER_RESULT_COMMANDS = new Set(['/tasks', '/team', '/teams', '/squad']);
+
+export function shouldRenderSlashCommandResultInComposer(command: string): boolean {
+  return FIXED_COMPOSER_RESULT_COMMANDS.has(command);
+}
+
+/**
+ * Route selected operational results into the fixed bottom UI without changing
+ * the transcript behavior of every other slash command.
+ */
+export function renderAgentSlashCommandResult(
+  host: AgentCommandRuntimeHost,
+  command: string,
+  result: string,
+): boolean {
+  if (!host.inkRenderer?.isRunning?.()) {
+    return false;
+  }
+  if (shouldRenderSlashCommandResultInComposer(command)) {
+    host.inkRenderer.setCommandResult?.(command, result);
+  } else {
+    host.inkRenderer.addAssistantMessage?.(result);
+  }
+  return true;
+}
 
 export function applyAgentAcpMode(host: AgentCommandRuntimeHost, modeId: string): void {
     const unrestricted = modeId === 'unrestricted' || modeId === 'full-access' || modeId === 'auto-mode';
@@ -164,16 +235,28 @@ export async function runAgentSlashCommandWithInput(host: AgentCommandRuntimeHos
         host.persistentInputActiveTurn = false;
       }
       cleanupConsoleBridge();
-      if (isInteractive && host.inkRenderer?.isRunning()) {
+      if (isInteractive && command !== '/whatityped' && host.inkRenderer?.isRunning()) {
         host.inkRenderer.clearInput();
       }
     }
   }
 
-export async function handleAgentSlashCommand(host: AgentCommandRuntimeHost, command: string, args: string[] = []): Promise<string | null> {
+export async function handleAgentSlashCommand(
+  host: AgentCommandRuntimeHost,
+  command: string,
+  args: string[] = [],
+  surface: CommandUseSurface = 'interactive',
+): Promise<string | null> {
     if (host.runtime.options.bare) {
       return BARE_SLASH_COMMANDS_DISABLED_MESSAGE;
     }
+
+    await host.telemetryManager?.trackCommand(buildCommandUseData({
+      command,
+      args,
+      knownSubcommands: host.slashHandler.getKnownSubcommands(command),
+      surface,
+    })).catch(() => {});
 
     // /mcp depends on background startup state (notably MCP auto-connect).
     // Ensure startup init is settled before rendering server status/actions.
@@ -206,7 +289,7 @@ export function parseAgentSlashCommand(_host: AgentCommandRuntimeHost, input: st
     const parts = trimmed.split(/\s+/);
 
     // Check for two-word commands like "/skills install", "/mcp install"
-    const twoWordCommands = ['/skills install', '/skills new', '/skills use', '/agents new', '/mcp install', '/handoff session'];
+    const twoWordCommands = ['/skills install', '/skills new', '/skills use', '/agents new', '/mcp install', '/handoff session', '/handoff web'];
     const potentialTwoWord = parts.slice(0, 2).join(' ');
 
     if (twoWordCommands.includes(potentialTwoWord)) {
@@ -413,8 +496,19 @@ export async function handleAgentExitPlanMode(
       return { success: false, kind: 'validation', error };
     }
 
-    // Non-interactive mode: auto-accept with default option
-    if (host.runtime.options.yes || host.runtime.options.unrestricted || process.env.CI === '1' || process.env.AUTOHAND_NON_INTERACTIVE === '1') {
+    const nonInteractive = Boolean(host.runtime.options.prompt)
+      || !process.stdin.isTTY
+      || process.env.CI === '1'
+      || process.env.CI === 'true'
+      || process.env.AUTOHAND_NON_INTERACTIVE === '1';
+    if (host.runtime.options.plan && nonInteractive) {
+      const output = 'Plan ready for review. Staying in planning mode. Do not execute the plan; summarize it for the user and stop.';
+      host.conversation.addSystemNote(output);
+      return { success: true, output };
+    }
+
+    // Explicit startup planning always requires a user decision before execution.
+    if (!host.runtime.options.plan && (host.runtime.options.yes || host.runtime.options.unrestricted || process.env.CI === '1' || process.env.AUTOHAND_NON_INTERACTIVE === '1')) {
       const config = planManager.acceptPlan('auto_accept');
       console.log(chalk.yellow('  (Auto-accepted in non-interactive mode)\n'));
       host.conversation.addSystemNote(
@@ -558,14 +652,21 @@ export function resolveAgentWorkspacePath(host: AgentCommandRuntimeHost, relativ
   }
 
 export async function switchAgentWorkspaceContext(host: AgentCommandRuntimeHost, workspaceRoot: string): Promise<void> {
-    host.runtime.workspaceRoot = workspaceRoot;
-    host.memoryManager.setWorkspace(workspaceRoot);
-    host.hookManager.setWorkspaceRoot(workspaceRoot);
-    host.files.setWorkspaceRoot(workspaceRoot);
-    host.persistentInput.setWorkspaceRoot(workspaceRoot);
-    host.ignoreFilter = new GitIgnoreParser(workspaceRoot, []);
-    host.workspaceFileCollector.setWorkspace(workspaceRoot, host.ignoreFilter);
-    await host.skillsRegistry.setWorkspace(workspaceRoot);
+    const workspaceChange: ThreadLease | undefined = workspaceRoot !== host.runtime.workspaceRoot
+      ? host.sessionThreadBudget?.beginWorkspaceChange()
+      : undefined;
+    try {
+      host.runtime.workspaceRoot = workspaceRoot;
+      host.memoryManager.setWorkspace(workspaceRoot);
+      host.hookManager.setWorkspaceRoot(workspaceRoot);
+      host.files.setWorkspaceRoot(workspaceRoot);
+      host.persistentInput.setWorkspaceRoot(workspaceRoot);
+      host.ignoreFilter = new GitIgnoreParser(workspaceRoot, []);
+      host.workspaceFileCollector.setWorkspace(workspaceRoot, host.ignoreFilter);
+      await host.skillsRegistry.setWorkspace(workspaceRoot);
+    } finally {
+      await workspaceChange?.release();
+    }
   }
 
 export async function enterAgentSessionWorktree(host: AgentCommandRuntimeHost, name?: string): Promise<string> {
@@ -573,25 +674,30 @@ export async function enterAgentSessionWorktree(host: AgentCommandRuntimeHost, n
       return `Already inside worktree ${host.sessionWorktreeState.worktreePath} (${host.sessionWorktreeState.branchName}). Exit it first with exit_worktree.`;
     }
 
-    const originalWorkspaceRoot = host.runtime.workspaceRoot;
-    const info = prepareSessionWorktree({
-      cwd: originalWorkspaceRoot,
-      worktree: name ?? true,
-      mode: 'cli',
-    });
+    const workspaceChange: ThreadLease | undefined = host.sessionThreadBudget?.beginWorkspaceChange();
+    try {
+      const originalWorkspaceRoot = host.runtime.workspaceRoot;
+      const info = prepareSessionWorktree({
+        cwd: originalWorkspaceRoot,
+        worktree: name ?? true,
+        mode: 'cli',
+      });
 
-    host.sessionWorktreeState = {
-      ...info,
-      originalWorkspaceRoot,
-    };
+      host.sessionWorktreeState = {
+        ...info,
+        originalWorkspaceRoot,
+      };
 
-    await host.switchWorkspaceContext(info.worktreePath);
+      await host.switchWorkspaceContext(info.worktreePath);
 
-    return [
-      `Entered worktree ${info.worktreePath}.`,
-      `Branch: ${info.branchName}${info.createdBranch ? ' (new)' : ''}`,
-      `Original workspace: ${originalWorkspaceRoot}`,
-    ].join('\n');
+      return [
+        `Entered worktree ${info.worktreePath}.`,
+        `Branch: ${info.branchName}${info.createdBranch ? ' (new)' : ''}`,
+        `Original workspace: ${originalWorkspaceRoot}`,
+      ].join('\n');
+    } finally {
+      await workspaceChange?.release();
+    }
   }
 
 export function handleAgentSkillTool(
@@ -691,20 +797,25 @@ export async function exitAgentSessionWorktree(host: AgentCommandRuntimeHost, ke
       return 'No active session worktree.';
     }
 
-    if (!keep) {
-      const manager = new WorktreeManager(state.repoRoot);
-      await manager.remove(state.worktreePath, {
-        force: true,
-        deleteBranch: state.createdBranch,
-      });
+    const workspaceChange: ThreadLease | undefined = host.sessionThreadBudget?.beginWorkspaceChange();
+    try {
+      if (!keep) {
+        const manager = new WorktreeManager(state.repoRoot);
+        await manager.remove(state.worktreePath, {
+          force: true,
+          deleteBranch: state.createdBranch,
+        });
+      }
+
+      await host.switchWorkspaceContext(state.originalWorkspaceRoot);
+      host.sessionWorktreeState = null;
+
+      return keep
+        ? `Exited worktree ${state.worktreePath} and returned to ${state.originalWorkspaceRoot}. Worktree kept on disk.`
+        : `Exited worktree ${state.worktreePath} and returned to ${state.originalWorkspaceRoot}.`;
+    } finally {
+      await workspaceChange?.release();
     }
-
-    await host.switchWorkspaceContext(state.originalWorkspaceRoot);
-    host.sessionWorktreeState = null;
-
-    return keep
-      ? `Exited worktree ${state.worktreePath} and returned to ${state.originalWorkspaceRoot}. Worktree kept on disk.`
-      : `Exited worktree ${state.worktreePath} and returned to ${state.originalWorkspaceRoot}.`;
   }
 
 export function isAgentDestructiveCommand(_host: AgentCommandRuntimeHost, command: string): boolean {

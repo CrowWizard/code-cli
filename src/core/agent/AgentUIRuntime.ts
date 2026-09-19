@@ -25,6 +25,8 @@ import {
   type LineExtension,
 } from '../../ui/ink/StatusLine.js';
 import { createQueuedAgentInstruction } from './PostTurnActionCoordinator.js';
+import { renderAgentSlashCommandResult } from './AgentCommandRuntime.js';
+import { GoalManager } from '../../goals/GoalManager.js';
 
 export interface AgentUIRuntimeHost {
   [key: string]: any;
@@ -140,6 +142,7 @@ function echoInkSubmittedInstructionImmediately(host: AgentUIRuntimeHost, text: 
 function isConcurrentSafeSlashCommand(text: string): boolean {
   const trimmed = text.trim();
   return /^\/deep-(?:research|search)\s+status\s*$/i.test(trimmed)
+    || /^\/(?:agents|squad)\s+view\s*$/i.test(trimmed)
     || /^\/ps\s*$/i.test(trimmed)
     || /^\/stop(?:\s+\S+)?\s*$/i.test(trimmed);
 }
@@ -275,6 +278,19 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
         getInteractionMode: () => host.getInteractionMode(),
         onCycleInteractionMode: () => host.cycleInteractionMode(),
         mouseComposerCursor: host.runtime?.config?.ui?.mouseComposerCursor !== false,
+        taskListPositionProvider: () =>
+          host.runtime?.config?.ui?.taskListPosition ?? 'above-composer',
+        onEditGoalObjective: async (request) => {
+          const manager = host.goalActivityManager ?? new GoalManager(host.runtime.workspaceRoot, {
+            sessionId: host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
+          });
+          const result = await manager.editGoalObjective(request.id, request.objective);
+          if (!result.ok) {
+            host.notifyUser(result.message ?? 'Goal edit failed.');
+          }
+        },
+        onCancelAgentRun: (id) => host.agentRunStore?.requestCancel(id),
+        onMessageAgentRun: (id, text) => host.agentRunStore?.sendMessage(id, text) ?? Promise.resolve(false),
         skillsProvider: () =>
           host.skillsRegistry.listSkills().map((skill: { name: string; description?: string; isActive: boolean; source: string }) => ({
             name: skill.name,
@@ -318,6 +334,15 @@ export async function initializeAgentUI(host: AgentUIRuntimeHost, abortControlle
         syncAgentAnnouncementLine(host);
         if (host.teamActivitySnapshot) {
           host.inkRenderer?.setTeamActivity?.(host.teamActivitySnapshot);
+        }
+        if (host.agentRunStore) {
+          host.inkRenderer?.setAgentRuns?.(host.agentRunStore.getSnapshot());
+        }
+        if (host.goalActivityManager) {
+          host.goalActivitySnapshot = await host.goalActivityManager.getSessionSnapshot();
+        }
+        if (host.goalActivitySnapshot) {
+          host.inkRenderer?.setGoalActivity?.(host.goalActivitySnapshot);
         }
         
         // Ensure fallback spinner is NOT initialized when Ink is active
@@ -560,7 +585,7 @@ export async function handleAgentInkSubmittedInstruction(host: AgentUIRuntimeHos
       try {
         const result = await host.handleSlashCommand(command, args);
         if (result) {
-          host.inkRenderer?.addAssistantMessage?.(result);
+          renderAgentSlashCommandResult(host, command, result);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

@@ -26,7 +26,11 @@ import { ShortcutsHelpPanel } from './ShortcutsHelpPanel.js';
 import { SitrepMessage, parseSitrepText } from './SitrepMessage.js';
 import { TaskActivityPanel, type ActivityItem } from './TaskActivityPanel.js';
 import { TeamPanel } from './TeamPanel.js';
+import { AgentRunsPanel } from './AgentRunsPanel.js';
+import type { AgentRunsSnapshot, AgentRunSource } from '../../core/agents/AgentRunStore.js';
 import type { TeamActivitySnapshot } from '../../core/teams/types.js';
+import { GoalPanel, getEditableGoalItems, type GoalEditRequest } from './GoalPanel.js';
+import type { GoalSessionSnapshot } from '../../goals/types.js';
 import { useTheme } from '../theme/ThemeContext.js';
 import { useTranslation } from '../i18n/index.js';
 import { getPlanModeManager } from '../../commands/plan.js';
@@ -46,6 +50,8 @@ import { renderTerminalMarkdown } from '../../core/immediateCommandRouter.js';
 import { buildFileMentionSuggestions } from '../mentionFilter.js';
 import { getContentDisplay } from '../displayUtils.js';
 import type { ChatLogMessage } from '../../session/chatLog.js';
+import { TypedMessageHistory, type TypedMessageEntry } from '../../session/TypedMessageHistory.js';
+import type { TaskListPosition } from '../../types.js';
 import { formatCompactTokens } from '../../core/agent/AgentFormatter.js';
 import {
   getInteractionModeDescription,
@@ -58,7 +64,9 @@ import {
   parseCursorPositionReport,
   parseSgrMouseInput,
   resolveComposerClickPosition,
+  resolveMouseTargetClick,
   type ComposerOutputLayout,
+  type OutputLayout,
   type SgrMouseInput,
 } from './mouseInput.js';
 
@@ -110,6 +118,12 @@ export interface AnnouncementLineState {
   visible: boolean;
 }
 
+/** A slash-command result held in the fixed composer area until the next turn. */
+export interface CommandResultState {
+  command: string;
+  output: string;
+}
+
 export interface AgentUIState {
   isWorking: boolean;
   status: string;
@@ -127,6 +141,8 @@ export interface AgentUIState {
   notifications: string[];
   /** Number of chat messages already committed to terminal scrollback by a previous Ink mount. */
   staticChatMessageOffset: number;
+  /** Changes whenever canonical chat history is replaced so Ink Static keys stay unique. */
+  chatHistoryEpoch: number;
   currentInput: string;
   finalResponse: string | null;
   /** Completion stats shown after work finishes */
@@ -161,15 +177,24 @@ export interface AgentUIState {
   showModeLabel?: boolean;
   /**
    * Grouped multi-step / multi-agent activity (todo_write + sub-agents).
-   * Rendered sticky above the status line.
+   * Rendered sticky below the status line and above the composer.
    */
   activityItems?: ActivityItem[];
   /** Live background team state owned by TeamManager. */
   teamActivity?: TeamActivitySnapshot;
   /** Whether the expanded team view is visible. */
   teamPanelVisible: boolean;
+  agentRuns?: AgentRunsSnapshot;
+  agentRunsPanelVisible: boolean;
+  agentRunsSource?: AgentRunSource;
+  /** Live persistent goal state for the current session. */
+  goalActivity?: GoalSessionSnapshot;
+  /** Whether the expanded persistent goals view is visible. */
+  goalPanelVisible: boolean;
   /** Highest-priority active CLI announcement rendered above status. */
   announcement?: AnnouncementLineState;
+  /** Compact command result placed below the status line instead of transcript history. */
+  commandResult?: CommandResultState;
 }
 
 export interface AgentUILineExtensions {
@@ -179,14 +204,22 @@ export interface AgentUILineExtensions {
 
 export interface AgentUIProps {
   state: AgentUIState;
+  typedMessageHistory?: TypedMessageHistory;
   onInstruction: (text: string) => void;
   onEscape: () => void;
   onCtrlC: () => void;
   /** Dismiss the currently rendered announcement without changing composer input. */
   onDismissAnnouncement?: (id: string) => void;
-  onToggleLiveCommandExpanded?: () => void;
+  onToggleLiveCommandExpanded?: (id?: string) => void;
   /** Toggle the expanded live team view. */
   onToggleTeamPanel?: () => void;
+  onCloseAgentRunsPanel?: () => void;
+  onCancelAgentRun?: (id: string) => void | Promise<unknown>;
+  onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
+  /** Toggle the expanded persistent goals view. */
+  onToggleGoalPanel?: () => void;
+  /** Persist a composer edit for an active or queued goal. */
+  onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
   onInputChange?: (input: string) => void;
   enableQueueInput?: boolean;
   /** Called when a dragged/dropped image is detected in the input */
@@ -217,6 +250,8 @@ export interface AgentUIProps {
   onCycleInteractionMode?: () => InteractionMode;
   /** Enable click-to-position composer input. */
   mouseComposerCursor?: boolean;
+  /** Place the task list above status or directly above the composer. */
+  taskListPosition?: TaskListPosition;
 }
 
 interface TextBufferKeyInfo {
@@ -230,8 +265,10 @@ interface TextBufferKeyInfo {
 const RESERVED_EXTENSION_KEYBINDINGS = new Set([
   'ctrl+c',
   'ctrl+d',
+  'ctrl+g',
   'ctrl+x',
   'ctrl+t',
+  'meta+g',
   'meta+t',
   'shift+tab',
   'escape',
@@ -241,6 +278,10 @@ const RESERVED_EXTENSION_KEYBINDINGS = new Set([
 
 export function isTeamViewShortcut(input: string, key: InkKey): boolean {
   return input.toLowerCase() === 't' && (key.meta || key.ctrl);
+}
+
+export function isGoalViewShortcut(input: string, key: InkKey): boolean {
+  return input.toLowerCase() === 'g' && (key.meta || key.ctrl);
 }
 
 export function matchesExtensionKeybinding(
@@ -278,6 +319,7 @@ const INK_END_KEY_INPUTS = new Set(['\x1b[F', '\x1bOF', '\x1b[4~', '\x1b[8~']);
 
 interface ChatHistoryItem {
   index: number;
+  key: string;
   message: ChatLogMessage;
 }
 
@@ -709,12 +751,18 @@ function matchesCurrentAssistantResponseSuggestion(
 
 export function AgentUI({
   state,
+  typedMessageHistory,
   onInstruction,
   onEscape,
   onCtrlC,
   onDismissAnnouncement,
   onToggleLiveCommandExpanded,
   onToggleTeamPanel,
+  onCloseAgentRunsPanel,
+  onCancelAgentRun,
+  onMessageAgentRun,
+  onToggleGoalPanel,
+  onEditGoalObjective,
   onInputChange,
   enableQueueInput = true,
   onImageDetected,
@@ -730,6 +778,7 @@ export function AgentUI({
   getInteractionMode,
   onCycleInteractionMode,
   mouseComposerCursor = true,
+  taskListPosition = 'above-composer',
 }: AgentUIProps) {
   const { stdout } = useStdout();
   const { colors } = useTheme();
@@ -738,6 +787,19 @@ export function AgentUI({
   const extensionKeybindings = state.extensionKeybindings ?? extensionKeybindingProps;
   const [input, setInput] = useState(state.currentInput || '');
   const [cursorOffset, setCursorOffset] = useState((state.currentInput || '').length);
+  const [inputHistory] = useState(() => typedMessageHistory ?? new TypedMessageHistory());
+  const historyNavigationRef = useRef<{
+    entries: readonly TypedMessageEntry[];
+    index: number;
+    draft: string;
+    row: number;
+    col: number;
+    hiddenContent: string | null;
+    hiddenPastes: InkPasteState['hiddenPastes'];
+  } | null>(null);
+  useEffect(() => { void inputHistory.refresh().catch(() => {}); }, [inputHistory]);
+  const [isReadingHistory, setIsReadingHistory] = useState(false);
+  const readingHistoryRef = useRef(false);
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const [planModeIndicator, setPlanModeIndicator] = useState('');
   const [planModeStatusKey, setPlanModeStatusKey] = useState('');
@@ -746,6 +808,8 @@ export function AgentUI({
   );
   const [queueSelectionIndex, setQueueSelectionIndex] = useState<number | null>(null);
   const [editingQueueIndex, setEditingQueueIndex] = useState<number | null>(null);
+  const [goalSelectionIndex, setGoalSelectionIndex] = useState<number | null>(null);
+  const [editingGoal, setEditingGoal] = useState<GoalEditRequest | null>(null);
   
   // File mention autocomplete state
   const [fileMentionSuggestions, setFileMentionSuggestions] = useState<FileMentionSuggestion[]>([]);
@@ -792,9 +856,26 @@ export function AgentUI({
   const inputRef = useRef(input);
   inputRef.current = input;
   const composerLayoutRef = useRef<ComposerOutputLayout | null>(null);
+  const liveCommandLayoutsRef = useRef(new Map<string, OutputLayout>());
+  const goalRowLayoutsRef = useRef(new Map<string, OutputLayout>());
   const pendingMouseClickRef = useRef<{ input: SgrMouseInput; at: number } | null>(null);
   const handleComposerLayoutChange = useCallback((layout: ComposerOutputLayout | null) => {
     composerLayoutRef.current = layout;
+  }, []);
+  const handleLiveCommandLayoutChange = useCallback((id: string, layout: OutputLayout | null) => {
+    if (layout) {
+      liveCommandLayoutsRef.current.set(id, layout);
+    } else {
+      liveCommandLayoutsRef.current.delete(id);
+    }
+  }, []);
+  const handleGoalRowLayoutChange = useCallback((target: GoalEditRequest, layout: OutputLayout | null) => {
+    const key = `${target.kind}:${target.id}`;
+    if (layout) {
+      goalRowLayoutsRef.current.set(key, layout);
+    } else {
+      goalRowLayoutsRef.current.delete(key);
+    }
   }, []);
   const cursorOffsetRef = useRef(cursorOffset);
   cursorOffsetRef.current = cursorOffset;
@@ -822,6 +903,10 @@ export function AgentUI({
   onToggleLiveCommandExpandedRef.current = onToggleLiveCommandExpanded;
   const onToggleTeamPanelRef = useRef(onToggleTeamPanel);
   onToggleTeamPanelRef.current = onToggleTeamPanel;
+  const onToggleGoalPanelRef = useRef(onToggleGoalPanel);
+  onToggleGoalPanelRef.current = onToggleGoalPanel;
+  const onEditGoalObjectiveRef = useRef(onEditGoalObjective);
+  onEditGoalObjectiveRef.current = onEditGoalObjective;
   const onInstructionRef = useRef(onInstruction);
   onInstructionRef.current = onInstruction;
   const onInputChangeRef = useRef(onInputChange);
@@ -840,6 +925,14 @@ export function AgentUI({
   queueSelectionIndexRef.current = queueSelectionIndex;
   const editingQueueIndexRef = useRef(editingQueueIndex);
   editingQueueIndexRef.current = editingQueueIndex;
+  const goalSelectionIndexRef = useRef(goalSelectionIndex);
+  goalSelectionIndexRef.current = goalSelectionIndex;
+  const editingGoalRef = useRef(editingGoal);
+  editingGoalRef.current = editingGoal;
+  const goalItemsRef = useRef(getEditableGoalItems(state.goalActivity));
+  goalItemsRef.current = getEditableGoalItems(state.goalActivity);
+  const goalPanelVisibleRef = useRef(state.goalPanelVisible);
+  goalPanelVisibleRef.current = state.goalPanelVisible;
   const onImageDetectedRef = useRef(onImageDetected);
   onImageDetectedRef.current = onImageDetected;
   const filesProviderRef = useRef(filesProvider);
@@ -893,6 +986,16 @@ export function AgentUI({
     flushInputSync();
   }, [flushInputSync]);
 
+  const beginGoalEdit = useCallback((target: GoalEditRequest, index: number) => {
+    historyNavigationRef.current = null;
+    textBufferRef.current.setText(target.objective);
+    editingGoalRef.current = target;
+    goalSelectionIndexRef.current = index;
+    setEditingGoal(target);
+    setGoalSelectionIndex(index);
+    syncInputFromBuffer();
+  }, [syncInputFromBuffer]);
+
   const lastColumnsRef = useRef(process.stdout.columns);
 
   const syncBufferViewport = useCallback(() => {
@@ -928,6 +1031,9 @@ export function AgentUI({
   }, []);
 
   const insertPastedText = useCallback((pastedText: string) => {
+    readingHistoryRef.current = false;
+    setIsReadingHistory(false);
+    historyNavigationRef.current = null;
     const imageDetector = onImageDetectedRef.current;
     const processedText = imageDetector
       ? processImagesInText(pastedText, imageDetector, { announce: false })
@@ -1060,6 +1166,7 @@ export function AgentUI({
   useEffect(() => {
     const buffer = textBufferRef.current;
     if (state.currentInput !== buffer.getText()) {
+      historyNavigationRef.current = null;
       buffer.setText(state.currentInput || '');
       syncInputFromBuffer();
     }
@@ -1086,6 +1193,24 @@ export function AgentUI({
       return Math.min(current, queueLength - 1);
     });
   }, [state.queuedInstructions.length]);
+
+  useEffect(() => {
+    const goalItems = getEditableGoalItems(state.goalActivity);
+    const goalCount = goalItems.length;
+    setGoalSelectionIndex((current) => {
+      if (current === null || goalCount === 0) {
+        return null;
+      }
+      return Math.min(current, goalCount - 1);
+    });
+    const activeEdit = editingGoalRef.current;
+    if (activeEdit && !goalItems.some((item) => (
+      item.id === activeEdit.id && item.kind === activeEdit.kind
+    ))) {
+      editingGoalRef.current = null;
+      setEditingGoal(null);
+    }
+  }, [state.goalActivity]);
 
   // Reset ctrl+c count after 2 seconds
   useEffect(() => {
@@ -1149,6 +1274,7 @@ export function AgentUI({
 
   // Update file mention suggestions when input changes
   useEffect(() => {
+    if (historyNavigationRef.current) return;
     if (!filesProvider) {
       setFileMentionVisible(false);
       setFileMentionSuggestions([]);
@@ -1188,6 +1314,7 @@ export function AgentUI({
 
   // Update slash command suggestions when input changes
   useEffect(() => {
+    if (historyNavigationRef.current) return;
     const cmds = slashCommandsRef.current;
     if (!cmds || cmds.length === 0) {
       setSlashVisible(false);
@@ -1255,6 +1382,7 @@ export function AgentUI({
 
   // Update skill ($) mention suggestions when input changes
   useEffect(() => {
+    if (historyNavigationRef.current) return;
     const provider = skillsProviderRef.current;
     if (!provider) {
       if (skillVisibleRef.current) {
@@ -1305,8 +1433,18 @@ export function AgentUI({
     if (mouseComposerCursor) {
       const mouseInput = parseSgrMouseInput(char);
       if (mouseInput) {
+        if (mouseInput.action === 'wheel') {
+          // Mouse reporting redirects the wheel away from native scrollback.
+          // Yield it until keyboard input resumes; background goal updates must
+          // not recapture the wheel or move the composer cursor while reading.
+          pendingMouseClickRef.current = null;
+          readingHistoryRef.current = true;
+          setIsReadingHistory(true);
+          return;
+        }
         if (
-          mouseInput.action === 'press'
+          !readingHistoryRef.current
+          && mouseInput.action === 'press'
           && mouseInput.button === 'left'
           && composerLayoutRef.current
         ) {
@@ -1332,7 +1470,37 @@ export function AgentUI({
           return;
         }
 
+        const clickedLiveCommandId = [...liveCommandLayoutsRef.current.entries()]
+          .find(([, target]) => resolveMouseTargetClick(pendingClick.input, terminalCursor, layout, target))
+          ?.[0];
+        if (clickedLiveCommandId) {
+          onToggleLiveCommandExpandedRef.current?.(clickedLiveCommandId);
+          return;
+        }
+
+        const clickedGoalKey = [...goalRowLayoutsRef.current.entries()]
+          .find(([, target]) => resolveMouseTargetClick(pendingClick.input, terminalCursor, layout, target))
+          ?.[0];
+        if (clickedGoalKey) {
+          const index = goalItemsRef.current.findIndex((target) => (
+            `${target.kind}:${target.id}` === clickedGoalKey
+          ));
+          const target = goalItemsRef.current[index];
+          if (target && index >= 0) {
+            beginGoalEdit(target, index);
+          }
+          return;
+        }
+
         const clickedCell = resolveComposerClickPosition(pendingClick.input, terminalCursor, layout);
+        // Ink layout measurements can be stale across a scroll-region repaint.
+        // A click that is definitely outside the composer still belongs to the
+        // live command surface, so preserve the mouse affordance for the latest
+        // running subprocess rather than dropping that interaction.
+        if (!clickedCell && liveCommandsRef.current.length > 0) {
+          onToggleLiveCommandExpandedRef.current?.();
+          return;
+        }
         if (!clickedCell) {
           return;
         }
@@ -1357,6 +1525,8 @@ export function AgentUI({
       // (tmux without passthrough, a repaint racing the query). Drop the stale
       // click so a later CPR-shaped report cannot hijack the caret.
       pendingMouseClickRef.current = null;
+      readingHistoryRef.current = false;
+      setIsReadingHistory(false);
     }
 
     const pasteResult = consumeInkBracketedPasteInput(char, pasteStateRef.current);
@@ -1369,6 +1539,11 @@ export function AgentUI({
 
     if (isTeamViewShortcut(char, key)) {
       onToggleTeamPanelRef.current?.();
+      return;
+    }
+
+    if (isGoalViewShortcut(char, key)) {
+      onToggleGoalPanelRef.current?.();
       return;
     }
 
@@ -1418,6 +1593,20 @@ export function AgentUI({
         setCtrlCCount(0);
         return;
       }
+      if (goalSelectionIndexRef.current !== null || editingGoalRef.current !== null) {
+        const wasEditingGoal = editingGoalRef.current !== null;
+        goalSelectionIndexRef.current = null;
+        editingGoalRef.current = null;
+        setGoalSelectionIndex(null);
+        setEditingGoal(null);
+        if (wasEditingGoal) {
+          textBufferRef.current.setText('');
+          clearInkHiddenPastes(pasteStateRef.current);
+          syncInputFromBuffer();
+        }
+        setCtrlCCount(0);
+        return;
+      }
       if (clearBareComposerTrigger(textBufferRef.current)) {
         dismissAutocompleteState();
         syncInputFromBuffer();
@@ -1434,6 +1623,7 @@ export function AgentUI({
 
     // Handle Ctrl+C - clear input if non-empty, otherwise warn then exit
     if (key.ctrl && char === 'c') {
+      historyNavigationRef.current = null;
       const currentInput = textBufferRef.current.getText();
 
       if (currentInput.length > 0) {
@@ -1478,6 +1668,38 @@ export function AgentUI({
 
     const queueLength = queuedInstructionsRef.current.length;
     const currentComposerText = textBufferRef.current.getText();
+    const goalItems = goalItemsRef.current;
+    const selectedGoalIndex = goalSelectionIndexRef.current;
+    const canNavigateGoals =
+      goalPanelVisibleRef.current
+      && editingGoalRef.current === null
+      && goalItems.length > 0
+      && currentComposerText.trim().length === 0
+      && !slashVisibleRef.current
+      && !skillVisibleRef.current
+      && !fileMentionVisibleRef.current;
+
+    if (canNavigateGoals && (key.upArrow || key.downArrow)) {
+      const nextIndex = selectedGoalIndex === null
+        ? (key.upArrow ? goalItems.length - 1 : 0)
+        : key.upArrow
+          ? (selectedGoalIndex > 0 ? selectedGoalIndex - 1 : goalItems.length - 1)
+          : (selectedGoalIndex < goalItems.length - 1 ? selectedGoalIndex + 1 : 0);
+      goalSelectionIndexRef.current = nextIndex;
+      setGoalSelectionIndex(nextIndex);
+      setCtrlCCount(0);
+      return;
+    }
+
+    if (canNavigateGoals && selectedGoalIndex !== null && key.return) {
+      const selectedGoal = goalItems[selectedGoalIndex];
+      if (selectedGoal) {
+        beginGoalEdit(selectedGoal, selectedGoalIndex);
+      }
+      setCtrlCCount(0);
+      return;
+    }
+
     const selectedQueueIndex = queueSelectionIndexRef.current;
     const canNavigateQueue =
       isWorkingRef.current &&
@@ -1562,6 +1784,41 @@ export function AgentUI({
         setFileMentionActiveIndex(prev => 
           prev < fileMentionSuggestionsRef.current.length - 1 ? prev + 1 : 0
         );
+        return;
+      }
+    }
+
+    if ((key.upArrow || key.downArrow) && !key.ctrl && !key.meta && !key.shift
+      && editingQueueIndexRef.current === null && editingGoalRef.current === null) {
+      const buffer = textBufferRef.current;
+      const [row] = buffer.getVisualCursor();
+      let navigation = historyNavigationRef.current;
+      if (!navigation && key.upArrow && row === 0 && inputHistory.entries().length > 0) {
+        navigation = {
+          entries: [...inputHistory.entries()], index: -1, draft: buffer.getText(),
+          row: buffer.getCursorRow(), col: buffer.getCursorCol(),
+          hiddenContent: pasteStateRef.current.hiddenContent,
+          hiddenPastes: [...(pasteStateRef.current.hiddenPastes ?? [])],
+        };
+        historyNavigationRef.current = navigation;
+      }
+      if (navigation) {
+        navigation.index = key.upArrow
+          ? Math.min(navigation.index + 1, navigation.entries.length - 1)
+          : navigation.index - 1;
+        clearInkHiddenPastes(pasteStateRef.current);
+        if (navigation.index < 0) {
+          buffer.setText(navigation.draft);
+          buffer.setCursor(navigation.row, navigation.col);
+          pasteStateRef.current.hiddenContent = navigation.hiddenContent;
+          pasteStateRef.current.hiddenPastes = navigation.hiddenPastes;
+          historyNavigationRef.current = null;
+        } else {
+          buffer.setText(navigation.entries[navigation.index].text);
+        }
+        dismissAutocompleteState();
+        syncInputFromBuffer();
+        setCtrlCCount(0);
         return;
       }
     }
@@ -1659,15 +1916,45 @@ export function AgentUI({
     }
 
     const buffer = textBufferRef.current;
+    const textBeforeKey = buffer.getText();
     const result = handleInkTextBufferInput(buffer, char, key);
+    if (buffer.getText() !== textBeforeKey) historyNavigationRef.current = null;
 
     if (result === 'submit') {
+      historyNavigationRef.current = null;
       const pasteState = pasteStateRef.current;
       
       // Keep the compact paste marker editable in the Composer while resolving
       // it back to the actual pasted text only at submit time.
       let text = resolveInkHiddenPastes(buffer.getText(), pasteState);
       text = text.trim();
+      const goalEdit = editingGoalRef.current;
+
+      if (goalEdit !== null) {
+        clearInkComposerInputForSubmit(buffer, pasteState, {
+          setInput,
+          setCursorOffset,
+          onInputChange: onInputChangeRef.current,
+          clearPendingInputSync: () => {
+            pendingInputSyncRef.current = null;
+            if (inputSyncTimerRef.current) {
+              clearTimeout(inputSyncTimerRef.current);
+              inputSyncTimerRef.current = null;
+            }
+          },
+        });
+        dismissAutocompleteState();
+        goalSelectionIndexRef.current = null;
+        editingGoalRef.current = null;
+        setGoalSelectionIndex(null);
+        setEditingGoal(null);
+
+        if (text.length > 0) {
+          void onEditGoalObjectiveRef.current?.({ ...goalEdit, objective: text });
+        }
+        return;
+      }
+
       const editingIndex = editingQueueIndexRef.current;
 
       if (editingIndex !== null) {
@@ -1713,6 +2000,7 @@ export function AgentUI({
         },
       });
       dismissAutocompleteState();
+      void inputHistory.record(text, workspaceRootRef.current ?? process.cwd()).catch(() => {});
       onInstructionRef.current(text);
 
       return;
@@ -1852,8 +2140,10 @@ export function AgentUI({
     }
   }, [
     acceptActiveAutocompleteSuggestion,
+    beginGoalEdit,
     dismissAutocompleteState,
     insertPastedText,
+    inputHistory,
     mouseComposerCursor,
     stdout,
     syncBufferViewport,
@@ -1869,17 +2159,17 @@ export function AgentUI({
   }, []);
 
   const handlePaste = useCallback((pastedText: string) => {
-    if (isWorkingRef.current && !enableQueueInputRef.current) {
+    if (state.agentRunsPanelVisible || (isWorkingRef.current && !enableQueueInputRef.current)) {
       return;
     }
     insertPastedText(pastedText);
-  }, [insertPastedText]);
+  }, [insertPastedText, state.agentRunsPanelVisible]);
 
   // Ink owns bracketed-paste framing at the stdin parser boundary. Its paste
   // channel buffers split protocol markers and keeps pasted bytes out of
   // useInput, so the composer receives the complete payload exactly once.
   usePaste(handlePaste);
-  useInput(stableHandleInput);
+  useInput(stableHandleInput, { isActive: !state.agentRunsPanelVisible });
 
   // Memoize tool outputs to prevent unnecessary re-renders
   // Static items use the entry id as key and never re-render
@@ -1957,8 +2247,12 @@ export function AgentUI({
 
     return sourceMessages
       .filter((message) => message.role !== 'notification')
-      .map((message, index) => ({ index, message }));
-  }, [state.chatMessages, state.userMessages]);
+      .map((message, index) => ({
+        index,
+        key: `${state.chatHistoryEpoch}:${index}`,
+        message,
+      }));
+  }, [state.chatHistoryEpoch, state.chatMessages, state.userMessages]);
   const staticChatMessageOffset = Math.min(
     Math.max(0, state.staticChatMessageOffset),
     chatHistoryItems.length
@@ -2008,12 +2302,16 @@ export function AgentUI({
   return (
     <Box flexDirection="column">
       {liveCommandItems.map((item) => (
-        <LiveCommandBlock key={item.id} entry={item} />
+        <LiveCommandBlock
+          key={item.id}
+          entry={item}
+          onLayoutChange={(layout) => handleLiveCommandLayoutChange(item.id, layout)}
+        />
       ))}
 
-      <Static items={staticChatHistoryItems}>
-        {({ message, index }) => (
-          <ChatHistoryMessage key={`chat-${index}`} message={message} index={index} />
+      <Static key={`chat-history-${state.chatHistoryEpoch}`} items={staticChatHistoryItems}>
+        {({ message, index, key }) => (
+          <ChatHistoryMessage key={`chat-${key}`} message={message} index={index} />
         )}
       </Static>
 
@@ -2035,7 +2333,18 @@ export function AgentUI({
       <NotificationStack notifications={state.notifications} />
 
       {/* Fixed bottom section - always renders for layout stability */}
-      <FixedBottom
+      {state.agentRunsPanelVisible ? (
+        <AgentRunsPanel
+          snapshot={state.agentRuns ?? { runs: [], updatedAt: 0 }}
+          source={state.agentRunsSource}
+          terminalRows={windowSize.rows}
+          terminalColumns={windowSize.columns}
+          onClose={() => onCloseAgentRunsPanel?.()}
+          onCancel={onCancelAgentRun}
+          onMessage={onMessageAgentRun}
+          onCtrlC={onCtrlC}
+        />
+      ) : <FixedBottom
         announcement={state.announcement}
         terminalColumns={windowSize.columns ?? process.stdout.columns ?? 80}
         terminalRows={windowSize.rows}
@@ -2049,6 +2358,11 @@ export function AgentUI({
         activityItems={state.activityItems ?? []}
         teamActivity={state.teamActivity}
         teamPanelVisible={state.teamPanelVisible}
+        goalActivity={state.goalActivity}
+        goalPanelVisible={state.goalPanelVisible}
+        selectedGoalIndex={goalSelectionIndex}
+        onGoalRowLayoutChange={handleGoalRowLayoutChange}
+        commandResult={state.commandResult}
         enableQueueInput={enableQueueInput}
         input={input}
         cursorOffset={cursorOffset}
@@ -2087,13 +2401,19 @@ export function AgentUI({
         nextPromptSuggestion={composerNextPromptSuggestion}
         inlineGhostSuffix={composerInlineGhostSuffix}
         mouseComposerCursor={mouseComposerCursor}
+        isReadingHistory={isReadingHistory}
+        enableMouseTargetControls={mouseComposerCursor && (
+          liveCommandItems.length > 0
+          || (state.goalPanelVisible && goalItemsRef.current.length > 0)
+        )}
         onComposerLayoutChange={handleComposerLayoutChange}
         showShortcuts={showShortcuts}
         interactionMode={interactionMode}
         showModeLabel={state.showModeLabel ?? true}
         modeIndicator={interactionModeIndicator}
         modeDescription={interactionModeDescription}
-      />
+        taskListPosition={taskListPosition}
+      />}
     </Box>
   );
 }
@@ -2335,6 +2655,11 @@ interface StatusSectionProps {
   activityItems?: ActivityItem[];
   teamActivity?: TeamActivitySnapshot;
   teamPanelVisible: boolean;
+  goalActivity?: GoalSessionSnapshot;
+  goalPanelVisible: boolean;
+  selectedGoalIndex: number | null;
+  onGoalRowLayoutChange?: (target: GoalEditRequest, layout: OutputLayout | null) => void;
+  commandResult?: CommandResultState;
   contextPercent?: number;
   contextTokens?: ContextTokenDisplay;
   provider?: string;
@@ -2343,6 +2668,7 @@ interface StatusSectionProps {
   modeIndicator?: string;
   /** Human-readable description paired with the bracketed indicator. */
   modeDescription?: string;
+  taskListPosition: TaskListPosition;
   lineExtension?: LineExtension;
 }
 
@@ -2397,6 +2723,24 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
   prev.selectedQueueIndex === next.selectedQueueIndex
 ));
 
+const CommandResultPanel = memo(function CommandResultPanel({
+  commandResult,
+}: {
+  commandResult: CommandResultState;
+}) {
+  const { colors } = useTheme();
+
+  return (
+    <Box flexDirection="column" marginTop={1} marginBottom={1}>
+      <Text color={colors.accent} bold>{commandResult.command}</Text>
+      <MarkdownDiffContent content={commandResult.output} />
+    </Box>
+  );
+}, (previous, next) => (
+  previous.commandResult.command === next.commandResult.command
+  && previous.commandResult.output === next.commandResult.output
+));
+
 const StatusSection = memo(function StatusSection({
   terminalRows,
   isWorking,
@@ -2409,12 +2753,18 @@ const StatusSection = memo(function StatusSection({
   activityItems = [],
   teamActivity,
   teamPanelVisible,
+  goalActivity,
+  goalPanelVisible,
+  selectedGoalIndex,
+  onGoalRowLayoutChange,
+  commandResult,
   contextPercent,
   contextTokens,
   provider,
   model,
   modeIndicator,
   modeDescription,
+  taskListPosition,
   lineExtension,
 }: StatusSectionProps) {
   const { colors } = useTheme();
@@ -2426,12 +2776,9 @@ const StatusSection = memo(function StatusSection({
 
   return (
     <>
-      {/* Grouped todos + sub-agent runs — sticky above the spinner/status line */}
-      {showActivity && <TaskActivityPanel items={activityItems} terminalRows={terminalRows} />}
-
-      {teamPanelVisible && teamActivity?.team && (
-        <TeamPanel team={teamActivity.team} tasks={teamActivity.tasks} />
-      )}
+      {showActivity && taskListPosition === 'up' ? (
+        <TaskActivityPanel items={activityItems} terminalRows={terminalRows} />
+      ) : null}
 
       {/* Status line with spinner - always renders for stability */}
       <StatusLine
@@ -2447,6 +2794,22 @@ const StatusSection = memo(function StatusSection({
         teamActivity={teamActivity}
         lineExtension={lineExtension}
       />
+
+      {/* Keep interactive panels adjacent to the status line, before the composer. */}
+      {commandResult && <CommandResultPanel commandResult={commandResult} />}
+      {showActivity && taskListPosition === 'above-composer' ? (
+        <TaskActivityPanel items={activityItems} terminalRows={terminalRows} />
+      ) : null}
+      {teamPanelVisible && teamActivity?.team && (
+        <TeamPanel team={teamActivity.team} tasks={teamActivity.tasks} />
+      )}
+      {goalPanelVisible && goalActivity ? (
+        <GoalPanel
+          snapshot={goalActivity}
+          selectedIndex={selectedGoalIndex}
+          onRowLayoutChange={onGoalRowLayoutChange}
+        />
+      ) : null}
 
       {/* Below the status line: rendering it above the dynamic output region
           flushes it into scrollback on every repaint once tool output exceeds
@@ -2492,10 +2855,17 @@ const StatusSection = memo(function StatusSection({
          prev.activityItems === next.activityItems &&
          prev.teamActivity === next.teamActivity &&
          prev.teamPanelVisible === next.teamPanelVisible &&
+         prev.goalActivity === next.goalActivity &&
+         prev.goalPanelVisible === next.goalPanelVisible &&
+         prev.selectedGoalIndex === next.selectedGoalIndex &&
+         prev.onGoalRowLayoutChange === next.onGoalRowLayoutChange &&
+         prev.commandResult?.command === next.commandResult?.command &&
+         prev.commandResult?.output === next.commandResult?.output &&
          prev.provider === next.provider &&
          prev.model === next.model &&
          prev.modeIndicator === next.modeIndicator &&
          prev.modeDescription === next.modeDescription &&
+         prev.taskListPosition === next.taskListPosition &&
          prev.lineExtension === next.lineExtension;
 });
 
@@ -2736,6 +3106,11 @@ interface FixedBottomProps {
   activityItems?: ActivityItem[];
   teamActivity?: TeamActivitySnapshot;
   teamPanelVisible: boolean;
+  goalActivity?: GoalSessionSnapshot;
+  goalPanelVisible: boolean;
+  selectedGoalIndex: number | null;
+  onGoalRowLayoutChange?: (target: GoalEditRequest, layout: OutputLayout | null) => void;
+  commandResult?: CommandResultState;
   enableQueueInput: boolean;
   input: string;
   cursorOffset: number;
@@ -2759,6 +3134,9 @@ interface FixedBottomProps {
   nextPromptSuggestion?: string;
   inlineGhostSuffix?: string;
   mouseComposerCursor?: boolean;
+  isReadingHistory: boolean;
+  /** Keep mouse tracking active while a rendered block exposes a click target. */
+  enableMouseTargetControls: boolean;
   onComposerLayoutChange?: (layout: ComposerOutputLayout | null) => void;
   /** Whether the shortcuts help panel is visible */
   showShortcuts: boolean;
@@ -2770,6 +3148,7 @@ interface FixedBottomProps {
   modeIndicator?: string;
   /** Human-readable description paired with the bracketed indicator. */
   modeDescription?: string;
+  taskListPosition: TaskListPosition;
 }
 
 interface ComposerCursorIntent {
@@ -2838,6 +3217,11 @@ const FixedBottom = memo(function FixedBottom({
   activityItems = [],
   teamActivity,
   teamPanelVisible,
+  goalActivity,
+  goalPanelVisible,
+  selectedGoalIndex,
+  onGoalRowLayoutChange,
+  commandResult,
   enableQueueInput,
   input,
   cursorOffset,
@@ -2859,12 +3243,15 @@ const FixedBottom = memo(function FixedBottom({
   nextPromptSuggestion,
   inlineGhostSuffix,
   mouseComposerCursor,
+  isReadingHistory,
+  enableMouseTargetControls,
   onComposerLayoutChange,
   showShortcuts,
   interactionMode,
   showModeLabel,
   modeIndicator,
   modeDescription,
+  taskListPosition,
 }: FixedBottomProps) {
   const composerCursorIntent = useUserDrivenComposerCursor(isWorking, input, cursorOffset);
 
@@ -2890,12 +3277,18 @@ const FixedBottom = memo(function FixedBottom({
         activityItems={activityItems}
         teamActivity={teamActivity}
         teamPanelVisible={teamPanelVisible}
+        goalActivity={goalActivity}
+        goalPanelVisible={goalPanelVisible}
+        selectedGoalIndex={selectedGoalIndex}
+        onGoalRowLayoutChange={onGoalRowLayoutChange}
+        commandResult={commandResult}
         contextPercent={contextPercent}
         contextTokens={contextTokens}
         provider={provider}
         model={model}
         modeIndicator={modeIndicator}
         modeDescription={modeDescription}
+        taskListPosition={taskListPosition}
         lineExtension={mergeLineExtensions(
           configuredLineExtensions?.status,
           lineExtensions?.status,
@@ -2911,9 +3304,9 @@ const FixedBottom = memo(function FixedBottom({
         placeholderText={placeholderText}
         nextPromptSuggestion={nextPromptSuggestion}
         inlineGhostSuffix={inlineGhostSuffix}
-        enableHardwareCursor={composerCursorIntent.enabled}
-        refreshHardwareCursor={composerCursorIntent.refreshOnParentRender}
-        enableMouseCursor={mouseComposerCursor}
+        enableHardwareCursor={!isReadingHistory && (composerCursorIntent.enabled || enableMouseTargetControls)}
+        refreshHardwareCursor={!isReadingHistory && composerCursorIntent.refreshOnParentRender}
+        enableMouseCursor={mouseComposerCursor && !isReadingHistory}
         onLayoutChange={onComposerLayoutChange}
       />
       <FileMentionWrapper fileMentionDropdown={fileMentionDropdown} />
@@ -2958,6 +3351,7 @@ export function createInitialUIState(): AgentUIState {
     chatMessages: [],
     notifications: [],
     staticChatMessageOffset: 0,
+    chatHistoryEpoch: 0,
     currentInput: '',
     finalResponse: null,
     completionStats: null,
@@ -2973,5 +3367,7 @@ export function createInitialUIState(): AgentUIState {
     showModeLabel: true,
     activityItems: [],
     teamPanelVisible: false,
+    agentRunsPanelVisible: false,
+    goalPanelVisible: false,
   };
 }

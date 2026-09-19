@@ -3,6 +3,8 @@
  * @license Apache-2.0
  */
 import { spawn } from 'node:child_process';
+import { matchesImportedHook, importedHookInput, importedHookEnvironment, importedHookResponse } from './ImportedHookAdapter.js';
+import { HOOK_EVENTS } from './hookEvents.js';
 import { minimatch } from 'minimatch';
 import type { HooksSettings, HookDefinition, HookEvent, HookFilter, HookResponse } from '../types.js';
 import type { ExtensionRuntimeHook } from '../extensions/ExtensionRuntimeHost.js';
@@ -11,6 +13,8 @@ import type { ExtensionRuntimeHook } from '../extensions/ExtensionRuntimeHost.js
 export interface HookContext {
   /** Event that triggered the hook */
   event: HookEvent;
+  previousMode?: string;
+  mode?: string;
   /** Workspace root path */
   workspace: string;
   /** Session ID */
@@ -81,6 +85,13 @@ export interface HookContext {
   subagentError?: string;
   /** Subagent duration ms (for subagent-stop) */
   subagentDuration?: number;
+  subagentParentId?: string;
+  subagentSource?: string;
+  subagentStatus?: string;
+  subagentWorkspace?: string;
+  subagentTask?: string;
+  subagentActivity?: string;
+  subagentMessage?: string;
 
   // Permission hooks
   /** Permission type (for permission-request) */
@@ -161,6 +172,20 @@ export interface HookContext {
   reviewInstructions?: string;
   /** Review error message (for review:failed) */
   reviewError?: string;
+  /** Review kind selected by the caller */
+  reviewKind?: string;
+  /** Report audience selected by the caller */
+  reviewAudience?: string;
+  /** Report format selected by the caller */
+  reviewFormat?: string;
+  /** Surface that executed the review */
+  reviewSurface?: string;
+  /** Current review lifecycle status */
+  reviewStatus?: string;
+  /** Git comparison base, when provided */
+  reviewBase?: string;
+  /** Git comparison head, when provided */
+  reviewHead?: string;
 
   // Goal hooks
   /** Goal ID (for goal-written:completed) */
@@ -421,6 +446,10 @@ export class HookManager {
     this.extensionHooks = [...hooks];
   }
 
+  getExtensionHooks(): ExtensionRuntimeHook[] {
+    return [...this.extensionHooks];
+  }
+
   /**
    * Get current settings
    */
@@ -432,9 +461,13 @@ export class HookManager {
    * Update settings
    */
   async updateSettings(settings: Partial<HooksSettings>): Promise<void> {
+    const previous = this.settings;
     this.settings = { ...this.settings, ...settings };
-    if (this.onPersist) {
-      await this.onPersist();
+    try {
+      await this.onPersist?.();
+    } catch (error) {
+      this.settings = previous;
+      throw error;
     }
   }
 
@@ -442,11 +475,13 @@ export class HookManager {
    * Add a new hook
    */
   async addHook(hook: HookDefinition): Promise<void> {
-    const hooks = this.settings.hooks ?? [];
-    hooks.push({ ...hook, enabled: hook.enabled !== false });
-    this.settings.hooks = hooks;
-    if (this.onPersist) {
-      await this.onPersist();
+    const previous = this.settings;
+    this.settings = { ...previous, hooks: [...(previous.hooks ?? []), { ...hook, enabled: hook.enabled !== false }] };
+    try {
+      await this.onPersist?.();
+    } catch (error) {
+      this.settings = previous;
+      throw error;
     }
   }
 
@@ -486,12 +521,15 @@ export class HookManager {
       return false;
     }
 
-    const hook = eventHooks[index];
-    hook.enabled = hook.enabled === false;
+    return this.setHookEnabled(event, index, eventHooks[index].enabled === false);
+  }
 
-    if (this.onPersist) {
-      await this.onPersist();
-    }
+  async setHookEnabled(event: HookEvent, index: number, enabled: boolean): Promise<boolean> {
+    const hooks = this.settings.hooks ?? [];
+    const hook = hooks.filter(candidate => candidate.event === event)[index];
+    if (!Number.isInteger(index) || index < 0 || !hook) return false;
+    if ((hook.enabled !== false) === enabled) return true;
+    await this.updateSettings({ hooks: hooks.map(candidate => candidate === hook ? { ...candidate, enabled } : candidate) });
     return true;
   }
 
@@ -542,6 +580,10 @@ export class HookManager {
       case 'session-end':
         value = context.sessionEndReason ?? '';
         break;
+      case 'subagent-start':
+      case 'subagent-progress':
+      case 'subagent-message':
+      case 'subagent-cancel-requested':
       case 'subagent-stop':
         value = context.subagentType ?? '';
         break;
@@ -567,11 +609,17 @@ export class HookManager {
       case 'autoresearch:run':
       case 'autoresearch:after':
       case 'autoresearch:log':
+      case 'autoresearch:decision':
+      case 'autoresearch:replay':
+      case 'autoresearch:rescore':
+      case 'autoresearch:prune':
       case 'autoresearch:complete':
       case 'autoresearch:error':
         value = [
           context.autoresearchGoal,
           context.autoresearchSubcommand,
+          context.autoresearchAttemptId,
+          context.autoresearchDecision,
           context.tool,
           formatMatcherArgs(context.args),
           context.error,
@@ -587,6 +635,13 @@ export class HookManager {
           context.reviewScope,
           context.reviewInstructions,
           context.reviewError,
+          context.reviewKind,
+          context.reviewAudience,
+          context.reviewFormat,
+          context.reviewSurface,
+          context.reviewStatus,
+          context.reviewBase,
+          context.reviewHead,
         ].filter((part) => part !== undefined && part !== null).join(' ');
         break;
       case 'goal-written:completed':
@@ -632,6 +687,9 @@ export class HookManager {
       HOOK_WORKSPACE: context.workspace,
     };
 
+    if (context.previousMode) env.HOOK_PREVIOUS_MODE = context.previousMode;
+    if (context.mode) env.HOOK_MODE = context.mode;
+
     // Session info
     if (context.sessionId) env.HOOK_SESSION_ID = context.sessionId;
 
@@ -674,7 +732,16 @@ export class HookManager {
 
     // Subagent hooks
     if (context.subagentId) env.HOOK_SUBAGENT_ID = context.subagentId;
+    if (context.subagentName) env.HOOK_SUBAGENT_NAME = context.subagentName;
     if (context.subagentType) env.HOOK_SUBAGENT_TYPE = context.subagentType;
+    if (context.subagentParentId) env.HOOK_SUBAGENT_PARENT_ID = context.subagentParentId;
+    if (context.subagentSource) env.HOOK_SUBAGENT_SOURCE = context.subagentSource;
+    if (context.subagentStatus) env.HOOK_SUBAGENT_STATUS = context.subagentStatus;
+    if (context.subagentWorkspace) env.HOOK_SUBAGENT_WORKSPACE = context.subagentWorkspace;
+    if (context.subagentActivity) env.HOOK_SUBAGENT_ACTIVITY = context.subagentActivity;
+    if (context.subagentSuccess !== undefined) env.HOOK_SUBAGENT_SUCCESS = String(context.subagentSuccess);
+    if (context.subagentDuration !== undefined) env.HOOK_SUBAGENT_DURATION = String(context.subagentDuration);
+    if (context.subagentError !== undefined) env.HOOK_SUBAGENT_ERROR = context.subagentError.slice(0, 4_000);
 
     // Permission hooks
     if (context.permissionType) env.HOOK_PERMISSION_TYPE = context.permissionType;
@@ -719,6 +786,13 @@ export class HookManager {
       if (context.reviewScope) env.HOOK_REVIEW_SCOPE = context.reviewScope;
       if (context.reviewError) env.HOOK_REVIEW_ERROR = context.reviewError;
       if (context.reviewInstructions) env.HOOK_REVIEW_INSTRUCTIONS = context.reviewInstructions;
+      if (context.reviewKind) env.HOOK_REVIEW_KIND = context.reviewKind;
+      if (context.reviewAudience) env.HOOK_REVIEW_AUDIENCE = context.reviewAudience;
+      if (context.reviewFormat) env.HOOK_REVIEW_FORMAT = context.reviewFormat;
+      if (context.reviewSurface) env.HOOK_REVIEW_SURFACE = context.reviewSurface;
+      if (context.reviewStatus) env.HOOK_REVIEW_STATUS = context.reviewStatus;
+      if (context.reviewBase) env.HOOK_REVIEW_BASE = context.reviewBase;
+      if (context.reviewHead) env.HOOK_REVIEW_HEAD = context.reviewHead;
     }
 
     // Goal hooks
@@ -749,8 +823,18 @@ export class HookManager {
   /**
    * Build JSON input to pass via stdin to hook
    */
+  getContextFields(): string[] {
+    return Object.keys(this.buildJsonContext({ event: 'pre-tool', workspace: this.workspaceRoot }));
+  }
+
   private buildJsonInput(context: HookContext): string {
-    return JSON.stringify({
+    return JSON.stringify(this.buildJsonContext(context));
+  }
+
+  private buildJsonContext(context: HookContext): Record<string, unknown> {
+    return {
+      previous_mode: context.previousMode,
+      mode: context.mode,
       session_id: context.sessionId,
       cwd: context.workspace,
       hook_event_name: context.event,
@@ -786,6 +870,13 @@ export class HookManager {
       subagent_success: context.subagentSuccess,
       subagent_error: context.subagentError,
       subagent_duration: context.subagentDuration,
+      subagent_parent_id: context.subagentParentId,
+      subagent_source: context.subagentSource,
+      subagent_status: context.subagentStatus,
+      subagent_workspace: context.subagentWorkspace,
+      subagent_task: context.subagentTask,
+      subagent_activity: context.subagentActivity,
+      subagent_message: context.subagentMessage,
       // Permission context
       permission_type: context.permissionType,
       // Notification context
@@ -823,6 +914,13 @@ export class HookManager {
       review_scope: context.reviewScope,
       review_instructions: context.reviewInstructions,
       review_error: context.reviewError,
+      review_kind: context.reviewKind,
+      review_audience: context.reviewAudience,
+      review_format: context.reviewFormat,
+      review_surface: context.reviewSurface,
+      review_status: context.reviewStatus,
+      review_base: context.reviewBase,
+      review_head: context.reviewHead,
       // Goal context
       goal_id: context.goalId,
       goal_objective: context.goalObjective,
@@ -840,7 +938,7 @@ export class HookManager {
       team_tasks_total: context.teamTasksTotal,
       // Multi-directory support
       additional_workspaces: context.additionalWorkspaces,
-    });
+    };
   }
 
   /**
@@ -871,8 +969,8 @@ export class HookManager {
     const startTime = Date.now();
     const timeout = hook.timeout ?? DEFAULT_HOOK_TIMEOUT;
     const killGracePeriodMs = options.killGracePeriodMs ?? DEFAULT_KILL_GRACE_PERIOD_MS;
-    const env = this.buildEnvironment(context);
-    const jsonInput = this.buildJsonInput(context);
+    const env = { ...this.buildEnvironment(context), ...(hook.importedFrom ? importedHookEnvironment(hook.importedFrom, context) : {}) };
+    const jsonInput = hook.importedFrom ? JSON.stringify(importedHookInput(hook.importedFrom, context)) : this.buildJsonInput(context);
 
     if (options.signal?.aborted) {
       return {
@@ -887,13 +985,15 @@ export class HookManager {
     return new Promise((resolve) => {
       const child = spawn(hook.command, [], {
         shell: true,
-        cwd: this.workspaceRoot,
+        detached: process.platform !== 'win32',
+        cwd: hook.importedFrom?.workingDirectory ?? this.workspaceRoot,
         env,
         stdio: ['pipe', 'pipe', 'pipe'], // stdin enabled for JSON input
       });
 
       let stdout = '';
       let stderr = '';
+      let stdinError: Error | undefined;
       let settled = false;
       let terminationReason: 'abort' | 'timeout' | undefined;
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
@@ -917,14 +1017,28 @@ export class HookManager {
         resolve(result);
       };
 
+      const signalHook = (signal: NodeJS.Signals): void => {
+        if (process.platform !== 'win32' && child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, signal);
+            return;
+          } catch {
+            child.kill(signal);
+            return;
+          }
+        }
+        child.kill(signal);
+      };
+
       const terminate = (reason: 'abort' | 'timeout'): void => {
         if (settled || terminationReason) return;
         terminationReason = reason;
-        child.kill('SIGTERM');
+        signalHook('SIGTERM');
+        if (settled) return;
         forceKillTimer = setTimeout(() => {
           forceKillTimer = undefined;
           if (!settled) {
-            child.kill('SIGKILL');
+            signalHook('SIGKILL');
           }
         }, killGracePeriodMs);
         forceKillTimer.unref?.();
@@ -938,7 +1052,12 @@ export class HookManager {
       timeoutId.unref?.();
       options.signal?.addEventListener('abort', handleAbort, { once: true });
 
-      // Write JSON context to stdin
+      child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
+        // Hooks may exit without reading their context; their exit status still applies.
+        if (error.code !== 'EPIPE' && error.code !== 'ERR_STREAM_DESTROYED') {
+          stdinError = error;
+        }
+      });
       child.stdin?.write(jsonInput);
       child.stdin?.end();
 
@@ -955,17 +1074,17 @@ export class HookManager {
         const exitCode = code ?? 0;
 
         // Exit code 2 = blocking error (special handling)
-        const isBlockingError = exitCode === 2;
+        const isBlockingError = exitCode === 2 && (hook.importedFrom?.source !== 'grok' || context.event === 'pre-tool');
 
         // Parse JSON response if exit code is 0 and stdout looks like JSON
         let response: HookResponse | undefined;
         if (exitCode === 0) {
-          response = this.parseHookResponse(stdout);
+          response = hook.importedFrom ? importedHookResponse(hook.importedFrom, stdout, context) : this.parseHookResponse(stdout);
         }
 
         const result: HookExecutionResult = {
           hook,
-          success: terminationReason === undefined && exitCode === 0,
+          success: terminationReason === undefined && stdinError === undefined && exitCode === 0,
           aborted: terminationReason === 'abort',
           stdout: stdout.trim() || undefined,
           stderr: stderr.trim() || undefined,
@@ -975,7 +1094,7 @@ export class HookManager {
               ? `Hook timed out after ${timeout}ms`
             : isBlockingError
               ? stderr.trim() || 'Hook blocked execution'
-              : undefined,
+              : stdinError?.message,
           duration,
           exitCode,
           blockingError: isBlockingError,
@@ -1062,7 +1181,7 @@ export class HookManager {
 
     // Get hooks for event, then filter by both filter and matcher
     const hooks = this.getHooksForEvent(event).filter(h =>
-      this.matchesFilter(h.filter, fullContext) && this.matchesMatcher(h, fullContext)
+      this.matchesFilter(h.filter, fullContext) && (h.importedFrom ? matchesImportedHook(h, fullContext) : this.matchesMatcher(h, fullContext))
     );
 
     if (hooks.length === 0) {
@@ -1170,69 +1289,9 @@ export class HookManager {
    * Get a summary of hooks by event
    */
   getSummary(): Record<HookEvent, { total: number; enabled: number }> {
-    const events: HookEvent[] = [
-      'pre-tool',
-      'post-tool',
-      'file-modified',
-      'pre-prompt',
-      'stop',
-      'post-response', // Alias for 'stop'
-      'session-error',
-      'rate-limit',
-      'subagent-stop',
-      'session-start',
-      'session-end',
-      'pre-clear',
-      'permission-request',
-      'notification',
-      // Auto-mode events
-      'automode:start',
-      'automode:iteration',
-      'automode:checkpoint',
-      'automode:pause',
-      'automode:resume',
-      'automode:cancel',
-      'automode:complete',
-      'automode:error',
-      // Auto-research events
-      'autoresearch:start',
-      'autoresearch:pause',
-      'autoresearch:init',
-      'autoresearch:before',
-      'autoresearch:run',
-      'autoresearch:after',
-      'autoresearch:log',
-      'autoresearch:complete',
-      'autoresearch:error',
-      // Learn events
-      'pre-learn',
-      'post-learn',
-      // Goal authoring events
-      'goal-written:completed',
-      // Review events
-      'review:start',
-      'review:end',
-      'review:paused',
-      'review:failed',
-      'review:completed',
-      // Team events
-      'team-created',
-      'teammate-spawned',
-      'teammate-idle',
-      'task-assigned',
-      'task-completed',
-      'team-shutdown',
-      // Mode events
-      'mode-change',
-      // Context lifecycle events
-      'context:compact',
-      'context:overflow',
-      'context:warning',
-      'context:critical',
-    ];
     const summary: Record<HookEvent, { total: number; enabled: number }> = {} as Record<HookEvent, { total: number; enabled: number }>;
 
-    for (const event of events) {
+    for (const event of HOOK_EVENTS) {
       const eventHooks = this.getHooks().filter(h => h.event === event);
       summary[event] = {
         total: eventHooks.length,

@@ -326,8 +326,17 @@ export const RPC_NOTIFICATIONS = {
   HOOK_SESSION_START: 'autohand.hook.sessionStart',
   HOOK_SESSION_END: 'autohand.hook.sessionEnd',
   HOOK_SUBAGENT_STOP: 'autohand.hook.subagentStop',
+  HOOK_SUBAGENT_START: 'autohand.hook.subagentStart',
+  HOOK_SUBAGENT_PROGRESS: 'autohand.hook.subagentProgress',
+  HOOK_SUBAGENT_MESSAGE: 'autohand.hook.subagentMessage',
+  HOOK_SUBAGENT_CANCEL_REQUESTED: 'autohand.hook.subagentCancelRequested',
   HOOK_PERMISSION_REQUEST: 'autohand.hook.permissionRequest',
   HOOK_NOTIFICATION: 'autohand.hook.notification',
+  HOOK_REVIEW_START: 'autohand.hook.reviewStart',
+  HOOK_REVIEW_END: 'autohand.hook.reviewEnd',
+  HOOK_REVIEW_PAUSED: 'autohand.hook.reviewPaused',
+  HOOK_REVIEW_FAILED: 'autohand.hook.reviewFailed',
+  HOOK_REVIEW_COMPLETED: 'autohand.hook.reviewCompleted',
   // Auto-mode lifecycle notifications
   AUTOMODE_START: 'autohand.automode.start',
   AUTOMODE_ITERATION: 'autohand.automode.iteration',
@@ -948,6 +957,19 @@ export interface HookSubagentStopNotificationParams {
   success: boolean;
   duration: number;
   error?: string;
+  timestamp: string;
+}
+
+export interface HookSubagentActivityNotificationParams {
+  subagentId: string;
+  subagentName: string;
+  subagentType: string;
+  parentId?: string;
+  source?: string;
+  status?: string;
+  workspace?: string;
+  activity?: string;
+  message?: string;
   timestamp: string;
 }
 

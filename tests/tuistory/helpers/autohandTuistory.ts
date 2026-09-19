@@ -77,6 +77,7 @@ export interface MockAuthServer {
 }
 
 export interface MockAuthServerOptions {
+  paymentBlocked?: () => boolean;
   authorizeAfterPolls?: number;
   deviceAuthSchemaVersion?: 1 | 2;
 }
@@ -942,7 +943,10 @@ export async function createMockAuthServer(
           email: 'tuistory@example.com',
           name: 'Tuistory Test',
         },
-        entitlement: {
+        entitlement: options.paymentBlocked?.() ? {
+          tier: 'free', freeRemaining: 20,
+          paymentAccess: { status: 'suspended', reason: 'stripe_blocked', effectiveTier: 'free', planName: 'Autohand Code Pro', since: '2026-09-08T00:00:00Z', message: 'Stripe blocked your payment. Your paid plan is suspended and your account is now on Free.', actionUrl: 'https://console.autohand.ai/billing?account=personal_tuistory' },
+        } : {
           tier: 'pro',
           freeRemaining: null,
           limits: {
@@ -1187,6 +1191,8 @@ export function expectCleanExit(session: Session): void {
   }
 }
 
+const SESSION_TEARDOWN_MARKER = 'Ending Autohand session';
+
 export async function exitInteractive(session: Session): Promise<void> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await session.press(['ctrl', 'c']);
@@ -1197,6 +1203,9 @@ export async function exitInteractive(session: Session): Promise<void> {
     } catch {
       // The first Ctrl+C may clear composer text or show the exit warning.
     }
+    // Once teardown has started Ink has released raw mode, so another Ctrl+C
+    // would reach the process as a real SIGINT and turn a clean exit into 130.
+    if ((await session.text({ immediate: true })).includes(SESSION_TEARDOWN_MARKER)) break;
   }
 
   await waitForExit(session);
