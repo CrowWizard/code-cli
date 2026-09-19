@@ -27,6 +27,12 @@ vi.mock('../../src/commands/login.js', () => ({
   login: vi.fn(),
 }));
 
+const mockSpawn = vi.fn();
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:child_process')>()),
+  spawn: (...args: unknown[]) => mockSpawn(...args),
+}));
+
 vi.mock('../../src/utils/versionCheck.js', () => ({
   checkForUpdates: vi.fn().mockResolvedValue({
     currentVersion: '0.0.0',
@@ -246,6 +252,26 @@ describe('ensureAuthenticated', () => {
     expect(exitSpy).not.toHaveBeenCalled();
   });
 
+  it('reloads the signed-in config for the same workspace so project hooks and settings survive login', async () => {
+    const mockConfig: LoadedConfig = {
+      configPath: '/tmp/config.json',
+      overlayWorkspaceRoot: '/work/repo',
+    };
+    mockLogin.mockResolvedValue(null);
+    mockLoadConfig.mockResolvedValue({
+      ...mockConfig,
+      auth: {
+        token: 'new-token',
+        user: { id: 'u1', email: 'test@example.com', name: 'Test' },
+        expiresAt: new Date(Date.now() + 86400000).toISOString(),
+      },
+    });
+
+    await ensureAuthenticated(mockConfig);
+
+    expect(mockLoadConfig).toHaveBeenCalledWith('/tmp/config.json', '/work/repo');
+  });
+
   it('passes terminal-width-aware logo art to the login modal', async () => {
     const mockConfig: LoadedConfig = {
       configPath: '/tmp/config.json',
@@ -287,6 +313,29 @@ describe('ensureAuthenticated', () => {
         { label: 'Exit', value: 'exit' },
       ],
     }));
+  });
+
+  it('runs the installer for an upgrade without letting it start a nested Autohand', async () => {
+    const { EventEmitter } = await import('node:events');
+    mockCheckForUpdates.mockResolvedValue({
+      currentVersion: '0.8.2',
+      latestVersion: '0.9.0',
+      isUpToDate: false,
+      updateAvailable: true,
+      channel: 'stable',
+    });
+    mockShowModal.mockResolvedValue({ value: 'upgrade' });
+    mockSpawn.mockImplementation(() => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', 0));
+      return child;
+    });
+
+    await expect(ensureAuthenticated({ configPath: '/tmp/config.json' })).rejects.toThrow('PROCESS_EXIT');
+
+    expect(mockSpawn).toHaveBeenCalledOnce();
+    const [, , options] = mockSpawn.mock.calls[0] as [string, string[], { env?: Record<string, string> }];
+    expect(options.env?.AUTOHAND_INSTALL_FIRST_RUN).toBe('no');
   });
 
   it('trusts local token on network error during validation', async () => {

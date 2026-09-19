@@ -47,9 +47,6 @@ export const ACP_HOOK_NOTIFICATIONS = {
   SETUP_COMPLETE: "autohand.setup.complete",
 } as const;
 
-export type AcpHookNotification =
-  (typeof ACP_HOOK_NOTIFICATIONS)[keyof typeof ACP_HOOK_NOTIFICATIONS];
-
 // ============================================================================
 // Tool Kind Mapping
 // ============================================================================
@@ -67,7 +64,7 @@ export const TOOL_KIND_MAP: Record<string, ToolKind> = {
   file_info: "read",
 
   // Search operations
-  fff_grep: "search",
+  find_grep: "search",
   fff_find: "search",
   find: "search",
   web_search: "fetch",
@@ -152,7 +149,7 @@ export const TOOL_DISPLAY_NAMES: Record<string, string> = {
   file_info: "Info",
 
   // Search operations
-  fff_grep: "Search",
+  find_grep: "Search",
   fff_find: "Find files",
   find: "Search",
   search: "Search",

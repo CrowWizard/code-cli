@@ -132,6 +132,77 @@ describe("BedrockProvider", () => {
     expect(toolResult.content[0]?.text.trim()).not.toBe("");
   });
 
+  it("treats a paused Converse turn as incomplete", async () => {
+    mockRuntimeSend.mockResolvedValueOnce({
+      output: { message: { role: "assistant", content: [{ text: "Partial server-tool result" }] } },
+      stopReason: "pause_turn",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    });
+
+    const { BedrockProvider } = await import("../../src/providers/BedrockProvider.js");
+    const provider = new BedrockProvider({
+      model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+      region: "us-east-1",
+      authMode: "aws-credentials",
+    });
+
+    const response = await provider.complete({ messages: [{ role: "user", content: "continue" }] });
+
+    expect(response.finishReason).toBe("length");
+  });
+
+  it("carries Converse cache figures, which AWS reports alongside inputTokens", async () => {
+    mockRuntimeSend.mockResolvedValueOnce({
+      output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 100,
+        outputTokens: 20,
+        totalTokens: 8_312,
+        cacheReadInputTokens: 8_000,
+        cacheWriteInputTokens: 192,
+      },
+    });
+
+    const { BedrockProvider } = await import("../../src/providers/BedrockProvider.js");
+    const provider = new BedrockProvider({
+      model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+      region: "us-east-1",
+      authMode: "aws-credentials",
+    });
+
+    const response = await provider.complete({ messages: [{ role: "user", content: "go" }] });
+
+    expect(response.usage?.cacheReadTokens).toBe(8_000);
+    expect(response.usage?.cacheWriteTokens).toBe(192);
+    // Converse reports inputTokens without the cached share. Folding it in
+    // keeps promptTokens meaning the same thing it means for every other
+    // provider here, and keeps the cache breakdown inside the total it is
+    // checked against.
+    expect(response.usage?.promptTokens).toBe(8_292);
+  });
+
+  it("leaves Converse cache figures absent when AWS reports none", async () => {
+    mockRuntimeSend.mockResolvedValueOnce({
+      output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+      stopReason: "end_turn",
+      usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+    });
+
+    const { BedrockProvider } = await import("../../src/providers/BedrockProvider.js");
+    const provider = new BedrockProvider({
+      model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+      region: "us-east-1",
+      authMode: "aws-credentials",
+    });
+
+    const response = await provider.complete({ messages: [{ role: "user", content: "go" }] });
+
+    expect(response.usage?.promptTokens).toBe(100);
+    expect(response.usage?.cacheReadTokens).toBeUndefined();
+    expect(response.usage?.cacheWriteTokens).toBeUndefined();
+  });
+
   it("reports omitted screenshot input in the text-only Converse adapter", async () => {
     mockRuntimeSend.mockResolvedValueOnce({
       output: { message: { role: "assistant", content: [{ text: "Image unavailable." }] } },
@@ -458,6 +529,67 @@ describe("BedrockProvider", () => {
       completionTokens: 6,
       totalTokens: 10,
     });
+  });
+
+  it("preserves incomplete Bedrock Responses output as a truncated turn", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: "bedrock-incomplete-response",
+          created_at: 123,
+          output_text: "partial",
+          output: [],
+          incomplete_details: { reason: "max_output_tokens" },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+
+    const { BedrockProvider } = await import("../../src/providers/BedrockProvider.js");
+    const provider = new BedrockProvider({
+      model: "openai.gpt-oss-120b-1:0",
+      region: "us-east-1",
+      apiMode: "openai-responses",
+      authMode: "bedrock-api-key",
+      apiKey: "bedrock-api-key",
+    });
+
+    const response = await provider.complete({ messages: [{ role: "user", content: "write" }] });
+
+    expect(response).toMatchObject({ content: "partial", finishReason: "length" });
+  });
+
+  it.each([
+    ["max_output_tokens", "length"],
+    ["content_filter", "content_filter"],
+    [undefined, "stop"],
+  ] as const)("normalizes a Responses incomplete_details reason of %s to %s", async (reason, expected) => {
+    globalThis.fetch = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: "bedrock-finish-response",
+          created_at: 123,
+          output_text: "answer",
+          output: [],
+          ...(reason ? { incomplete_details: { reason } } : {}),
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    ) as typeof globalThis.fetch;
+
+    const { BedrockProvider } = await import("../../src/providers/BedrockProvider.js");
+    const provider = new BedrockProvider({
+      model: "openai.gpt-oss-120b-1:0",
+      region: "us-east-1",
+      apiMode: "openai-responses",
+      authMode: "bedrock-api-key",
+      apiKey: "bedrock-api-key",
+    });
+
+    const response = await provider.complete({ messages: [{ role: "user", content: "write" }] });
+
+    expect(response.finishReason).toBe(expected);
   });
 
   it("turns Bedrock access and throttling failures into friendly errors", async () => {

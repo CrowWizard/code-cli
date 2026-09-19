@@ -8,6 +8,26 @@ import { describe, expect, it } from 'vitest';
 import { InkRenderer } from '../../../src/ui/ink/InkRenderer.js';
 
 describe('InkRenderer live command blocks', () => {
+  it('keeps partial responses transient and clears them on completion and cancellation', () => {
+    const renderer = new InkRenderer({ onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {} });
+    renderer.setWorking(true);
+    renderer.setStreamingResponse('First token');
+    expect(renderer.getState()).toMatchObject({ isWorking: true, streamingResponse: 'First token', finalResponse: null, chatMessages: [] });
+    renderer.setFinalResponse('Completed answer');
+    expect(renderer.getState().streamingResponse).toBeNull();
+    renderer.setStreamingResponse('Another incomplete answer');
+    renderer.setWorking(false);
+    expect(renderer.getState().streamingResponse).toBeNull();
+  });
+
+  it('retires an applied reply draft when the composer is cleared', () => {
+    const renderer = new InkRenderer({ onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {} });
+    renderer.setPeerDraft({ reference: { alias: 'builder', start: 0, end: 8, peerId: 'builder', instanceId: 'original' }, replyTo: 'message-1' });
+    renderer.clearInput();
+    expect(renderer.getState().peerDraft).toBeUndefined();
+    expect(renderer.getState().currentInput).toBe('');
+  });
+
   it('advances the static chat identity when session history is replaced', () => {
     const renderer = new InkRenderer({
       onInstruction: () => {},
@@ -192,9 +212,103 @@ describe('InkRenderer live command blocks', () => {
         success: true,
         content: '$ pwd\n/tmp/project',
       },
+      { role: 'thinking', content: 'Need to inspect the current directory.' },
       { role: 'assistant', content: 'You are in /tmp/project.' },
       { role: 'completion', content: 'Completed in 1s · 10 tokens' },
       { role: 'user', content: 'thanks' },
+    ]);
+  });
+
+  it('keeps a final-turn thought visible while idle and archives it ahead of the reply', () => {
+    const renderer = new InkRenderer({
+      onInstruction: () => {},
+      onEscape: () => {},
+      onCtrlC: () => {},
+    });
+
+    renderer.addUserMessage('tell me a joke');
+    renderer.setThinking('Weigh two jokes.');
+    renderer.setWorking(false);
+    renderer.setFinalResponse('Light attracts bugs.');
+    // The thought moves into the transcript ahead of its reply as soon as the
+    // turn completes, so it stays visible without living in the dynamic frame.
+    expect(renderer.getState().thinking).toBeNull();
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'user', content: 'tell me a joke' },
+      { role: 'thinking', content: 'Weigh two jokes.' },
+      { role: 'assistant', content: 'Light attracts bugs.' },
+    ]);
+
+    renderer.addUserMessage('another');
+    expect(renderer.getState().thinking).toBeNull();
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'user', content: 'tell me a joke' },
+      { role: 'thinking', content: 'Weigh two jokes.' },
+      { role: 'assistant', content: 'Light attracts bugs.' },
+      { role: 'user', content: 'another' },
+    ]);
+  });
+
+  it('archives the final response into the transcript as soon as the turn completes', () => {
+    // A long reply left in the dynamic frame makes Ink clear the screen and
+    // scrollback on every repaint once it is taller than the viewport.
+    const renderer = new InkRenderer({
+      onInstruction: () => {},
+      onEscape: () => {},
+      onCtrlC: () => {},
+    });
+    const wall = Array.from({ length: 80 }, (_, index) => `wall line ${index + 1}`).join('\n');
+
+    renderer.addUserMessage('print a wall of text');
+    renderer.setWorking(true, 'Working...');
+    renderer.setWorking(false);
+    renderer.setFinalResponse(wall);
+
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'user', content: 'print a wall of text' },
+      { role: 'assistant', content: wall },
+    ]);
+    expect(renderer.getState().finalResponse).toBe(wall);
+  });
+
+  it('archives a final response that arrives before the turn is marked idle', () => {
+    const renderer = new InkRenderer({
+      onInstruction: () => {},
+      onEscape: () => {},
+      onCtrlC: () => {},
+    });
+
+    renderer.addUserMessage('hi');
+    renderer.setWorking(true, 'Working...');
+    renderer.setFinalResponse('hello');
+    expect(renderer.getState().chatMessages).toEqual([{ role: 'user', content: 'hi' }]);
+
+    renderer.setWorking(false);
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+    ]);
+
+    renderer.setWorking(true, 'Working...');
+    renderer.setWorking(false);
+    expect(renderer.getState().chatMessages.filter((message) => message.role === 'assistant')).toHaveLength(1);
+  });
+
+  it('archives a reply without a thinking entry when no thought was shown', () => {
+    const renderer = new InkRenderer({
+      onInstruction: () => {},
+      onEscape: () => {},
+      onCtrlC: () => {},
+    });
+
+    renderer.addUserMessage('hi');
+    renderer.setWorking(false);
+    renderer.setFinalResponse('hello');
+    renderer.setWorking(true, 'Working...');
+
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
     ]);
   });
 
@@ -215,6 +329,31 @@ describe('InkRenderer live command blocks', () => {
     expect(renderer.getState().chatMessages).toContainEqual({
       role: 'completion',
       content: 'Failed in 6m 43s · 543.4k tokens',
+    });
+  });
+
+  it('does not relabel a failed turn as completed when a slash command runs afterwards', () => {
+    const renderer = new InkRenderer({
+      onInstruction: () => {},
+      onEscape: () => {},
+      onCtrlC: () => {},
+    });
+
+    renderer.addUserMessage('/deep-search premature completion audit');
+    renderer.setWorking(true, 'Researching...');
+    renderer.setElapsed('0m 00s');
+    renderer.setTokens('54 tokens');
+    renderer.setWorking(false, '', { succeeded: false });
+    expect(renderer.getState().completionStats).toMatchObject({ status: 'failed' });
+
+    // A slash command echoes the input, runs without a model turn, then returns to idle.
+    renderer.addUserMessage('/deep-search status');
+    renderer.setWorking(false);
+
+    expect(renderer.getState().completionStats).toBeNull();
+    expect(renderer.getState().chatMessages).toContainEqual({
+      role: 'completion',
+      content: 'Failed in 0m 00s · 54 tokens',
     });
   });
 

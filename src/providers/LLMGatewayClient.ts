@@ -11,11 +11,14 @@ import type {
   NetworkSettings,
   FunctionDefinition,
   MultimodalMessage,
-  NvidiaChatTemplateKwargs,
 } from "../types.js";
+import { joinReasoning, splitInlineThinking } from "./inlineThinking.js";
 import { ApiError, classifyApiError } from "./errors.js";
 import { normalizeOutboundMessages, toTextOnlyContent } from "./messagePayload.js";
 import { normalizeLLMUsage } from "./usage.js";
+import { readOpenAIEventStream } from "./openAIEventStream.js";
+import { buildChatTemplateKwargs, coerceErrorDetail } from "./openAICompatibleShared.js";
+import { normalizeProviderFinishReason } from "./finishReason.js";
 
 /**
  * Sanitize messages for API consumption.
@@ -55,20 +58,10 @@ const MAX_ALLOWED_RETRIES = 5;
 const DEFAULT_RETRY_DELAY = 1000;
 const DEFAULT_TIMEOUT = 30000;
 /**
- * The timeout guards time to response headers, not the whole exchange — it is cleared as
- * soon as `fetch` resolves. A streaming response sends headers the moment the upstream
- * starts, so `network.timeout` is a fair budget for it. A non-streaming one sends nothing
- * until the entire completion has been generated, so the budget has to cover generation.
- *
- * At 30s it did not. On 2026-08-26 that aborted Autohand AI sessions mid-answer and then
- * retried them three times over — ~2 min burned per turn, `Request timed out`, no output.
- * Measured against api.autohand.ai on 2026-08-27, 4000 completion tokens took 35.6s on
- * `moa` (~112 tok/s) and 100.3s on `fantail` (~40 tok/s), and the agent loop asks for
- * `maxTokens: 16000` — so 30s was never a plausible budget for the answers it requests.
- *
- * 5 min matches the ceiling the inference Worker sets on itself (`limits.cpu_ms`). It
- * still does not cover 16000 tokens at fantail's rate: the fix for that is to stream the
- * agent loop's completions, after which this budget only has to cover time to headers.
+ * Buffered completions may withhold headers until generation finishes. Give them
+ * a larger header budget; streamed completions use a separate idle timeout after
+ * headers arrive, so ongoing generation can outlast this budget. Worker CPU limits
+ * do not bound time spent waiting for inference.
  */
 const COMPLETION_TIMEOUT = 300_000;
 
@@ -97,16 +90,6 @@ function buildFriendlyErrors(labels: LLMGatewayCompatibleErrorLabels): Record<st
     server_error: `The ${labels.serviceName} service is temporarily unavailable. Please try again later.`,
     timeout: `The request timed out. The ${labels.serviceName} service may be experiencing high load.`,
   };
-}
-
-function coerceErrorDetail(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value && typeof value === "object") {
-    return JSON.stringify(value);
-  }
-  return "";
 }
 
 function isTransientUpstreamProviderFailure(detail: string): boolean {
@@ -335,7 +318,7 @@ export class LLMGatewayClient {
     // Add chat_template_kwargs for NVIDIA reasoning models
     if (request.chatTemplateKwargs) {
       payload.extra_body = {
-        chat_template_kwargs: this.buildChatTemplateKwargs(request.chatTemplateKwargs),
+        chat_template_kwargs: buildChatTemplateKwargs(request.chatTemplateKwargs),
       };
     }
 
@@ -370,7 +353,8 @@ export class LLMGatewayClient {
           headers,
           request.signal,
           payloadJson,
-          request.stream ?? false
+          request.stream ?? false,
+          request.onDelta,
         );
         return response;
       } catch (error) {
@@ -417,6 +401,7 @@ export class LLMGatewayClient {
       temperature: request.temperature ?? 0.2,
       max_tokens: request.maxTokens ?? 16000,
       stream: request.stream ?? false,
+      ...(request.stream ? { stream_options: { include_usage: true } } : {}),
     };
     if (this.reasoningEffort) {
       payload.reasoning_effort = this.reasoningEffort;
@@ -424,21 +409,13 @@ export class LLMGatewayClient {
     return payload;
   }
 
-  private buildChatTemplateKwargs(kwargs: NvidiaChatTemplateKwargs): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-    if (kwargs.thinking !== undefined) result.thinking = kwargs.thinking;
-    if (kwargs.enable_thinking !== undefined) result.enable_thinking = kwargs.enable_thinking;
-    if (kwargs.reasoning_effort !== undefined) result.reasoning_effort = kwargs.reasoning_effort;
-    if (kwargs.clear_thinking !== undefined) result.clear_thinking = kwargs.clear_thinking;
-    return result;
-  }
-
   private async makeRequest(
     payload: object,
     headers: Record<string, string>,
     signal?: AbortSignal,
     preSerializedBody?: string,
-    isStreaming: boolean = false
+    isStreaming: boolean = false,
+    onDelta?: LLMRequest['onDelta'],
   ): Promise<LLMResponse> {
     let response: Response;
 
@@ -468,19 +445,15 @@ export class LLMGatewayClient {
     } catch (error) {
       const err = error as Error;
 
-      // Timeout. Retrying is only worth it for a streaming request, where nothing arrived
-      // within a budget that only ever had to cover time to headers. A non-streaming one
-      // timed out because generating the answer took longer than the budget allows, and
-      // re-sending identical work just spends that budget again — three retries is how a
-      // 30s abort became ~2 min of dead time per turn on 2026-08-26.
+      // No response was accepted. Buffered requests can also hit transient stalls;
+      // let the configured retry policy recover them. Body/partial-stream failures
+      // are handled separately and must not replay an accepted response.
       if (err.name === "AbortError") {
         throw new ApiError(
-          isStreaming
-            ? `Request timed out. The ${this.errorLabels.serviceName} service may be experiencing high load.`
-            : `The ${this.errorLabels.serviceName} response did not arrive within ${Math.round(Math.max(this.timeout, COMPLETION_TIMEOUT) / 1000)}s. Try a smaller request, or a model that answers faster.`,
+          `Request timed out waiting for ${this.errorLabels.serviceName} to start a response (${Math.round((isStreaming ? this.timeout : Math.max(this.timeout, COMPLETION_TIMEOUT)) / 1000)}s).`,
           "timeout",
           0,
-          isStreaming,
+          true,
         );
       }
 
@@ -497,14 +470,16 @@ export class LLMGatewayClient {
       throw await this.buildFriendlyError(response);
     }
 
-    // Handle streaming responses
-    if (isStreaming) {
-      return this.handleStreamingResponse(response);
+    // Inspection gateways can explicitly return buffered JSON even for stream:true.
+    // Preserve that response without inventing incremental deltas or retrying billed work.
+    if (isStreaming && !response.headers?.get('content-type')?.includes('application/json')) {
+      return readOpenAIEventStream(response, onDelta, signal, this.timeout);
     }
 
     const json = (await response.json()) as any;
     const message = json?.choices?.[0]?.message;
-    const text = message?.content ?? "";
+    const inline = splitInlineThinking(message?.content ?? "");
+    const reasoning = joinReasoning(message?.reasoning ?? message?.reasoning_content, inline.reasoning);
     const finishReason = json?.choices?.[0]?.finish_reason;
 
     // Parse tool calls if present
@@ -528,83 +503,12 @@ export class LLMGatewayClient {
     return {
       id: json.id ?? "llmgateway-response",
       created: json.created ?? Date.now(),
-      content: text,
+      content: inline.content,
       toolCalls,
-      finishReason: finishReason as LLMResponse["finishReason"],
+      finishReason: normalizeProviderFinishReason(finishReason),
       usage,
+      reasoning,
       raw: json,
-    };
-  }
-
-  private async handleStreamingResponse(response: Response): Promise<LLMResponse> {
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error("No response body for streaming");
-    }
-
-    const decoder = new TextDecoder();
-    let fullContent = "";
-    let fullReasoning = "";
-    let lastChunk: any = null;
-    let finishReason: string = "stop";
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n").filter(line => line.trim());
-
-        for (const line of lines) {
-          // Handle SSE format: "data: {...}"
-          if (line.startsWith("data: ")) {
-            const dataStr = line.slice(6).trim();
-            if (dataStr === "[DONE]") continue;
-
-            try {
-              const data = JSON.parse(dataStr);
-              lastChunk = data;
-
-              const delta = data.choices?.[0]?.delta;
-              if (!delta) continue;
-
-              // Extract reasoning content (DeepSeek uses 'reasoning', Z.ai uses 'reasoning_content')
-              const reasoning = delta.reasoning || delta.reasoning_content;
-              if (reasoning) {
-                fullReasoning += reasoning;
-              }
-
-              // Extract regular content
-              if (delta.content) {
-                fullContent += delta.content;
-              }
-
-              // Track finish reason
-              if (data.choices?.[0]?.finish_reason) {
-                finishReason = data.choices[0].finish_reason;
-              }
-            } catch {
-              // Skip invalid JSON lines
-            }
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-
-    // Combine reasoning and content if reasoning exists
-    const finalContent = fullReasoning
-      ? `<thinking>${fullReasoning}</thinking>\n\n${fullContent}`
-      : fullContent;
-
-    return {
-      id: lastChunk?.id ?? `llmgateway-stream-${Date.now()}`,
-      created: lastChunk?.created ?? Math.floor(Date.now() / 1000),
-      content: finalContent,
-      finishReason: finishReason as LLMResponse["finishReason"],
-      raw: { content: fullContent, reasoning: fullReasoning, chunks: lastChunk },
     };
   }
 

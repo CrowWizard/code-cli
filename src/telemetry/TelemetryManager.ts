@@ -14,6 +14,9 @@ import type {
   ProviderModelMetadata,
   SessionSyncData,
   SkillUseData,
+  ContextCompactionData,
+  GoalEventData,
+  OutcomeData,
   SessionFailureBugData
 } from './types.js';
 import packageJson from '../../package.json' with { type: 'json' };
@@ -159,7 +162,9 @@ export class TelemetryManager {
       tool: data.tool,
       success: data.success,
       duration: data.duration,
-      error: data.error
+      error: data.error,
+      resultTokens: data.resultTokens,
+      resultTruncated: data.resultTruncated
     });
   }
 
@@ -239,6 +244,31 @@ export class TelemetryManager {
   }
 
   /**
+   * Track a goal's lifecycle.
+   *
+   * Emitted per transition, not per turn: the console folds these per goal,
+   * so a goal paused and resumed twice must still report as one goal.
+   */
+  async trackGoalEvent(data: GoalEventData): Promise<void> {
+    await this.trackEvent('goal_event', {
+      goalId: data.goalId,
+      action: data.action,
+      status: data.status,
+      source: data.source,
+    });
+  }
+
+  /** Track how a unit of work ended. */
+  async trackOutcome(data: OutcomeData): Promise<void> {
+    await this.trackEvent('outcome', {
+      outcome: data.outcome,
+      surface: data.surface,
+      action: data.action,
+      message: data.message,
+    });
+  }
+
+  /**
    * Track skill activation/usage
    */
   async trackSkillUse(data: SkillUseData): Promise<void> {
@@ -246,7 +276,31 @@ export class TelemetryManager {
       skillName: data.skillName,
       source: data.source,
       activationType: data.activationType,
+      spanId: data.spanId,
+      tokenSize: data.tokenSize,
+      sizeBytes: data.sizeBytes,
+      version: data.version,
+      createdAt: data.createdAt,
+      modifiedAt: data.modifiedAt,
+      releaseReason: data.releaseReason,
       action: data.action,
+    });
+  }
+
+  /**
+   * Track a context compaction.
+   *
+   * The survivor list is sent even when empty: downstream has to tell "no
+   * skill was being carried" from "this client cannot say", and those price a
+   * session very differently.
+   */
+  async trackContextCompaction(data: ContextCompactionData): Promise<void> {
+    await this.trackEvent('context_compaction', {
+      tokensBefore: data.tokensBefore,
+      tokensAfter: data.tokensAfter,
+      survivingSpanIds: data.survivingSpanIds,
+      reason: data.reason,
+      croppedCount: data.croppedCount,
     });
   }
 

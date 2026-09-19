@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import type { PermissionManager } from '../../permissions/PermissionManager.js';
 import { getProviderConfig } from '../../config.js';
 import { isSearchConfigured } from '../../actions/web.js';
 import { formatToolOutputForDisplay } from '../../ui/toolOutput.js';
@@ -30,11 +31,15 @@ import type { AutoReportManager } from '../../reporting/AutoReportManager.js';
 import type { ProjectManager } from '../../session/ProjectManager.js';
 import type { SessionManager } from '../../session/SessionManager.js';
 import type { ConversationManager } from '../conversationManager.js';
+import type { SteeringQueue } from './SteeringQueue.js';
 import type { ContextOrchestrator } from '../context/orchestrator.js';
 import type { ToolManager } from '../toolManager.js';
 import type { ToolsRegistry } from '../toolsRegistry.js';
 import { calculateContextUsage } from '../context/tokenizer.js';
 import { filterToolsByRelevance } from '../toolFilter.js';
+import type { PeerCommunicationRuntime } from './PeerCommunicationRuntime.js';
+import type { AgentPeerRuntime } from './AgentPeerRuntime.js';
+import { pushBounded } from '../../utils/bounded.js';
 import { EXIT_PLAN_MODE_TOOL_DEFINITION, PLAN_TOOL_DEFINITION } from '../toolManager.js';
 import {
   buildHostTokenUsageStatus,
@@ -53,18 +58,23 @@ import {
 } from './ToolLoopPolicy.js';
 import { isAutohandDebugEnabled } from '../../utils/debugLog.js';
 import { syncDynamicRuntimeExtensions } from './dynamicRuntimeExtensions.js';
-import {
-  classifyResponseCompletion,
-  isDeferredFinalResponse,
-} from './ResponseCompletionClassifier.js';
+import { isDeferredFinalResponse } from './ResponseCompletionClassifier.js';
 import type { ResponseCompletionHook } from './ResponseCompletionClassifier.js';
 import { evaluateAssistantTurn } from './TurnOutcomeEvaluator.js';
+import { TruncationRecoveryTracker } from './TruncationRecovery.js';
 import {
   WorkspaceChangeCapture,
+  WorkspaceChangeCaptureBudgetError,
+  WORKSPACE_CHANGE_CAPTURE_BUDGET_MS,
   type WorkspaceChangeSet,
 } from './WorkspaceChangeCapture.js';
 import { stripAnsiCodes } from '../../ui/displayUtils.js';
 import { getSessionPromptCacheDirective as deriveSessionPromptCacheDirective } from './PromptCache.js';
+import { StreamingResponsePreview } from './StreamingResponsePreview.js';
+import type { RunBudgetGate } from './RunBudget.js';
+
+const COMPLETION_REMINDER_TOOL_BATCH_THRESHOLD = 3;
+const MAX_TOOL_FREE_RECOVERIES = 2;
 
 /**
  * Turns provider retry events into a visible countdown. The periodic status renderer rewrites
@@ -162,9 +172,12 @@ export interface ReactLoopInkRenderer {
   setContextTokens?(contextTokens: { used: number; total: number } | undefined): void;
   setWorking(isWorking: boolean): void;
   setFinalResponse(response: string): void;
+  setStreamingResponse?(response: string | null): void;
 }
 
 export interface AgentReactLoopHost {
+  peerCommunicationRuntime?: PeerCommunicationRuntime;
+  peerRuntime?: AgentPeerRuntime;
   activeProvider?: ProviderName;
   autoReportManager: Pick<AutoReportManager, 'reportError'>;
   consecutiveCancellations: number;
@@ -174,6 +187,14 @@ export interface AgentReactLoopHost {
   > & Partial<Pick<ContextOrchestrator, 'setContextWindow'>>;
   contextPercentLeft: number;
   conversation: Pick<ConversationManager, 'addMessage' | 'addSystemNote' | 'history'>;
+  /** Messages the user steered into this turn; drained before each model request. */
+  steering?: Pick<SteeringQueue, 'drain'>;
+  /** Narrows advertised tool schemas to what the effective permissions can authorize. */
+  permissionManager?: Pick<PermissionManager, 'filterAdvertisedTools' | 'setExtensionPolicies'>;
+  /** Set once the per-turn git snapshot exceeded its budget on this repository. */
+  workspaceChangeCaptureDisabled?: boolean;
+  /** Run budget shared with in-process sub-agents; checked before every model request. */
+  runBudget?: RunBudgetGate;
   inkRenderer: ReactLoopInkRenderer | null;
   lastAssistantResponseForNotification: string;
   llm: LLMProvider;
@@ -212,6 +233,7 @@ export interface AgentReactLoopHost {
   attachToolImages?(message: LLMMessage, imagePaths: readonly string[], signal: AbortSignal): Promise<{ attached: number; error?: string }>;
   getReactionParser(): { parseAssistantResponse(completion: LLMResponse): AssistantReactPayload };
   handleSmartContextCrop(call: ToolCallRequest): Promise<string>;
+  hasIncompleteTodoActivity?(): boolean;
   isContextOverflowError(errorOrMessage: Error | string): boolean;
   isPromptCachingEnabled?(): boolean;
   saveAssistantMessage(content: string, toolCalls?: ToolCallRequest[]): Promise<void>;
@@ -238,6 +260,7 @@ export interface ReactLoopControl {
 
 export type ReactLoopResult =
   | { status: 'completed' }
+  | { status: 'incomplete'; reason: 'iteration_limit' | 'pending_todos' }
   | { status: 'stopped'; stepNumber: number }
   | { status: 'aborted' };
 
@@ -247,23 +270,29 @@ function getSessionPromptCacheDirective(host: AgentReactLoopHost) {
   return deriveSessionPromptCacheDirective(sessionId);
 }
 
-function addUsageToTurn(existing: TurnUsage, provider: ProviderName | undefined, usage: LLMUsage): TurnUsage {
-  if (existing.kind === 'actual') {
-    return {
-      kind: 'actual',
-      provider,
-      promptTokens: existing.promptTokens + usage.promptTokens,
-      completionTokens: existing.completionTokens + usage.completionTokens,
-      totalTokens: existing.totalTokens + usage.totalTokens,
-    };
-  }
+/**
+ * Sums an optional per-request figure across a turn. A provider that says
+ * nothing contributes nothing rather than a zero, because a zero here is a
+ * measurement — "this request hit cache for nothing" — and would make every
+ * silent provider look like a permanent cache miss.
+ */
+function addOptionalTokens(existing: number | undefined, incoming: number | undefined): number | undefined {
+  return incoming === undefined ? existing : (existing ?? 0) + incoming;
+}
+
+export function addUsageToTurn(existing: TurnUsage, provider: ProviderName | undefined, usage: LLMUsage): TurnUsage {
+  const previous = existing.kind === 'actual' ? existing : undefined;
+  const cacheReadTokens = addOptionalTokens(previous?.cacheReadTokens, usage.cacheReadTokens);
+  const cacheWriteTokens = addOptionalTokens(previous?.cacheWriteTokens, usage.cacheWriteTokens);
 
   return {
     kind: 'actual',
     provider,
-    promptTokens: usage.promptTokens,
-    completionTokens: usage.completionTokens,
-    totalTokens: usage.totalTokens,
+    promptTokens: (previous?.promptTokens ?? 0) + usage.promptTokens,
+    completionTokens: (previous?.completionTokens ?? 0) + usage.completionTokens,
+    totalTokens: (previous?.totalTokens ?? 0) + usage.totalTokens,
+    ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
   };
 }
 
@@ -385,6 +414,8 @@ export interface ToolCallLogLine {
 }
 
 const MAX_GROUPED_LOG_DETAILS = 2;
+/** Only the most recent searches are ever summarised back to the model; older ones are dropped. */
+export const MAX_TRACKED_SEARCH_QUERIES = 20;
 
 /**
  * Collapse runs of parallel calls to the same tool into a single log line so
@@ -447,7 +478,7 @@ function getToolCallFilePath(call: ToolCallRequest | undefined): string | null {
   return null;
 }
 
-export { isDeferredFinalResponse, classifyResponseCompletion };
+export { isDeferredFinalResponse };
 
 export async function runAgentReactLoop(
   host: AgentReactLoopHost,
@@ -495,6 +526,12 @@ export async function runAgentReactLoop(
         definitions = definitions.filter((tool) => tool.name !== 'web_search');
       }
 
+      // Tools the permission settings exclude outright are not advertised at
+      // all; this also covers MCP and delegated tools registered at runtime.
+      if (host.permissionManager) {
+        definitions = host.permissionManager.filterAdvertisedTools(definitions);
+      }
+
       return definitions;
     };
 
@@ -511,11 +548,14 @@ export async function runAgentReactLoop(
     host.startStatusUpdates();
 
     // Check if thinking should be shown
-    const showThinking = host.runtime.config.ui?.showThinking !== false;
+    const showThinking = host.runtime.config.ui?.showThinking === true;
     const displayToolOutput = shouldDisplayToolOutput(host.runtime.config);
-    const workspaceChangeCapture = host.inkRenderer && displayToolOutput
+    // Once capture blows its budget on this repository, later turns skip it
+    // instead of paying the same wait again before every tool call.
+    const workspaceChangeCapture = host.inkRenderer && displayToolOutput && !host.workspaceChangeCaptureDisabled
       ? await WorkspaceChangeCapture.create(host.runtime.workspaceRoot).catch((error: unknown) => {
-          host.writeDebugLine(`[DEBUG] Workspace change capture unavailable: ${error instanceof Error ? error.message : String(error)}`);
+          if (error instanceof WorkspaceChangeCaptureBudgetError) host.workspaceChangeCaptureDisabled = true;
+          if (debugMode) host.writeDebugLine(`[DEBUG] Workspace change capture unavailable: ${error instanceof Error ? error.message : String(error)}`);
           return null;
         })
       : null;
@@ -528,17 +568,23 @@ export async function runAgentReactLoop(
     let expectedOutboundToolResultIds: string[] = [];
     let invalidDeferredActionCount = 0;
     let consecutiveEmptyResponseCount = 0;
+    const truncationRecovery = new TruncationRecoveryTracker();
+    let consecutiveSuccessfulToolBatches = 0;
+    let completionReminderSent = false;
+    let pendingToolFreeRecovery = false;
+    let toolFreeRecoveryCount = 0;
+    let invalidLoopGuardFinalCount = 0;
+    let pendingTodoReminderSent = false;
 
     const renderFinalResponse = (
       response: string,
-      options: { thought?: string; usedThoughtAsResponse: boolean; streamedResponse?: string },
+      options: { thought?: string; usedThoughtAsResponse?: boolean; streamedResponse?: string } = {},
     ): void => {
       host.stopStatusUpdates();
       consecutiveEmptyResponseCount = 0;
       host.lastAssistantResponseForNotification = response;
 
-      const suppressThinking = options.usedThoughtAsResponse && response.length > 0;
-      if (options.thought && !suppressThinking) {
+      if (options.thought) {
         host.emitOutput({ type: 'thinking', thought: options.thought });
       }
       const remainingResponse = options.streamedResponse && response.startsWith(options.streamedResponse)
@@ -549,7 +595,7 @@ export async function runAgentReactLoop(
       }
 
       if (host.inkRenderer) {
-        if (showThinking && options.thought && !suppressThinking) {
+        if (showThinking && options.thought) {
           host.inkRenderer.setThinking(options.thought);
         }
         host.inkRenderer.setElapsed(formatElapsedTime(host.taskStartedAt ?? host.sessionStartedAt));
@@ -562,15 +608,11 @@ export async function runAgentReactLoop(
       } else {
         host.runtime.spinner?.stop();
         if (!host.runtime.commandOutputCaptured) {
-          if (showThinking && options.thought && !suppressThinking) {
+          if (showThinking && options.thought) {
             console.log(chalk.gray(`Thinking: ${options.thought}`));
             console.log();
           }
-          if (options.usedThoughtAsResponse) {
-            console.log(chalk.gray('Thinking: ') + response);
-          } else {
-            console.log(response);
-          }
+          console.log(response);
         }
       }
     };
@@ -593,14 +635,29 @@ export async function runAgentReactLoop(
       }
     };
 
+    // Steered messages join the conversation only between iterations, once
+    // every tool result of the previous assistant turn is in place; a user
+    // message between a tool call and its result is a shape providers reject.
+    const drainSteering = (): boolean => {
+      const steered = host.steering?.drain() ?? [];
+      for (const content of steered) {
+        host.conversation.addMessage({ role: 'user', content });
+        host.inkRenderer?.setStatus?.('Applying your steering message...');
+      }
+      return steered.length > 0;
+    };
+
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       // Check for abort at the start of each iteration
       if (abortController.signal.aborted) {
         if (debugMode) host.writeDebugLine('[AGENT DEBUG] Abort detected at loop start, breaking');
         break;
       }
+      drainSteering();
 
       // Filter tools by relevance to reduce token overhead
+      await host.peerCommunicationRuntime?.safeBoundary();
+      if (abortController.signal.aborted) break;
       const messages = host.conversation.history();
       let tools = filterToolsByRelevance(allTools, messages, {
         cache: host.runtime.config.agent?.toolSelectionCache !== false,
@@ -622,10 +679,11 @@ export async function runAgentReactLoop(
       // Set whenever the loop deliberately removes tools for a recovery turn:
       // the assistant physically cannot emit a tool call, so announcing a next
       // step is narration rather than a deferred action worth rejecting.
-      let toolsWithheldForRecovery = false;
-      if (loopGuard.isForcingFinalResponse()) {
+      let toolsWithheldForRecovery = pendingToolFreeRecovery;
+      pendingToolFreeRecovery = false;
+      const toolsWithheldByLoopGuard = loopGuard.isForcingFinalResponse();
+      if (toolsWithheldByLoopGuard || toolsWithheldForRecovery) {
         tools = [];
-        toolsWithheldForRecovery = true;
       }
 
       // Use ContextOrchestrator for smart auto-compaction
@@ -662,7 +720,6 @@ export async function runAgentReactLoop(
           expectedOutboundToolResultIds,
         );
         if (!integrity.ok) {
-          loopGuard.forceFinalResponse();
           tools = [];
           toolsWithheldForRecovery = true;
           const integrityNote =
@@ -725,7 +782,16 @@ export async function runAgentReactLoop(
 
         const requestTools = supportsNativeToolCalling && tools.length > 0 ? tools : undefined;
 
+        host.runBudget?.assertRequestAllowed();
+        host.runBudget?.recordRequest();
         const retryWait = createRetryWaitStatus(host);
+        // Streamed cloud completions: the first tokens reach the terminal while
+        // the answer is still being generated, and the client no longer has to
+        // wait for the whole completion inside one timeout budget.
+        const supportsStreaming = host.llm.getCapabilities?.().streaming === true;
+        const preview = supportsStreaming && host.inkRenderer?.setStreamingResponse
+          ? new StreamingResponsePreview((text) => host.inkRenderer?.setStreamingResponse?.(text))
+          : undefined;
         try {
           completion = await host.llm.complete({
             messages: messagesWithImages,
@@ -747,9 +813,11 @@ export async function runAgentReactLoop(
               streamedResponse = nextResponse;
               host.emitOutput({ type: 'message', content: nextDelta });
             },
+            ...(supportsStreaming ? { stream: true, onDelta: preview?.onDelta } : {}),
           });
         } finally {
           retryWait.dispose();
+          preview?.dispose();
         }
         if (abortController.signal.aborted) {
           host.stopStatusUpdates();
@@ -792,6 +860,7 @@ export async function runAgentReactLoop(
       }
 
       // Track token usage from response and immediately update UI
+      host.runBudget?.recordUsage(completion.usage);
       if (completion.usage) {
         host.currentTurnActualUsage = addUsageToTurn(
           host.currentTurnActualUsage,
@@ -826,22 +895,76 @@ export async function runAgentReactLoop(
         completion,
         payload,
         cleanupModelResponse: host.cleanupModelResponse,
-        responseCompletionHooks: toolsWithheldForRecovery ? undefined : host.responseCompletionHooks,
+        responseCompletionHooks: host.responseCompletionHooks,
       });
 
       if (turnOutcome.type === 'repair') {
+        if (turnOutcome.reason === 'truncated_response') {
+          const partialContent = completion.content.trim();
+          if (partialContent) {
+            host.conversation.addMessage({
+              role: 'assistant',
+              content: completion.content,
+            });
+            await host.saveAssistantMessage(completion.content);
+            host.updateContextUsage(host.conversation.history(), tools);
+          }
+
+          const truncationDecision = truncationRecovery.observeTruncation(turnOutcome.instruction);
+          if (truncationDecision.type === 'exhausted') {
+            renderFinalResponse(
+              `The provider ${truncationDecision.summary}. I stopped without marking the task complete so partial output is not mistaken for a finished result. Please retry with a narrower requested output or a model with a larger output limit.`,
+            );
+            throw new LoopAbortedError(`The provider ${truncationDecision.summary}`);
+          }
+          host.conversation.addSystemNote(truncationDecision.note);
+          continue;
+        }
+
+        truncationRecovery.observeCompleteResponse();
         if (turnOutcome.reason === 'invalid_deferred_action') {
+          if (toolsWithheldForRecovery) {
+            invalidDeferredActionCount = 0;
+            if (toolFreeRecoveryCount >= MAX_TOOL_FREE_RECOVERIES) {
+              renderFinalResponse(
+                `The model kept announcing steps instead of executing them through ${MAX_TOOL_FREE_RECOVERIES} tool-free recoveries. `
+                + 'I stopped without marking the task complete so the narrated plan is not mistaken for a finished result.',
+              );
+              throw new LoopAbortedError('Tool-free recovery limit exceeded');
+            }
+            host.conversation.addSystemNote(
+              '[System] RECOVERY: The tool-free recovery response still described unfinished work. '
+              + 'Tool access is restored for the next response. Emit the required tool call, or provide a complete answer now.'
+            );
+            continue;
+          }
+
+          if (toolsWithheldByLoopGuard) {
+            invalidLoopGuardFinalCount += 1;
+            if (invalidLoopGuardFinalCount >= 2) {
+              throw new LoopAbortedError('The model could not provide a complete answer after the repeated-tool loop guard');
+            }
+            host.conversation.addSystemNote(
+              '[System] RECOVERY: Repeated tools remain disabled. Provide a complete answer from the available evidence; '
+              + 'do not describe another future action.'
+            );
+            continue;
+          }
+
           invalidDeferredActionCount += 1;
           if (invalidDeferredActionCount < 2) {
             host.conversation.addSystemNote(turnOutcome.instruction);
             continue;
           }
 
-          loopGuard.forceFinalResponse();
+          invalidDeferredActionCount = 0;
+          pendingToolFreeRecovery = true;
+          toolFreeRecoveryCount += 1;
           host.conversation.addSystemNote(
             '[System] RECOVERY: You twice announced an action without emitting a tool call. ' +
-            'Tools are unavailable for this recovery response. Do not narrate another action, progress update, ' +
-            'or next step; provide the best complete final answer from the evidence already available.',
+            'Tools are unavailable for one recovery response. Do not narrate another action, progress update, ' +
+            'or next step; provide a complete final answer from the evidence already available. ' +
+            'If work is still required, tool access will be restored on the following response.',
           );
           continue;
         }
@@ -852,12 +975,9 @@ export async function runAgentReactLoop(
           if (consecutiveEmptyResponseCount >= 3) {
             if (debugMode) host.writeDebugLine('[AGENT DEBUG] Exiting after 3 consecutive empty responses');
             console.log(chalk.yellow('\n⚠ Model not providing response after multiple attempts. Showing available context.'));
-            const fallback = payload.thought || 'The model did not provide a clear response. Please try rephrasing your question.';
+            const fallback = 'The model did not provide a clear response. Please try rephrasing your question.';
             host.setComposerIdle();
-            renderFinalResponse(fallback, {
-              thought: payload.thought,
-              usedThoughtAsResponse: false,
-            });
+            renderFinalResponse(fallback);
             throw new LoopAbortedError('Model produced empty responses after multiple attempts');
           }
         }
@@ -867,6 +987,7 @@ export async function runAgentReactLoop(
       }
 
       consecutiveEmptyResponseCount = 0;
+      truncationRecovery.observeCompleteResponse();
       invalidDeferredActionCount = 0;
       const assistantToolCalls = resolveAssistantToolCalls(
         completion.toolCalls,
@@ -899,8 +1020,7 @@ export async function runAgentReactLoop(
 
       // Show what the LLM is doing for visibility
       const toolCount = payload.toolCalls?.length ?? 0;
-      // Response could come from finalResponse, response, or thought (when no tool calls)
-      const hasResponse = Boolean(payload.finalResponse || payload.response || (!toolCount && payload.thought));
+      const hasResponse = Boolean(payload.finalResponse || payload.response || (!toolCount && completion.content.trim()));
 
       if (!host.inkRenderer) {
         // Console mode: show iteration status
@@ -914,9 +1034,23 @@ export async function runAgentReactLoop(
         }
       }
 
-      const reflectionDecision = reflectionGuard.evaluate(payload);
+      if (toolsWithheldForRecovery && payload.toolCalls?.length) {
+        await recordRejectedNativeToolCalls(
+          payload.toolCalls,
+          'Tool call not executed: tools were unavailable for the one-response completion recovery.',
+        );
+        expectedOutboundToolResultIds = currentAssistantToolCallIds;
+        host.conversation.addSystemNote(
+          '[System] RECOVERY: A tool call emitted during the tool-free recovery was not executed. '
+          + 'Tool access is restored for the next response; retry the required call once, or provide a complete answer.'
+        );
+        continue;
+      }
+      const reflectionDecision = reflectionGuard.evaluate(payload, {
+        requireExplicitReflection: !supportsNativeToolCalling,
+      });
       if (reflectionDecision.type === 'integrity_failure' && payload.toolCalls?.length) {
-        loopGuard.forceFinalResponse();
+        pendingToolFreeRecovery = true;
         const integrityMessage =
           '[Tool Result Integrity] The assistant reported that prior tool results were unavailable. ' +
           'The proposed follow-up tools were not executed to prevent a blind retry loop. ' +
@@ -1145,7 +1279,7 @@ export async function runAgentReactLoop(
 
           const checkpoint = workspaceChangeCapture
             ? await workspaceChangeCapture.begin().catch((error: unknown) => {
-                host.writeDebugLine(`[DEBUG] Workspace change checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+                if (debugMode) host.writeDebugLine(`[DEBUG] Workspace change checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
                 return null;
               })
             : null;
@@ -1175,11 +1309,11 @@ export async function runAgentReactLoop(
               if (group.items.length >= group.expected) {
                 flushToolGroup(group);
               }
-            }, { signal: abortController.signal });
+            }, { signal: abortController.signal, ...(host.peerRuntime?.automatic ? { peerAutomatic: true } : {}) });
           } finally {
             if (workspaceChangeCapture && checkpoint) {
               workspaceChanges = await workspaceChangeCapture.finish(checkpoint).catch((error: unknown) => {
-                host.writeDebugLine(`[DEBUG] Workspace change comparison failed: ${error instanceof Error ? error.message : String(error)}`);
+                if (debugMode) host.writeDebugLine(`[DEBUG] Workspace change comparison failed: ${error instanceof Error ? error.message : String(error)}`);
                 return null;
               });
             }
@@ -1351,17 +1485,22 @@ export async function runAgentReactLoop(
           }
         }
 
-        // After tool execution, add a hint to encourage the model to respond
-        // This helps models that might get stuck in tool-calling loops
-        if (iteration > 0 && results.length > 0 && results.every(r => r.success)) {
-          // Only add hint if we've been calling tools for a while without a response
-          const recentMessages = host.conversation.history().slice(-6);
-          const toolResultCount = recentMessages.filter((message) => message.role === 'tool').length;
-          if (toolResultCount >= 2) {
-            host.conversation.addSystemNote(
-              '[Reminder] Tool execution complete. Please analyze the results and provide your response to the user\'s original question. Do not call more tools unless absolutely necessary.'
-            );
-          }
+        if (stepResults.length > 0 && stepResults.every((result) => result.success)) {
+          consecutiveSuccessfulToolBatches += 1;
+          toolFreeRecoveryCount = 0;
+        } else {
+          consecutiveSuccessfulToolBatches = 0;
+        }
+
+        if (
+          !completionReminderSent
+          && consecutiveSuccessfulToolBatches >= COMPLETION_REMINDER_TOOL_BATCH_THRESHOLD
+        ) {
+          completionReminderSent = true;
+          host.conversation.addSystemNote(
+            '[Reminder] You have completed several consecutive tool batches. Reassess the original request: '
+            + 'continue with any tools still needed, or provide a complete answer only when every requirement is satisfied.'
+          );
         }
 
         // Search-specific throttling to prevent excessive sequential searches
@@ -1371,7 +1510,7 @@ export async function runAgentReactLoop(
         // Track search queries for this iteration
         for (const call of searchCallsThisIteration) {
           const query = String(call.args?.query || call.args?.pattern || 'unknown');
-          host.searchQueries.push(query);
+          pushBounded(host.searchQueries, query, MAX_TRACKED_SEARCH_QUERIES);
         }
 
         // Add search limit warning if too many searches in one iteration
@@ -1418,9 +1557,29 @@ export async function runAgentReactLoop(
       if (turnOutcome.type !== 'finish') {
         throw new Error(`Unexpected non-final turn outcome after tool handling: ${turnOutcome.type}`);
       }
+      // A steer that arrived while the model was answering deserves a reply
+      // of its own instead of being read only by the next turn.
+      if (drainSteering()) {
+        continue;
+      }
+      if ((await host.peerCommunicationRuntime?.finishTurn())?.continueTurn) continue;
+      if (host.hasIncompleteTodoActivity?.()) {
+        if (!pendingTodoReminderSent && !toolsWithheldByLoopGuard) {
+          pendingTodoReminderSent = true;
+          host.conversation.addSystemNote(
+            '[Completion Check] The current turn still has unfinished todo items. '
+            + 'Continue the work and update the todo list explicitly before providing a final answer.'
+          );
+          continue;
+        }
+        renderFinalResponse(turnOutcome.response, {
+          thought: payload.thought,
+          streamedResponse,
+        });
+        return { status: 'incomplete', reason: 'pending_todos' };
+      }
       renderFinalResponse(turnOutcome.response, {
         thought: payload.thought,
-        usedThoughtAsResponse: turnOutcome.usedThoughtAsResponse,
         streamedResponse,
       });
       return { status: 'completed' };
@@ -1453,7 +1612,7 @@ export async function runAgentReactLoop(
         host.setComposerIdle();
         host.setComposerFinalResponse(summaryResponse);
         host.emitOutput({ type: 'message', content: summaryResponse });
-        return { status: 'completed' };
+        return { status: 'incomplete', reason: 'iteration_limit' };
       }
     } catch {
       // Summary call failed - fall through to static summary
@@ -1471,10 +1630,14 @@ export async function runAgentReactLoop(
     host.setComposerIdle();
     host.setComposerFinalResponse(fallbackMsg);
     host.emitOutput({ type: 'message', content: fallbackMsg });
-    return { status: 'completed' };
+    return { status: 'incomplete', reason: 'iteration_limit' };
     } finally {
+      if (workspaceChangeCapture?.hasExceededBudget() && !host.workspaceChangeCaptureDisabled) {
+        host.workspaceChangeCaptureDisabled = true;
+        if (debugMode) host.writeDebugLine(`[DEBUG] Workspace change capture disabled for this session: a git snapshot exceeded ${WORKSPACE_CHANGE_CAPTURE_BUDGET_MS} ms.`);
+      }
       await workspaceChangeCapture?.dispose().catch((error: unknown) => {
-        host.writeDebugLine(`[DEBUG] Workspace change capture cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        if (debugMode) host.writeDebugLine(`[DEBUG] Workspace change capture cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     }
   }

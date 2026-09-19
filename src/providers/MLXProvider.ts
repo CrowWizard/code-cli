@@ -5,7 +5,9 @@
  */
 
 import type { LLMProvider, LLMProviderCapabilities } from './LLMProvider.js';
-import type { LLMRequest, LLMResponse, LLMToolCall, LLMUsage, ProviderSettings, NetworkSettings, FunctionDefinition } from '../types.js';
+import type { LLMRequest, LLMResponse, LLMToolCall, ProviderSettings, NetworkSettings, FunctionDefinition } from '../types.js';
+import { normalizeLLMUsage } from './usage.js';
+import { normalizeProviderFinishReason } from './finishReason.js';
 import { isMLXSupported } from '../utils/platform.js';
 import { ApiError, classifyApiError } from './errors.js';
 import { toTextOnlyContent } from './messagePayload.js';
@@ -264,8 +266,12 @@ export class MLXProvider implements LLMProvider {
             } catch {
                 // ignore
             }
+            const diagnostic = rawBody.trim()
+                ? `MLX server returned an invalid response. Raw: ${rawBody.slice(0, 500)}`
+                : `MLX server returned an empty response body (HTTP ${response.status}). `
+                    + 'Check the MLX server logs and confirm the selected model is loaded before retrying.';
             throw new ApiError(
-                `MLX server returned an invalid response. The model may have crashed or returned malformed output. Raw: ${rawBody.slice(0, 500)}`,
+                diagnostic,
                 'server_error',
                 response.status,
                 true,
@@ -287,20 +293,14 @@ export class MLXProvider implements LLMProvider {
             }));
         }
 
-        let usage: LLMUsage | undefined;
-        if (data.usage) {
-            usage = {
-                promptTokens: data.usage.prompt_tokens,
-                completionTokens: data.usage.completion_tokens,
-                totalTokens: data.usage.total_tokens
-            };
-        }
+        // Through the shared normalizer rather than by hand, so a cached-prompt
+        // detail is carried when the server reports one, and an impossible
+        // breakdown is discarded instead of passed on.
+        const usage = normalizeLLMUsage(data.usage, 'openai-chat');
 
         const finishReason = toolCalls?.length
             ? 'tool_calls'
-            : (choice?.finish_reason === 'stop' || choice?.finish_reason === 'length' || choice?.finish_reason === 'content_filter')
-                ? choice.finish_reason
-                : 'stop';
+            : normalizeProviderFinishReason(choice?.finish_reason);
 
         return {
             id: data.id || `mlx-${Date.now()}`,
@@ -315,6 +315,7 @@ export class MLXProvider implements LLMProvider {
 
     private async buildApiError(response: Response): Promise<ApiError> {
         let errorDetail = '';
+        const responseBody = typeof response.clone === 'function' ? response.clone() : response;
         try {
             const body = (await response.json()) as Record<string, unknown>;
             const maybeError = body?.error;
@@ -330,7 +331,7 @@ export class MLXProvider implements LLMProvider {
             }
         } catch {
             try {
-                errorDetail = await response.text();
+                errorDetail = await responseBody.text();
             } catch {
                 // Ignore
             }

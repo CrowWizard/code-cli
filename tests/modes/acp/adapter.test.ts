@@ -57,6 +57,8 @@ const {
   };
 
   const mockAgent = {
+    shutdown: vi.fn().mockResolvedValue(undefined),
+    shutdownRuntimeResources: vi.fn().mockResolvedValue(undefined),
     initializeForRPC: vi.fn().mockResolvedValue(undefined),
     setOutputListener: vi.fn(),
     setConfirmationCallback: vi.fn(),
@@ -322,6 +324,33 @@ describe("AutohandAcpAdapter", () => {
   // initialize()
   // -------------------------------------------------------------------------
 
+  describe("peer communication events", () => {
+    it("negotiates the peer extension and forwards idle events with structured provenance", async () => {
+      config.sessions = { communication: { enabled: true } };
+      const initialized = await adapter.initialize(makeInitRequest({
+        clientCapabilities: { _meta: { autohandPeerEvents: 1 } },
+      }));
+      expect(initialized._meta).toMatchObject({ peerCommunication: { version: 1 } });
+      const session = await adapter.newSession(makeNewSessionRequest());
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      const event = { type: 'message', messageId: 'peer-message-1', from: 'peer-a', to: 'peer-b', state: 'accepted', cursor: '1' };
+      await outputListener({ type: 'peer_update', peerEvent: event });
+      await vi.waitFor(() => expect(connection.extNotification).toHaveBeenCalledWith(
+        'autohand.peerUpdate', expect.objectContaining({ sessionId: session.sessionId, event }),
+      ));
+    });
+
+    it("does not send unsolicited peer extension notifications to a legacy client", async () => {
+      config.sessions = { communication: { enabled: true } };
+      await adapter.initialize(makeInitRequest());
+      await adapter.newSession(makeNewSessionRequest());
+      vi.mocked(connection.extNotification).mockClear();
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      await outputListener({ type: 'peer_update', peerEvent: { type: 'receipt', messageId: 'peer-message-1', state: 'consumed', cursor: '1' } });
+      expect(vi.mocked(connection.extNotification).mock.calls.some(([method]) => method === 'autohand.peerUpdate')).toBe(false);
+    });
+  });
+
   describe("initialize()", () => {
     it("returns correct protocol version", async () => {
       const result = await adapter.initialize(makeInitRequest());
@@ -471,6 +500,90 @@ describe("AutohandAcpAdapter", () => {
   // -------------------------------------------------------------------------
   // newSession()
   // -------------------------------------------------------------------------
+
+  describe("hook lifecycle", () => {
+    let executeHooks: ReturnType<typeof vi.fn>;
+    let lifecycleListener: ((context: Record<string, unknown>) => void) | null;
+
+    beforeEach(async () => {
+      executeHooks = vi.fn().mockResolvedValue([]);
+      lifecycleListener = null;
+      mockAgent.getHookManager.mockReturnValue({
+        executeHooks,
+        subscribeLifecycle: (listener: (context: Record<string, unknown>) => void) => {
+          lifecycleListener = listener;
+          return () => {
+            lifecycleListener = null;
+          };
+        },
+      });
+      await adapter.initialize(makeInitRequest());
+      await adapter.newSession(makeNewSessionRequest());
+    });
+
+    it("runs the session-end hook and notifies the client when the connection closes", async () => {
+      mockAgent.shutdownRuntimeResources.mockClear();
+      await adapter.shutdown("exit");
+
+      // Ending the session must not leave its MCP servers or background processes behind.
+      expect(mockAgent.shutdownRuntimeResources).toHaveBeenCalledOnce();
+
+      expect(executeHooks).toHaveBeenCalledWith(
+        "session-end",
+        expect.objectContaining({ sessionEndReason: "exit" }),
+      );
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.sessionEnd",
+        expect.objectContaining({ reason: "exit" }),
+      );
+    });
+
+    it("forwards permission, notification, and subagent hook events to the client", () => {
+      expect(typeof lifecycleListener).toBe("function");
+
+      lifecycleListener!({ event: "permission-request", tool: "run_command", command: "ls" });
+      lifecycleListener!({ event: "notification", notificationType: "info", notificationMessage: "done" });
+      lifecycleListener!({
+        event: "subagent-stop",
+        subagentId: "a1",
+        subagentName: "helper",
+        subagentType: "task",
+        subagentSuccess: true,
+        subagentDuration: 5,
+      });
+
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.permissionRequest",
+        expect.objectContaining({ tool: "run_command", command: "ls" }),
+      );
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.notification",
+        expect.objectContaining({ notificationType: "info", message: "done" }),
+      );
+      expect(connection.extNotification).toHaveBeenCalledWith(
+        "autohand.hook.subagentStop",
+        expect.objectContaining({ subagentName: "helper", success: true }),
+      );
+    });
+  });
+
+  describe("dispose()", () => {
+    it("shuts down every session agent so MCP servers and background processes do not outlive the connection", async () => {
+      mockAgent.shutdown.mockClear();
+      mockAgent.shutdownRuntimeResources.mockClear();
+      const { sessionId } = await adapter.newSession(makeNewSessionRequest());
+
+      await adapter.dispose();
+
+      expect(mockAgent.shutdown).toHaveBeenCalledOnce();
+      expect(mockAgent.shutdownRuntimeResources).toHaveBeenCalledOnce();
+      mockAgent.runInstruction.mockClear();
+      await expect(
+        adapter.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] }),
+      ).rejects.toThrow();
+      expect(mockAgent.runInstruction).not.toHaveBeenCalled();
+    });
+  });
 
   describe("newSession()", () => {
     beforeEach(async () => {

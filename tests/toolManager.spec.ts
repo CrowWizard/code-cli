@@ -129,10 +129,29 @@ describe('ToolManager', () => {
     expect(defaultNames.has('get_goal')).toBe(false);
   });
 
+  it('describes acceptance criteria and structured completion evidence in goal tool schemas', () => {
+    for (const name of ['create_goal', 'create_goal_from_template', 'enqueue_goal']) {
+      expect(GOAL_TOOL_DEFINITIONS.find((tool) => tool.name === name)?.parameters?.properties.acceptance_criteria)
+        .toMatchObject({ type: 'array', items: { type: 'string' } });
+    }
+    expect(GOAL_TOOL_DEFINITIONS.find((tool) => tool.name === 'update_goal')?.parameters?.properties.completion_evidence)
+      .toMatchObject({ type: 'object', required: ['summary', 'checks'], properties: { checks: {
+        items: { required: ['criterion', 'status', 'evidence'], properties: { status: { enum: ['passed', 'failed', 'notRun'] } } },
+      } } });
+  });
+
+  it('exposes explicit stop states, resumption conditions, and checkpoints to goal tools', () => {
+    const properties = GOAL_TOOL_DEFINITIONS.find((tool) => tool.name === 'update_goal')?.parameters?.properties;
+    expect(properties?.status.enum).toEqual(expect.arrayContaining(['blocked', 'waiting']));
+    expect(properties?.stop_reason.type).toBe('string');
+    expect(properties?.resume_when.type).toBe('string');
+    expect(properties?.checkpoint).toMatchObject({ type: 'object', required: ['summary'] });
+  });
+
   it('exposes fff search tools instead of deprecated find and glob by default', () => {
     const names = new Set(DEFAULT_TOOL_DEFINITIONS.map((tool) => tool.name));
 
-    expect(names.has('fff_grep')).toBe(true);
+    expect(names.has('find_grep')).toBe(true);
     expect(names.has('fff_find')).toBe(true);
     expect(names.has('find')).toBe(false);
     expect(names.has('glob')).toBe(false);
@@ -442,7 +461,7 @@ describe('ToolManager', () => {
       ['code_review', { scope: 'file', path: '.env' }],
       ['git_diff', { path: '.env' }],
       ['git_checkout', { path: '.env' }],
-      ['fff_grep', { query: 'SECRET', path: '.env' }],
+      ['find_grep', { query: 'SECRET', path: '.env' }],
       ['find', { query: 'SECRET', path: '.env' }],
       ['checksum', { path: '.env' }],
     ] as const)('applies sensitive-file policy to the %s adapter', async (tool, args) => {
@@ -1946,5 +1965,26 @@ describe('ToolManager', () => {
       // but parallel should never be significantly slower than sequential
       expect(parMs).toBeLessThanOrEqual(seqMs + 50); // parallel <= sequential + generous margin
     });
+  });
+});
+
+describe('find_grep tool naming', () => {
+  it('exposes the content search tool as find_grep and runs legacy fff_grep calls through it', async () => {
+    const executor = vi.fn().mockResolvedValue(successfulOutcome('found'));
+    const manager = new ToolManager({
+      executor,
+      confirmApproval: vi.fn().mockResolvedValue({ decision: 'allow_once' }),
+    });
+
+    const names = manager.listDefinitions().map((definition) => definition.name);
+    expect(names).toContain('find_grep');
+    expect(names).not.toContain('fff_grep');
+
+    const [legacy] = await manager.execute([{ tool: 'fff_grep', args: { query: 'needle' } }]);
+    expect(legacy).toMatchObject({ tool: 'find_grep', success: true });
+    expect(executor).toHaveBeenCalledWith(
+      { type: 'find_grep', query: 'needle' },
+      expect.objectContaining({ tool: 'find_grep' })
+    );
   });
 });

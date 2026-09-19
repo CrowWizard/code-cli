@@ -18,8 +18,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import {
+  DEFAULT_SHELL_TIMEOUT_MS,
   ensureNodePtyHelperExecutable,
   executeStreamingShellCommand,
+  getDirectoryEntriesCacheSizeForTests,
+  getShellCommandSuggestions,
   isImmediateCommand,
   isShellCommand,
   parseShellCommand,
@@ -169,6 +172,24 @@ describe('parseShellCommand', () => {
 });
 
 describe('executeStreamingShellCommand', () => {
+  it('bounds newline-free shell output without suppressing live stream chunks', async () => {
+    const count = 2 * 1024 * 1024;
+    const script = `process.stdout.write('shell-start' + 'x'.repeat(${count}) + 'shell-end')`;
+    let streamedLength = 0;
+    const result = await executeStreamingShellCommand(
+      `'${process.execPath.replaceAll("'", "'\\''")}' -e '${script.replaceAll("'", "'\\''")}'`,
+      tmpdir(),
+      { preferPty: false, onStdout: (chunk) => { streamedLength += chunk.length; } },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.output?.length).toBeLessThanOrEqual(1024 * 1024 + 128);
+    expect(result.output?.startsWith('shell-start')).toBe(true);
+    expect(result.output?.endsWith('shell-end')).toBe(true);
+    expect(result.output).toContain('[output truncated:');
+    expect(streamedLength).toBe(count + 'shell-startshell-end'.length);
+  });
+
   it('repairs the node-pty native helper before PTY execution', async () => {
     const nodePtyRoot = mkdtempSync(join(tmpdir(), 'autohand-node-pty-runtime-'));
     const nativeDirectory = join(nodePtyRoot, 'prebuilds', 'darwin-arm64');
@@ -468,6 +489,31 @@ describe('executeStreamingShellCommand', () => {
       };
     }
 
+    it('bounds PTY capture while preserving the first and final output and all live chunks', async () => {
+      const capture: Parameters<typeof fakePty>[0] = {};
+      setNodePtyLoaderForTests(async () => fakePty(capture));
+      let streamedLength = 0;
+      const result = await withTty(async () => {
+        const pending = executeStreamingShellCommand('verbose build', tmpdir(), {
+          preferPty: true,
+          onStdout: (chunk) => { streamedLength += chunk.length; },
+        });
+        await vi.waitFor(() => expect(capture.exit).toBeDefined());
+        capture.data?.('pty-start');
+        for (let index = 0; index < 32; index += 1) capture.data?.('x'.repeat(64 * 1024));
+        capture.data?.('pty-end');
+        capture.exit?.({ exitCode: 0 });
+        return pending;
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.output?.length).toBeLessThanOrEqual(1024 * 1024 + 128);
+      expect(result.output?.startsWith('pty-start')).toBe(true);
+      expect(result.output?.endsWith('pty-end')).toBe(true);
+      expect(result.output).toContain('[output truncated:');
+      expect(streamedLength).toBe(2 * 1024 * 1024 + 'pty-startpty-end'.length);
+    });
+
     async function runWithDebug(debugEnabled: boolean): Promise<string[]> {
       const previous = process.env.AUTOHAND_DEBUG;
       if (debugEnabled) process.env.AUTOHAND_DEBUG = '1';
@@ -553,5 +599,72 @@ describe('executeStreamingShellCommand', () => {
 
     expect(addEventListener).toHaveBeenCalledWith('abort', expect.any(Function), { once: true });
     expect(removeEventListener).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
+});
+
+describe('executeStreamingShellCommand PTY watchdog', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    setNodePtyLoaderForTests();
+  });
+
+  it('kills a PTY command that never exits once the shell timeout elapses', async () => {
+    vi.useFakeTimers();
+    const stdinIsTty = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+    const stdoutIsTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+
+    const kill = vi.fn();
+    setNodePtyLoaderForTests(async () => ({
+      spawn: () => ({
+        pid: 4242,
+        onData: () => ({ dispose: vi.fn() }),
+        onExit: () => ({ dispose: vi.fn() }),
+        kill,
+      }),
+    }));
+
+    try {
+      const pending = executeStreamingShellCommand('sleep 999', tmpdir(), { preferPty: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(kill).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_SHELL_TIMEOUT_MS);
+
+      expect(kill).toHaveBeenCalledOnce();
+      await expect(pending).resolves.toMatchObject({ success: false, error: expect.stringMatching(/timed out/i) });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (stdinIsTty) Object.defineProperty(process.stdin, 'isTTY', stdinIsTty);
+      else delete (process.stdin as { isTTY?: boolean }).isTTY;
+      if (stdoutIsTty) Object.defineProperty(process.stdout, 'isTTY', stdoutIsTty);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
+  });
+});
+
+describe('shell path completion cache', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('drops expired directory listings instead of retaining every directory ever completed', () => {
+    vi.useFakeTimers();
+    const root = mkdtempSync(join(tmpdir(), 'autohand-shell-cache-'));
+    try {
+      mkdirSync(join(root, 'alpha'));
+      mkdirSync(join(root, 'beta'));
+
+      getShellCommandSuggestions('! ls alpha/', { cwd: root });
+      expect(getDirectoryEntriesCacheSizeForTests()).toBe(1);
+
+      vi.advanceTimersByTime(60_000);
+      getShellCommandSuggestions('! ls beta/', { cwd: root });
+
+      expect(getDirectoryEntriesCacheSizeForTests()).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

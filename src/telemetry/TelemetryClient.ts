@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import type { SessionSyncData, TelemetryEvent, TelemetryConfig } from './types.js';
 import { AUTOHAND_PATHS, AUTOHAND_FILES } from '../constants.js';
 import { atomicWriteJson } from '../utils/atomicFile.js';
+import { discardResponseBody } from '../utils/responseBody.js';
 
 const TELEMETRY_DIR = AUTOHAND_PATHS.telemetry;
 const QUEUE_FILE = AUTOHAND_FILES.telemetryQueue;
@@ -71,6 +72,8 @@ function isOptionalSessionUsageMetadata(value: unknown): boolean {
     && typeof value.updatedAt === 'string'
     && isOptionalFiniteNumber(value.promptTokens)
     && isOptionalFiniteNumber(value.completionTokens)
+    && isOptionalFiniteNumber(value.cacheReadTokens)
+    && isOptionalFiniteNumber(value.cacheWriteTokens)
     && isOptionalFiniteNumber(value.longestTurnDurationMs);
 }
 
@@ -348,6 +351,7 @@ export class TelemetryClient {
         HEALTH_REQUEST_TIMEOUT_MS,
         signal
       );
+      discardResponseBody(response);
       return response.ok;
     } catch {
       return false;
@@ -447,6 +451,7 @@ export class TelemetryClient {
           TELEMETRY_REQUEST_TIMEOUT_MS,
           signal
         );
+        discardResponseBody(response);
 
         if (response.ok) {
           const acknowledgedIds = new Set(eventsToSend.map((event) => event.id));

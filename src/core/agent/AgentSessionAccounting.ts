@@ -41,6 +41,8 @@ export interface AgentSessionAccountingHost {
   teamShutdownPromise?: Promise<void> | null;
   modifiedFilePaths: Set<string>;
   outputListener?: (event: AgentOutputEvent) => void;
+  /** The most recent final message emitted to the output listener; command mode validates it against --output-schema. */
+  lastEmittedMessage?: string;
   getReactionParser(): ReactionParser;
   persistentInput: { dispose(): void };
   runtime: AgentRuntime;
@@ -152,6 +154,7 @@ type SyncableSession = {
     projectName?: string;
     status?: string;
     summary?: string;
+    title?: string;
     client?: string;
     clientVersion?: string;
     usage?: SessionUsageMetadata;
@@ -191,6 +194,7 @@ function buildSessionSyncMetadata(
     projectName: session.metadata.projectName,
     status: session.metadata.status,
     summary: session.metadata.summary,
+    title: session.metadata.title,
     client: session.metadata.client,
     clientVersion: session.metadata.clientVersion,
     usage: session.metadata.usage,
@@ -222,6 +226,8 @@ export function syncAgentSessionSnapshot(
   host: AgentSessionAccountingHost,
   options: { force?: boolean; session?: SyncableSession; endTimeMs?: number } = {}
 ): Promise<void> {
+  // An ephemeral run keeps nothing, locally or remotely.
+  if (host.runtime.options?.ephemeral) return Promise.resolve();
   const existing = host.sessionSyncPromise;
   if (existing && !options.force) return existing;
 
@@ -522,9 +528,12 @@ export function getAgentCompletionNotificationBody(host: AgentSessionAccountingH
     }
 
     const payload = host.getReactionParser().parseAssistantReactPayload(message.content);
+    const plainTextFallback = message.content.trimStart().startsWith('{')
+      ? ''
+      : message.content;
     const candidate = normalizeAgentCompletionNotificationBody(
       host,
-      payload.finalResponse ?? payload.response ?? payload.thought ?? message.content
+      payload.finalResponse ?? payload.response ?? plainTextFallback
     );
     if (candidate) {
       return candidate;
@@ -567,6 +576,7 @@ export function emitAgentOutput(
   host: AgentSessionAccountingHost,
   event: AgentOutputEvent
 ): void {
+  if (event.type === 'message') host.lastEmittedMessage = event.content;
   if (host.outputListener) {
     host.outputListener(event);
   }

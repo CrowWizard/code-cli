@@ -16,7 +16,7 @@ describe('SystemPromptBuilder', () => {
         config: {},
       },
       getToolDefinitions: () => [{
-        name: 'fff_grep',
+        name: 'find_grep',
         description: 'Search code, symbols, and matching context in the workspace',
         parameters: {
           type: 'object',
@@ -41,12 +41,12 @@ describe('SystemPromptBuilder', () => {
     const prompt = await builder.build();
 
     expect(prompt).toContain('Use `fff_find` for file path discovery.');
-    expect(prompt).toContain('Use `fff_grep` for content/code discovery.');
+    expect(prompt).toContain('Use `find_grep` for content/code discovery.');
     expect(prompt).toContain('Use `read_file` after search identifies the exact file or region you need.');
     expect(prompt).not.toContain('Legacy find:');
     expect(prompt).toContain('### Tool Capability Catalog');
-    expect(prompt).toContain('fff_grep');
-    expect(prompt).not.toContain('fff_grep(query: string)');
+    expect(prompt).toContain('find_grep');
+    expect(prompt).not.toContain('find_grep(query: string)');
     expect(prompt).not.toContain('Text or pattern to find');
     expect(prompt).toContain('Exact tool schemas are selected per request');
     expect(prompt).toContain('Reflect Before Acting');
@@ -131,6 +131,12 @@ describe('SystemPromptBuilder', () => {
     expect(enabledPrompt).toContain('### Persistent Goals');
     expect(enabledPrompt).toContain('create_goal');
     expect(enabledPrompt).toContain('Persistent goal execution is session-scoped');
+    expect(enabledPrompt).toContain('Spending floors are not proof');
+    expect(enabledPrompt).toContain('not independent verification');
+    expect(enabledPrompt).toContain('a slow command alone is not a blocker');
+    expect(enabledPrompt).toContain('stop_reason and resume_when');
+    expect(enabledPrompt).toContain('/goal recover <session-id>');
+    expect(enabledPrompt).toContain('Never recover a live owner');
     expect(enabledPrompt).toContain('/goal resume');
   });
 

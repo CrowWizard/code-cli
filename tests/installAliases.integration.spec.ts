@@ -7,12 +7,15 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -111,7 +114,7 @@ describe('release installer command aliases', () => {
     expect(readFileSync(installedBinary, 'utf8')).toBe(existingBinary);
   });
 
-  unixIt('force-refreshes autohand-code and agent aliases in the install directory', () => {
+  unixIt('force-refreshes autohand-code, agent, and ah aliases in the install directory', () => {
     const tempRoot = mkdtempSync(join(tmpdir(), 'autohand-installer-aliases-'));
     tempRoots.push(tempRoot);
     const payloadDir = join(tempRoot, 'payload');
@@ -139,6 +142,7 @@ describe('release installer command aliases', () => {
 
     writeFileSync(join(installDir, 'agent'), 'owned by another installation\n');
     writeFileSync(join(installDir, 'autohand-code'), 'stale compatibility shim\n');
+    writeFileSync(join(installDir, 'ah'), 'stale short alias\n');
 
     execFileSync('/bin/sh', ['install.sh'], {
       cwd: ROOT,
@@ -155,14 +159,20 @@ describe('release installer command aliases', () => {
 
     const compatibilityAlias = join(installDir, 'autohand-code');
     const agentAlias = join(installDir, 'agent');
+    const shortAlias = join(installDir, 'ah');
     expect(lstatSync(compatibilityAlias).isSymbolicLink()).toBe(true);
     expect(readlinkSync(compatibilityAlias)).toBe('autohand');
     expect(lstatSync(agentAlias).isSymbolicLink()).toBe(true);
     expect(readlinkSync(agentAlias)).toBe('autohand');
+    expect(lstatSync(shortAlias).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(shortAlias)).toBe('autohand');
     expect(execFileSync(compatibilityAlias, ['--version'], { encoding: 'utf8' })).toBe(
       'test-version\n',
     );
     expect(execFileSync(agentAlias, ['--version'], { encoding: 'utf8' })).toBe(
+      'test-version\n',
+    );
+    expect(execFileSync(shortAlias, ['--version'], { encoding: 'utf8' })).toBe(
       'test-version\n',
     );
   });
@@ -217,5 +227,148 @@ describe('release installer command aliases', () => {
     expect(execFileSync(competitorAgent, ['--version'], { encoding: 'utf8' })).toBe(
       'test-version\n',
     );
+  });
+});
+
+describe('release installer binary replacement', () => {
+  // `autohand update` runs install.sh from inside a running autohand, so the
+  // installer always replaces an executable that is currently mapped by the
+  // kernel. On macOS, writing into that inode in place invalidates the cached
+  // code signature and every later launch dies with SIGKILL ("zsh: killed");
+  // on Linux the same in-place write fails with ETXTBSY. Swapping in a fresh
+  // inode via rename is safe on both, so the installed path must never keep
+  // the inode of the binary it replaces.
+  unixIt('replaces an existing binary with a fresh inode instead of writing into it', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'autohand-installer-replace-'));
+    tempRoots.push(tempRoot);
+    const payloadDir = join(tempRoot, 'payload');
+    const fixtureBinDir = join(tempRoot, 'fixture-bin');
+    const installDir = join(tempRoot, 'install');
+    const archivePath = join(tempRoot, 'autohand.tar.gz');
+    const checksumPath = `${archivePath}.sha256`;
+    const fixtureBinary = join(payloadDir, 'autohand');
+    const installedBinary = join(installDir, 'autohand');
+    const newBinary = '#!/bin/sh\n[ "${1:-}" = "--version" ] && printf "test-version\\n"\n';
+
+    mkdirSync(payloadDir, { recursive: true });
+    mkdirSync(fixtureBinDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(fixtureBinary, newBinary);
+    chmodSync(fixtureBinary, 0o755);
+    writeFileSync(installedBinary, '#!/bin/sh\nprintf "existing-version\\n"\n');
+    chmodSync(installedBinary, 0o755);
+    execFileSync('tar', ['-czf', archivePath, '-C', payloadDir, 'autohand']);
+    const checksum = createHash('sha256')
+      .update(readFileSync(archivePath))
+      .digest('hex');
+    writeFileSync(checksumPath, `${checksum}  autohand.tar.gz\n`);
+
+    writeFakeCurl(fixtureBinDir);
+
+    const existingInode = statSync(installedBinary).ino;
+
+    execFileSync('/bin/sh', ['install.sh'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${fixtureBinDir}:${SAFE_SYSTEM_PATH}`,
+        AUTOHAND_INSTALL_DIR: installDir,
+        AUTOHAND_TEST_ARCHIVE: archivePath,
+        AUTOHAND_TEST_CHECKSUM: checksumPath,
+        AUTOHAND_VERSION: 'test-version',
+      },
+    });
+
+    const installed = statSync(installedBinary);
+    expect(installed.ino).not.toBe(existingInode);
+    expect(installed.mode & 0o111).not.toBe(0);
+    expect(readFileSync(installedBinary, 'utf8')).toBe(newBinary);
+    expect(execFileSync(installedBinary, ['--version'], { encoding: 'utf8' })).toBe(
+      'test-version\n',
+    );
+    expect(readdirSync(installDir).filter((name) => name.includes('.tmp'))).toEqual([]);
+  });
+});
+
+describe('release installer first run', () => {
+  // A fixture binary that answers --version for the startup probe and records
+  // whatever the installer feeds it, so the test can see the first message.
+  function seedFirstRunFixture(tempRoot: string): { installDir: string; env: Record<string, string> } {
+    const payloadDir = join(tempRoot, 'payload');
+    const fixtureBinDir = join(tempRoot, 'fixture-bin');
+    const installDir = join(tempRoot, 'install');
+    const archivePath = join(tempRoot, 'autohand.tar.gz');
+    const checksumPath = `${archivePath}.sha256`;
+    const launchLog = join(tempRoot, 'launch.log');
+    mkdirSync(payloadDir, { recursive: true });
+    mkdirSync(fixtureBinDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(
+      join(payloadDir, 'autohand'),
+      `#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then printf "test-version\\n"; exit 0; fi
+{ printf "args=%s\\n" "$*"; printf "stdin="; cat; } > "$AUTOHAND_TEST_LAUNCH_LOG"
+`,
+    );
+    chmodSync(join(payloadDir, 'autohand'), 0o755);
+    execFileSync('tar', ['-czf', archivePath, '-C', payloadDir, 'autohand']);
+    const checksum = createHash('sha256').update(readFileSync(archivePath)).digest('hex');
+    writeFileSync(checksumPath, `${checksum}  autohand.tar.gz\n`);
+    writeFakeCurl(fixtureBinDir);
+    return {
+      installDir,
+      env: {
+        ...process.env,
+        PATH: `${fixtureBinDir}:${SAFE_SYSTEM_PATH}`,
+        AUTOHAND_INSTALL_DIR: installDir,
+        AUTOHAND_TEST_ARCHIVE: archivePath,
+        AUTOHAND_TEST_CHECKSUM: checksumPath,
+        AUTOHAND_TEST_LAUNCH_LOG: launchLog,
+        AUTOHAND_VERSION: 'test-version',
+      } as Record<string, string>,
+    };
+  }
+
+  function runInstaller(env: Record<string, string>): string {
+    return execFileSync('/bin/sh', ['install.sh'], { cwd: ROOT, encoding: 'utf8', env, stdio: ['pipe', 'pipe', 'pipe'] });
+  }
+
+  unixIt('starts the installed binary with "hello world" as its first message when asked to', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'autohand-installer-first-run-'));
+    tempRoots.push(tempRoot);
+    const { env } = seedFirstRunFixture(tempRoot);
+
+    const output = runInstaller({ ...env, AUTOHAND_INSTALL_FIRST_RUN: 'yes' });
+
+    expect(readFileSync(env.AUTOHAND_TEST_LAUNCH_LOG, 'utf8')).toBe('args=\nstdin=hello world\n');
+    expect(output).toContain('Starting Autohand with your first message');
+  });
+
+  unixIt('does not start the binary when the first run is declined', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'autohand-installer-first-run-'));
+    tempRoots.push(tempRoot);
+    const { env } = seedFirstRunFixture(tempRoot);
+
+    const output = runInstaller({ ...env, AUTOHAND_INSTALL_FIRST_RUN: 'no' });
+
+    expect(existsSync(env.AUTOHAND_TEST_LAUNCH_LOG)).toBe(false);
+    expect(output).not.toContain('first message');
+  });
+
+  unixIt('neither asks nor starts the binary without a terminal or inside a running Autohand', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'autohand-installer-first-run-'));
+    tempRoots.push(tempRoot);
+    const { env } = seedFirstRunFixture(tempRoot);
+
+    // execFileSync gives the installer pipes, not a terminal: an unattended install must finish on its own.
+    const unattended = runInstaller(env);
+    expect(existsSync(env.AUTOHAND_TEST_LAUNCH_LOG)).toBe(false);
+    expect(unattended).not.toContain('first message');
+
+    // `autohand upgrade` runs this script from inside Autohand; a nested session must never start.
+    const nested = runInstaller({ ...env, AUTOHAND_CLI: '1', AUTOHAND_INSTALL_FIRST_RUN: '' });
+    expect(existsSync(env.AUTOHAND_TEST_LAUNCH_LOG)).toBe(false);
+    expect(nested).not.toContain('first message');
   });
 });

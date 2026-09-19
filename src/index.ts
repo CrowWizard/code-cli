@@ -16,18 +16,24 @@ const requestsProtocolOutput = process.argv.some((arg, index, argv) => (
   || (arg === '--mode' && (argv[index + 1] === 'rpc' || argv[index + 1] === 'acp'))
 ));
 if (process.stdout.isTTY && !requestsStructuredCommandOutput && !requestsProtocolOutput) {
-  process.stdout.write('\x1b]0;Autohand Code\x07');
+  // The agent later replaces this with the session name and state; see ui/terminalTitle.ts.
+  process.stdout.write('\x1b]0;Autohand Code\x1b\\');
 }
 // Set environment variable for detection by Expect and other tools
 process.env.AUTOHAND_CODE = '1';
 import 'dotenv/config';
+import { collectToolPatternOption } from './permissions/cliPolicyMutation.js';
+import { configureRunConfigOverlay } from './runConfigOverlay.js';
+import { loadOutputSchema } from './modes/outputSchema.js';
+import { startupTimeline } from './startup/startupTimeline.js';
 import { Command, Option } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { getProviderConfig, loadConfig, resolveWorkspaceRoot, saveConfig } from './config.js';
+import { applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
+import { reportCliCommand } from './telemetry/commandUsage.js';
 import { runStartupChecks, printStartupCheckResults, validateWorkspacePath } from './startup/checks.js';
 import { checkWorkspaceSafety, printDangerousWorkspaceWarning } from './startup/workspaceSafety.js';
 import { ensureAuthenticated } from './auth/index.js';
@@ -53,6 +59,7 @@ import { registerBrowserCommand, registerBrowserOptions } from './browser/cliCom
 import { registerReviewCommand } from './review/reviewCliCommand.js';
 import { registerTransferCommand } from './startup/transferCommand.js';
 import { registerResumeCommand } from './startup/resumeCommand.js';
+import { probeMcpServersWithManager, registerDoctorCommand } from './startup/doctorCommand.js';
 import type { ReviewCliExecution } from './review/reviewCliRuntime.js';
 import { formatDeprecatedBrowserOptionWarning } from './browser/compatibility.js';
 import {
@@ -106,15 +113,17 @@ if (process.argv.includes('--answer-only') || process.argv.includes('--setup-onl
   process.env.AUTOHAND_DISABLE_AUTO_REPORT = '1';
 }
 
-async function refreshModelCatalogBeforeAgentStart(options: {
-  bare?: boolean;
-  offline?: boolean;
-}): Promise<void> {
-  const { refreshModelCatalogOnStartup } = await import('./providers/modelCatalogUpdater.js');
-  await refreshModelCatalogOnStartup({
-    offline: options.offline === true || options.bare === true ? true : undefined,
-    userAgent: `autohand/${runtimeVersion}`,
-  });
+/**
+ * A model the Autohand cloud gateway cannot serve (issue #584: one left over
+ * from another provider) is corrected as soon as the config is loaded, so the
+ * banner, the status line and the first request all agree on the served model.
+ */
+async function applyServedAutohandModel(config: LoadedConfig, opts: { model?: string }): Promise<void> {
+  const { normalizeAutohandAIStartupModel } = await import('./core/agent/AutohandAIModelTierPolicy.js');
+  const served = normalizeAutohandAIStartupModel(config);
+  if (served && opts.model) {
+    opts.model = served;
+  }
 }
 
 function applyCliModelOverride(config: LoadedConfig, model: string): void {
@@ -141,6 +150,58 @@ function applyCliModelOverride(config: LoadedConfig, model: string): void {
 
 function canUseProviderWithoutAccountAuth(config: LoadedConfig): boolean {
   return (config.provider ?? 'openrouter') !== 'autohandai' && getProviderConfig(config) !== null;
+}
+
+/**
+ * Exit with a clear error when a non-interactive run targets a workspace path
+ * that is invalid or one of the dangerous directories.
+ */
+async function exitUnlessWorkspaceIsSafe(workspaceRoot: string): Promise<void> {
+  // The safety check is pure string inspection, so it runs before any filesystem work.
+  const safetyCheck = checkWorkspaceSafety(workspaceRoot);
+  if (!safetyCheck.safe) {
+    printDangerousWorkspaceWarning(workspaceRoot, safetyCheck);
+    process.exit(1);
+  }
+
+  const workspacePathValidation = await validateWorkspacePath(workspaceRoot);
+  if (!workspacePathValidation.valid) {
+    console.error(chalk.red(`Error: ${workspacePathValidation.error}`));
+    process.exit(1);
+  }
+}
+
+/**
+ * Resolve the --add-dir entries for a non-interactive run, exiting when one
+ * is missing, is not a directory, or fails the workspace safety check.
+ */
+async function resolveAdditionalDirectoriesOrExit(addDir: string[] | undefined): Promise<string[]> {
+  const additionalDirs: string[] = [];
+  if (!addDir || addDir.length === 0) {
+    return additionalDirs;
+  }
+
+  for (const dir of addDir) {
+    const resolvedDir = path.resolve(dir);
+    if (!await fs.pathExists(resolvedDir)) {
+      console.error(chalk.red(`Error: Additional directory does not exist: ${dir}`));
+      process.exit(1);
+    }
+    const stats = await fs.stat(resolvedDir);
+    if (!stats.isDirectory()) {
+      console.error(chalk.red(`Error: Additional path is not a directory: ${dir}`));
+      process.exit(1);
+    }
+    const addDirSafetyCheck = checkWorkspaceSafety(resolvedDir);
+    if (!addDirSafetyCheck.safe) {
+      console.error(chalk.red(`Error: Unsafe additional directory: ${dir}`));
+      console.error(chalk.yellow(`  ${addDirSafetyCheck.reason}`));
+      process.exit(1);
+    }
+    additionalDirs.push(resolvedDir);
+  }
+
+  return additionalDirs;
 }
 
 /**
@@ -245,6 +306,41 @@ import { isDiscoveryInvocation, registerDiscoveryCommand } from './discovery/cli
 installProcessErrorHandlers();
 
 const program = new Command();
+
+const collectRepeatable = (value: string, previous: string[] = []): string[] => [...previous, value];
+
+// --profile and --set apply to every command, including subcommands, and to
+// every config load in this process, before any of them reads the config.
+program.hook('preAction', (thisCommand, actionCommand) => {
+  const { profile, set } = thisCommand.opts<{ profile?: string; set?: string[] }>();
+  configureRunConfigOverlay({ profile, sets: set });
+
+  // Every top-level command reports itself from here rather than from its own
+  // action. Interactive slash commands are already covered by a single call
+  // site in AgentCommandRuntime; top-level commands never reach that runtime,
+  // so all of them were invisible. Hooking the program means a command added
+  // later is reported without anyone remembering to instrument it.
+  void reportCliCommand({
+    commandPath: commandPathOf(actionCommand),
+    loadConfig: () => loadConfig(undefined, undefined, { createIfMissing: false, initializeTheme: false }),
+    clientVersion: getVersionString(),
+  });
+});
+
+/**
+ * The command's full path, e.g. ['mcp', 'connect']. Names only — arguments
+ * carry paths, server names and prompts, and none of that belongs in
+ * telemetry.
+ */
+function commandPathOf(command: Command): string[] {
+  const parts: string[] = [];
+  let current: Command | null = command;
+  while (current && current.name() && current.name() !== 'autohand') {
+    parts.unshift(current.name());
+    current = current.parent as Command | null;
+  }
+  return parts;
+}
 registerBrowserCommand(program);
 registerBrowserOptions(program);
 registerExtensionsCommand(program);
@@ -258,6 +354,7 @@ program
   .option('-p, --prompt [text]', 'Run a single instruction in command mode')
   .option('--output-format <format>', 'Command output format: stream-json')
   .option('--json [mode]', 'Command JSON output: stream (default) or local')
+  .option('--output-schema <file>', 'Command mode only: the final answer must be one JSON document valid against this JSON Schema file')
   .option('--bare', 'Minimal mode: skip hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and AGENTS.md auto-discovery', false)
   .option('--offline', 'Disable startup network operations, including model catalog refreshes', false)
   .option('--path <path>', 'Workspace path to operate in')
@@ -310,6 +407,9 @@ program
   .option('--checkpoint-interval <n>', 'Git commit every N iterations (default: 5)', parseInt)
   .option('--max-runtime <m>', 'Max runtime in minutes (default: 120)', parseInt)
   .option('--max-cost <d>', 'Max API cost in dollars (default: 10)', parseFloat)
+  .option('--max-requests <n>', 'Stop the run after this many model requests, sub-agents included', parseInt)
+  .option('--max-tokens <n>', 'Stop the run once reported token usage reaches this total, sub-agents included', parseInt)
+  .option('--max-duration <seconds>', 'Stop the run after this much wall time', parseInt)
   .option('--interactive-on-complete', 'After auto-mode ends, hand off directly to interactive mode (TTY only)', false)
   .option('--setup', 'Run the setup wizard to configure or reconfigure Autohand', false)
   .option('--about', 'Show information about Autohand', false)
@@ -329,8 +429,14 @@ program
   .option('--agents <json|path>', 'Custom agents as inline JSON ({"reviewer":{"description":"...","prompt":"..."}}) or an external agents directory')
   .option('--plugin-dir <path>', 'Explicit plugin/meta-tool directory')
   .option('--yolo [pattern]', 'Auto-approve tool calls matching pattern (e.g., allow:read,write or deny:delete)')
+  .option('--allowed-tools <patterns>', 'Only offer and authorize these tools this run, comma-separated or repeated (e.g. read_file,run_command(git:*))', collectToolPatternOption)
+  .option('--disallowed-tools <patterns>', 'Never offer or authorize these tools this run, comma-separated or repeated (e.g. delete_path,run_command)', collectToolPatternOption)
   .option('--timeout <seconds>', 'Timeout in seconds for auto-approve mode', parseInt)
   .option('--fork <pathOrId>', 'Create and resume a new session branch from an existing session reference')
+  .option('--rename <name>', 'Name the most recent session of this workspace and exit')
+  .option('--ephemeral', 'Keep this run out of session history: no session files, no auto-memory, no session sync', false)
+  .option('--profile <name>', 'Layer profiles.<name> from the config onto this run without saving it')
+  .option('--set <key=value>', 'Override one setting for this run, e.g. --set ui.theme=aurora (repeatable, never saved)', collectRepeatable)
   .action(async (positionalPrompt: string | undefined, opts: RootCliOptions) => {
     // Clear screen immediately for Cursor-like behavior (before any output)
     if (
@@ -377,8 +483,6 @@ program
 
     const { extensionRuntimeHost } = await import('./extensions/ExtensionRuntimeHost.js');
     extensionRuntimeHost.setCliOptions(opts as unknown as Record<string, unknown>);
-
-    await refreshModelCatalogBeforeAgentStart(opts);
 
     // `--agents` accepts inline JSON (Claude Code format) or a directory path.
     // Parse and validate inline JSON up front so users get a clear error before
@@ -440,6 +544,22 @@ program
       return;
     }
 
+    // Handle --rename flag
+    if (typeof opts.rename === 'string') {
+      const { renameLastSession } = await import('./startup/renameSession.js');
+      try {
+        const renamed = await renameLastSession({
+          workspacePath: opts.path ?? process.cwd(),
+          name: opts.rename,
+        });
+        console.log(chalk.green(`Session ${renamed.sessionId} renamed to "${renamed.title}".`));
+        process.exit(0);
+      } catch (error) {
+        console.error(chalk.red(error instanceof Error ? error.message : String(error)));
+        process.exit(1);
+      }
+    }
+
     // Handle --settings flag
     if ((opts as any).settings) {
       const config = await loadConfig(opts.config, process.cwd());
@@ -490,17 +610,7 @@ program
     if (opts.setup) {
       const config = await loadConfig(opts.config, process.cwd());
       const workspaceRoot = resolveWorkspaceRoot(config, opts.path);
-
-      const workspacePathValidation = await validateWorkspacePath(workspaceRoot);
-      if (!workspacePathValidation.valid) {
-        console.error(chalk.red(`Error: ${workspacePathValidation.error}`));
-        process.exit(1);
-      }
-      const safetyCheck = checkWorkspaceSafety(workspaceRoot);
-      if (!safetyCheck.safe) {
-        printDangerousWorkspaceWarning(workspaceRoot, safetyCheck);
-        process.exit(1);
-      }
+      await exitUnlessWorkspaceIsSafe(workspaceRoot);
 
       const { SetupWizard } = await import('./onboarding/index.js');
       const wizard = new SetupWizard(workspaceRoot, config);
@@ -564,23 +674,25 @@ program
     {
       const preAuthConfig = await loadConfig(opts.config, process.cwd());
       const workspaceRoot = resolveWorkspaceRoot(preAuthConfig, opts.path);
-      const workspacePathValidation = await validateWorkspacePath(workspaceRoot);
-      if (!workspacePathValidation.valid) {
-        console.error(chalk.red(`Error: ${workspacePathValidation.error}`));
-        process.exit(1);
-      }
-      const safetyCheck = checkWorkspaceSafety(workspaceRoot);
-      if (!safetyCheck.safe) {
-        printDangerousWorkspaceWarning(workspaceRoot, safetyCheck);
-        process.exit(1);
-      }
+      await exitUnlessWorkspaceIsSafe(workspaceRoot);
+    }
+
+    if (opts.outputSchema && !opts.prompt) {
+      console.error(chalk.red('--output-schema applies to command mode: pass the instruction with --prompt.'));
+      process.exit(1);
+    }
+
+    // An ephemeral run has no session to continue; refuse before asking anyone to sign in.
+    if (opts.ephemeral && (opts.resumeSessionId || opts.fork)) {
+      console.error(chalk.red('--ephemeral cannot be combined with --resume or --fork: an ephemeral run has no session to continue.'));
+      process.exit(1);
     }
 
     // ── Authentication gate ──
     // Account-backed providers require a valid login. Configured BYOK and local
     // providers authenticate directly with their selected provider instead.
     {
-      let authConfig = await loadConfig(opts.config, process.cwd());
+  let authConfig = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
       if (!canUseProviderWithoutAccountAuth(authConfig)) {
         authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
       }
@@ -658,7 +770,6 @@ registerReviewCommand(program, {
     const { executeReviewCliInvocation } = await import('./review/reviewCliRuntime.js');
     await executeReviewCliInvocation(invocation, {
       cwd: () => process.cwd(),
-      refreshModelCatalog: refreshModelCatalogBeforeAgentStart,
       loadConfig,
       resolveWorkspaceRoot,
       validateWorkspacePath,
@@ -685,19 +796,33 @@ registerReviewCommand(program, {
 
 registerTransferCommand(program, {
   run: async ({ provider, ...opts }) => {
-    await refreshModelCatalogBeforeAgentStart(opts);
     const authConfig = await ensureAuthenticated(await loadConfig(opts.config, opts.path));
     await runCLI({ ...opts, _authConfig: { ...authConfig, provider, autohandai: { plan: 'cloud', authMode: 'account', accountToken: authConfig.auth?.token, model: opts.model } } });
   },
 });
 
+registerDoctorCommand(program, {
+  version: getVersionString,
+  loadConfig: (configPath, workspaceRoot) => loadConfig(configPath, workspaceRoot),
+  runStartupChecks: async (workspaceRoot) => (await import('./startup/checks.js')).runStartupChecks(workspaceRoot),
+  loadNodePty: async () => (await import('./ui/shellCommand.js')).loadNodePty(),
+  checkAuthenticated: async (config) => (await import('./auth/index.js')).checkAuthenticated(config),
+  getProviderConfig: (config, provider) => getProviderConfig(config, provider as Parameters<typeof getProviderConfig>[1]),
+  probeMcpServers: async (servers) => {
+    const { McpClientManager } = await import('./mcp/McpClientManager.js');
+    return probeMcpServersWithManager(servers, () => new McpClientManager());
+  },
+  extensionDoctor: async () => {
+    const { extensionServiceFor } = await import('./extensions/cli.js');
+    return (await extensionServiceFor(program)).doctor();
+  },
+});
+
 registerResumeCommand(program, {
   run: async (opts) => {
-    await refreshModelCatalogBeforeAgentStart(opts);
-
     // Account-backed providers require a valid login; configured BYOK and local
     // providers authenticate directly with their selected provider instead.
-    let authConfig = await loadConfig(opts.config, process.cwd());
+  let authConfig = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
     if (!canUseProviderWithoutAccountAuth(authConfig)) {
       authConfig = await ensureAuthenticated(authConfig);
     }
@@ -1346,9 +1471,11 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
   });
   try {
     let config = options._authConfig ?? await awaitCliLifecycleStep(
-      loadConfig(options.config, process.cwd()),
+      loadConfig(options.config, resolveRequestedWorkspaceRoot(options.path)),
       commandLifecycleController.signal,
     );
+    startupTimeline.mark('config loaded');
+    config = applyCliProviderOverride(config, options.provider);
     if (options.bare) {
       config = await awaitCliLifecycleStep(
         prepareBareModeConfig(config, options),
@@ -1358,6 +1485,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     if (commandLifecycleController.signal.aborted) {
       return;
     }
+    await applyServedAutohandModel(config, options);
     const originalWorkspaceRoot = resolveWorkspaceRoot(config, options.path);
     let workspaceRoot = originalWorkspaceRoot;
     let sessionWorktree: ReturnType<typeof import('./utils/sessionWorktree.js')['prepareSessionWorktree']> | null = null;
@@ -1383,6 +1511,14 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       import('./permissions/yoloMode.js'),
       commandLifecycleController.signal,
     );
+    // `autohand resume` reaches runCLI directly, after its own sign-in, so the
+    // ephemeral conflict is checked here as well as on the root command.
+    if (options.ephemeral && (options.resumeSessionId || options.fork)) {
+      console.error(chalk.red('--ephemeral cannot be combined with --resume or --fork: an ephemeral run has no session to continue.'));
+      process.exitCode = 1;
+      return;
+    }
+
     const normalizedYolo = normalizeYoloInput(options.yolo as string | boolean | undefined);
     if (normalizedYolo) {
       try {
@@ -1454,6 +1590,27 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       printDangerousWorkspaceWarning(originalWorkspaceRoot, safetyCheck);
       process.exitCode = 1;
       return;
+    }
+
+    // loadConfig held back project hooks and MCP servers from an untrusted
+    // workspace. Ask a person at the terminal; otherwise warn and skip them.
+    if (!options.bare && config.workspaceTrust && !config.workspaceTrust.trusted) {
+      const { resolveWorkspaceTrust } = await awaitCliLifecycleStep(
+        import('./startup/workspaceTrustPrompt.js'),
+        commandLifecycleController.signal,
+      );
+      await awaitCliLifecycleStep(
+        resolveWorkspaceTrust(config, {
+          interactive: resolveAgentLaunchMode(options) !== 'command'
+            && !structuredOutput
+            && process.stdin.isTTY === true
+            && process.stdout.isTTY === true,
+        }),
+        commandLifecycleController.signal,
+      );
+      if (commandLifecycleController.signal.aborted) {
+        return;
+      }
     }
 
     // Optional isolated git worktree for interactive/prompt sessions
@@ -1591,6 +1748,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
           runStartupChecks(workspaceRoot),
           commandLifecycleController.signal,
         );
+        startupTimeline.mark('startup checks (git, tools)');
         if (!structuredOutput) {
           printStartupCheckResults(checkResults);
         }
@@ -1615,6 +1773,16 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
                 checkIntervalHours: config.ui?.updateCheckInterval ?? 24,
               })
             : Promise.resolve(null);
+
+          // The remote catalog only refines the bundled one, so it refreshes
+          // here, after first paint, instead of holding the banner for its
+          // network timeout. It swallows its own failures.
+          const { refreshModelCatalogOnStartup } = await import('./providers/modelCatalogUpdater.js');
+          void refreshModelCatalogOnStartup({
+            offline: options.offline === true ? true : undefined,
+            signal: commandLifecycleController.signal,
+            userAgent: `autohand/${runtimeVersion}`,
+          });
 
           const [authUser, versionResult] = await Promise.all([
             validateAuthOnStartup(config),
@@ -1779,6 +1947,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     }
     agent = new AutohandAgent(llmProvider, files, runtime);
     agentHolder.current = agent;
+    startupTimeline.mark('agent constructed');
     if (commandLifecycleController.signal.aborted) {
       agent.requestExit();
       return;
@@ -1841,15 +2010,18 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       if (commandOutputWriter) {
         agent.setOutputListener((event) => commandOutputWriter.handleEvent(event));
       }
+      const outputSchema = options.outputSchema && !options.reviewExecution
+        ? await loadOutputSchema(options.outputSchema)
+        : undefined;
       const succeeded = options.reviewExecution
         ? await agent.runCommandMode(options.prompt, {
             signal: commandLifecycleController.signal,
             review: options.reviewExecution,
           })
-        : await agent.runCommandMode(
-            options.prompt,
-            commandLifecycleController.signal,
-          );
+        : await agent.runCommandMode(options.prompt, {
+            signal: commandLifecycleController.signal,
+            ...(outputSchema ? { outputSchema } : {}),
+          });
       commandOutputWriter?.finish(succeeded);
       commandOutputCompleted = true;
       agent.setOutputListener(undefined);
@@ -2200,7 +2372,7 @@ async function runLearnNonInteractive(opts: CLIOptions, subcommand: 'recommend' 
 }
 
 async function runGoalFlag(opts: CLIOptions): Promise<void> {
-  const config = (opts as any)._authConfig ?? await loadConfig(opts.config, process.cwd());
+  const config = (opts as any)._authConfig ?? await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const { GOAL_FEATURE_DISABLED_MESSAGE, isGoalFeatureEnabled } = await import('./goals/feature.js');
   if (!isGoalFeatureEnabled(config)) {
     console.error(chalk.yellow(GOAL_FEATURE_DISABLED_MESSAGE));
@@ -2208,16 +2380,7 @@ async function runGoalFlag(opts: CLIOptions): Promise<void> {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(config, opts.path);
-  const workspacePathValidation = await validateWorkspacePath(workspaceRoot);
-  if (!workspacePathValidation.valid) {
-    console.error(chalk.red(`Error: ${workspacePathValidation.error}`));
-    process.exit(1);
-  }
-  const safetyCheck = checkWorkspaceSafety(workspaceRoot);
-  if (!safetyCheck.safe) {
-    printDangerousWorkspaceWarning(workspaceRoot, safetyCheck);
-    process.exit(1);
-  }
+  await exitUnlessWorkspaceIsSafe(workspaceRoot);
 
   const { runGoalCli } = await import('./commands/goal.js');
   const result = await runGoalCli(workspaceRoot, opts.goal ?? '', config);
@@ -2320,21 +2483,16 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
   const fs = await import('fs-extra');
   const { generateUnifiedPatch, formatChangeSummary } = await import('./utils/patch.js');
 
-  const config = await loadConfig(opts.config);
+  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
   let workspaceRoot = originalWorkspaceRoot;
 
-  // Check for dangerous workspace directories
-  const workspacePathValidation = await validateWorkspacePath(originalWorkspaceRoot);
-  if (!workspacePathValidation.valid) {
-    console.error(chalk.red(`Error: ${workspacePathValidation.error}`));
-    process.exit(1);
-  }
+  await exitUnlessWorkspaceIsSafe(originalWorkspaceRoot);
 
-  const safetyCheck = checkWorkspaceSafety(originalWorkspaceRoot);
-  if (!safetyCheck.safe) {
-    printDangerousWorkspaceWarning(originalWorkspaceRoot, safetyCheck);
-    process.exit(1);
+  // Nobody can answer a trust prompt here, so untrusted project hooks and MCP servers are skipped with a warning.
+  if (!opts.bare) {
+    const { resolveWorkspaceTrust } = await import('./startup/workspaceTrustPrompt.js');
+    await resolveWorkspaceTrust(config, { interactive: false });
   }
 
   if (isSessionWorktreeEnabled(opts.worktree)) {
@@ -2353,34 +2511,13 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
     console.error(chalk.gray(`Branch: ${sessionWorktree.branchName}${sessionWorktree.createdBranch ? ' (new)' : ''}\n`));
   }
 
-  // Validate and resolve additional directories from --add-dir flag
-  const additionalDirs: string[] = [];
-  if (opts.addDir && opts.addDir.length > 0) {
-    for (const dir of opts.addDir) {
-      const resolvedDir = path.resolve(dir);
-      if (!await fs.pathExists(resolvedDir)) {
-        console.error(chalk.red(`Error: Additional directory does not exist: ${dir}`));
-        process.exit(1);
-      }
-      const stats = await fs.stat(resolvedDir);
-      if (!stats.isDirectory()) {
-        console.error(chalk.red(`Error: Additional path is not a directory: ${dir}`));
-        process.exit(1);
-      }
-      const addDirSafetyCheck = checkWorkspaceSafety(resolvedDir);
-      if (!addDirSafetyCheck.safe) {
-        console.error(chalk.red(`Error: Unsafe additional directory: ${dir}`));
-        console.error(chalk.yellow(`  ${addDirSafetyCheck.reason}`));
-        process.exit(1);
-      }
-      additionalDirs.push(resolvedDir);
-    }
-  }
+  const additionalDirs = await resolveAdditionalDirectoriesOrExit(opts.addDir);
 
   // Override model from CLI if provided
   if (opts.model) {
     applyCliModelOverride(config, opts.model);
   }
+  await applyServedAutohandModel(config, opts);
 
   const { ProviderFactory } = await import('./providers/ProviderFactory.js');
   const { FileActionManager } = await import('./actions/filesystem.js');
@@ -2467,50 +2604,24 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
     process.exit(1);
   }
 
-  const config = await loadConfig(opts.config);
+  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
 
-  // Check for dangerous workspace directories
-  const workspacePathValidation = await validateWorkspacePath(originalWorkspaceRoot);
-  if (!workspacePathValidation.valid) {
-    console.error(chalk.red(`Error: ${workspacePathValidation.error}`));
-    process.exit(1);
+  await exitUnlessWorkspaceIsSafe(originalWorkspaceRoot);
+
+  // Nobody can answer a trust prompt here, so untrusted project hooks and MCP servers are skipped with a warning.
+  if (!opts.bare) {
+    const { resolveWorkspaceTrust } = await import('./startup/workspaceTrustPrompt.js');
+    await resolveWorkspaceTrust(config, { interactive: false });
   }
 
-  const safetyCheck = checkWorkspaceSafety(originalWorkspaceRoot);
-  if (!safetyCheck.safe) {
-    printDangerousWorkspaceWarning(originalWorkspaceRoot, safetyCheck);
-    process.exit(1);
-  }
-
-  // Validate and resolve additional directories from --add-dir flag
-  const additionalDirs: string[] = [];
-  if (opts.addDir && opts.addDir.length > 0) {
-    for (const dir of opts.addDir) {
-      const resolvedDir = path.resolve(dir);
-      if (!await fs.pathExists(resolvedDir)) {
-        console.error(chalk.red(`Error: Additional directory does not exist: ${dir}`));
-        process.exit(1);
-      }
-      const stats = await fs.stat(resolvedDir);
-      if (!stats.isDirectory()) {
-        console.error(chalk.red(`Error: Additional path is not a directory: ${dir}`));
-        process.exit(1);
-      }
-      const addDirSafetyCheck = checkWorkspaceSafety(resolvedDir);
-      if (!addDirSafetyCheck.safe) {
-        console.error(chalk.red(`Error: Unsafe additional directory: ${dir}`));
-        console.error(chalk.yellow(`  ${addDirSafetyCheck.reason}`));
-        process.exit(1);
-      }
-      additionalDirs.push(resolvedDir);
-    }
-  }
+  const additionalDirs = await resolveAdditionalDirectoriesOrExit(opts.addDir);
 
   // Override model from CLI if provided
   if (opts.model) {
     applyCliModelOverride(config, opts.model);
   }
+  await applyServedAutohandModel(config, opts);
 
   // Override debug mode from CLI if provided
   if (opts.debug) {

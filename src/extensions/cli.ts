@@ -325,10 +325,6 @@ export async function runExtensionsCommand(
   }
 }
 
-export function extensionsUsage(): string {
-  return EXTENSIONS_USAGE;
-}
-
 async function confirmRemoval(extension: LoadedExtension): Promise<boolean> {
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   try {
@@ -339,7 +335,7 @@ async function confirmRemoval(extension: LoadedExtension): Promise<boolean> {
   }
 }
 
-async function extensionServiceFor(program: Command): Promise<ExtensionService> {
+export async function extensionServiceFor(program: Command): Promise<ExtensionService> {
   const rootOptions = program.opts<{ path?: string; config?: string }>();
   const workspaceRoot = path.resolve(rootOptions.path ?? process.cwd());
   const config = await loadConfig(rootOptions.config, workspaceRoot);

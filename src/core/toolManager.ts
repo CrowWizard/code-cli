@@ -20,6 +20,7 @@ import {
   type PermissionPromptResponse,
 } from '../permissions/types.js';
 import { PermissionManager } from '../permissions/PermissionManager.js';
+import { checkRunToolScope, describeRunScopeRefusal } from '../permissions/runToolScope.js';
 import type { HookExecutionResult } from './HookManager.js';
 import {
   getToolCategory,
@@ -31,6 +32,8 @@ import {
 import { getPlanModeManager } from '../commands/plan.js';
 import { randomUUID } from 'node:crypto';
 import { HOOK_TOOL_NAMES } from './hookTools.js';
+import { PEER_TOOL_DEFINITIONS } from './peerTools.js';
+import { GOAL_STATUSES } from '../goals/types.js';
 
 type ReadyToolExecutionTask = {
   call: ToolCallRequest;
@@ -172,6 +175,11 @@ const WRITE_CAPABILITY_TOOLS = new Set<AgentAction['type']>([
   'copy_path',
 ]);
 
+/** Former tool names that older prompts, plans, and skills may still emit. */
+const LEGACY_TOOL_NAMES: Readonly<Record<string, ToolCallRequest['tool']>> = {
+  fff_grep: 'find_grep',
+};
+
 const READ_FILE_PATH_ALIASES = [
   'file_path',
   'filePath',
@@ -196,7 +204,7 @@ function resolveEffectivePermissionTool(
   }
   if ((action.type === 'code_review' && values.scope === 'file' && values.path !== undefined)
     || (action.type === 'git_diff' && values.path !== undefined)
-    || (action.type === 'fff_grep' && values.path !== undefined)
+    || (action.type === 'find_grep' && values.path !== undefined)
     || (action.type === 'find' && values.path !== undefined)
     || action.type === 'checksum') {
     return 'read_file';
@@ -214,7 +222,9 @@ function resolveEffectivePermissionTool(
 export function buildToolPermissionContexts(action: AgentAction): PermissionContext[] {
   const values = action as unknown as Record<string, unknown>;
   const effectiveTool = resolveEffectivePermissionTool(action, values);
-  const context: PermissionContext = { tool: effectiveTool };
+  const context: PermissionContext = effectiveTool === action.type
+    ? { tool: effectiveTool }
+    : { tool: effectiveTool, requestedTool: action.type };
 
   if (action.type === 'run_command'
     || action.type === 'shell'
@@ -264,10 +274,31 @@ export function buildToolPermissionContexts(action: AgentAction): PermissionCont
   return [context];
 }
 
-/** Build the primary standard permission context for compatibility callers. */
-export function buildToolPermissionContext(action: AgentAction): PermissionContext {
-  return buildToolPermissionContexts(action)[0];
-}
+const acceptanceCriteriaParameter: ToolParameter = {
+  type: 'array',
+  description: 'Optional 1–20 unique acceptance criteria explicitly approved by the user; each requires passed completion evidence',
+  items: { type: 'string', description: 'An approved criterion, at most 2000 characters' },
+};
+
+const completionEvidenceParameter: ToolParameter = {
+  type: 'object',
+  description: 'Reported evidence for completion, required when the goal has acceptance criteria; spending is not proof',
+  properties: {
+    summary: { type: 'string', description: 'Completion summary, at most 2000 characters' },
+    checks: {
+      type: 'array', description: '1–20 checks, exactly one passed check for each approved criterion',
+      items: {
+        type: 'object', required: ['criterion', 'status', 'evidence'],
+        properties: {
+          criterion: { type: 'string', description: 'Exact approved criterion' },
+          status: { type: 'string', description: 'Actual check outcome; only passed permits completion', enum: ['passed', 'failed', 'notRun'] },
+          evidence: { type: 'string', description: 'Observed result or artifact reference, at most 4000 characters' },
+        },
+      },
+    },
+  },
+  required: ['summary', 'checks'],
+};
 
 export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
@@ -281,6 +312,7 @@ export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         objective: { type: 'string', description: 'Explicit user-requested goal objective' },
+        acceptance_criteria: acceptanceCriteriaParameter,
         token_budget: { type: 'number', description: 'Optional positive token budget' },
         time_budget_seconds: { type: 'number', description: 'Optional positive time budget in seconds' },
         min_tokens_before_wrap_up: { type: 'number', description: 'Optional minimum tokens before normal completion is allowed' },
@@ -296,6 +328,7 @@ export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         template: { type: 'string', description: 'Template name or alias' },
+        acceptance_criteria: acceptanceCriteriaParameter,
         flags: { type: 'object', description: 'Template flag values' },
         args: { type: 'string', description: 'Trailing template arguments' },
         token_budget: { type: 'number', description: 'Optional positive token budget' },
@@ -313,7 +346,18 @@ export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         objective: { type: 'string', description: 'Optional replacement objective' },
-        status: { type: 'string', description: 'Optional status', enum: ['active', 'paused', 'complete', 'budgetLimited'] },
+        completion_evidence: completionEvidenceParameter,
+        status: { type: 'string', description: 'Optional status; blocked and waiting require a stop reason and resumption condition', enum: [...GOAL_STATUSES] },
+        stop_reason: { type: 'string', description: 'Why the goal is blocked or waiting, at most 4000 characters' },
+        resume_when: { type: 'string', description: 'Concrete condition required before an explicit resume, at most 4000 characters' },
+        checkpoint: {
+          type: 'object', description: 'Save current progress without claiming completion', required: ['summary'],
+          properties: {
+            summary: { type: 'string', description: 'Progress made, at most 4000 characters' },
+            nextStep: { type: 'string', description: 'Next action after resuming, at most 4000 characters' },
+            artifacts: { type: 'array', description: 'At most 20 artifact references', items: { type: 'string' } },
+          },
+        },
         token_budget: { type: 'number', description: 'Optional positive token budget; use clear_goal for removal requests' },
         time_budget_seconds: { type: 'number', description: 'Optional positive time budget in seconds' },
         min_tokens_before_wrap_up: { type: 'number', description: 'Optional token floor' },
@@ -336,6 +380,7 @@ export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         objective: { type: 'string', description: 'Goal objective to queue' },
+        acceptance_criteria: acceptanceCriteriaParameter,
         token_budget: { type: 'number', description: 'Optional positive token budget' },
         time_budget_seconds: { type: 'number', description: 'Optional positive time budget in seconds' },
         min_tokens_before_wrap_up: { type: 'number', description: 'Optional token floor' },
@@ -378,6 +423,7 @@ export const GOAL_TOOL_DEFINITIONS: ToolDefinition[] = [
 ];
 
 export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
+  ...PEER_TOOL_DEFINITIONS,
   {
     name: 'tools_registry',
     description: 'List all available tools (built-in and meta)'
@@ -477,7 +523,7 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
   {
-    name: 'fff_grep',
+    name: 'find_grep',
     description: 'Content search with frecency ranking and definition detection when native FFF is available, plus a ripgrep-backed fallback. Use this for content search.',
     parameters: {
       type: 'object',
@@ -567,7 +613,7 @@ export const DEFAULT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'run_command',
-    description: 'Execute a shell command in the user\'s shell with full pipe, redirect, and environment variable support. Cross-platform (bash/zsh on macOS/Linux, cmd/PowerShell on Windows). Prefer dedicated tools for file operations (read_file, write_file, fff_grep, fff_find). For most commands, prefer the `shell` tool instead - it shows real-time output. Use this only for quick commands where you don\'t need progress monitoring.',
+    description: 'Execute a shell command in the user\'s shell with full pipe, redirect, and environment variable support. Cross-platform (bash/zsh on macOS/Linux, cmd/PowerShell on Windows). Prefer dedicated tools for file operations (read_file, write_file, find_grep, fff_find). For most commands, prefer the `shell` tool instead - it shows real-time output. Use this only for quick commands where you don\'t need progress monitoring.',
     parameters: {
       type: 'object',
       properties: {
@@ -2626,7 +2672,7 @@ export class ToolManager {
   async execute(
     toolCalls: ToolCallRequest[],
     onToolComplete?: (index: number, result: ToolExecutionResult) => void,
-    executionContext: Pick<ToolExecutionContext, 'signal'> = {},
+    executionContext: Omit<ToolExecutionContext, 'toolCallId'> = {},
   ): Promise<ToolExecutionResult[]> {
     const signal = executionContext.signal;
     const results = new Map<number, ToolExecutionResult>();
@@ -2641,7 +2687,7 @@ export class ToolManager {
     const readyToExecute: ReadyToolExecutionTask[] = [];
 
     for (let i = 0; i < toolCalls.length; i++) {
-      let call = this.cloneToolCallWithStableId(toolCalls[i]);
+      let call = this.resolveLegacyToolName(this.cloneToolCallWithStableId(toolCalls[i]));
 
       const reject = (
         error: string,
@@ -2701,6 +2747,13 @@ export class ToolManager {
 
       try {
         this.assertNotAborted(signal);
+        // The run scope is matched on the tool the model actually named, before
+        // capability mapping turns e.g. delete_path into a write_file context.
+        const scope = checkRunToolScope(this.permissionManager.getRunToolScope(), { kind: call.tool, target: '' });
+        if (!scope.allowed) {
+          reject(describeRunScopeRefusal(call.tool, scope.reason), 'validation');
+          continue;
+        }
         let action = this.toAction(call);
         let permissionContexts = this.resolvePermissionContexts(action);
         let policyEvaluation = this.evaluatePermissionContexts(permissionContexts);
@@ -2912,7 +2965,7 @@ export class ToolManager {
       const execResults = await this.executeScheduled(
         readyToExecute,
         onToolComplete,
-        signal,
+        executionContext,
       );
       for (const [index, result] of execResults) {
         results.set(index, result);
@@ -3200,6 +3253,11 @@ export class ToolManager {
     });
   }
 
+  private resolveLegacyToolName(call: ToolCallRequest): ToolCallRequest {
+    const current = LEGACY_TOOL_NAMES[call.tool];
+    return current ? { ...call, tool: current } : call;
+  }
+
   private applyAlternative(
     call: ToolCallRequest,
     alternative: string
@@ -3291,7 +3349,7 @@ export class ToolManager {
   private async executeScheduled(
     tasks: ReadyToolExecutionTask[],
     onToolComplete?: (index: number, result: ToolExecutionResult) => void,
-    signal?: AbortSignal,
+    executionContext: Omit<ToolExecutionContext, 'toolCallId'> = {},
   ): Promise<Map<number, ToolExecutionResult>> {
     const results = new Map<number, ToolExecutionResult>();
     let parallelBatch: ReadyToolExecutionTask[] = [];
@@ -3310,7 +3368,7 @@ export class ToolManager {
         parallelBatch,
         this.maxConcurrency,
         onToolComplete,
-        signal,
+        executionContext,
       );
       mergeResults(batchResults);
       parallelBatch = [];
@@ -3327,7 +3385,7 @@ export class ToolManager {
         [task],
         1,
         onToolComplete,
-        signal,
+        executionContext,
       );
       mergeResults(sequentialResult);
     }
@@ -3347,8 +3405,9 @@ export class ToolManager {
     tasks: ReadyToolExecutionTask[],
     maxConcurrency: number,
     onToolComplete?: (index: number, result: ToolExecutionResult) => void,
-    signal?: AbortSignal,
+    executionContext: Omit<ToolExecutionContext, 'toolCallId'> = {},
   ): Promise<Map<number, ToolExecutionResult>> {
+    const signal = executionContext.signal;
     const results = new Map<number, ToolExecutionResult>();
     let cursor = 0;
 
@@ -3364,6 +3423,7 @@ export class ToolManager {
           if (!this.isProviderAllowed(call.tool)) throw new Error('Lifecycle hook tools are available only with the Autohand AI provider.');
           const action = this.toAction(call);
           const outcome = this.normalizeToolOutcome(await this.executor(action, {
+            ...executionContext,
             toolCallId: call.id,
             tool: call.tool,
             approvalHandled: true,

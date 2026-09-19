@@ -744,6 +744,29 @@ export AUTOHAND_SKIP_UPDATE_CHECK=1
 
 ---
 
+### Profile für Tastenkürzel
+
+Wer bereits einen anderen Coding-Agenten nutzt, kann den Composer dessen Kürzel folgen lassen. Das Profil wird beim Setup angeboten (wenn Autohand den Agenten findet), unter `/settings` → UI → Tastenkürzel gewählt oder direkt gesetzt:
+
+```sh
+autohand config set ui.keybindingProfile codex
+```
+
+| Profil | Zeilenumbruch | Beenden | Verlauf |
+| --- | --- | --- | --- |
+| `autohand` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+| `claude-code`, `codex`, `devin` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | Ctrl+R |
+| `cursor`, `antigravity` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | `/whatityped` |
+| `factory` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+
+Ctrl+D beendet nur bei leerem Composer. Das `?`-Panel zeigt immer die Kürzel des aktiven Profils. Mit `claude-code` werden eigene Belegungen aus `~/.claude/keybindings.json` übernommen, mit `codex` die aus `[tui.keymap.*]` in `~/.codex/config.toml`.
+
+Welche Kürzel ankommen, entscheidet das Terminal: Shift+Enter braucht das kitty-Tastaturprotokoll (Ghostty, kitty, WezTerm, iTerm2 3.5+), Alt+Enter braucht Option als Meta unter macOS, Ctrl+J funktioniert in jedem Terminal, auch in tmux.
+
+**Import beim Setup.** Findet das Setup einen anderen Agenten, bietet es zusätzlich an, Erinnerungen, Sitzungen und Skills so zu importieren wie `/import`; ein fehlgeschlagener Import blockiert das Setup nicht.
+
+---
+
 ## Agenten-Einstellungen
 
 Steuern Sie das Agentenverhalten und die Iterationslimits.
@@ -790,7 +813,7 @@ Steuern Sie das Agentenverhalten und die Iterationslimits.
 
 Autohand sendet nicht jedes vollständige Tool-Schema bei jeder LLM-Anfrage. Der System-Prompt enthält einen kompakten Tool-Fähigkeitenkatalog, und jede Anfrage legt nur eine kleine Menge konkreter Schemas offen, ausgewählt aus:
 
-- Kern-Erkennungstools wie `tool_search`, `read_file`, `fff_find`, und `fff_grep`
+- Kern-Erkennungstools wie `tool_search`, `read_file`, `fff_find`, und `find_grep`
 - Absichtsübereinstimmende Tools für Bearbeitungs-, Verifizierungs-, Git-, Browser-, Web-, Abhängigkeits- oder Projekt-Tracking-Arbeit
 - Tools, die über kürzliche `tool_search`-Aufrufe angefordert wurden oder explizit namentlich erwähnt wurden
 
@@ -2160,6 +2183,7 @@ Autohand bietet eine umfangreiche Reihe von Slash-Befehlen für die interaktive 
 | `/status`     | Sitzungsstatus anzeigen                                   |
 | `/usage`      | Modell, Anbieter, Kontext und Nutzungslimits anzeigen       |
 
+| `/upgrade`    | Konsole öffnen, um den Autohand-Plan zu upgraden            |
 ### Modell & Anbieter
 
 | Befehl       | Beschreibung                                           |

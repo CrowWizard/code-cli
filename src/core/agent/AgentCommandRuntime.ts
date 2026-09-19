@@ -10,7 +10,7 @@ import { getContextWindow } from '../context/tokenizer.js';
 import type { AgentAction, ToolActionOutcome } from '../../types.js';
 import type { McpServerConfig } from '../../mcp/types.js';
 import { GitIgnoreParser } from '../../utils/gitIgnore.js';
-import { prepareSessionWorktree } from '../../utils/sessionWorktree.js';
+import { prepareCoordinatedSessionWorktree } from '../../utils/sessionWorktree.js';
 import { WorktreeManager } from '../../actions/worktree.js';
 import { getPlanModeManager } from '../../commands/plan.js';
 import { showDirectoryAccessModal } from '../../ui/directoryAccessModal.js';
@@ -19,7 +19,7 @@ import { showQuestionModal } from '../../ui/questionModal.js';
 import { confirm as unifiedConfirm, isExternalCallbackEnabled } from '../../ui/promptCallback.js';
 import { safeSetRawMode } from '../../ui/rawMode.js';
 import { isToolAllowedByYolo, normalizeYoloInput, parseYoloPattern } from '../../permissions/yoloMode.js';
-import { normalizePermissionPromptResponse, type PermissionPromptResult } from '../../permissions/types.js';
+import { isAllowedPermissionPrompt, normalizePermissionPromptResponse, type PermissionPromptResult } from '../../permissions/types.js';
 import type { Plan } from '../../modes/planMode/types.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js';
@@ -235,7 +235,7 @@ export async function runAgentSlashCommandWithInput(host: AgentCommandRuntimeHos
         host.persistentInputActiveTurn = false;
       }
       cleanupConsoleBridge();
-      if (isInteractive && command !== '/whatityped' && host.inkRenderer?.isRunning()) {
+      if (isInteractive && command !== '/whatityped' && command !== '/peers' && host.inkRenderer?.isRunning()) {
         host.inkRenderer.clearInput();
       }
     }
@@ -322,13 +322,16 @@ export async function confirmAgentDangerousAction(host: AgentCommandRuntimeHost,
       return { decision: 'allow_once' };
     }
 
+    const promptContext = context?.tool
+      ? { tool: context.tool, path: context.path, command: context.command }
+      : undefined;
     let decision: PermissionPromptResult;
 
     // Use confirmation callback if set (e.g., RPC mode)
     if (host.confirmationCallback) {
       decision = normalizePermissionPromptResponse(await host.confirmationCallback(message, context));
     } else if (isExternalCallbackEnabled()) {
-      decision = normalizePermissionPromptResponse(await unifiedConfirm(message));
+      decision = normalizePermissionPromptResponse(await unifiedConfirm(message, promptContext));
     } else {
       host.notificationService.notify(
         { body: message, reason: 'confirmation' },
@@ -341,7 +344,7 @@ export async function confirmAgentDangerousAction(host: AgentCommandRuntimeHost,
         if (wasRaw) {
           safeSetRawMode(process.stdin as NodeJS.ReadStream, false);
         }
-        return unifiedConfirm(message);
+        return unifiedConfirm(message, promptContext);
       });
     }
 
@@ -354,6 +357,14 @@ export async function confirmAgentDangerousAction(host: AgentCommandRuntimeHost,
         },
         decision
       );
+      if (!isAllowedPermissionPrompt(decision)) {
+        await host.hookManager.executeHooks('permission-denied', {
+          tool: context.tool,
+          path: context.path,
+          command: context.command,
+          permissionType: decision.decision,
+        });
+      }
     }
 
     return decision;
@@ -677,7 +688,7 @@ export async function enterAgentSessionWorktree(host: AgentCommandRuntimeHost, n
     const workspaceChange: ThreadLease | undefined = host.sessionThreadBudget?.beginWorkspaceChange();
     try {
       const originalWorkspaceRoot = host.runtime.workspaceRoot;
-      const info = prepareSessionWorktree({
+      const info = await prepareCoordinatedSessionWorktree({
         cwd: originalWorkspaceRoot,
         worktree: name ?? true,
         mode: 'cli',

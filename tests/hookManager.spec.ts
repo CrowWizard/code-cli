@@ -148,6 +148,24 @@ describe('HookManager', () => {
       expect(env?.HOOK_SUBAGENT_ERROR).toHaveLength(4_000);
     });
 
+    it('applies the shell.env policy to hook commands while keeping hook variables', async () => {
+      const { configureChildProcessEnvPolicy } = await import('../src/utils/childProcessEnv.js');
+      process.env.ZZ_HOOK_SECRET = 'leak';
+      configureChildProcessEnvPolicy({ exclude: ['ZZ_HOOK_*'], set: { HOOK_PINNED: 'yes' } });
+      try {
+        await manager.addHook({ event: 'session-start', command: 'true' });
+        await manager.executeHooks('session-start', {});
+        const env = vi.mocked(spawn).mock.calls.at(-1)?.[2]?.env as NodeJS.ProcessEnv;
+        expect(env.ZZ_HOOK_SECRET).toBeUndefined();
+        expect(env.HOOK_PINNED).toBe('yes');
+        expect(env.HOOK_EVENT).toBe('session-start');
+        expect(env.AUTOHAND_CLI).toBe('1');
+      } finally {
+        configureChildProcessEnvPolicy(undefined);
+        delete process.env.ZZ_HOOK_SECRET;
+      }
+    });
+
     it('exposes subagent controls in summaries and passes run context through filtered shell hooks', async () => {
       const events = ['subagent-start', 'subagent-progress', 'subagent-message', 'subagent-cancel-requested'] as const;
       for (const event of events) await manager.addHook({ event, command: 'true', matcher: '^reviewer$' });
@@ -633,5 +651,42 @@ describe('autoresearch decision matching', () => {
     const manager = new HookManager({ workspaceRoot: process.cwd(), settings: { hooks: [{ event: 'autoresearch:decision', matcher: 'attempt-42.*keep', command: 'echo matched' }] } });
     expect(await manager.executeHooks('autoresearch:decision', { autoresearchAttemptId: 'attempt-42', autoresearchDecision: 'keep' })).toHaveLength(1);
     expect(await manager.executeHooks('autoresearch:decision', { autoresearchAttemptId: 'attempt-42', autoresearchDecision: 'discard' })).toEqual([]);
+  });
+});
+
+describe('legacy hook names and templates', () => {
+  it('fires legacy-named hooks on their real events with the documented conditions', async () => {
+    const manager = new HookManager({ workspaceRoot: '/ws', settings: { enabled: true, hooks: [
+      { event: 'on_file_create', command: 'echo created {{file}}' },
+      { event: 'before_command', command: 'echo cmd {{command}}' },
+    ] } });
+    vi.mocked(spawn).mockClear();
+
+    await manager.executeHooks('file-modified', { path: 'src/new.ts', changeType: 'modify' });
+    expect(spawn).not.toHaveBeenCalled();
+
+    await manager.executeHooks('file-modified', { path: 'src/new.ts', changeType: 'create' });
+    expect(spawn).toHaveBeenCalledWith('echo created src/new.ts', [], expect.anything());
+
+    await manager.executeHooks('pre-tool', { tool: 'read_file', args: { path: 'x' } });
+    expect(spawn).toHaveBeenCalledTimes(1);
+
+    await manager.executeHooks('pre-tool', { tool: 'shell', args: { command: 'npm test' } });
+    expect(spawn).toHaveBeenLastCalledWith(`echo cmd 'npm test'`, [], expect.anything());
+  });
+
+  it('accepts the event-keyed settings shape and counts those hooks under their real events', async () => {
+    const manager = new HookManager({ workspaceRoot: '/ws', settings: {
+      on_file_change: ['eslint {{file}} --fix'],
+      on_session_end: ['notify-send done'],
+    } as unknown as HooksSettings });
+
+    expect(manager.getHooks()).toEqual([
+      { event: 'on_file_change', command: 'eslint {{file}} --fix' },
+      { event: 'on_session_end', command: 'notify-send done' },
+    ]);
+    expect(manager.getSummary()['file-modified']).toEqual({ total: 1, enabled: 1 });
+    expect(manager.getSummary()['session-end']).toEqual({ total: 1, enabled: 1 });
+    expect(manager.getHooksForEvent('session-end')).toHaveLength(1);
   });
 });

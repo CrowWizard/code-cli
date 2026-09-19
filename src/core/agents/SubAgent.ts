@@ -5,6 +5,8 @@
  */
 
 import chalk from 'chalk';
+import { SUBAGENT_SKILLS_PROMPT_KEY, SubAgentSkills, type SubAgentSkillsRegistry } from './subAgentSkills.js';
+import type { RunBudgetGate } from '../agent/RunBudget.js';
 import { AgentRegistry, type AgentDefinition } from './AgentRegistry.js';
 import { formatAgentRoster } from './agentRoster.js';
 import { buildWorkerProjectMemoryContext } from './workerProjectMemory.js';
@@ -31,16 +33,29 @@ import type { ThreadBudget } from './SessionThreadBudget.js';
 import type { ClientContext, LLMMessage, LLMUsage, LoadedConfig, ToolCallRequest } from '../../types.js';
 import { isGoalFeatureEnabled } from '../../goals/feature.js';
 import { ReactionParser } from '../agent/ReactionParser.js';
+import type { PeerClient, PeerEvent } from '../../session/peers/PeerMessaging.js';
+import type { ResourceCoordinatorClient } from '../../session/peers/ResourceCoordinator.js';
+import { PeerCommunicationRuntime, formatPeerContext, type PeerContextEnvelope } from '../agent/PeerCommunicationRuntime.js';
+import { peerToolAvailable } from '../peerTools.js';
 import {
     resolveAssistantToolCalls,
     ToolLoopGuard,
     ToolReflectionGuard,
 } from '../agent/ToolLoopPolicy.js';
+import { evaluateAssistantTurn } from '../agent/TurnOutcomeEvaluator.js';
+import { TruncationRecoveryTracker } from '../agent/TruncationRecovery.js';
+import { DEFAULT_RESPONSE_COMPLETION_HOOKS } from '../agent/ResponseCompletionClassifier.js';
 
 /**
  * Options for creating a SubAgent with context inheritance
  */
 export interface SubAgentOptions {
+    bindPeerRun?: DelegatorOptions['bindPeerRun'];
+    peerAutomatic?: boolean;
+    peerMessaging?: PeerClient;
+    resourceCoordinator?: ResourceCoordinatorClient;
+    onPeerEvent?: (event: PeerEvent) => void;
+    recordPeerContext?: (messages: PeerContextEnvelope[]) => Promise<void>;
     workspaceRoot?: string;
     projectMemoryEnabled?: boolean;
     userRequest?: string;
@@ -68,6 +83,10 @@ export interface SubAgentOptions {
     confirmApproval?: ToolManagerOptions['confirmApproval'];
     /** Resolve the current runtime tool set, including extension-owned tools. */
     getToolDefinitions?: () => ToolDefinition[];
+    /** Skills the delegated agent may read and activate for itself. */
+    skillsRegistry?: SubAgentSkillsRegistry;
+    /** The lead's run budget; every sub-agent request counts against it. */
+    runBudget?: RunBudgetGate;
     /** Model selected by the parent delegation policy for this execution. */
     model?: string;
     /** Propagate provider/model resolution through nested delegation. */
@@ -100,7 +119,7 @@ const DELEGATION_TOOL_DEFINITIONS = DEFAULT_TOOL_DEFINITIONS.filter(definition =
 const LEAD_ONLY_TOOL_NAMES = new Set([
     'create_team', 'compose_team', 'add_teammate', 'create_task', 'task_get', 'task_list',
     'task_update', 'task_stop', 'task_output', 'team_status', 'send_team_message',
-    'orchestrate_specialists', 'install_specialist_roster', 'skill', 'sleep',
+    'orchestrate_specialists', 'install_specialist_roster', 'sleep',
     'enter_worktree', 'exit_worktree', 'cron_create', 'cron_delete', 'list_schedules',
     'cancel_schedule', 'exit_plan_mode', 'find_mcp_servers', 'install_mcp_server', 'install_agent_skill',
 ]);
@@ -126,6 +145,7 @@ export class SubAgent {
     private readonly supportsNativeToolCalling: boolean;
     private readonly reactionParser = new ReactionParser();
     private readonly usage: LLMUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    private readonly skills: SubAgentSkills | null;
 
     constructor(
         private readonly config: AgentDefinition,
@@ -156,9 +176,15 @@ export class SubAgent {
         let definitions = allowedTools.has('*')
             ? availableDefinitions
             : availableDefinitions.filter(def => allowedTools.has(def.name));
+        this.skills = options.skillsRegistry ? new SubAgentSkills(options.skillsRegistry, config.skills ?? []) : null;
         definitions = definitions.filter(definition => !LEAD_ONLY_TOOL_NAMES.has(definition.name)
+            && peerToolAvailable(definition.name, options.peerMessaging)
             && !definition.name.startsWith('mcp__')
+            && (definition.name !== 'skill' || this.skills !== null)
             && (canDelegate || !DELEGATION_TOOL_NAMES.has(definition.name)));
+        // The lead's run scope and exclusions apply to delegated agents too.
+        const scopedDefinitions = options.authorization?.permissionManager?.filterAdvertisedTools(definitions);
+        if (scopedDefinitions) definitions = scopedDefinitions;
 
         // Add delegation tools if sub-agent can delegate further
         if (canDelegate) {
@@ -175,6 +201,7 @@ export class SubAgent {
         // Create delegator if sub-agent can delegate
         if (canDelegate) {
             this.delegator = new AgentDelegator(llm, actionExecutor, {
+                bindPeerRun: options.bindPeerRun,
                 workspaceRoot: options.workspaceRoot,
                 projectMemoryEnabled: options.projectMemoryEnabled,
                 getUserRequest: () => options.userRequest,
@@ -186,6 +213,8 @@ export class SubAgent {
                 authorization: options.authorization,
                 confirmApproval: options.confirmApproval,
                 getToolDefinitions: options.getToolDefinitions,
+                getSkillsRegistry: () => options.skillsRegistry,
+                runBudget: options.runBudget,
                 resolveSubagentAssignment: options.resolveSubagentAssignment,
                 createSubagentProvider: options.createSubagentProvider,
                 threadBudget: options.threadBudget,
@@ -216,7 +245,10 @@ export class SubAgent {
                 if (action.type === 'delegate_parallel' && this.delegator) {
                     return this.delegator.delegateParallelForTool(action.tasks, { signal: context?.signal });
                 }
-                return this.actionExecutor.executeForTool(action, context);
+                if (action.type === 'skill' && this.skills) {
+                    return this.skills.handle(action);
+                }
+                return this.actionExecutor.executeForTool(action, { ...context, peerMessaging: options.peerMessaging, resourceCoordinator: options.resourceCoordinator, peerAutomatic: options.peerAutomatic });
             },
             confirmApproval: options.confirmApproval ?? (async () => false),
             definitions,
@@ -234,6 +266,14 @@ export class SubAgent {
         ].filter(Boolean).join('\n\n');
         this.conversation = new ConversationManager();
         this.conversation.reset(enhancedSystemPrompt);
+        this.refreshSkillsPrompt();
+    }
+
+    /** Keeps the skills section in step with this agent's activation state. */
+    private refreshSkillsPrompt(): void {
+        if (!this.skills) return;
+        const canActivate = this.toolManager.listToolNames().includes('skill');
+        this.conversation.addSystemNote(this.skills.buildPrompt({ canActivate }), SUBAGENT_SKILLS_PROMPT_KEY);
     }
 
     /**
@@ -305,6 +345,24 @@ export class SubAgent {
     }
 
     public async run(task: string, options: SubAgentRunOptions = {}): Promise<string> {
+        const runtime = this.options.peerMessaging ? new PeerCommunicationRuntime({
+            messaging: this.options.peerMessaging,
+            notify: event => this.options.onPeerEvent?.(event),
+            requestAutoTurn: async () => {},
+            commitContext: async messages => {
+                if (this.options.recordPeerContext) await this.options.recordPeerContext(messages);
+                else await this.options.peerMessaging!.recordContext(messages);
+                this.conversation.addMessage({ role: 'user', content: formatPeerContext(messages) });
+            },
+        }) : undefined;
+        const aborted = () => runtime?.setPaused('cancelled', true);
+        options.signal?.addEventListener('abort', aborted, { once: true });
+        runtime?.beginTurn();
+        try { return await this.runTask(task, options, runtime); }
+        finally { options.signal?.removeEventListener('abort', aborted); await runtime?.close(); }
+    }
+
+    private async runTask(task: string, options: SubAgentRunOptions, peerRuntime?: PeerCommunicationRuntime): Promise<string> {
         options.signal?.throwIfAborted();
         console.log(chalk.cyan(`\nSub-agent '${this.name}' starting task... (depth ${this.options.depth}/${this.options.maxDepth})`));
 
@@ -326,6 +384,9 @@ export class SubAgent {
         const tools = this.toolManager.toFunctionDefinitions();
         const loopGuard = new ToolLoopGuard();
         const reflectionGuard = new ToolReflectionGuard();
+        let withholdToolsNextRequest = false;
+        let consecutiveRepairCount = 0;
+        const truncationRecovery = new TruncationRecoveryTracker();
         const maxIterations = 10;
         for (let i = 0; i < maxIterations; i++) {
             options.signal?.throwIfAborted();
@@ -333,20 +394,29 @@ export class SubAgent {
             await this.options.onProgress?.({ status: 'thinking', usage: this.getUsage() });
             options.signal?.throwIfAborted();
             this.consumePendingInstructions();
+            this.refreshSkillsPrompt();
+            await peerRuntime?.safeBoundary();
+            const withholdToolsForRequest = withholdToolsNextRequest;
+            withholdToolsNextRequest = false;
             const requestTools = this.supportsNativeToolCalling
                 && !loopGuard.isForcingFinalResponse()
+                && !withholdToolsForRequest
                 && tools.length > 0
                 ? tools
                 : undefined;
 
+            this.options.runBudget?.assertRequestAllowed();
+            this.options.runBudget?.recordRequest();
             const completion = await this.llm.complete({
                 messages: this.toolImages.prepare(this.conversation.history()),
-                model: this.options.model ?? this.config.model,
+                // A definition's model is a suggestion resolved by the team policy; never send it raw.
+            model: this.options.model,
                 temperature: 0.2,
                 signal: options.signal,
                 tools: requestTools,
                 toolChoice: requestTools ? 'auto' : undefined
             });
+            this.options.runBudget?.recordUsage(completion.usage);
             if (completion.usage) {
                 this.usage.promptTokens += completion.usage.promptTokens;
                 this.usage.completionTokens += completion.usage.completionTokens;
@@ -362,6 +432,42 @@ export class SubAgent {
 
             // Prefer native tool calls if available
             const payload = this.reactionParser.parseAssistantResponse(completion);
+            const turnOutcome = evaluateAssistantTurn({
+                completion,
+                payload,
+                cleanupModelResponse: content => content,
+                responseCompletionHooks: DEFAULT_RESPONSE_COMPLETION_HOOKS,
+            });
+
+            if (turnOutcome.type === 'repair') {
+                if (turnOutcome.reason === 'truncated_response') {
+                    consecutiveRepairCount = 0;
+                    if (completion.content.trim()) {
+                        this.conversation.addMessage({ role: 'assistant', content: completion.content });
+                    }
+                    const truncationDecision = truncationRecovery.observeTruncation(turnOutcome.instruction);
+                    if (truncationDecision.type === 'exhausted') {
+                        throw new SubAgentExecutionError(
+                            `[${this.name}] Provider ${truncationDecision.summary} before the delegated task completed.`,
+                        );
+                    }
+                    this.conversation.addSystemNote(truncationDecision.note);
+                    continue;
+                }
+
+                truncationRecovery.observeCompleteResponse();
+                consecutiveRepairCount += 1;
+                if (consecutiveRepairCount >= 3) {
+                    throw new SubAgentExecutionError(
+                        `[${this.name}] Failed to provide a complete delegated result after three recovery attempts.`,
+                    );
+                }
+                this.conversation.addSystemNote(turnOutcome.instruction);
+                continue;
+            }
+
+            consecutiveRepairCount = 0;
+            truncationRecovery.observeCompleteResponse();
 
             // Preserve native tool_calls on the assistant turn so Responses API
             // providers (xAI OAuth / Grok 4.5) can continue multi-turn tool use.
@@ -386,12 +492,26 @@ export class SubAgent {
                 console.log(chalk.gray(`[${this.name}] ${payload.thought}`));
             }
 
-            if (payload.toolCalls && payload.toolCalls.length > 0) {
-                const reflectionDecision = reflectionGuard.evaluate(payload);
-                if (reflectionDecision.type === 'integrity_failure') {
-                    loopGuard.forceFinalResponse();
+            if (turnOutcome.type === 'continue_with_tools') {
+                const toolCalls = turnOutcome.toolCalls;
+                if (withholdToolsForRequest) {
                     this.recordRejectedNativeToolCalls(
-                        payload.toolCalls,
+                        toolCalls,
+                        'Tool call not executed: tools were unavailable for the one-response integrity recovery.',
+                    );
+                    this.conversation.addSystemNote(
+                        '[Tool Result Integrity] A tool call emitted during the tool-free recovery was not executed. '
+                        + 'Tool access is restored for the next response; retry the required call once, or provide the final answer.',
+                    );
+                    continue;
+                }
+                const reflectionDecision = reflectionGuard.evaluate(payload, {
+                    requireExplicitReflection: !this.supportsNativeToolCalling,
+                });
+                if (reflectionDecision.type === 'integrity_failure') {
+                    withholdToolsNextRequest = true;
+                    this.recordRejectedNativeToolCalls(
+                        toolCalls,
                         'Tool call not executed: prior tool-result visibility was reported as unavailable.',
                     );
                     this.conversation.addSystemNote(
@@ -404,7 +524,7 @@ export class SubAgent {
 
                 if (reflectionDecision.type === 'require_reflection') {
                     this.recordRejectedNativeToolCalls(
-                        payload.toolCalls,
+                        toolCalls,
                         'Tool call not executed: reflection on the previous tool results is required first.',
                     );
                     this.conversation.addSystemNote(
@@ -414,10 +534,10 @@ export class SubAgent {
                     continue;
                 }
 
-                const decision = loopGuard.observeCalls(payload.toolCalls);
+                const decision = loopGuard.observeCalls(toolCalls);
                 if (decision.type !== 'allow') {
                     this.recordRejectedNativeToolCalls(
-                        payload.toolCalls,
+                        toolCalls,
                         'Tool call not executed: the loop guard requires a final response.',
                     );
                     this.conversation.addSystemNote(
@@ -432,15 +552,15 @@ export class SubAgent {
 
                 // Execute tools
                 await this.options.onProgress?.({
-                    status: 'tool', tool: payload.toolCalls.map(call => call.tool).join(', '), usage: this.getUsage(),
+                    status: 'tool', tool: toolCalls.map(call => call.tool).join(', '), usage: this.getUsage(),
                 });
                 options.signal?.throwIfAborted();
-                const results = await this.toolManager.execute(payload.toolCalls, undefined, { signal: options.signal });
+                const results = await this.toolManager.execute(toolCalls, undefined, { signal: options.signal });
                 options.signal?.throwIfAborted();
 
                 for (let j = 0; j < results.length; j++) {
                     const result = results[j];
-                    const toolCall = payload.toolCalls[j];
+                    const toolCall = toolCalls[j];
                     const content = result.success
                         ? result.output ?? '(no output)'
                         : result.error ?? 'Tool failed';
@@ -474,11 +594,11 @@ export class SubAgent {
             }
 
             if (this.consumePendingInstructions()) continue;
+            if ((await peerRuntime?.finishTurn())?.continueTurn) continue;
 
             // No tools, return final response
-            const response = payload.finalResponse ?? payload.response ?? completion.content;
             console.log(chalk.cyan(`[${this.name}] Finished.`));
-            return response;
+            return turnOutcome.response;
         }
 
         throw new SubAgentExecutionError(`[${this.name}] Failed to complete task within ${maxIterations} iterations.`);

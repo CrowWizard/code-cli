@@ -6,6 +6,7 @@
 import crypto from 'node:crypto';
 
 import type { AutohandAgent } from '../../core/agent.js';
+import { AgentRegistry } from '../../core/agents/AgentRegistry.js';
 import type { HookContext } from '../../core/HookManager.js';
 import { resolveReviewCommand } from '../../commands/review.js';
 import {
@@ -109,6 +110,7 @@ import type {
   ApplyFlagSettingsResult,
   GetSupportedModelsResult,
   GetSupportedCommandsResult,
+  GetSupportedAgentsResult,
   GetToolsRegistryResult,
   GetContextUsageResult,
   ReloadPluginsResult,
@@ -154,7 +156,7 @@ import { negotiateBrowserCapabilities } from '../../browser/browserCapabilities.
 import { redactBrowserToolArguments } from '../../browser/browserRedaction.js';
 import { CHROME_AUTOMATION_V2_SYSTEM_PROMPT } from '../../browser/chromeSkill.js';
 import { GoalManager } from '../../goals/GoalManager.js';
-import type { GoalStatus } from '../../goals/types.js';
+import { parseGoalStatus, type GoalCheckpointInput, type GoalCompletionEvidence } from '../../goals/types.js';
 import { GOAL_FEATURE_DISABLED_MESSAGE, isGoalFeatureEnabled } from '../../goals/feature.js';
 import { getRpcErrorMetadata, writeRpcDebugLine } from './logging.js';
 import { SLASH_COMMANDS } from '../../core/slashCommands.js';
@@ -478,6 +480,7 @@ export class RPCAdapter {
 
   async handleGoalCreate(params: {
     objective: string;
+    acceptance_criteria?: string[];
     token_budget?: number;
     time_budget_seconds?: number;
     min_tokens_before_wrap_up?: number;
@@ -487,6 +490,7 @@ export class RPCAdapter {
     return new GoalManager(this.workspace).createOrQueueGoal({
       objective: params.objective,
       source: 'rpc',
+      acceptanceCriteria: params.acceptance_criteria,
       tokenBudget: params.token_budget,
       timeBudgetSeconds: params.time_budget_seconds,
       minTokensBeforeWrapUp: params.min_tokens_before_wrap_up,
@@ -496,6 +500,10 @@ export class RPCAdapter {
 
   async handleGoalUpdate(params: {
     objective?: string;
+    completion_evidence?: GoalCompletionEvidence;
+    stop_reason?: string;
+    resume_when?: string;
+    checkpoint?: GoalCheckpointInput;
     status?: string;
     token_budget?: number | null;
     time_budget_seconds?: number | null;
@@ -505,7 +513,11 @@ export class RPCAdapter {
     if (!this.isGoalFeatureEnabled()) return this.goalFeatureDisabledResult();
     return new GoalManager(this.workspace).updateGoal({
       objective: params.objective,
-      status: parseRpcGoalStatus(params.status),
+      status: parseGoalStatus(params.status),
+      completionEvidence: params.completion_evidence,
+      stopReason: params.stop_reason,
+      resumeWhen: params.resume_when,
+      checkpoint: params.checkpoint,
       tokenBudget: params.token_budget,
       timeBudgetSeconds: params.time_budget_seconds,
       minTokensBeforeWrapUp: params.min_tokens_before_wrap_up,
@@ -520,6 +532,7 @@ export class RPCAdapter {
 
   async handleGoalQueue(params: {
     objective: string;
+    acceptance_criteria?: string[];
     token_budget?: number;
     time_budget_seconds?: number;
     min_tokens_before_wrap_up?: number;
@@ -530,6 +543,7 @@ export class RPCAdapter {
     return manager.enqueueGoal({
       objective: params.objective,
       source: 'rpc',
+      acceptanceCriteria: params.acceptance_criteria,
       tokenBudget: params.token_budget,
       timeBudgetSeconds: params.time_budget_seconds,
       minTokensBeforeWrapUp: params.min_tokens_before_wrap_up,
@@ -1467,6 +1481,8 @@ export class RPCAdapter {
         'deny_session',
         'allow_always_project',
         'allow_always_user',
+        'allow_prefix_project',
+        'allow_prefix_user',
         'deny_always_project',
         'deny_always_user',
         'alternative',
@@ -2807,6 +2823,7 @@ export class RPCAdapter {
         createdAt: m.createdAt,
         lastActiveAt: m.lastActiveAt ?? m.createdAt,
         summary: m.summary,
+        title: m.title,
         messages,
         workspaceRoot: m.projectPath ?? '',
       };
@@ -2932,6 +2949,24 @@ export class RPCAdapter {
     return {
       tools: registry.getRegistryEntries({ includeDisabled: true }),
       diagnostics: registry.getDiagnostics(),
+    };
+  }
+
+  /** Return the same effective registry used by delegation, without agent prompts. */
+  handleGetSupportedAgents(): GetSupportedAgentsResult {
+    if (!this.agent) throw new Error('Agent not initialized');
+    return {
+      agents: AgentRegistry.getInstance().getAllAgents().map(agent => ({
+        id: agent.name,
+        name: agent.name,
+        description: agent.description,
+        tools: [...agent.tools],
+        model: agent.model,
+        source: agent.source,
+        extensionId: agent.extensionId,
+        extensionVersion: agent.extensionVersion,
+        extensionScope: agent.extensionScope,
+      })),
     };
   }
 
@@ -3255,6 +3290,14 @@ export class RPCAdapter {
     );
     const prompt = this.activePrompt;
     switch (event.type) {
+      case 'peer_update':
+      case 'resource_update': {
+        const update = event.type === 'peer_update' ? event.peerEvent : event.resourceEvent;
+        if (update) writeNotification(event.type === 'peer_update' ? 'autohand.peerUpdate' : 'autohand.resourceUpdate', {
+          event: update, timestamp: createTimestamp(),
+        });
+        break;
+      }
       case 'thinking':
         if (event.thought
           && prompt
@@ -4420,11 +4463,4 @@ export class RPCAdapter {
       };
     }
   }
-}
-
-function parseRpcGoalStatus(value: string | undefined): GoalStatus | undefined {
-  if (value === 'active' || value === 'paused' || value === 'complete' || value === 'budgetLimited') {
-    return value;
-  }
-  return undefined;
 }

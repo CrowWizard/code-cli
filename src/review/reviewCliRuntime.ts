@@ -3,6 +3,7 @@
  * Copyright 2026 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import path from 'node:path';
 import { resolveCommandOutputFormat } from '../modes/commandOutput.js';
 import type { CLIOptions, LoadedConfig } from '../types.js';
 import type { ReviewCliInvocation } from './reviewCliCommand.js';
@@ -20,7 +21,6 @@ export interface ReviewCliExecution {
 
 export interface ReviewCliRuntimeDependencies {
   cwd(): string;
-  refreshModelCatalog(options: { bare?: boolean; offline?: boolean }): Promise<void>;
   loadConfig(configPath: string | undefined, cwd: string): Promise<LoadedConfig>;
   resolveWorkspaceRoot(config: LoadedConfig, workspacePath?: string): string;
   validateWorkspacePath(workspaceRoot: string): Promise<{ valid: boolean; error?: string }>;
@@ -37,13 +37,12 @@ export async function executeReviewCliInvocation(
   const output = resolveCommandOutputFormat(invocation.runtimeOptions);
   if ('error' in output) throw new Error(output.error);
 
-  await dependencies.refreshModelCatalog({
-    bare: invocation.runtimeOptions.bare,
-    offline: invocation.runtimeOptions.offline,
-  });
-
   const cwd = dependencies.cwd();
-  const config = await dependencies.loadConfig(invocation.runtimeOptions.config, cwd);
+  // Project overlays belong to the reviewed workspace, not the launch directory.
+  const config = await dependencies.loadConfig(
+    invocation.runtimeOptions.config,
+    path.resolve(cwd, invocation.runtimeOptions.path ?? '.'),
+  );
   const workspaceRoot = dependencies.resolveWorkspaceRoot(
     config,
     invocation.runtimeOptions.path,

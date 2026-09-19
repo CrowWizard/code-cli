@@ -6,6 +6,7 @@
 import fs from 'fs-extra';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { open } from 'node:fs/promises';
 import type {
     SessionMetadata,
     SessionMessage,
@@ -14,8 +15,10 @@ import type {
     SessionTurnUsageInput,
     SessionReadFileState,
 } from './types.js';
+import { normalizeSessionTitle } from './sessionTitle.js';
+import { sessionActivityAt } from './sessionActivity.js';
 import { AUTOHAND_PATHS } from '../constants.js';
-import { atomicWriteJson, withFileLock } from '../utils/atomicFile.js';
+import { atomicWriteJson, FileLockTimeoutError, withFileLock } from '../utils/atomicFile.js';
 import { runWithConcurrency } from '../utils/parallel.js';
 
 const SESSION_INDEX_FILE = 'index.json';
@@ -103,11 +106,26 @@ export class SessionManager {
     private currentSession: Session | null = null;
     private index: SessionIndex | null = null;
 
-    constructor(baseDir?: string) {
+    private indexLockWarned = false;
+
+    /** False for an ephemeral run: sessions live in memory and nothing reaches disk. */
+    private readonly persist: boolean;
+
+    constructor(baseDir?: string, options: { persist?: boolean } = {}) {
         this.sessionsDir = baseDir ?? AUTOHAND_PATHS.sessions;
+        this.persist = options.persist ?? true;
+    }
+
+    /** True when this manager keeps sessions in memory only. */
+    isEphemeral(): boolean {
+        return !this.persist;
     }
 
     async initialize(): Promise<void> {
+        if (!this.persist) {
+            this.index = this.createEmptyIndex();
+            return;
+        }
         await fs.ensureDir(this.sessionsDir);
         await this.loadIndex();
     }
@@ -115,7 +133,7 @@ export class SessionManager {
     async createSession(projectPath: string, model: string): Promise<Session> {
         const sessionId = this.generateSessionId();
         const sessionDir = path.join(this.sessionsDir, sessionId);
-        await fs.ensureDir(sessionDir);
+        if (this.persist) await fs.ensureDir(sessionDir);
 
         // Detect client from environment (set by ACP extensions like Zed)
         const client = process.env.AUTOHAND_CLIENT_NAME || 'terminal';
@@ -134,7 +152,7 @@ export class SessionManager {
             clientVersion,
         };
 
-        const session = new Session(sessionDir, metadata);
+        const session = new Session(sessionDir, metadata, { persist: this.persist });
         await session.save();
 
         this.currentSession = session;
@@ -182,7 +200,22 @@ export class SessionManager {
         }
 
         await this.loadIndex();
-        const candidates = this.index?.sessions.filter((session) => session.id.startsWith(trimmed)) ?? [];
+        const sessions = this.index?.sessions ?? [];
+
+        // A saved name wins over an id prefix: names are chosen, prefixes are typed.
+        const wantedTitle = normalizeSessionTitle(trimmed).toLowerCase();
+        const named = wantedTitle
+            ? sessions.filter((session) => session.title?.toLowerCase() === wantedTitle)
+            : [];
+        if (named.length === 1) {
+            return named[0].id;
+        }
+        if (named.length > 1) {
+            const ids = named.map((session) => session.id.slice(0, 8)).join(', ');
+            throw new Error(`Ambiguous session name "${trimmed}": matches ${named.length} sessions (${ids}). Use an id prefix instead.`);
+        }
+
+        const candidates = sessions.filter((session) => session.id.startsWith(trimmed));
         if (candidates.length === 1) {
             return candidates[0].id;
         }
@@ -306,8 +339,12 @@ export class SessionManager {
     }
 
     /**
-     * Return a bounded, newest-first page for interactive session pickers.
+     * Return a bounded, most-recently-active-first page for interactive session pickers.
      * This avoids waiting for every historical metadata file before the picker opens.
+     *
+     * The index only records `createdAt`, so paging (the slice below) is still bounded
+     * by creation order. Only the metadata loaded for the returned page is re-sorted by
+     * last activity, which is enough to keep each page's picker groups contiguous.
      */
     async listRecentSessions(
         filter?: { project?: string; since?: Date },
@@ -323,7 +360,7 @@ export class SessionManager {
 
         return {
             sessions: sessions.sort((a, b) =>
-                new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+                sessionActivityAt(b).getTime() - sessionActivityAt(a).getTime()
             ),
             total: indexedSessions.length,
         };
@@ -357,6 +394,36 @@ export class SessionManager {
 
     getCurrentSession(): Session | null {
         return this.currentSession;
+    }
+
+    /** Names the live session; the name survives closeSession's summary. */
+    async renameCurrentSession(title: string, options: { source?: 'user' | 'auto' } = {}): Promise<SessionMetadata> {
+        if (!this.currentSession) {
+            throw new Error('No active session to rename.');
+        }
+        const normalized = normalizeSessionTitle(title);
+        this.currentSession.metadata.title = normalized;
+        this.currentSession.metadata.titleSource = options.source ?? 'user';
+        this.currentSession.metadata.lastActiveAt = new Date().toISOString();
+        await this.currentSession.save();
+        await this.updateIndex(this.currentSession.metadata);
+        return this.currentSession.metadata;
+    }
+
+    /** Names a stored session by id, id prefix, or path without loading it as the current one. */
+    async renameSession(reference: string, title: string): Promise<SessionMetadata> {
+        const normalized = normalizeSessionTitle(title);
+        const sessionId = await this.resolveSessionReference(reference);
+        if (this.currentSession?.metadata.sessionId === sessionId) {
+            return this.renameCurrentSession(normalized);
+        }
+        const metadataPath = path.join(this.sessionsDir, sessionId, 'metadata.json');
+        const metadata = await fs.readJson(metadataPath) as SessionMetadata;
+        metadata.title = normalized;
+        metadata.titleSource = 'user';
+        await atomicWriteJson(metadataPath, metadata);
+        await this.updateIndex(metadata);
+        return metadata;
     }
 
     private generateSessionId(): string {
@@ -400,12 +467,35 @@ export class SessionManager {
     }
 
     private async loadIndex(): Promise<void> {
-        await withFileLock(this.indexLockPath, async () => {
+        if (!this.persist) {
+            this.index ??= this.createEmptyIndex();
+            return;
+        }
+        try {
+            await withFileLock(this.indexLockPath, async () => {
+                this.index = await this.readIndexFromDisk();
+            }, SESSION_INDEX_LOCK_OPTIONS);
+        } catch (error) {
+            if (!(error instanceof FileLockTimeoutError)) throw error;
+            // Another Autohand process is holding the index. Reads must not fail
+            // for that: use the last committed index (writes are atomic) and say so once.
+            if (!this.indexLockWarned) {
+                this.indexLockWarned = true;
+                console.warn(`Session index is locked by another Autohand process (${path.basename(this.indexLockPath)}); continuing with the last saved index.`);
+            }
             this.index = await this.readIndexFromDisk();
-        }, SESSION_INDEX_LOCK_OPTIONS);
+        }
     }
 
     private async mutateIndex(mutation: (index: SessionIndex) => void): Promise<void> {
+        if (!this.persist) {
+            // An ephemeral run keeps its own in-memory index so listing and
+            // renaming behave, but the shared index on disk never learns of it.
+            const index = this.index ?? this.createEmptyIndex();
+            mutation(index);
+            this.index = index;
+            return;
+        }
         await withFileLock(this.indexLockPath, async () => {
             const latestIndex = await this.readIndexFromDisk();
             mutation(latestIndex);
@@ -421,6 +511,7 @@ export class SessionManager {
                 projectPath: metadata.projectPath,
                 createdAt: metadata.createdAt,
                 summary: metadata.summary,
+                title: metadata.title,
                 importedFrom: metadata.importedFrom
                     ? {
                         source: metadata.importedFrom.source,
@@ -442,6 +533,7 @@ export class SessionManager {
             const session = index.sessions.find(s => s.id === metadata.sessionId);
             if (session) {
                 session.summary = metadata.summary;
+                session.title = metadata.title;
                 session.branch = metadata.branch;
             }
         });
@@ -477,10 +569,19 @@ export class Session {
     public metadata: SessionMetadata;
     private messages: SessionMessage[] = [];
     private state: WorkspaceState | null = null;
+    private contextAppend: Promise<void> = Promise.resolve();
 
-    constructor(sessionDir: string, metadata: SessionMetadata) {
+    /** False for an ephemeral session: every write stays in memory. */
+    private readonly persist: boolean;
+
+    constructor(sessionDir: string, metadata: SessionMetadata, options: { persist?: boolean } = {}) {
         this.sessionDir = sessionDir;
         this.metadata = metadata;
+        this.persist = options.persist ?? true;
+    }
+
+    isEphemeral(): boolean {
+        return !this.persist;
     }
 
     private async ensureSessionDir(): Promise<void> {
@@ -491,6 +592,7 @@ export class Session {
         this.messages.push(message);
         this.metadata.messageCount = this.messages.length;
         this.metadata.lastActiveAt = new Date().toISOString();
+        if (!this.persist) return;
 
         // Append to JSONL file
         await this.ensureSessionDir();
@@ -502,14 +604,37 @@ export class Session {
     }
 
     async appendTransient(message: SessionMessage): Promise<void> {
+        if (!this.persist) return;
         await this.ensureSessionDir();
         const conversationPath = path.join(this.sessionDir, 'conversation.jsonl');
         await fs.appendFile(conversationPath, JSON.stringify(message) + '\n');
     }
 
+    appendContext(message: SessionMessage, recordId: string): Promise<void> {
+        const pending = this.contextAppend.catch(() => {}).then(async () => {
+            if (this.messages.some(entry => entry._meta?.recordId === recordId)) return;
+            await this.ensureSessionDir();
+            const entry = { ...message, _meta: { ...message._meta, recordId } };
+            const handle = await open(path.join(this.sessionDir, 'conversation.jsonl'), 'a', 0o600);
+            try {
+                await handle.writeFile(JSON.stringify(entry) + '\n');
+                await handle.sync();
+            } finally {
+                await handle.close();
+            }
+            this.messages.push(entry);
+            this.metadata.messageCount = this.messages.length;
+            this.metadata.lastActiveAt = entry.timestamp;
+            await this.save().catch(() => {});
+        });
+        this.contextAppend = pending;
+        return pending;
+    }
+
     async replaceMessages(messages: SessionMessage[]): Promise<void> {
         this.messages = [...messages];
         this.metadata.messageCount = this.messages.length;
+        if (!this.persist) return;
         const conversationPath = path.join(this.sessionDir, 'conversation.jsonl');
         const content = this.messages.map((message) => JSON.stringify(message)).join('\n');
         await fs.writeFile(conversationPath, content ? `${content}\n` : '');
@@ -517,6 +642,7 @@ export class Session {
 
     async updateState(state: WorkspaceState): Promise<void> {
         this.state = state;
+        if (!this.persist) return;
         await this.ensureSessionDir();
         const statePath = path.join(this.sessionDir, 'state.json');
         await fs.writeJson(statePath, state, { spaces: 2 });
@@ -530,10 +656,15 @@ export class Session {
         const durationMs = normalizeUsageCount(input.durationMs);
         const updatedAt = input.occurredAt ?? new Date().toISOString();
 
+        const cacheReadTokens = addOptionalUsageCount(current?.cacheReadTokens, input.cacheReadTokens);
+        const cacheWriteTokens = addOptionalUsageCount(current?.cacheWriteTokens, input.cacheWriteTokens);
+
         this.metadata.usage = {
             promptTokens: (current?.promptTokens ?? 0) + promptTokens,
             completionTokens: (current?.completionTokens ?? 0) + completionTokens,
             totalTokens: (current?.totalTokens ?? 0) + totalTokens,
+            ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+            ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
             turnCount: (current?.turnCount ?? 0) + 1,
             tokenUsageStatus:
                 current?.tokenUsageStatus === 'unavailable' || input.tokenUsageStatus === 'unavailable'
@@ -548,6 +679,7 @@ export class Session {
     }
 
     async save(): Promise<void> {
+        if (!this.persist) return;
         await this.ensureSessionDir();
         const metadataPath = path.join(this.sessionDir, 'metadata.json');
         await atomicWriteJson(metadataPath, this.metadata);
@@ -606,4 +738,20 @@ function normalizeUsageCount(value: number | undefined): number {
     return typeof value === 'number' && Number.isFinite(value) && value > 0
         ? Math.round(value)
         : 0;
+}
+
+/**
+ * Accumulates a figure only the reporting providers supply. Unlike
+ * `normalizeUsageCount` a reported zero is kept rather than folded away,
+ * because a provider that measured no cache hits said something, and a
+ * provider that stayed silent did not.
+ */
+function addOptionalUsageCount(
+    current: number | undefined,
+    incoming: number | undefined,
+): number | undefined {
+    if (typeof incoming !== 'number' || !Number.isFinite(incoming) || incoming < 0) {
+        return current;
+    }
+    return (current ?? 0) + Math.round(incoming);
 }

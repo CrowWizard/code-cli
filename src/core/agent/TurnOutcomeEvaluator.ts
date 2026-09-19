@@ -39,7 +39,6 @@ export type TurnOutcome =
   | {
       type: 'finish';
       response: string;
-      usedThoughtAsResponse: boolean;
       saveAssistantMessage: true;
     };
 
@@ -57,36 +56,27 @@ const EMPTY_NO_TOOL_INSTRUCTION =
 
 const TRUNCATED_RESPONSE_INSTRUCTION =
   '[System] Your previous response was truncated due to output length limits. ' +
-  'Please continue from where you left off. If you were making a tool call, retry it.';
+  'The partial response is preserved in the immediately preceding assistant message. ' +
+  'Produce a concise, complete replacement answer rather than only the missing suffix. ' +
+  'If an intended tool call was cut off, emit the complete tool call again.';
 
 function extractUsableResponse({
   completion,
   payload,
   cleanupModelResponse,
-}: TurnOutcomeInput): { response: string; usedThoughtAsResponse: boolean } {
-  const usedThoughtAsResponse = Boolean(payload.thought) &&
-    !payload.finalResponse &&
-    !payload.response &&
-    !payload.toolCalls?.length;
-
+}: TurnOutcomeInput): string {
   const cleanedContent = cleanupModelResponse(completion.content);
   const rawResponse = payload.finalResponse ??
     payload.response ??
-    (!payload.toolCalls?.length && payload.thought ? payload.thought : undefined) ??
     (cleanedContent.startsWith('{') ? '' : cleanedContent);
 
-  let response = cleanupModelResponse(rawResponse.trim());
-  if (!response && usedThoughtAsResponse && payload.thought) {
-    response = payload.thought.trim();
-  }
-
-  return { response, usedThoughtAsResponse };
+  return cleanupModelResponse(rawResponse.trim());
 }
 
 export function evaluateAssistantTurn(input: TurnOutcomeInput): TurnOutcome {
   const { completion, payload, responseCompletionHooks } = input;
   const toolCalls = payload.toolCalls ?? [];
-  const { response, usedThoughtAsResponse } = extractUsableResponse(input);
+  const response = extractUsableResponse(input);
 
   if (completion.finishReason === 'length') {
     return {
@@ -142,7 +132,6 @@ export function evaluateAssistantTurn(input: TurnOutcomeInput): TurnOutcome {
   return {
     type: 'finish',
     response,
-    usedThoughtAsResponse,
     saveAssistantMessage: true,
   };
 }

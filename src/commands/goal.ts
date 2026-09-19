@@ -4,12 +4,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import path from 'node:path';
+import { showModal } from '../ui/ink/components/Modal.js';
+import { activateGoalAutoMode } from '../core/agent/GoalActivation.js';
 import { buildGoalContinuationInstruction, GoalManager } from '../goals/GoalManager.js';
+import { parseCompletionEvidence } from '../goals/GoalCompletion.js';
+import { parseGoalCheckpoint, parseGoalProgressCommand } from '../goals/GoalProgress.js';
 import type { SlashCommand, SlashCommandContext } from '../core/slashCommandTypes.js';
 import type { GoalMutationResult, GoalSessionSnapshot, GoalState } from '../goals/types.js';
+import type { GoalEventData } from '../telemetry/types.js';
 import { GOAL_FEATURE_DISABLED_MESSAGE, resolveGoalFeatureEnabled } from '../goals/feature.js';
 
 const GOAL_OBJECTIVE_PREVIEW_LENGTH = 160;
+
+type GoalCommandContext = Pick<SlashCommandContext, 'workspaceRoot'> & Partial<SlashCommandContext>;
 
 export const metadata: SlashCommand = {
   command: '/goal',
@@ -21,9 +29,14 @@ export const metadata: SlashCommand = {
     { name: 'edit', description: 'Edit an active or queued goal by ID' },
     { name: 'queue', description: 'List queued goals or enqueue a goal' },
     { name: 'pause', description: 'Pause the current goal' },
+    { name: 'blocked', description: 'Stop with a reason, resumption condition, and optional checkpoint JSON' },
+    { name: 'waiting', description: 'Wait for an external condition with optional checkpoint JSON' },
+    { name: 'checkpoint', description: 'Save progress and the next step as JSON' },
     { name: 'resume', description: 'Resume a paused or queued goal' },
     { name: 'complete', description: 'Mark the current goal complete' },
     { name: 'clear', description: 'Clear the current goal' },
+    { name: 'repair', description: 'Restore damaged goal storage from its validated backup' },
+    { name: 'recover', description: 'Restore an offline goal’s conversation without starting work' },
     { name: 'templates', description: 'List reusable .pi-goals templates' },
   ],
 };
@@ -34,7 +47,7 @@ export const goalsMetadata: SlashCommand = {
   description: 'Open the live goals queue and manage persistent goals',
 };
 
-export async function goal(ctx: SlashCommandContext, args: string[] = []): Promise<string> {
+export async function goal(ctx: GoalCommandContext, args: string[] = []): Promise<string> {
   if (!resolveGoalFeatureEnabled(ctx.config, ctx.isFeatureEnabled)) {
     return GOAL_FEATURE_DISABLED_MESSAGE;
   }
@@ -90,11 +103,30 @@ export async function goal(ctx: SlashCommandContext, args: string[] = []): Promi
     }
     case 'queue':
       return handleQueue(manager, rest);
-    case 'pause':
-      return formatMutation(await manager.updateGoal({ status: 'paused' }));
+    case 'pause': {
+      const paused = await manager.updateGoal({ status: 'paused' });
+      reportGoal(ctx, paused, 'paused');
+      return formatMutation(paused);
+    }
+    case 'blocked':
+    case 'waiting':
+    case 'checkpoint': {
+      const operation = subcommand.toLowerCase();
+      let update;
+      try {
+        const value: unknown = JSON.parse(rest);
+        update = operation === 'checkpoint'
+          ? { checkpoint: parseGoalCheckpoint(value) }
+          : { ...parseGoalProgressCommand(value), status: operation === 'blocked' ? 'blocked' as const : 'waiting' as const };
+      } catch (error) {
+        return `Invalid goal progress: ${error instanceof Error ? error.message : 'expected JSON'}`;
+      }
+      return formatMutation(await manager.updateGoal(update));
+    }
     case 'resume': {
       const snapshot = await manager.getSessionSnapshot();
-      if (!snapshot.goal && snapshot.queue.length > 0) {
+      const canStartQueued = !snapshot.goal || snapshot.goal.status === 'complete' || snapshot.goal.status === 'budgetLimited';
+      if (canStartQueued && snapshot.queue.length > 0) {
         const started = await manager.startQueuedGoal();
         if (started.ok && started.goal) {
           queueGoalContinuation(ctx, started.goal.objective);
@@ -102,20 +134,37 @@ export async function goal(ctx: SlashCommandContext, args: string[] = []): Promi
         return formatMutation(started);
       }
       const resumed = await manager.updateGoal({ status: 'active' });
+      reportGoal(ctx, resumed, 'resumed');
       if (resumed.ok && resumed.goal) {
         queueGoalContinuation(ctx, resumed.goal.objective);
       }
       return formatMutation(resumed);
     }
     case 'complete': {
-      const completed = await manager.updateGoal({ status: 'complete' });
+      let completionEvidence;
+      if (rest) {
+        try {
+          completionEvidence = parseCompletionEvidence(JSON.parse(rest) as unknown);
+        } catch (error) {
+          return `Invalid completion evidence: ${error instanceof Error ? error.message : 'expected JSON'}`;
+        }
+      }
+      const completed = await manager.updateGoal({ status: 'complete', completionEvidence });
+      reportGoal(ctx, completed, 'completed');
       if (completed.ok && completed.started && completed.goal?.status === 'active') {
         queueGoalContinuation(ctx, completed.goal.objective);
       }
       return formatMutation(completed);
     }
-    case 'clear':
-      return formatMutation(await manager.clearGoal());
+    case 'clear': {
+      const cleared = await manager.clearGoal();
+      reportGoal(ctx, cleared, 'cancelled');
+      return formatMutation(cleared);
+    }
+    case 'repair':
+      return formatMutation(await manager.repairSnapshot());
+    case 'recover':
+      return recoverGoalSession(ctx, manager, rest);
     case 'templates': {
       const templates = await manager.listTemplates();
       if (templates.length === 0) return 'No goal templates found in .pi-goals/ or .ai/.pi-goals/.';
@@ -154,12 +203,17 @@ export async function runGoalCli(workspaceRoot: string, rawInput?: string, confi
   const manager = new GoalManager(workspaceRoot);
   const input = rawInput?.trim() ?? '';
   if (!input) return formatSnapshot(await manager.getSessionSnapshot());
+  const structured = /^(complete|blocked|waiting|checkpoint)\s+([\s\S]+)$/i.exec(input);
+  if (structured) return goal({ workspaceRoot, config, isNonInteractive: true }, [structured[1], structured[2]]);
 
   const args = input.match(/"[^"]*"|'[^']*'|\S+/g)?.map(unquote) ?? [];
-  return goal({ workspaceRoot } as SlashCommandContext, args);
+  return goal({ workspaceRoot, config, isNonInteractive: true }, args);
 }
 
-function startGoalWriter(ctx: SlashCommandContext, roughGoal?: string): string {
+function startGoalWriter(ctx: GoalCommandContext, roughGoal?: string): string {
+  if (ctx.isNonInteractive || !ctx.queueInstruction) {
+    return 'Goal writer requires an interactive session. Run autohand, then /goal writer.';
+  }
   const activated = ctx.skillsRegistry?.activateSkill('goal-writer') ?? false;
   const roughGoalText = roughGoal?.trim() || 'No rough goal was provided yet.';
   ctx.queueInstruction?.([
@@ -178,8 +232,61 @@ function startGoalWriter(ctx: SlashCommandContext, roughGoal?: string): string {
   ].join('\n');
 }
 
+async function recoverGoalSession(ctx: GoalCommandContext, manager: GoalManager, requestedId: string): Promise<string> {
+  const snapshot = await manager.getSessionSnapshot();
+  const offline = snapshot.peers.filter((peer) => !peer.ownerAlive);
+  if (ctx.isNonInteractive || !ctx.restoreSession || !ctx.sessionManager) {
+    return [
+      'Recover a goal from an interactive session; recovery does not start work.',
+      ...offline.map((peer) => `/goal recover ${peer.sessionId} — ${formatObjectivePreview(peer.objective)} (${peer.status})`),
+      ...(offline.length ? [] : ['No offline goal sessions are available.']),
+    ].join('\n');
+  }
+  if (snapshot.goal?.status === 'active') return 'Pause or complete this session’s active goal before recovering another session.';
+  let sessionId = requestedId;
+  if (!sessionId) {
+    if (!offline.length) return 'No offline goal sessions are available. Live sessions cannot be recovered.';
+    try {
+      await ctx.onBeforeModal?.();
+      const selection = await showModal({
+        title: 'Recover an offline goal',
+        hint: '↑↓ choose · enter restore conversation · esc cancel · goals stay stopped',
+        options: offline.map((peer) => ({
+          value: peer.sessionId, label: formatObjectivePreview(peer.objective),
+          description: `${peer.sessionId} · ${peer.status} · offline`,
+        })),
+      });
+      if (!selection) return 'Recovery cancelled. No goals were changed.';
+      sessionId = selection.value;
+    } catch (error) {
+      return `Goal recovery failed: ${error instanceof Error ? error.message : 'picker unavailable'}`;
+    } finally {
+      await ctx.onAfterModal?.();
+    }
+  }
+  if (!/^[a-zA-Z0-9_.-]+$/.test(sessionId) || sessionId === '.' || sessionId === '..') {
+    return 'Recovery requires an exact saved session ID, not a path.';
+  }
+  try {
+    const sessions = await ctx.sessionManager.listSessions({ project: ctx.workspaceRoot });
+    if (!sessions.some((session) => session.sessionId === sessionId && path.resolve(session.projectPath) === path.resolve(ctx.workspaceRoot))) {
+      return 'The original conversation is unavailable in this workspace. No goals were changed.';
+    }
+    const prepared = await manager.prepareSessionRecovery(sessionId);
+    if (!prepared.ok) return prepared.message ?? 'Recovery was refused.';
+    try {
+      await ctx.restoreSession(sessionId);
+    } catch (error) {
+      return `Conversation recovery failed: ${error instanceof Error ? error.message : 'unknown error'}. The original goal remains safely stopped; retry /goal recover ${sessionId}.`;
+    }
+    return [`Recovered session ${sessionId}. Its goal remains stopped; use /goal resume when ready.`, prepared.storageWarning].filter(Boolean).join('\n');
+  } catch (error) {
+    return `Goal recovery failed: ${error instanceof Error ? error.message : 'unknown error'}`;
+  }
+}
+
 async function emitGoalWrittenCompleted(
-  ctx: SlashCommandContext,
+  ctx: GoalCommandContext,
   goalState: GoalState,
   source: string
 ): Promise<void> {
@@ -199,25 +306,14 @@ async function handleQueue(manager: GoalManager, rest: string): Promise<string> 
   return formatMutation(await manager.enqueueGoalBlock(rest, 'command'));
 }
 
-/**
- * A goal is a standing instruction to keep working, so starting one puts the
- * session in auto mode: the agent drives its own turns and stops asking for
- * tool approval until the goal is done. Set `agent.goalAutoMode: false` to keep
- * the normal turn-by-turn loop.
- */
-function isGoalAutoModeEnabled(ctx: SlashCommandContext): boolean {
-  return ctx.config?.agent?.goalAutoMode !== false;
-}
-
-function queueGoalContinuation(ctx: SlashCommandContext, objective: string): void {
-  if (isGoalAutoModeEnabled(ctx)) {
-    ctx.setInteractionMode?.('automode');
-  }
+function queueGoalContinuation(ctx: GoalCommandContext, objective: string): void {
+  activateGoalAutoMode(ctx);
   ctx.queueInstruction?.(buildGoalContinuationInstruction(objective));
 }
 
 function formatMutation(result: GoalMutationResult): string {
   const lines = [result.ok ? chalk.green(result.message ?? 'Goal updated.') : chalk.yellow(result.message ?? 'Goal command failed.')];
+  if (result.storageWarning) lines.push(chalk.yellow(result.storageWarning));
   if (result.goal) {
     lines.push('');
     lines.push(formatGoal(result.goal));
@@ -271,7 +367,7 @@ function formatSnapshot(snapshot: GoalSessionSnapshot): string {
     parts.push([
       `Other active sessions (${snapshot.peers.length}):`,
       ...snapshot.peers.map((peer) => (
-        `- ${formatObjectivePreview(peer.objective)} (${peer.status}${peer.ownerAlive ? '' : ', session offline'})`
+        `- ${formatObjectivePreview(peer.objective)} (${peer.status}${peer.ownerAlive ? '' : ', session offline'}) · ${peer.sessionId}${peer.ownerAlive ? '' : ` · /goal recover ${peer.sessionId}`}`
       )),
     ].join('\n'));
   }
@@ -289,6 +385,18 @@ function formatGoal(goalState: GoalState): string {
   if (goalState.timeBudgetSeconds) lines.push(`Time budget: ${formatDuration(goalState.timeBudgetSeconds)}`);
   if (goalState.minTokensBeforeWrapUp) lines.push(`Token floor: ${goalState.minTokensBeforeWrapUp}`);
   if (goalState.minTimeSecondsBeforeWrapUp) lines.push(`Time floor: ${formatDuration(goalState.minTimeSecondsBeforeWrapUp)}`);
+  if (goalState.stopReason) lines.push(`Stopped because: ${goalState.stopReason}`);
+  if (goalState.resumeWhen) lines.push(`Resume when: ${goalState.resumeWhen}`);
+  if (goalState.checkpoint) {
+    lines.push(`Checkpoint: ${goalState.checkpoint.summary}`);
+    if (goalState.checkpoint.nextStep) lines.push(`Next step: ${goalState.checkpoint.nextStep}`);
+    if (goalState.checkpoint.artifacts?.length) lines.push(`Artifacts: ${goalState.checkpoint.artifacts.join(', ')}`);
+  }
+  if (goalState.acceptanceCriteria) lines.push('Acceptance criteria:', ...goalState.acceptanceCriteria.map((criterion) => `- ${criterion}`));
+  if (goalState.completionReceipt) {
+    lines.push(`Reported completion evidence: ${goalState.completionReceipt.summary}`);
+    lines.push(...goalState.completionReceipt.checks.map((check) => `- ${check.criterion}: ${check.status} — ${check.evidence}`));
+  }
   return lines.join('\n');
 }
 
@@ -305,7 +413,7 @@ function formatQueue(snapshot: Pick<GoalSessionSnapshot, 'queue'>): string {
 function formatCompletedRun(completed: NonNullable<GoalMutationResult['completedRun']>): string {
   return [
     `Completed goals this session (${completed.length}):`,
-    ...completed.map((item, index) => `${index + 1}. ${formatObjectivePreview(item.objective)}`),
+    ...completed.map((item, index) => `${index + 1}. ${formatObjectivePreview(item.objective)}${item.completionReceipt ? ` — Reported completion evidence: ${item.completionReceipt.summary}` : ''}`),
   ].join('\n');
 }
 
@@ -326,4 +434,29 @@ function formatDuration(seconds: number): string {
 
 function unquote(value: string): string {
   return value.replace(/^['"]|['"]$/g, '');
+}
+
+/**
+ * Reports a goal transition, once, only when the mutation actually succeeded.
+ *
+ * A refused mutation still returns a result, and reporting it would inflate
+ * every count on the console's goals page with work that never happened.
+ *
+ * `budgetLimited` is reported as `blocked` with its reason: the goal stopped
+ * without finishing, which is what the surface aggregates, and the reason is
+ * what makes the stall actionable.
+ */
+function reportGoal(
+  ctx: GoalCommandContext,
+  result: GoalMutationResult,
+  action: GoalEventData['action'],
+): void {
+  if (!result.ok) return;
+  const blocked = result.goal?.status === 'budgetLimited';
+  void ctx.trackGoalEvent?.({
+    goalId: result.goal?.goalId,
+    action: blocked ? 'blocked' : action,
+    status: blocked ? 'budget limited' : undefined,
+    source: 'slash_command',
+  });
 }

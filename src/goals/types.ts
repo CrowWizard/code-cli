@@ -4,11 +4,55 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-export type GoalStatus = 'active' | 'paused' | 'budgetLimited' | 'complete';
+export const GOAL_STATUSES = ['active', 'paused', 'blocked', 'waiting', 'budgetLimited', 'complete'] as const;
+export type GoalStatus = typeof GOAL_STATUSES[number];
+
+export function isGoalStatus(value: unknown): value is GoalStatus {
+  return GOAL_STATUSES.some((status) => status === value);
+}
+
+export function parseGoalStatus(value: unknown): GoalStatus | undefined {
+  if (value === undefined) return undefined;
+  if (!isGoalStatus(value)) throw new TypeError(`status must be one of: ${GOAL_STATUSES.join(', ')}.`);
+  return value;
+}
+
+export const UNSCOPED_GOAL_SESSION_KEY = '__unscoped__';
+
+export interface GoalCompletionCheck {
+  criterion: string;
+  status: 'passed' | 'failed' | 'notRun';
+  evidence: string;
+}
+
+export interface GoalCompletionEvidence {
+  summary: string;
+  checks: GoalCompletionCheck[];
+}
+
+export interface GoalCompletionReceipt extends GoalCompletionEvidence {
+  recordedAt: number;
+  provenance: 'reported';
+}
+
+export interface GoalCheckpointInput {
+  summary: string;
+  nextStep?: string;
+  artifacts?: string[];
+}
+
+export interface GoalCheckpoint extends GoalCheckpointInput {
+  recordedAt: number;
+}
 
 export interface GoalState {
   goalId: string;
   objective: string;
+  acceptanceCriteria?: string[];
+  completionReceipt?: GoalCompletionReceipt;
+  stopReason?: string;
+  resumeWhen?: string;
+  checkpoint?: GoalCheckpoint;
   status: GoalStatus;
   tokenBudget?: number;
   timeBudgetSeconds?: number;
@@ -23,6 +67,7 @@ export interface GoalState {
 export interface QueuedGoal {
   queueId: string;
   objective: string;
+  acceptanceCriteria?: string[];
   tokenBudget?: number;
   timeBudgetSeconds?: number;
   minTokensBeforeWrapUp?: number;
@@ -36,7 +81,10 @@ export interface QueuedGoal {
 
 export interface CompletedGoal {
   goalId: string;
+  sessionId?: string;
   objective: string;
+  acceptanceCriteria?: string[];
+  completionReceipt?: GoalCompletionReceipt;
   status: Extract<GoalStatus, 'complete' | 'budgetLimited'>;
   tokensUsed: number;
   timeUsedSeconds: number;
@@ -73,6 +121,8 @@ export interface GoalPeer {
 /** Per-session view of the workspace goal state (what `get_goal` returns). */
 export interface GoalSessionSnapshot {
   version: 2;
+  sessionId?: string;
+  storageError?: string;
   /** This session's active goal, if any. */
   goal: GoalState | null;
   queue: QueuedGoal[];
@@ -97,6 +147,8 @@ export interface GoalTemplateMetadata {
 
 export interface GoalMutationResult {
   ok: boolean;
+  storageWarning?: string;
+  recovery?: { backupPath: string; preservedPath?: string };
   goal: GoalState | null;
   queue: QueuedGoal[];
   telemetry?: {
@@ -106,6 +158,7 @@ export interface GoalMutationResult {
   };
   message?: string;
   queued?: QueuedGoal[];
+  queueError?: string;
   started?: QueuedGoal;
   completed?: CompletedGoal;
   completedRun?: CompletedGoal[];
@@ -115,14 +168,24 @@ export interface GoalMutationResult {
 
 export interface GoalCreateInput {
   objective: string;
+  acceptanceCriteria?: string[];
   tokenBudget?: number;
   timeBudgetSeconds?: number;
   minTokensBeforeWrapUp?: number;
   minTimeSecondsBeforeWrapUp?: number;
 }
 
+export interface GoalTurnUsageInput {
+  tokensUsed?: number;
+  goalId?: string | null;
+}
+
 export interface GoalUpdateInput {
   objective?: string;
+  completionEvidence?: GoalCompletionEvidence;
+  stopReason?: string;
+  resumeWhen?: string;
+  checkpoint?: GoalCheckpointInput;
   status?: GoalStatus;
   tokenBudget?: number | null;
   timeBudgetSeconds?: number | null;

@@ -37,9 +37,11 @@ For local repository scanning and credential reuse during workflow uploads, see
 - [UI Settings](#ui-settings)
 - [Agent Settings](#agent-settings)
 - [Concurrent Session Awareness](#concurrent-session-awareness)
+- [Local Peer Communication](#local-peer-communication)
 - [Permissions Settings](#permissions-settings)
 - [Patch Mode](#patch-mode)
 - [Network Settings](#network-settings)
+- [Required Ports and Agent Transports](#required-ports-and-agent-transports)
 - [Telemetry Settings](#telemetry-settings)
 - [External Agents](#external-agents)
 - [Skills System](#skills-system)
@@ -71,6 +73,32 @@ You can also override the base directory:
 export AUTOHAND_HOME=/custom/path  # Changes ~/.autohand to /custom/path
 ```
 
+### Profiles and One-Run Overrides
+
+A profile is a partial config stored under `profiles.<name>` and selected with `--profile <name>`. `--set key=value` overrides one setting with a dotted path; repeat it for several. Values are parsed as JSON when they parse (`true`, `50`, `["a","b"]`) and kept as text otherwise.
+
+```json
+{
+  "provider": "openrouter",
+  "profiles": {
+    "review": {
+      "provider": "autohandai",
+      "autohandai": { "model": "moa" },
+      "permissions": { "mode": "restricted" },
+      "ui": { "showThinking": true }
+    }
+  }
+}
+```
+
+```bash
+autohand --profile review
+autohand --set ui.theme=aurora --set agent.maxIterations=50
+autohand doctor --profile review --json
+```
+
+Precedence, lowest first: config file, workspace `.autohand` overlays, environment variables, profile, `--set`. Both layers exist for the run only: nothing is written to the config file, and a save triggered during the run (for example by `/model` or `/theme`) restores the file's own value under every layered path unless you changed that setting during the run, in which case your change is kept. Neither a profile nor `--set` can touch `auth` or `profiles`. An unknown profile name stops startup with the list of defined profiles.
+
 ---
 
 ## Environment Variables
@@ -79,6 +107,7 @@ export AUTOHAND_HOME=/custom/path  # Changes ~/.autohand to /custom/path
 | -------------------------------------- | ------------------------------------------------ | -------------------------------- |
 | `AUTOHAND_HOME`                        | Base directory for all Autohand data             | `/custom/path`                   |
 | `AUTOHAND_CONFIG`                      | Custom config file path                          | `/path/to/config.toml`           |
+| `AUTOHAND_PROVIDER`                    | Select provider for this process, overriding global and workspace selection | `autohandai` |
 | `AUTOHAND_MODELS_CATALOG`              | Custom provider model catalog path               | `/path/to/models.json`           |
 | `AUTOHAND_API_URL`                     | API endpoint (overrides config)                  | `https://api.autohand.ai`        |
 | `AUTOHAND_AUTH_URL`                    | Sign-in and account-sync website origin (independent of `AUTOHAND_API_URL`) | `https://autohand.ai` |
@@ -97,6 +126,21 @@ export AUTOHAND_HOME=/custom/path  # Changes ~/.autohand to /custom/path
 | `AUTOHAND_CODE`                        | Environment detection flag (set automatically)   | `1`                              |
 | `AUTOHAND_CODE_SIMPLE`                 | Enable bare mode without passing `--bare`        | `1`                              |
 | `AUTOHAND_DISABLE_STATEFUL_READ`       | Emergency opt-out for all stateful-read experiments | `1`                           |
+
+### Process provider selection
+
+Set `AUTOHAND_PROVIDER=autohandai` to select Autohand AI for this process even
+when the global configuration or `.autohand/settings.local.json` selects another
+provider. Supply inference credentials through `AUTOHAND_AI_API_KEY`,
+`AUTOHAND_AI_BASE_URL`, and `AUTOHAND_AI_PLAN`; normal account authentication
+still applies. Existing feature gates remain in effect.
+
+The override accepts the normal built-in, `custom:<id>`, and `extension:<id>`
+provider names. An empty or unsupported explicit value fails startup. Omitting
+the variable preserves normal saved-provider selection. Incidental settings
+saves retain the saved provider selection and its configuration section,
+including credentials, instead of writing process-only values to disk. For
+custom or extension providers, their configuration map is retained from disk.
 
 ### Thinking Level
 
@@ -230,7 +274,7 @@ Use `autohand update --models` or `autohand upgrade --models` to force an immedi
 
 ### `autohandai`
 
-Autohand AI provider configuration. Cloud mode uses Autohand-hosted OpenAI-compatible inference at `https://api.autohand.ai/v1`; Local mode uses Apple Silicon MLX inference.
+Autohand AI provider configuration. Cloud mode uses Autohand-hosted OpenAI-compatible inference at `https://inference.autohand.ai/v1` (a saved `https://api.autohand.ai/v1` is migrated automatically; private gateways are left alone). Completions stream, so the first tokens appear while the answer is still being generated. Local mode uses Apple Silicon MLX inference.
 
 Requires `features.autohand_inference: true` or `AUTOHAND_FEATURE_AUTOHAND_INFERENCE=1`.
 
@@ -239,7 +283,7 @@ Requires `features.autohand_inference: true` or `AUTOHAND_FEATURE_AUTOHAND_INFER
   "autohandai": {
     "plan": "cloud",
     "authMode": "account",
-    "baseUrl": "https://api.autohand.ai/v1",
+    "baseUrl": "https://inference.autohand.ai/v1",
     "model": "moa",
     "contextWindow": 1000000,
     "reasoningEffort": "high"
@@ -252,7 +296,7 @@ Requires `features.autohand_inference: true` or `AUTOHAND_FEATURE_AUTOHAND_INFER
 | `plan`           | `"cloud"` or `"local"`     | Yes      | `"cloud"`                     | Hosted Autohand AI or local MLX inference                 |
 | `authMode`       | `"account"` or `"api-key"` | Cloud    | `"account"` in CLI when logged in | CLI can use account auth; SDK Cloud must use API key |
 | `apiKey`         | string                     | SDK Cloud/API-key Cloud | -                   | Autohand AI API key                                       |
-| `baseUrl`        | string                     | No       | `https://api.autohand.ai/v1`  | OpenAI-compatible API endpoint                            |
+| `baseUrl`        | string                     | No       | `https://inference.autohand.ai/v1` | OpenAI-compatible API endpoint                       |
 | `model`          | string                     | Yes      | `fantail`                     | `fantail`, `moa`, or a selected local MLX coding model    |
 | `contextWindow`  | number                     | No       | `262144` for Fantail, `1000000` for Moa, `256000` for Local | Model context window                      |
 | `reasoningEffort` | `"medium"`, `"high"`, or `"xhigh"` | Moa Cloud | `"high"` during setup | Moa thinking effort level |
@@ -698,8 +742,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
       "showCancelHint": true
     },
     "showCompletionNotification": true,
-    "showThinking": true,
-    "mouseComposerCursor": true,
+    "showThinking": false,
     "terminalBell": true,
     "checkForUpdates": true,
     "updateCheckInterval": 24
@@ -718,6 +761,8 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `activityVerbs`              | string or string[] | built-in pool | Custom activity verb or verb pool for the working indicator, rendered as `Verb...` |
 | `activityVerbsEnabled`       | boolean | `true`  | Show rotating activity verbs like `Compiling...` while the agent is working |
 | `activitySymbol`             | string | `"✳"`   | Symbol shown before the activity verb in activity indicator output |
+| `showTips`                   | boolean | `true`  | Rotate tips about slash commands, the `/ @ $ ! : ?` triggers and shortcuts beside the idle composer |
+| `enterWhileWorking`          | string  | `steer` | What Enter does while a turn runs. `steer` sends the text into the running turn on its next model request and Shift+Enter queues it for after the turn; `queue` keeps Enter queueing and Shift+Enter steering |
 | `statusLine.showProviderModel` | boolean | `true`  | Show the active provider and model in the composer status line |
 | `statusLine.showContext`       | boolean | `true`  | Show the context percentage in the composer status line |
 | `statusLine.showCommandHint`   | boolean | `true`  | Show command, mention, skill, and terminal-entry hints in the composer status line |
@@ -729,8 +774,10 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `statusLine.showCancelHint`    | boolean | `true`  | Show the Esc cancel hint while the agent is working |
 | `completionReportEnabled`    | boolean | `true`  | Ask the model to include a concise completion report after completed action turns |
 | `showCompletionNotification` | boolean | `true`  | Show system notification when task completes                                                   |
-| `showThinking`               | boolean | `true`  | Display LLM's reasoning/thought process                                                        |
-| `mouseComposerCursor`        | boolean | `true`  | Enable click-to-position editing in the Ink composer                                           |
+| `showThinking`               | boolean | `false` | Display LLM's reasoning/thought process                                                        |
+| `renderMarkdown`             | boolean | `true`  | Render assistant markdown in the terminal: headings, emphasis, inline and fenced code, lists, task lists, quotes, rules, links, and tables. Set `false` to show the markdown as written. Toggle it in `/settings` under UI & Display, or run `/settings render_markdown off` |
+| `mouseComposerCursor`        | boolean | on, except iTerm2 | Enable click-to-position editing in the Ink composer                                           |
+| `keybindingProfile`          | string | `"autohand"` | Shortcut profile for the composer: `autohand`, `claude-code`, `codex`, `cursor`, `antigravity`, `devin` or `factory`. See [Keyboard Shortcut Profiles](#keyboard-shortcut-profiles) |
 | `terminalBell`               | boolean | `true`  | Ring terminal bell when task completes (shows badge on terminal tab/dock)                      |
 | `checkForUpdates`            | boolean | `true`  | Check for CLI updates on startup                                                               |
 | `updateCheckInterval`        | number | `24`    | Hours between update checks (uses cached result within interval)                               |
@@ -855,7 +902,7 @@ Customize the verbs in the config file when you want a fixed status label or a s
 }
 ```
 
-`activityVerbs` accepts either a single string or a non-empty string array. When `activityVerbsEnabled` is `false`, Autohand falls back to `Working...` instead of rotating through custom or built-in verbs.
+`activityVerbs` accepts either a single string or a non-empty string array. When `activityVerbsEnabled` is `false`, Autohand falls back to `Working...` instead of rotating through custom or built-in verbs. While no turn is running, a tip rotates every 30 seconds at the right end of the row above the composer, beside the `Completed in …` summary. Tips cover slash commands, the `/ @ $ ! : ?` composer triggers, keyboard shortcuts and your installed skills; only tips that fit the remaining width are drawn, and they hide while the agent works. Set `showTips` to `false`, or toggle Idle tips in `/settings`, to turn them off.
 
 You can toggle completion reports, including the structured `SITREP` prompt, without editing the file:
 
@@ -907,19 +954,75 @@ Note: This feature is experimental and may have edge cases. The default ora-base
 
 ### Mouse Composer Cursor
 
-`mouseComposerCursor` is enabled by default. To enable it explicitly or restore the default, run:
+`mouseComposerCursor` is on by default except in iTerm2, where terminal mouse reporting makes the viewport jump when it is switched around scroll-wheel events. The option is left unset in `config.json` so this per-terminal default applies; to force it on everywhere, run:
 
 ```bash
 autohand config set ui.mouseComposerCursor true
 ```
 
-This lets you place the blinking composer cursor by clicking text, including wrapped lines and Unicode text. To disable it, run:
+This lets you place the blinking composer cursor by clicking text, including wrapped lines and Unicode text. To turn it off everywhere, run:
 
 ```bash
 autohand config set ui.mouseComposerCursor false
 ```
 
 Terminal mouse reporting can change native selection and scroll-wheel behavior. During active work, click a live command to expand or compact its output; clicks in the composer continue to position its cursor. Mouse reporting is always restored when Autohand exits. Terminal-specific modifier keys, commonly Shift, may bypass mouse reporting for native selection.
+
+### Keyboard Shortcut Profiles
+
+If you already use another coding agent, the composer can follow its shortcuts.
+Pick a profile during setup (offered when Autohand detects the agent on your
+machine), in `/settings` → UI → Keyboard shortcuts, or directly:
+
+```sh
+autohand config set ui.keybindingProfile codex
+```
+
+Every profile keeps Autohand's fixed keys: Enter submits (while a turn runs it steers that turn and Shift+Enter queues, see `ui.enterWhileWorking`), Esc interrupts,
+Shift+Tab cycles interaction modes, Ctrl+C clears the input and exits on a
+second press, `?` on an empty composer shows the shortcuts panel, and Ctrl+O,
+Ctrl+T and Ctrl+G expand command output and toggle the team and goals panels.
+Profiles add what the other agent binds on top:
+
+| Profile       | Newline                              | Exit                | History                 |
+| ------------- | ------------------------------------ | ------------------- | ----------------------- |
+| `autohand`    | Shift+Enter, Alt+Enter               | Ctrl+C twice        | `/whatityped`           |
+| `claude-code` | Shift+Enter, Alt+Enter, Ctrl+J       | Ctrl+D              | Ctrl+R                  |
+| `codex`       | Shift+Enter, Alt+Enter, Ctrl+J       | Ctrl+D              | Ctrl+R                  |
+| `cursor`      | Shift+Enter, Alt+Enter, Ctrl+J       | Ctrl+D              | `/whatityped`           |
+| `antigravity` | Shift+Enter, Alt+Enter, Ctrl+J       | Ctrl+D              | `/whatityped`           |
+| `devin`       | Shift+Enter, Alt+Enter, Ctrl+J       | Ctrl+D              | Ctrl+R                  |
+| `factory`     | Shift+Enter, Alt+Enter               | Ctrl+C twice        | `/whatityped`           |
+
+Ctrl+D exits only when the composer is empty. Ctrl+R opens the same history
+view as `/whatityped`. The `?` panel always lists the chords of the active
+profile, so it is the quickest way to check what is bound.
+
+Two agents let you remap their own shortcuts in a file, and Autohand honours
+those remaps for the actions it shares. With `claude-code`, bindings in
+`~/.claude/keybindings.json` for `chat:newline`, `chat:cycleMode`, `app:exit`,
+`app:toggleTranscript`, `app:toggleTodos` and `history:search` are applied,
+including `null` to unbind. With `codex`, `insert_newline` and
+`history_search` under `[tui.keymap.composer]` and `exit` under
+`[tui.keymap.global]` in `~/.codex/config.toml` replace the profile's chords.
+Chords with more than one keystroke are ignored, and a malformed file leaves
+the profile defaults in place. Extension keybindings can never take a chord
+that the active profile uses.
+
+Which chords actually arrive depends on the terminal, not on the profile:
+
+- **Shift+Enter** needs a terminal that encodes modified keys through the kitty
+  keyboard protocol, which Autohand requests at start: Ghostty, kitty, WezTerm
+  and iTerm2 3.5 or later do; Terminal.app does not.
+- **Alt+Enter** needs Option configured as Meta in macOS terminals.
+- **Ctrl+J** is a plain control byte and works on any tty, including tmux,
+  which is why every non-default profile includes it.
+
+**Import during setup.** When setup detects Claude Code, Codex, Cursor, Gemini,
+Cline, Continue, Augment, OpenCode, Kimi or Grok, it also offers to bring your
+memories, sessions and skills across. Accepting runs the same import as
+`autohand import --all --categories memory,sessions,skills`; you can decline
+and run `/import` later, and a failed import never blocks setup.
 
 ### Update Check
 
@@ -989,6 +1092,9 @@ Control agent behavior and iteration limits.
 | `goalAutoMode`       | boolean | `true`  | Put the session in auto mode while a goal is active (autonomous turns, no tool approval prompts) |
 | `idleLogoutEnabled`  | boolean | `true`  | End authenticated interactive sessions after the idle timeout                  |
 | `idleTimeoutMs`      | number  | `14400000` | Milliseconds of inactivity before ending an authenticated session (4 hours)   |
+| `budget`             | object  | unset   | Limits for one run, shared with in-process sub-agents: `maxRequests` (model requests), `maxTokens` (reported prompt plus completion tokens; requests that report no usage are counted but their tokens are unknown), `maxDurationSeconds` (wall time). A request the budget no longer covers is refused before it is sent and the turn fails with the limit named. `--max-requests`, `--max-tokens`, and `--max-duration` override these for a run |
+| `sessionRetryLimit`  | number  | `3`     | Times a failed turn is re-run after a retryable error before the turn is reported as failed |
+| `sessionRetryDelay`  | number  | unset   | Milliseconds before the first re-run, growing 1.5× per attempt. When unset, provider outages (5xx, network, timeout) wait 5 s, 15 s, 45 s and other errors 1 s, 1.5 s, 2.25 s; a provider retry-after always wins |
 | `debug`              | boolean | `false` | Enable verbose debug output (logs agent internal state to stderr)              |
 
 ## Concurrent Session Awareness
@@ -1009,7 +1115,7 @@ Control agent behavior and iteration limits.
 
 Autohand does not send every full tool schema on every LLM request. The system prompt includes a compact tool capability catalog, and each request exposes only a small set of concrete schemas selected from:
 
-- Core discovery tools such as `tool_search`, `read_file`, `fff_find`, and `fff_grep`
+- Core discovery tools such as `tool_search`, `read_file`, `fff_find`, and `find_grep`
 - Intent-matched tools for editing, verification, git, browser, web, dependency, or project-tracking work
 - Tools requested through recent `tool_search` calls or explicitly mentioned by name
 
@@ -1045,6 +1151,18 @@ A goal is a standing instruction to keep working, so starting one switches the
 session into auto mode: the agent drives its own turns and stops asking for tool
 approval until the goal is complete. Setting a new goal while one is active
 queues it, and the queue advances automatically as each goal completes.
+After a goal reaches its budget limit, a new approved objective can start without
+clearing the old goal. The exhausted goal and its usage remain in terminal history;
+starting fresh does not resume or increase the exhausted goal's budget.
+Completion is saved before resolving the next queued template. If that template
+is missing or invalid, completion still succeeds, `queueError` describes the
+queue-start failure, and the item stays queued for an explicit retry.
+After repairing the template, `/goal resume`, `--goal resume`, or
+`start_queued_goal` starts the queued item without restarting the finished goal.
+Interactive goals created through the goal writer or agent tools use the same
+auto-mode policy as slash commands, including template starts and explicit
+resumes. The non-interactive `--goal` and RPC management APIs persist goals but
+do not silently launch an autonomous run or change interaction permissions.
 If a migration or interrupted session leaves queued work without a live owner,
 bare `/goal` starts the next item instead of leaving the backlog stranded.
 
@@ -1054,6 +1172,83 @@ macOS). `Esc` clears a goal selection or cancels its unsaved edit; it does not
 close the panel. Closing the view does not pause the goal; use `/goals pause`
 for that. See [viewing and managing goals](features.md#viewing-and-managing-goals)
 for keyboard controls and the queue, edit, resume, complete, and clear commands.
+
+Goal token usage follows the goal and session that owned the turn when it
+started. If completion starts the next queued goal during that turn, the final
+usage remains on the completed goal. A turn started without a goal is not
+charged retroactively to a newly created goal. Only reported provider usage is
+counted; unavailable usage is not estimated. Active elapsed time includes short
+turns and objective edits, and stops while the goal is paused or complete.
+
+Goal storage does not treat malformed, unreadable, or unsupported snapshots as
+empty state. Mutations stop without overwriting the stored file. Successful
+writes also refresh `.autohand/goals.local.json.backup`; if that refresh fails,
+the goal remains saved and a warning explains that the backup may be older.
+
+Use `/goal repair` or `--goal repair` to restore a validated backup explicitly.
+The damaged bytes are retained in a `goals.local.json.corrupt-*` file, created
+with mode `0600` where supported. Windows does not implement Unix owner/group
+permission distinctions through Node's file-mode API; see the
+[Node filesystem documentation](https://nodejs.org/api/fs.html#file-modes).
+Recovered active goals are paused and must be resumed deliberately. Recovery
+refuses newer schema versions and backups owned by another live session. If no
+valid backup exists, the original files remain untouched for manual recovery.
+
+Goal tools and RPC accept optional `acceptance_criteria`: 1–20 unique criteria
+approved by the user. Goals with criteria require `completion_evidence` when
+completing: a `summary` and `checks`, each with the exact `criterion`, a `status`
+of `passed`, and non-empty `evidence` (a result or artifact reference). Missing,
+failed, unrun, duplicate, and mismatched checks prevent completion. Spending
+floors remain separate requirements, not proof. Legacy goals without criteria
+retain their existing completion behavior.
+
+`/goal complete <JSON evidence>` and `--goal 'complete <JSON evidence>'` accept
+the same evidence object. Receipts survive queue advancement and appear in
+`get_goal`, command output, and history. They are explicitly **reported** evidence,
+not independently verified results. Reopening a completed goal removes its
+current receipt and requires new evidence before completing again.
+
+Goals may be `blocked` by an obstacle or `waiting` for an external condition.
+Both states require `stop_reason` and `resume_when` through tools/RPC, and stop
+automatic continuation and elapsed-time accrual. An optional `checkpoint`
+stores a `summary`, `nextStep`, and up to 20 `artifacts` references. A checkpoint
+alone saves progress without pausing. Explicit `/goal resume` preserves it and
+clears the stop details; it does not automatically verify the condition.
+
+The command equivalents accept JSON (camelCase field names):
+
+```text
+/goal waiting {"stopReason":"CI running","resumeWhen":"CI completes","checkpoint":{"summary":"Patch ready","nextStep":"Inspect CI"}}
+/goal checkpoint {"summary":"Tests prepared","artifacts":["test-report.log"]}
+```
+
+Use `/goal blocked` with the same fields for an obstacle. A slow command alone
+does not automatically mark a goal blocked. Invalid supplied statuses reject
+the entire update without silently applying other edits.
+
+`/goal recover` opens an offline-session picker; `/goal recover <session-id>`
+selects an exact owner directly. Recovery restores the original conversation,
+not just the goal text, and leaves work stopped until `/goal resume`. Live
+owners, unknown conversations, and cross-workspace sessions are refused.
+Canceling the picker changes nothing. Pause your current active goal first.
+
+Recovery preserves saved usage instead of charging unobservable offline time.
+If conversation restoration fails after preparation, the original goal remains
+safely stopped and can be retried. `--goal recover` only lists actionable
+offline choices; it does not open a picker or start autonomous work. Use
+`/goal repair` instead when the goal-storage file itself is damaged.
+
+The `/goals` panel (also **Ctrl+G**) refreshes across terminals approximately
+once per second, including elapsed time and owner liveness. It shows the current
+owner, token/time budgets, stop details, checkpoint, and latest reported
+completion evidence. Panel refreshes do not call a model or modify storage.
+Unchanged snapshots do not trigger redraws; closing the CLI releases monitoring.
+
+Queue updates preserve the selected goal by identity and keep an edit draft
+intact. If the edited goal disappears, Enter cannot send its draft as a new
+agent instruction; Escape cancels the edit. Storage errors are shown alongside
+the last valid view until storage can be read again. Nothing is reset or repaired
+automatically.
 
 To keep the normal turn-by-turn loop while goals are active:
 
@@ -1090,6 +1285,51 @@ When `enableRequestQueue` is enabled, you can continue typing messages while the
 - Maximum queue size is 10 requests
 
 ---
+
+
+## Local Peer Communication
+
+Communication is independent of `sessions.awareness` and defaults off. Enable it to
+address other local sessions and published workers with the `:` composer or peer tools.
+Peer communication uses local Unix-domain sockets on macOS/Linux and requires no TCP
+or UDP port. See [Required Ports and Agent Transports](#required-ports-and-agent-transports)
+for agent IPC, local model servers, browser integration, and optional HTTP listeners.
+
+```json
+{
+  "sessions": {
+    "communication": {
+      "enabled": true,
+      "scope": "workspace",
+      "idleBehavior": "notify",
+      "alias": "builder"
+    }
+  }
+}
+```
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `enabled` | `false` | Start authenticated local IPC and peer tools. |
+| `scope` | `workspace` | Maximum authorized scope: workspace, repository, or machine. Both peer policies must allow it. |
+| `idleBehavior` | `notify` | Notify while idle; `auto` explicitly allows peer-triggered turns within existing budgets. |
+| `alias` | Generated | Up to 64 letters, digits, dashes and underscores; starts with a letter. |
+| `coordinationDirectory` | `AUTOHAND_HOME` | Shared discovery/resource namespace; private inboxes stay in each profile. |
+| `allowResourceControl` | `false` | Permit explicit controller policy installation and resource grants. |
+| `resourceWaitTimeoutMs` | `300000` | Maximum parked command-admission wait. |
+| `limits` | Built-in bounded limits | Positive integer overrides documented in the protocol reference. |
+
+Use `/peers list workspace`, `/peers list repository`, or `/peers list machine` to
+choose a directory. The listing includes your own ID for controller setup. `/peers send`,
+`/peers inbox`, `/peers reply`, and `/peers status` expose delivery without requiring the
+user to relay model-to-model messages. Leading `:peer message` sends immediately; an
+inline selected `:peer` supplies an exact reference to the local model.
+
+See [the user guide](peer-communication.md), [resource coordination](peer-resource-coordination.md),
+[the technical reference](peer-communication-protocol.md), and [the two-session lab](peer-communication-lab.md).
+The Unix IPC adapter is implemented for macOS/Linux. Windows communication remains
+unavailable until private pipe and process-job adapters are implemented; keep communication
+disabled there. Changing auto-confirmation never bypasses an enabled resource policy.
 
 ## Permissions Settings
 
@@ -1182,6 +1422,10 @@ When you approve a file operation (edit, write, delete), it's automatically save
 - Next time, the same operation will be auto-approved
 - Local project settings are merged with global settings (local takes priority)
 - Add `.autohand/settings.local.json` to `.gitignore` to keep personal settings private
+
+**Project config overlays:**
+
+Both `.autohand/config.{json,toml,yaml,yml}` (shareable) and `.autohand/settings.local.json` (personal) are read at startup and layered over the global config, in that order. Only `hooks` and `mcp` are read from the shared project config file, because a repository can commit it. `settings.local.json` supports `hooks`, `mcp`, `permissions`, `agent`, `network`, `telemetry`, `provider`, and `model`. Hooks and MCP servers are appended to the global list, with a project entry replacing a global one that has the same identity (hook script name or event plus description/command; MCP server name). Permissions, telemetry, provider, and every other section in the shared project config file are ignored, so a cloned repository cannot switch on unrestricted mode or redirect session sync, and a config written by `autohand mcp add --scope project` cannot replace your real provider. Overlays are read from the workspace the invocation targets (`--path`, else the current directory), and saving settings never copies project hooks, MCP servers, or overridden fields into the file being saved. Project hooks and MCP servers from either file only apply after you trust the workspace; see Workspace trust in the hooks documentation. Trust decisions live in `~/.autohand/trusted-workspaces.json`.
 
 **Pattern format:**
 
@@ -1338,6 +1582,32 @@ git add -A && git commit -m "feat: add user dashboard with charts"
 
 ---
 
+## Shell Settings
+
+Control what shell commands started by Autohand can see. This covers the `run_command` tool, `!` terminal commands, and streaming or interactive shells. Hook commands and MCP server processes have their own launchers and are not affected.
+
+```json
+{
+  "shell": {
+    "env": {
+      "inherit": "essential",
+      "include": ["NODE_*", "NVM_DIR"],
+      "exclude": ["*_TOKEN", "AWS_*"],
+      "set": { "CI": "1" }
+    }
+  }
+}
+```
+
+| Field         | Type     | Default | Description                                                                                          |
+| ------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `env.inherit` | string   | `all`   | `all` passes the whole parent environment; `essential` keeps PATH, HOME, USER, SHELL, TMPDIR, locale and terminal variables (plus their Windows equivalents); `none` starts empty |
+| `env.include` | string[] | `[]`    | Variable names or globs to add back on top of the inherited set                                      |
+| `env.exclude` | string[] | `[]`    | Variable names or globs removed after inheritance and includes                                        |
+| `env.set`     | object   | `{}`    | Values pinned for every command; applied last                                                         |
+
+Variables Autohand needs to run its own tooling (`AUTOHAND_*`, `AUTOHAND_CLI`, `AUTOHAND_HOME`, `CODEX_HOME`) are always present. Explicit per-command overrides supplied by a tool call still win over the policy.
+
 ## Network Settings
 
 ```json
@@ -1355,6 +1625,81 @@ git add -A && git commit -m "feat: add user dashboard with charts"
 | `maxRetries` | number | `3`     | `5` | Retry attempts for failed API requests |
 | `timeout`    | number | `30000` | -   | Request timeout in milliseconds        |
 | `retryDelay` | number | `1000`  | -   | Delay between retries in milliseconds  |
+
+### Required Ports and Agent Transports
+
+Autohand Code has no single required inbound TCP port. Normal cloud inference uses
+outbound HTTPS, usually TCP **443**. Local agent communication does not open a TCP
+listener. Additional ports depend on the provider and optional features you enable.
+The `network` settings above control retries and timeouts; they do not configure a
+listener, peer port, or firewall rule.
+
+| Feature | Connection and default port | Configuration and when it is needed |
+| --- | --- | --- |
+| Peer messages, discovery queries, receipts, and resource coordination | Local Unix-domain sockets; **no TCP/UDP port** | Opt in with `sessions.communication.enabled`. Each root session owns a private socket, normally under `<coordinationDirectory>/peer-runtime/`; the directory defaults to `AUTOHAND_HOME`. Long paths use a verified private temporary directory. There is no `sessions.communication.port` setting. |
+| In-process subagents and teammate communication | In-process calls or parent/child stdio; **no TCP/UDP port** | Workers use their owning root's peer runtime. Running more agents does not require allocating a port per agent. Their model requests still use the selected provider's connection. |
+| RPC and ACP agent interfaces | JSON messages over stdin/stdout; **no TCP/UDP port** | The embedding application launches the CLI and owns its stdio pipes. These modes do not start an HTTP or WebSocket server. |
+| MCP tools over `stdio` | Child-process stdin/stdout; **no CLI transport port** | Configure `mcp.servers[].command` and `args`. A tool server may make its own network connections. |
+| MCP tools over `http` or `sse` | Outbound to `mcp.servers[].url`; HTTPS **443**, HTTP **80**, or the explicit URL port | Autohand is the client. A local MCP server must already listen on the port in its URL; there is no fixed Autohand MCP listener. |
+| Cloud inference, account sign-in/sync, downloads, and enabled online services | Outbound HTTPS, normally TCP **443** | Use the selected provider's `baseUrl` and the relevant service URL. `api.baseUrl` / `AUTOHAND_API_URL` select the account API; `AUTOHAND_AUTH_URL` selects the sign-in origin. Custom URLs can use other ports. |
+| Ollama | CLI connects to `http://localhost:11434`; TCP **11434** | `ollama.baseUrl`, or `ollama.port` when no explicit base URL is set. Only required when using that server. |
+| llama.cpp server | CLI connects to `http://localhost:8080`; TCP **8080** | `llamacpp.baseUrl`, or `llamacpp.port` when no explicit base URL is set. Setup can discover an existing server on another port, including **80**. |
+| MLX server | CLI connects to `http://localhost:8080`; TCP **8080** | `mlx.baseUrl`, or `mlx.port` when no explicit base URL is set. The server must use the same address and port. |
+| Autohand AI Local | Local model server, normally `http://127.0.0.1:8080`; TCP **8080** | `autohandai.baseUrl` and `autohandai.port`. Setup may start the chosen model on the next port, normally **8081**, if a reachable server is serving another model; it saves the resulting endpoint. |
+| OpenAI ChatGPT browser sign-in | Temporary callback listener on `127.0.0.1:1455`; TCP **1455** | If occupied, the CLI asks the OS for a free port. The browser uses the actual `http://localhost:<port>/auth/callback` redirect. No public inbound rule is needed; the listener closes after sign-in or failure. Device-code sign-in does not use this listener. |
+| `autohand review serve` | HTTP listener on `127.0.0.1`; **OS-assigned port** by default | `--port 0` selects a free port; `--port <1–65535>` selects a fixed one. Use the URL printed by the command. The host stays loopback-only. |
+| Chrome extension / native messaging bridge | Native messaging and local IPC; **no fixed TCP port** | `chrome` settings and `--browser` enable the integration. This is separate from the browser-profile search fallback below. |
+| Browser-profile search's headless Chrome fallback | Browser debugging TCP port randomly selected from **9222–10221** | Used when this fallback launches Chrome with `--remote-debugging-port`. There is no CLI setting to pin that port. It is unrelated to agent messaging; the browser also needs outbound access to the search site. |
+| Optional Squad runtime | Separate runtime; CLI fallback URL is `http://127.0.0.1:19821` | Check the separate runtime's status for its actual listener. `/squad` forwards `--host` and `--port`; `AUTOHAND_SQUAD_FIXED_PORT` is passed through runtime configuration. Core CLI peer messaging does not depend on Squad or port **19821**. |
+
+#### Peer communication across sessions and profiles
+
+Peers communicate on the **same machine, under the same OS user**. The `workspace`,
+`repository`, and `machine` scopes control which local peers can discover and address
+each other; `machine` does not enable LAN or cross-host communication. No router
+forwarding, public inbound rule, or reserved TCP port is required for peers.
+
+Profiles using different `AUTOHAND_HOME` directories must set the same
+`sessions.communication.coordinationDirectory` to discover one another. Each profile
+retains its private inbox in its own home. The runtime requires a private local
+directory and access to its Unix sockets; a shared network folder or opened firewall
+port does not create cross-host peer support. Windows peer communication is currently
+unavailable.
+
+#### Choosing ports and diagnosing conflicts
+
+For a local provider, an explicit `baseUrl` takes precedence over the provider's
+`port`. Change the server's listening port and the matching CLI URL together. For
+example, after starting Ollama on port `11435`, use:
+
+```json
+{
+  "provider": "ollama",
+  "ollama": {
+    "baseUrl": "http://127.0.0.1:11435",
+    "model": "your-installed-model"
+  },
+  "sessions": {
+    "communication": {
+      "enabled": true,
+      "scope": "workspace"
+    }
+  }
+}
+```
+
+For a predictable review URL, run `autohand review serve --port 4173`. If that port
+is occupied, choose another or use `--port 0`. Local providers that default to
+`8080` need distinct ports when running as separate servers at the same time.
+Optional local listeners should remain reachable only where you intend to use them.
+
+On macOS/Linux, `lsof -nP -iTCP:11434 -sTCP:LISTEN` identifies the process listening
+on a model port; substitute the port you are diagnosing. For peer failures, use
+`/peers list` and check communication enablement, scope, the shared coordination
+directory, and socket permissions instead of opening a TCP port. Project dev servers,
+hooks, external tools, and third-party MCP servers can need additional ports defined
+by those programs. `--offline` suppresses startup network refreshes; it is not a
+firewall and does not force a cloud provider or tool to run locally.
 
 ---
 
@@ -1988,6 +2333,18 @@ Configuration for lifecycle hooks that run shell commands on agent events. Open 
 
 `filter.tool` accepts an array of Autohand tool names, and `filter.path` accepts an array of path globs. Imported hooks also apply their source event's matching rules and success/failure filters. See [Matchers](./hooks.md#matcher-regex-filtering) for event-specific matching.
 
+### Legacy Shape and Template Variables
+
+The original event-keyed shape is still accepted: any key under `hooks` other than `enabled` and `hooks` is treated as an event name whose value is a command string, an array of command strings, or an array of definition objects. Legacy names such as `on_file_change`, `before_tool_call`, and `on_session_end` map onto the lifecycle events, and `{{file}}`-style placeholders in any command are replaced before it runs. See [Legacy Event Names, Config Shape, and Template Variables](./hooks.md#legacy-event-names-config-shape-and-template-variables).
+
+```json
+{
+  "hooks": {
+    "on_file_change": ["eslint {{file}} --fix"]
+  }
+}
+```
+
 ### Imported Hook Metadata
 
 The import feature writes `importedFrom` on each imported definition. Keep this metadata when editing a definition: it selects the source payload adapter and preserves project scope and duplicate detection.
@@ -2135,7 +2492,7 @@ autohand --no-browser       # Start with browser bridge disabled
     "theme": "aurora",
     "autoConfirm": false,
     "showCompletionNotification": true,
-    "showThinking": true,
+    "showThinking": false,
     "terminalBell": true,
     "checkForUpdates": true,
     "updateCheckInterval": 24
@@ -2222,7 +2579,7 @@ ui:
   theme: aurora
   autoConfirm: false
   showCompletionNotification: true
-  showThinking: true
+  showThinking: false
   terminalBell: true
   checkForUpdates: true
   updateCheckInterval: 24
@@ -2309,7 +2666,7 @@ allowDangerousOps = false
 theme = "aurora"
 autoConfirm = false
 showCompletionNotification = true
-showThinking = true
+showThinking = false
 terminalBell = true
 checkForUpdates = true
 updateCheckInterval = 24
@@ -2374,7 +2731,8 @@ Autohand stores data in `~/.autohand/` (or `$AUTOHAND_HOME`):
 
 ```
 <project>/.autohand/
-├── settings.local.json  # Local project permissions (gitignore this)
+├── config.json          # Shareable project overlay: hooks and mcp only
+├── settings.local.json  # Personal overlay: hooks, mcp, permissions, agent, network, telemetry, provider, model (gitignore this)
 ├── memory/              # Project-specific memory
 │   ├── events/
 │   │   └── LOG.jsonl    # Canonical append-only project history
@@ -2398,15 +2756,20 @@ These flags override config file settings:
 | ----------------------------- | ---------------------------------------------------------------------------------------------- |
 | `-v, --version`               | Output the current version                                                                     |
 | `-p, --prompt [text]`         | Run a single instruction in command mode                                                       |
+| `--output-schema <file>`      | Command mode only: the final answer must be one JSON document valid against this JSON Schema file. The answer is validated locally; one repair turn is attempted; the run exits 1 with the violations if it still fails. With `--json local` the result `content` is the canonical JSON text |
 | `--path <path>`               | Override workspace root                                                                        |
 | `--config <path>`             | Use custom config file                                                                         |
 | `--model <model>`             | Override model                                                                                 |
+| `--provider <provider>`       | Select the provider for this run or resumed session without changing the saved provider          |
 | `--temperature <n>`           | Set sampling temperature (0-1)                                                                  |
 | `--thinking [level]`          | Set thinking/reasoning depth (none, normal, extended)                                          |
 | `-y, --yes`                   | Auto-confirm prompts                                                                           |
 | `--dry-run`                   | Preview without executing                                                                      |
 | `-d, --debug`                 | Enable verbose debug output                                                                    |
 | `--bare`                      | Minimal explicit mode; also sets `AUTOHAND_CODE_SIMPLE=1` and disables slash commands          |
+| `--ephemeral`                 | Keep the run out of session history: no session directory or index entry, no automatic memory extraction, no session sync. Files the agent writes in the workspace are unaffected. Cannot be combined with `--resume` or `--fork` |
+| `--profile <name>`            | Layer `profiles.<name>` from the config onto this run; see [Profiles and One-Run Overrides](#profiles-and-one-run-overrides) |
+| `--set <key=value>`           | Override one setting for this run by dotted path; repeatable; never saved                       |
 | `--answer-only`               | Classified Blueprint answer RPC profile; requires RPC, restricted, and Blueprint context       |
 | `--setup-only`                | Scoped Autohand device-auth RPC profile; mutually exclusive with `--answer-only`                |
 | `--client-context <context>`  | Typed RPC client context: `vscode`, `chrome`, or `blueprint`                                    |
@@ -2421,7 +2784,12 @@ These flags override config file settings:
 | `--permissions`               | Display current permission settings and exit                                                   |
 | `--no-idle-logout`            | Keep authenticated sessions alive past the idle timeout for long-running agents                |
 | `--yolo [pattern]`            | Auto-approve tool calls matching pattern (e.g., `allow:read,write` or `deny:delete`)           |
+| `--allowed-tools <patterns>`  | Only offer and authorize these tools this run; comma-separated or repeated (e.g. `read_file,run_command(git:*)`). A run-only restriction on top of every configured policy: never saved, never widened by a local or extension allowlist |
+| `--disallowed-tools <patterns>` | Never offer or authorize these tools this run. Matched on the tool the model names, before capability mapping, so `delete_path` stays blocked even when unrestricted. Applies to MCP and delegated tools too |
 | `--timeout <seconds>`         | Timeout in seconds for auto-approve mode                                                       |
+| `--max-requests <n>`          | Stop the run after this many model requests, sub-agents included; the turn fails with the limit named and exit code 1 in command mode |
+| `--max-tokens <n>`            | Stop the run once reported token usage reaches this total, sub-agents included                  |
+| `--max-duration <seconds>`    | Stop the run after this much wall time; checked before each model request                       |
 
 ### Git & Worktree
 
@@ -2553,6 +2921,12 @@ Enable an increment with `autohand experiments enable <feature>`. Partial, clamp
 
 ---
 
+## Doctor
+
+`autohand doctor` checks the installation in one pass: runtime version and executable, config file and provider (custom and extension providers included), required and optional tools, workspace, terminal support, Autohand account status (startup requires a login whatever the inference provider is), every configured MCP server, and extension diagnostics. Each item is marked ok, warning, or failure, and the exit code is 1 when anything fails. Use `--json` for a structured report, `--skip-mcp` to avoid connecting to servers, and `--path` or `--config` to check another workspace or config file.
+
+---
+
 ## Slash Commands
 
 Start directly in planning mode with `autohand --plan`, or generate a one-shot plan with `autohand --plan --prompt "Plan the migration"`. Planning instructions and read-only tool gating apply from the first model request. Interactive plan acceptance requires a user decision even with `--yes` or `--unrestricted`; command and unattended runs leave the plan pending review. Use `/plan off` or Shift+Tab to change modes interactively.
@@ -2565,7 +2939,7 @@ Autohand provides a rich set of slash commands for interactive use. Type `/` in 
 
 From the shell, `autohand resume` opens a picker scoped to the current working directory. Use `--path <path>` to select another workspace, `--all` to browse every project, or `--last` to resume the most recently active session. `--last --all` selects the most recently active session across projects. Older metadata without a valid activity timestamp falls back to creation time.
 
-`autohand resume <reference>` accepts a full session ID, a unique ID prefix, or a saved session directory/file. Ambiguous or missing references exit with an error. Explicit references cannot be combined with `--last` or `--all`. `--config`, `--model`, and `--offline` remain available; `-c` continues to mean auto-commit.
+`autohand resume <reference>` accepts a saved session name (set with `/rename` or `--rename`, matched case-insensitively), a full session ID, a unique ID prefix, or a saved session directory/file. A name wins over an ID prefix. Ambiguous or missing references exit with an error, and a name shared by several sessions lists their ID prefixes. Explicit references cannot be combined with `--last` or `--all`. `--config`, `--model`, and `--offline` remain available; `-c` continues to mean auto-commit.
 
 The picker loads twenty sessions per page and provides **More sessions** and **Previous sessions** navigation. Escape or Ctrl+C cancels without starting an agent. Non-interactive invocations require `--last` or an explicit reference when saved sessions exist. Empty history exits successfully without starting a session.
 
@@ -2584,6 +2958,7 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | `/share`      | Share current session                                 |
 | `/status`     | Show session status and the signed-in Autohand plan   |
 | `/usage`      | Show Autohand plan limits and project token activity  |
+| `/upgrade`    | Open the console to upgrade your Autohand plan        |
 
 `/undo` never resets or cleans the Git worktree. It preserves unrelated tracked and untracked work, and refuses to overwrite a file that changed after the recorded agent mutation.
 

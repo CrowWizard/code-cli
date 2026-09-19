@@ -6,8 +6,9 @@
  * Code Formatters
  * Supports prettier, black, rustfmt, gofmt, and more
  */
-import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { signalCoordinatedProcess, spawnCoordinatedProcess, waitForProcessPublication } from '../session/peers/CommandCoordinationGate.js';
+import { killAfter } from '../utils/processTimeout.js';
 
 export type Formatter = (contents: string, file: string, workspaceRoot?: string) => Promise<string>;
 
@@ -92,21 +93,18 @@ export const EXTERNAL_FORMATTERS: Record<string, FormatterInfo> = {
  * Check if a command is available in PATH
  */
 async function isCommandAvailable(command: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const proc = spawn(command, ['--version'], {
-      stdio: 'ignore',
-      shell: process.platform === 'win32',
-    });
-
-    proc.on('error', () => resolve(false));
-    proc.on('close', (code) => resolve(code === 0));
-
-    // Timeout after 2 seconds
-    setTimeout(() => {
-      proc.kill();
-      resolve(false);
-    }, 2000);
+  const proc = await spawnCoordinatedProcess({ file: command, args: ['--version'], cwd: process.cwd() }, {
+    stdio: 'ignore', shell: process.platform === 'win32',
   });
+  return new Promise<boolean>((resolve) => {
+    proc.on('error', () => { resolve(false); });
+    proc.on('close', (code) => { resolve(code === 0); });
+
+    killAfter(proc, 2000, () => {
+      signalCoordinatedProcess(proc);
+      resolve(false);
+    });
+  }).finally(() => waitForProcessPublication(proc));
 }
 
 /**
@@ -118,21 +116,18 @@ async function runExternalFormatter(
   input: string,
   cwd?: string
 ): Promise<FormatterResult> {
-  return new Promise((resolve) => {
-    const proc = spawn(command, args, {
-      cwd,
-      shell: process.platform === 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
+  const proc = await spawnCoordinatedProcess({ file: command, args, cwd: cwd ?? process.cwd() }, {
+    shell: process.platform === 'win32', stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  return new Promise<FormatterResult>((resolve) => {
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (data) => {
+    proc.stdout?.on('data', (data) => {
       stdout += data.toString();
     });
 
-    proc.stderr.on('data', (data) => {
+    proc.stderr?.on('data', (data) => {
       stderr += data.toString();
     });
 
@@ -157,19 +152,18 @@ async function runExternalFormatter(
     });
 
     // Write input to stdin
-    proc.stdin.write(input);
-    proc.stdin.end();
+    proc.stdin?.write(input);
+    proc.stdin?.end();
 
-    // Timeout after 30 seconds
-    setTimeout(() => {
-      proc.kill();
+    killAfter(proc, 30000, () => {
+      signalCoordinatedProcess(proc);
       resolve({
         success: false,
         output: input,
         error: `${command} timed out after 30 seconds`,
       });
-    }, 30000);
-  });
+    });
+  }).finally(() => waitForProcessPublication(proc));
 }
 
 /**
@@ -339,21 +333,6 @@ const externalFormatters: Record<string, Formatter> = {
 };
 
 /**
- * Get the best formatter for a file based on extension
- */
-export function getFormatterForFile(filePath: string): string | null {
-  const ext = path.extname(filePath).toLowerCase();
-
-  for (const [name, info] of Object.entries(EXTERNAL_FORMATTERS)) {
-    if (info.extensions.includes(ext)) {
-      return name;
-    }
-  }
-
-  return null;
-}
-
-/**
  * Check which formatters are available
  */
 export async function checkAvailableFormatters(): Promise<Record<string, boolean>> {
@@ -370,7 +349,9 @@ export async function checkAvailableFormatters(): Promise<Record<string, boolean
     results[name] = available;
   });
 
-  await Promise.all(checks);
+  const settled = await Promise.allSettled(checks);
+  const failed = settled.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
   return results;
 }
 
@@ -419,45 +400,4 @@ export async function applyFormatter(
   }
 
   throw new Error(`Formatter "${name}" is not available. Run /formatters to see available formatters.`);
-}
-
-/**
- * Auto-format a file using the best available formatter
- */
-export async function autoFormat(
-  contents: string,
-  filePath: string,
-  workspaceRoot?: string
-): Promise<{ formatted: string; formatter: string | null }> {
-  const formatterName = getFormatterForFile(filePath);
-
-  if (!formatterName) {
-    // No specific formatter, just normalize
-    return {
-      formatted: await applyFormatter('trailing-newline', contents, filePath),
-      formatter: 'trailing-newline',
-    };
-  }
-
-  // Check if the formatter is available
-  const available = await isCommandAvailable(EXTERNAL_FORMATTERS[formatterName]?.command || formatterName);
-
-  if (!available) {
-    // Fall back to basic formatting
-    return {
-      formatted: await applyFormatter('trailing-newline', contents, filePath),
-      formatter: null,
-    };
-  }
-
-  try {
-    const formatted = await applyFormatter(formatterName, contents, filePath, workspaceRoot);
-    return { formatted, formatter: formatterName };
-  } catch {
-    // Formatting failed, return original with trailing newline
-    return {
-      formatted: await applyFormatter('trailing-newline', contents, filePath),
-      formatter: null,
-    };
-  }
 }

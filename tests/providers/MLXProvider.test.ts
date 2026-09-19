@@ -540,6 +540,71 @@ describe('MLXProvider', () => {
             })).rejects.toThrow('Raw: MLX backend exited while generating');
         });
 
+        it('recovers after an empty successful HTTP response within the configured retry budget', async () => {
+            const retryProvider = new MLXProvider(config, { maxRetries: 1, retryDelay: 0 });
+            global.fetch = vi.fn()
+                .mockResolvedValueOnce(new Response('', { status: 200 }))
+                .mockResolvedValueOnce(Response.json({
+                    choices: [{
+                        message: { role: 'assistant', content: 'Recovered' },
+                        finish_reason: 'stop',
+                    }],
+                }));
+
+            const response = await retryProvider.complete({
+                messages: [{ role: 'user', content: 'Hello' }],
+            });
+
+            expect(response.content).toBe('Recovered');
+            expect(global.fetch).toHaveBeenCalledTimes(2);
+        });
+
+        it('reports an empty body with server diagnostics after exhausting bounded retries', async () => {
+            const retryProvider = new MLXProvider(config, { maxRetries: 1, retryDelay: 0 });
+            global.fetch = vi.fn().mockImplementation(async () => new Response('', { status: 200 }));
+
+            const error = await retryProvider.complete({
+                messages: [{ role: 'user', content: 'Hello' }],
+            }).catch((caught: unknown) => caught);
+
+            expect(error).toBeInstanceOf(ApiError);
+            expect(error).toMatchObject({
+                code: 'server_error',
+                httpStatus: 200,
+                retryable: true,
+                rawDetail: '',
+                message: expect.stringContaining('empty response body (HTTP 200)'),
+            });
+            expect((error as ApiError).message).toContain('Check the MLX server logs');
+            expect(global.fetch).toHaveBeenCalledTimes(2);
+        });
+
+        it.each(['json', 'text'] as const)(
+            'preserves a %s prefill memory-guard rejection for context compaction without retrying the same prompt',
+            async (format) => {
+                const detail = 'oMLX prefill memory guard rejected this prompt: Prefill would require ~55.12 GB peak '
+                    + '(current 29.69 GB + KV+SDPA 25.43 GB) but metal_cap ceiling is 49.25 GB. '
+                    + 'Free system memory, or compact/reduce context.';
+                const response = format === 'json'
+                    ? Response.json({ error: { message: detail } }, { status: 400 })
+                    : new Response(detail, { status: 400 });
+                global.fetch = vi.fn().mockResolvedValue(response);
+
+                const error = await provider.complete({
+                    messages: [{ role: 'user', content: 'Continue' }],
+                }).catch((caught: unknown) => caught);
+
+                expect(error).toBeInstanceOf(ApiError);
+                expect(error).toMatchObject({
+                    code: 'context_overflow',
+                    httpStatus: 400,
+                    retryable: false,
+                    rawDetail: detail,
+                });
+                expect(global.fetch).toHaveBeenCalledTimes(1);
+            },
+        );
+
         // -----------------------------------------------------------------------
         // Error handling tests (TDD — these fail before the fix is implemented)
         // -----------------------------------------------------------------------
@@ -745,6 +810,26 @@ describe('MLXProvider', () => {
         it('uses default timeout when network settings not provided', () => {
             const p = new MLXProvider(config);
             expect(p.getName()).toBe('mlx');
+        });
+    });
+
+
+    describe('finish reason normalization', () => {
+        const mockJson = (body: unknown) => {
+            mockIsMLXSupported.mockReturnValue(true);
+            global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => body });
+        };
+
+        it('maps a vendor max_tokens finish reason to length', async () => {
+            mockJson({ id: 'r-1', created: 1, choices: [{ message: { role: 'assistant', content: '', }, finish_reason: 'max_tokens' }] });
+            const response = await provider.complete({ messages: [{ role: 'user', content: 'hi' }] });
+            expect(response.finishReason).toBe('length');
+        });
+
+        it('keeps tool_calls as tool_calls', async () => {
+            mockJson({ id: 'r-1', created: 1, choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] });
+            const response = await provider.complete({ messages: [{ role: 'user', content: 'hi' }] });
+            expect(response.finishReason).toBe('tool_calls');
         });
     });
 });

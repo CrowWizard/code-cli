@@ -91,4 +91,26 @@ describe('RPC goal handlers', () => {
     expect(result.ok).toBe(false);
     expect(result.message).toContain('slash_goal');
   });
+
+  it('preserves queued criteria and completion evidence across RPC handlers', async () => {
+    await adapter.handleGoalQueue({ objective: 'RPC evidence', acceptance_criteria: ['Tests pass'] });
+    await adapter.handleGoalStartQueued();
+    expect(await adapter.handleGoalUpdate({ status: 'complete' })).toMatchObject({ ok: false });
+
+    expect(await adapter.handleGoalUpdate({ status: 'complete', completion_evidence: {
+      summary: 'RPC verification', checks: [{ criterion: 'Tests pass', status: 'passed', evidence: 'RPC test log' }],
+    } })).toMatchObject({ ok: true, completed: { completionReceipt: { summary: 'RPC verification', provenance: 'reported' } } });
+  });
+
+  it('rejects invalid RPC statuses without editing the objective', async () => {
+    await adapter.handleGoalCreate({ objective: 'original RPC objective' });
+    await expect(adapter.handleGoalUpdate({ status: 'typo', objective: 'must not be saved' })).rejects.toThrow('status');
+    expect(await adapter.handleGoalGet()).toMatchObject({ goal: { objective: 'original RPC objective' } });
+  });
+
+  it('persists waiting metadata and a checkpoint through RPC', async () => {
+    await adapter.handleGoalCreate({ objective: 'wait for CI' });
+    expect(await adapter.handleGoalUpdate({ status: 'waiting', stop_reason: 'CI running', resume_when: 'CI passes', checkpoint: { summary: 'Patch ready' } }))
+      .toMatchObject({ ok: true, goal: { status: 'waiting', checkpoint: { summary: 'Patch ready' } } });
+  });
 });

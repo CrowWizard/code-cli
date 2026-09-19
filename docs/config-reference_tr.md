@@ -686,6 +686,29 @@ export AUTOHAND_SKIP_UPDATE_CHECK=1
 ```
 ---
 
+### Klavye kısayolu profilleri
+
+Zaten başka bir kodlama aracısı kullanıyorsanız, düzenleyici onun kısayollarını izleyebilir. Profili kurulum sırasında (Autohand aracıyı algıladığında), `/settings` → UI → Klavye kısayolları altında veya doğrudan seçin:
+
+```sh
+autohand config set ui.keybindingProfile codex
+```
+
+| Profil | Yeni satır | Çıkış | Geçmiş |
+| --- | --- | --- | --- |
+| `autohand` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+| `claude-code`, `codex`, `devin` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | Ctrl+R |
+| `cursor`, `antigravity` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | `/whatityped` |
+| `factory` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+
+Ctrl+D yalnızca düzenleyici boşken çıkar. `?` paneli her zaman etkin profilin kısayollarını listeler. `claude-code` ile `~/.claude/keybindings.json` içindeki yeniden atamalarınız, `codex` ile `~/.codex/config.toml` içindeki `[tui.keymap.*]` uygulanır.
+
+Hangi kısayolların ulaşacağına terminal karar verir: Shift+Enter kitty klavye protokolünü gerektirir (Ghostty, kitty, WezTerm, iTerm2 3.5+), Alt+Enter macOS'ta Option'ın Meta olmasını gerektirir, Ctrl+J tmux dahil her terminalde çalışır.
+
+**Kurulum sırasında içe aktarma.** Kurulum başka bir aracı algıladığında, bellekleri, oturumları ve becerileri `/import` ile aynı şekilde içe aktarmayı da önerir; başarısız bir içe aktarma kurulumu engellemez.
+
+---
+
 ## Temsilci Ayarları
 
 Kontrol aracısı davranışı ve yineleme sınırları.
@@ -730,7 +753,7 @@ Kontrol aracısı davranışı ve yineleme sınırları.
 
 Autohand her LLM isteğinde her araç şemasının tamamını göndermez. Sistem istemi, kompakt bir araç yetenek kataloğu içerir ve her istek, aşağıdakilerden seçilen yalnızca küçük bir dizi somut şemayı ortaya çıkarır:
 
-- `tool_search`, `read_file`, `fff_find` ve `fff_grep` gibi temel keşif araçları
+- `tool_search`, `read_file`, `fff_find` ve `find_grep` gibi temel keşif araçları
 - Düzenleme, doğrulama, git, tarayıcı, web, bağımlılık veya proje izleme çalışmaları için amaca uygun araçlar
 - Son `tool_search` çağrıları yoluyla talep edilen veya açıkça adı geçen araçlar
 
@@ -2018,6 +2041,7 @@ Autohand etkileşimli kullanım için zengin bir eğik çizgi komutları seti sa
 | `/status` | Oturum durumunu göster |
 | `/usage` | Modeli, sağlayıcıyı, içeriği ve kullanım sınırlarını göster |
 
+| `/upgrade`| Autohand planını yükseltmek için konsolu aç                 |
 ### Model ve Sağlayıcı
 
 | Komut | Açıklama |

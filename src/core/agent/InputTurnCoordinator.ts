@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { deliverAgentTargetMessage, listAgentMessageTargets, type MessageTargetHost } from './AgentMessageTargets.js';
+import { parseLeadingTargetMessage } from '../../ui/messageTargets.js';
 import readline from 'node:readline';
 import { format as formatText } from 'node:util';
 import { ApiError, classifyApiError } from '../../providers/errors.js';
 import { safeEmitKeypressEvents } from '../../ui/inputPrompt.js';
 import { safeSetRawMode } from '../../ui/rawMode.js';
 import { isImmediateCommand, isShellCommand, parseShellCommand } from '../../ui/shellCommand.js';
+import { canSteerComposerInput } from '../../ui/composerSteering.js';
 import { routeOutput } from '../immediateCommandRouter.js';
 import { isLikelyFilePathSlashInput } from '../slashInputDetection.js';
 import { describeInstruction, formatElapsedTime } from './AgentFormatter.js';
@@ -45,7 +48,9 @@ export interface AgentInputRecoveryHost {
   };
 }
 
-export interface AgentInputTurnHost {
+export interface AgentInputTurnHost extends MessageTargetHost {
+  /** Sends text into the running turn (Shift+Enter in the mid-turn composer). */
+  steerActiveInstruction?: (text: string) => Promise<boolean>;
   conversation: AgentInputRecoveryHost['conversation'];
   executeImmediateShellCommandForComposer(command: string, routeOpts: ImmediateShellRouteOptions): Promise<ImmediateShellResult>;
   handleSlashCommand(command: string, args: string[]): Promise<string | null>;
@@ -146,6 +151,19 @@ export function setupAgentEscListener(host: AgentInputTurnHost, controller: Abor
         return;
       }
 
+      if (parseLeadingTargetMessage(text, listAgentMessageTargets(host))) {
+        const routeOpts = {
+          persistentInputActiveTurn: host.persistentInputActiveTurn,
+          terminalRegionsDisabled: process.env.AUTOHAND_TERMINAL_REGIONS === '0',
+          writeAbove: (t: string) => host.persistentInput.writeAbove(t),
+        };
+        deliverAgentTargetMessage(host, text)
+          .then((delivery) => { if (delivery) routeOutput(delivery.ok ? chalk.gray(delivery.receipt) : chalk.red(delivery.receipt), routeOpts); })
+          .catch((error: Error) => routeOutput(chalk.red(error.message), routeOpts));
+        host.updateInputLine();
+        return;
+      }
+
       if (host.persistentInput.getQueueLength() >= 10) {
         host.updateInputLine();
         return;
@@ -211,6 +229,15 @@ export function setupAgentEscListener(host: AgentInputTurnHost, controller: Abor
         }
 
         if (key?.name === 'return' || key?.name === 'enter') {
+          const steerOnPlainEnter = (host.runtime.config.ui?.enterWhileWorking ?? 'steer') === 'steer';
+          const wantsSteer = steerOnPlainEnter ? !key?.shift : key?.shift === true;
+          if (wantsSteer && host.queueInput.trim() && canSteerComposerInput(host.queueInput) && typeof host.steerActiveInstruction === 'function') {
+            const steered = host.queueInput;
+            host.queueInput = '';
+            void host.steerActiveInstruction(steered);
+            host.updateInputLine();
+            return;
+          }
           submitQueueInput();
           return;
         }

@@ -10,15 +10,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActionExecutor } from '../../src/core/actionExecutor.js';
 import { FileActionManager } from '../../src/actions/filesystem.js';
 import type { AgentRuntime } from '../../src/types.js';
+import { GoalManager } from '../../src/goals/GoalManager.js';
 
 describe('goal tools', () => {
   let workspaceRoot: string;
   let executor: ActionExecutor;
   let currentSessionId: string;
+  let activatedObjectives: string[];
 
   beforeEach(async () => {
     workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-goal-tools-'));
     currentSessionId = 'session-current';
+    activatedObjectives = [];
     executor = new ActionExecutor({
       runtime: {
         workspaceRoot,
@@ -32,12 +35,53 @@ describe('goal tools', () => {
       resolveWorkspacePath: (relativePath: string) => path.resolve(workspaceRoot, relativePath),
       confirmDangerousAction: vi.fn().mockResolvedValue(true),
       getCurrentSessionId: () => currentSessionId,
+      onGoalActivated: (goal) => { activatedObjectives.push(goal.objective); },
     });
   });
 
   afterEach(async () => {
     vi.restoreAllMocks();
     await fs.remove(workspaceRoot);
+  });
+
+  it('activates a tool-created goal but does not reactivate it when another goal is queued', async () => {
+    await executor.execute({ type: 'create_goal', objective: 'started goal' });
+    await executor.execute({ type: 'create_goal', objective: 'queued goal' });
+
+    expect(activatedObjectives).toEqual(['started goal']);
+  });
+
+  it('activates queued starts and resumes without activating pauses or edits', async () => {
+    await executor.execute({ type: 'enqueue_goal', objective: 'queued goal' });
+    await executor.execute({ type: 'start_queued_goal' });
+    await executor.execute({ type: 'update_goal', status: 'paused' });
+    await executor.execute({ type: 'update_goal', objective: 'refined goal' });
+    await executor.execute({ type: 'update_goal', status: 'active' });
+
+    expect(activatedObjectives).toEqual(['queued goal', 'refined goal']);
+  });
+
+  it('does not silently discard invalid tool statuses while applying other fields', async () => {
+    await executor.execute({ type: 'create_goal', objective: 'original objective' });
+    await expect(executor.execute({ type: 'update_goal', status: 'typo', objective: 'must not be saved' })).rejects.toThrow('status');
+    expect(await executor.execute({ type: 'get_goal' })).toContain('original objective');
+  });
+
+  it('saves a blocked tool checkpoint without reactivating the goal', async () => {
+    await executor.execute({ type: 'create_goal', objective: 'blocked tool work' });
+    const output: unknown = JSON.parse(await executor.execute({ type: 'update_goal', status: 'blocked',
+      stop_reason: 'Need approval', resume_when: 'User approves', checkpoint: { summary: 'Prepared patch', nextStep: 'Apply approved patch' },
+    }));
+    expect(output).toMatchObject({ ok: true, goal: { status: 'blocked', stopReason: 'Need approval', checkpoint: { summary: 'Prepared patch' } } });
+    expect(activatedObjectives).toEqual(['blocked tool work']);
+  });
+
+  it('activates template goals after they resolve successfully', async () => {
+    await fs.outputFile(path.join(workspaceRoot, '.pi-goals', 'approved.md'), 'Finish approved template work.');
+
+    await executor.execute({ type: 'create_goal_from_template', template: 'approved' });
+
+    expect(activatedObjectives).toEqual(['Finish approved template work.']);
   });
 
   it('creates and reads goals through agent tools', async () => {
@@ -52,6 +96,17 @@ describe('goal tools', () => {
     const snapshot = await executor.execute({ type: 'get_goal' });
     expect(snapshot).toContain('finish tool wiring');
     expect(snapshot).toContain('tokenBudget');
+  });
+
+  it('enforces approved criteria through tools and returns a reported receipt', async () => {
+    await executor.execute({ type: 'create_goal', objective: 'evidence through tools', acceptance_criteria: ['Tests pass'] });
+    expect(JSON.parse(await executor.execute({ type: 'update_goal', status: 'complete' }))).toMatchObject({ ok: false });
+
+    const result: unknown = JSON.parse(await executor.execute({ type: 'update_goal', status: 'complete', completion_evidence: {
+      summary: 'Tool verification', checks: [{ criterion: 'Tests pass', status: 'passed', evidence: '12 passed in test log' }],
+    } }));
+
+    expect(result).toMatchObject({ ok: true, completed: { completionReceipt: { summary: 'Tool verification', provenance: 'reported' } } });
   });
 
   it('does not attach a prior-session goal to the current session through get_goal', async () => {
@@ -98,6 +153,7 @@ describe('goal tools', () => {
       started: { objective: 'second approved goal' },
       goal: { objective: 'second approved goal', status: 'active' },
     });
+    expect(activatedObjectives).toEqual(['first approved goal', 'second approved goal']);
   });
 
   it('blocks goal tools when slash_goal is disabled', async () => {
@@ -120,6 +176,37 @@ describe('goal tools', () => {
     });
 
     expect(result).toContain('slash_goal');
+  });
+
+  it('reports successful completion separately from an unresolved queued template', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: currentSessionId });
+    await manager.createGoal({ objective: 'completed tool work' });
+    await manager.enqueueGoal({ objective: 'pending template work', source: 'tool', template: 'missing-next' });
+
+    const result: unknown = JSON.parse(await executor.execute({ type: 'update_goal', status: 'complete' }));
+
+    expect(result).toMatchObject({
+      ok: true,
+      goal: { status: 'complete' },
+      completed: { objective: 'completed tool work' },
+      queueError: expect.stringContaining('missing-next'),
+    });
+    expect(activatedObjectives).toEqual([]);
+  });
+
+  it('surfaces backup warnings while acknowledging a successfully saved goal update', async () => {
+    await executor.execute({ type: 'create_goal', objective: 'saved tool goal' });
+    const backupPath = path.join(workspaceRoot, '.autohand', 'goals.local.json.backup');
+    await fs.move(backupPath, `${backupPath}.saved-for-test`);
+    await fs.ensureDir(backupPath);
+
+    const result: unknown = JSON.parse(await executor.execute({ type: 'update_goal', objective: 'updated tool goal' }));
+
+    expect(result).toMatchObject({
+      ok: true,
+      goal: { objective: 'updated tool goal' },
+      storageWarning: expect.stringContaining('backup could not be refreshed'),
+    });
   });
 
   it('classifies an unknown goal template as validation failure', async () => {

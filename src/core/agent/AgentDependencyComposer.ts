@@ -4,19 +4,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { resolveRunToolScope } from '../../permissions/runToolScope.js';
+import { RunBudget } from './RunBudget.js';
+import { SessionAutoNamer } from './SessionAutoNamer.js';
+import { syncAgentTerminalTitleName } from './AgentSessionTitle.js';
+import type { PeerComposerDraft } from '../../ui/peerMention.js';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { FileActionManager } from '../../actions/filesystem.js';
 import { saveConfig, getProviderConfig } from '../../config.js';
 import type { LLMProvider } from '../../providers/LLMProvider.js';
-import { ProviderFactory } from '../../providers/ProviderFactory.js';
 import { getOpenRouterModelContextWindow } from '../../providers/modelCapabilities.js';
-import { promptInterrupt, promptNotify } from '../../ui/inputPrompt.js';
+import { getHelpOrderedSlashCommands, promptInterrupt, promptNotify } from '../../ui/inputPrompt.js';
 import { isShellCommand, parseShellCommand } from '../../ui/shellCommand.js';
 import { shouldUseInkRenderer } from '../../ui/inkMode.js';
 import { getContextWindow } from '../context/tokenizer.js';
 import { GitIgnoreParser } from '../../utils/gitIgnore.js';
 import { createToolFilter } from '../toolFilter.js';
+import { PEER_TOOL_NAMES } from '../peerTools.js';
 import { ConversationManager } from '../conversationManager.js';
 import { ContextOrchestrator } from '../context/orchestrator.js';
 import {
@@ -69,7 +74,7 @@ import { TeamManager } from '../teams/TeamManager.js';
 import { authorizeTeammateTool, createTeammateConfirmation } from '../teams/TeammateAuthorization.js';
 import { SessionThreadBudget, DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION } from '../agents/SessionThreadBudget.js';
 import type { TeamMember, TeamTask } from '../teams/types.js';
-import { resolveTeamModelAssignment } from '../teams/TeamModelPolicy.js';
+import { createTeamMemberProvider, resolveTeamModelAssignment } from '../teams/TeamModelPolicy.js';
 import { RepeatManager } from '../RepeatManager.js';
 import { intervalToCron, shorthandToHuman, shorthandToMs } from '../../commands/repeat.js';
 import { ActivityIndicator } from '../../ui/activityIndicator.js';
@@ -104,6 +109,7 @@ import { getFeatureState } from '../../features/featureRegistry.js';
 import { SpecialistOrchestrator } from '../agents/SpecialistOrchestrator.js';
 import { isGoalFeatureEnabled, resolveGoalFeatureEnabled } from '../../goals/feature.js';
 import { GoalManager } from '../../goals/GoalManager.js';
+import { activateGoalAutoMode } from './GoalActivation.js';
 import type { GoalSessionSnapshot } from '../../goals/types.js';
 import { isLikelyFilePathSlashInput } from '../slashInputDetection.js';
 import { SuggestionEngine } from '../SuggestionEngine.js';
@@ -122,6 +128,8 @@ import type {
   MobileRelayController,
 } from '../../mobile/MobileRelay.js';
 import type { MobileAgentSessionExecutionContext } from './AgentLifecycleRunner.js';
+import type { GoalEventData } from '../../telemetry/types.js';
+import { estimateTokens } from '../context/tokenizer.js';
 import {
   createQueuedAgentInstruction,
   type PendingPostTurnAction,
@@ -389,9 +397,11 @@ export function initializeAgentDependencies(
       getParallelismLimit: () => host.getParallelismLimit(),
     });
     host.simpleChatHandler = new SimpleChatHandler(host as unknown as SimpleChatAgent);
+    const enabledToolDefinitions = DEFAULT_TOOL_DEFINITIONS.filter(definition => !PEER_TOOL_NAMES.has(definition.name)
+      || runtime.config.sessions?.communication?.enabled === true);
     const featureGatedToolDefinitions = isGoalFeatureEnabled(runtime.config)
-      ? [...DEFAULT_TOOL_DEFINITIONS, ...GOAL_TOOL_DEFINITIONS]
-      : DEFAULT_TOOL_DEFINITIONS;
+      ? [...enabledToolDefinitions, ...GOAL_TOOL_DEFINITIONS]
+      : enabledToolDefinitions;
 
     // Initialize suggestion engine if enabled in config.
     // Derive allowed tools from the user's permission config so suggestions
@@ -412,6 +422,10 @@ export function initializeAgentDependencies(
         debugLogger: (message: string) => host.writeDebugLine(message),
       });
     }
+    host.sessionAutoNamer = new SessionAutoNamer({
+      getProvider: () => host.llm,
+      enabled: !runtime.options.bare && runtime.options.offline !== true && runtime.config.ui?.promptSuggestions !== false,
+    });
 
     const agentRegistry = configureAgentRegistry(runtime);
     const pluginDir = (runtime.config as typeof runtime.config & { pluginDir?: string }).pluginDir;
@@ -457,6 +471,14 @@ export function initializeAgentDependencies(
       onHookEvent: async ({ event, ...context }) => {
         await host.hookManager.executeHooks(event, context);
       },
+      // Resolved through the host on every call, not captured now: the
+      // telemetry manager and the skills registry are both built further down
+      // this function, so binding either by value here would wire in undefined
+      // and leave every compaction unreported.
+      telemetryManager: {
+        trackContextCompaction: (data) => host.telemetryManager.trackContextCompaction(data),
+      },
+      getSurvivingSkillSpanIds: () => host.skillsRegistry.noteContextCompaction(),
     });
 
     // Initialize new feature modules
@@ -473,6 +495,13 @@ export function initializeAgentDependencies(
       activityVerbs: runtime.config.ui?.activityVerbs,
       activityVerbsEnabled: runtime.config.ui?.activityVerbsEnabled,
       activitySymbol: runtime.config.ui?.activitySymbol,
+      tipContext: {
+        listSkills: () => (host.skillsRegistry?.listSkills() ?? []).map((skill: SkillDefinition) => ({
+          name: skill.name,
+          description: skill.description,
+        })),
+        listCommands: () => getHelpOrderedSlashCommands(SLASH_COMMANDS),
+      },
     });
 
     // Create permission manager with persistence callback and local project support
@@ -484,6 +513,9 @@ export function initializeAgentDependencies(
         await saveConfig(runtime.config);
       }
     });
+    // --allowed-tools / --disallowed-tools: a run-only restriction layer,
+    // applied here so every launch mode that builds an agent honours it.
+    host.permissionManager.setRunToolScope(resolveRunToolScope(runtime.options));
     host.basePermissionMode = host.permissionManager.getMode();
     host.syncInteractiveAutomodePermissions();
 
@@ -579,10 +611,13 @@ export function initializeAgentDependencies(
       signal: host.runtimeResourceShutdownController?.signal,
       isVisible: () => host.inkRenderer?.getState?.().agentRunsPanelVisible === true,
     });
+    // One budget for the whole run: lead requests and in-process sub-agents alike.
+    host.runBudget = RunBudget.fromSettings(runtime.options, runtime.config.agent?.budget);
     host.sessionThreadBudget = new SessionThreadBudget(() =>
       runtime.config.features?.multi_agent_v2?.max_concurrent_threads_per_session
         ?? DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION);
     host.teamManager = new TeamManager({
+      bindPeerRun: (runId, alias) => host.peerRuntime?.bindRun(runId, alias),
       runStore: host.agentRunStore,
       leadSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
       threadBudget: host.sessionThreadBudget,
@@ -628,7 +663,7 @@ export function initializeAgentDependencies(
       resolveWorkspacePath: (relativePath) => host.resolveWorkspacePath(relativePath),
       confirmDangerousAction: async (message, context) => {
         const result = await host.confirmDangerousAction(message, context);
-        return result.decision === 'allow_once' || result.decision === 'allow_session' || result.decision === 'allow_always_project' || result.decision === 'allow_always_user';
+        return isAllowedPermissionPrompt(result) && result.decision !== 'alternative';
       },
       onExploration: (entry) => host.recordExploration(entry),
       onToolOutput: (chunk) => host.handleToolOutput(chunk),
@@ -642,6 +677,8 @@ export function initializeAgentDependencies(
       },
       backgroundProcessRegistry: host.backgroundProcessRegistry,
       peerAwareness: host.peerAwareness,
+      peerMessaging: () => host.peerMessaging,
+      resourceCoordinator: () => host.resourceCoordinator,
       onPeerWarning: (warning) => host.emitPeerWarning(warning),
       onToolActivity: (activity) => host.setPeerToolActivity(activity),
       readStateStore: {
@@ -692,6 +729,11 @@ export function initializeAgentDependencies(
           goalSource: context.goalSource,
         });
       },
+      onGoalActivated: () => activateGoalAutoMode({
+        config: runtime.config,
+        isNonInteractive: Boolean(runtime.isCommandMode || runtime.isRpcMode || runtime.options?.prompt),
+        setInteractionMode: (mode) => { host.setInteractionMode(mode); },
+      }),
       onModalPause: async <T>(fn: () => Promise<T>) => host.withModalPause(fn),
       onLiveCommandStart: (command) => host.inkRenderer?.startLiveCommand(command) ?? '',
       onLiveCommandOutput: (id, stream, chunk) => host.inkRenderer?.appendLiveCommandOutput(id, stream, chunk),
@@ -754,6 +796,7 @@ export function initializeAgentDependencies(
     const delegatorContext = runtime.options.clientContext
       ?? (runtime.options.restricted ? 'restricted' : 'cli');
     host.delegator = new AgentDelegator(llm, host.actionExecutor, {
+      bindPeerRun: (runId, alias) => host.peerRuntime?.bindRun(runId, alias),
       workspaceRoot: runtime.workspaceRoot,
       projectMemoryEnabled: !runtime.options.bare,
       getWorkspaceRoot: () => runtime.workspaceRoot,
@@ -765,6 +808,8 @@ export function initializeAgentDependencies(
       authorization: toolAuthorization,
       confirmApproval: (message, context) => host.confirmDangerousAction(message, context),
       getToolDefinitions: () => host.toolManager?.listDefinitions() ?? [],
+      getSkillsRegistry: () => host.skillsRegistry,
+      runBudget: host.runBudget,
       resolveSubagentAssignment: (definition) => {
         const provider = host.activeProvider ?? runtime.config.provider ?? 'openrouter';
         const model = runtime.options.model
@@ -775,16 +820,10 @@ export function initializeAgentDependencies(
           active: { provider, model },
           agentName: definition.name,
           agentModel: definition.model,
+          agentReasoning: definition.reasoning,
         });
       },
-      createSubagentProvider: (assignment) => {
-        const subagentProvider = ProviderFactory.create({
-          ...runtime.config,
-          provider: assignment.provider,
-        });
-        subagentProvider.setModel(assignment.model);
-        return subagentProvider;
-      },
+      createSubagentProvider: (assignment) => createTeamMemberProvider(runtime.config, assignment),
       onSubagentStart: async (context) => {
         host.agentRunStore.start({
           id: context.subagentId, parentId: context.parentId, depth: context.depth,
@@ -808,7 +847,7 @@ export function initializeAgentDependencies(
           label: formatSubAgentActivityLabel(context.subagentName, context.task),
           status: 'in_progress',
           detail: context.provider && context.model
-            ? `${context.provider} · ${context.model}`
+            ? `${context.provider} · ${context.model}${context.reasoningEffort ? ` · ${context.reasoningEffort}` : ''}`
             : context.subagentType,
         });
         await host.agentRunStore.waitForLifecycle(context.subagentId);
@@ -1205,12 +1244,17 @@ export function initializeAgentDependencies(
           let outcome: ToolActionOutcome | undefined;
           let result: string | undefined;
           if (isHookAction(action)) {
+            const hookLevels = { runtime: { config: runtime.config, workspaceRoot: runtime.workspaceRoot } };
             result = await executeHookTool(action, {
               manager: host.hookManager,
               getActiveProvider: () => host.activeProvider,
+              levels: hookLevels,
+              confirm: async preview => isAllowedPermissionPrompt(normalizePermissionPromptResponse(
+                await host.confirmDangerousAction(preview, { tool: 'set_lifecycle_hook' }),
+              )),
               authoring: new HookAuthoringService({
                 manager: host.hookManager, workspaceRoot: runtime.workspaceRoot,
-                getProvider: () => host.llm, requireAutohand: true,
+                getProvider: () => host.llm, requireAutohand: true, levels: hookLevels,
                 confirm: async preview => isAllowedPermissionPrompt(normalizePermissionPromptResponse(
                   await host.confirmDangerousAction(preview, { tool: 'create_hook' }),
                 )),
@@ -1340,6 +1384,7 @@ export function initializeAgentDependencies(
               override: { provider: action.provider, model: action.model },
               agentName: action.agent_name,
               agentModel: agentDefinition?.model,
+              agentReasoning: agentDefinition?.reasoning,
             });
             host.teamManager.addTeammate({
               name: action.name,
@@ -1648,10 +1693,13 @@ export function initializeAgentDependencies(
           host.recordExecutedAction(action.type);
 
           // Track the same explicit outcome used by hooks and transports.
+          const outputText = typeof readableOutput === 'string' ? readableOutput : '';
           await host.telemetryManager.trackToolUse({
             tool: action.type,
             success: finalOutcome.success,
             duration: Date.now() - startTime,
+            resultTokens: estimateTokens(outputText),
+            resultTruncated: isTruncatedToolResult(outputText),
             ...(finalOutcome.success ? {} : { error: finalOutcome.error }),
           });
 
@@ -1730,7 +1778,8 @@ export function initializeAgentDependencies(
       authorization: toolAuthorization,
     });
 
-    host.sessionManager = new SessionManager();
+    // --ephemeral keeps the session in memory; nothing about the run reaches disk.
+    host.sessionManager = new SessionManager(undefined, { persist: !runtime.options.ephemeral });
     host.projectManager = new ProjectManager();
     host.goalActivityManager = new GoalManager(runtime.workspaceRoot, {
       getSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
@@ -1904,6 +1953,8 @@ export function initializeAgentDependencies(
       // reference above; omitting it here left the command reporting peer
       // awareness as unavailable while peer warnings were firing normally.
       peerAwareness: host.peerAwareness,
+      get peerMessaging() { return host.peerMessaging; },
+      onPeerDraft: (draft: PeerComposerDraft) => host.inkRenderer?.setPeerDraft(draft),
       llm: host.llm,
       workspaceRoot: runtime.workspaceRoot,
       get model() {
@@ -1950,6 +2001,9 @@ export function initializeAgentDependencies(
       trackFeatureActivation: (key: string, metadata?: Record<string, unknown>) => {
         void host.featureFlagManager?.trackFeatureActivation?.(key, metadata);
       },
+      trackGoalEvent: (data: GoalEventData) => {
+        void host.telemetryManager?.trackGoalEvent(data).catch(() => {});
+      },
       refreshFeatureGatedTools: () => {
         const enabled = isGoalFeatureEnabled(runtime.config);
         for (const definition of GOAL_TOOL_DEFINITIONS) {
@@ -1976,6 +2030,7 @@ export function initializeAgentDependencies(
       get currentSession() {
         return sessionMgr.getCurrentSession() ?? undefined;
       },
+      onSessionRenamed: () => syncAgentTerminalTitleName(host),
       // Add-dir command context
       fileManager: host.files,
       get additionalDirs() {
@@ -2025,7 +2080,6 @@ export function initializeAgentDependencies(
           `[DEBUG] onAfterModal: inkRenderer exists=${!!host.inkRenderer}, persistentInputActive=${host.persistentInputActiveTurn}`,
           host.writeDebugLine?.bind(host)
         );
-        host.modalActive = false;
         if (host.persistentInputActiveTurn) {
           try {
             host.persistentInput.resumeFromModal();
@@ -2036,6 +2090,7 @@ export function initializeAgentDependencies(
         if (host.inkRenderer) {
           await host.inkRenderer.resume();
         }
+        host.modalActive = false;
         writeAutohandDebugLine('[DEBUG] onAfterModal completed', host.writeDebugLine?.bind(host));
       },
       // After /learn recommends a skill, seed the next prompt with the install command
@@ -2169,3 +2224,16 @@ export function initializeAgentDependencies(
   /**
    * Sync discovered MCP tools with tool definitions exposed to the LLM.
    */
+
+/**
+ * Whether a tool result was clipped before it reached the model.
+ *
+ * Detected from the markers the executor writes into the output itself,
+ * because truncation happens inside it and is not otherwise reported back.
+ * String sniffing is fragile — if those markers change this silently returns
+ * false — but the alternative is implying every result was complete and
+ * letting a floor read as an exact figure.
+ */
+function isTruncatedToolResult(result: string): boolean {
+  return result.includes('... (truncated)') || result.includes('output truncated at');
+}

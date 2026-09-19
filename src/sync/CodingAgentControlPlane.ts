@@ -15,6 +15,7 @@ import {
   SETTING_CATEGORIES,
   SETTINGS_REGISTRY,
   type SettingDef,
+  resolveSettingEnumValues,
 } from '../commands/settings.js';
 import { saveConfig } from '../config.js';
 import { t } from '../i18n/index.js';
@@ -23,8 +24,6 @@ import type { LoadedConfig, McpServerConfigEntry } from '../types.js';
 const DEFAULT_API_BASE_URL = 'https://api.autohand.ai';
 const CONTROL_PLANE_TIMEOUT_MS = 30_000;
 const SECRET_KEY_PATTERN = /(?:api[_-]?key|token|secret|password|credential|auth|cookie)/i;
-
-export type ManagedConnectorTransport = 'http' | 'stdio';
 
 const secretValues = z.record(z.string().min(1).max(120), z.string().max(8192));
 const connectorBase = {
@@ -314,7 +313,7 @@ export function createCodingAgentSettingsSnapshot(config: LoadedConfig, deviceId
     }];
   });
   const rest = Object.fromEntries(
-    Object.entries(config).filter(([key]) => !['auth', 'mcp', 'configPath', 'isNewConfig'].includes(key)),
+    Object.entries(config).filter(([key]) => !['auth', 'mcp', 'configPath', 'isNewConfig', 'workspaceOverlay', 'workspaceTrust', 'overlayWorkspaceRoot'].includes(key)),
   );
   return {
     deviceId,
@@ -332,7 +331,7 @@ function acceptsProfileValue(setting: SettingDef, value: unknown): value is stri
       && Number.isFinite(value)
       && (!setting.validate || setting.validate(String(value)) === true);
   }
-  if (setting.type === 'enum') return typeof value === 'string' && Boolean(setting.enumValues?.includes(value));
+  if (setting.type === 'enum') return typeof value === 'string' && resolveSettingEnumValues(setting).includes(value);
   return typeof value === 'string';
 }
 

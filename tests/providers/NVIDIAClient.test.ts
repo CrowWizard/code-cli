@@ -68,6 +68,20 @@ describe('NVIDIAClient', () => {
   });
 
   describe('complete', () => {
+    it('stops retrying a retired model and directs selection of another model (GH #544)', async () => {
+      const client = new NVIDIAClient({ apiKey: 'nvapi-test-key', model: 'mistralai/mistral-small-4-119b-2603' }, { maxRetries: 1, retryDelay: 0 });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({
+        status: 410,
+        title: 'Gone',
+        detail: "The model 'mistralai/mistral-small-4-119b-2603' has reached its end of life on 2026-07-27T00:00:00Z and is no longer available.",
+        type: 'about:blank',
+      }), { status: 410 }));
+
+      await expect(client.complete({ messages: [{ role: 'user', content: 'hello' }] }))
+        .rejects.toMatchObject({ code: 'model_not_found', httpStatus: 410, retryable: false, message: expect.stringContaining('/model') });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
     it('should make a successful request', async () => {
       const mockResponse = {
         id: 'test-id',
@@ -244,10 +258,59 @@ describe('NVIDIAClient', () => {
         stream: true
       });
 
-      expect(response.content).toBe('<thinking>Let me think about this</thinking>\n\nHello!');
+      expect(response.content).toBe('Hello!');
+      expect(response.reasoning).toBe('Let me think about this');
       expect(response.finishReason).toBe('stop');
     });
 
+
+    it('moves inline <think> blocks streamed inside content into reasoning', async () => {
+      const encoder = new TextEncoder();
+      const streamData = [
+        'data: {"id":"stream-test","created":1234567890,"choices":[{"delta":{"content":"<think>Weigh the options.</think>"},"finish_reason":null}]}\n\n',
+        'data: {"id":"stream-test","created":1234567890,"choices":[{"delta":{"content":"\\n\\nUse the cache."},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n'
+      ];
+      const mockStream = new ReadableStream({
+        start(controller) {
+          streamData.forEach(chunk => controller.enqueue(encoder.encode(chunk)));
+          controller.close();
+        }
+      });
+      global.fetch = vi.fn().mockResolvedValue({ ok: true, body: mockStream });
+
+      const client = new NVIDIAClient({ apiKey: 'nvapi-test-key', model: 'deepseek-ai/deepseek-v4-pro' });
+      const response = await client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+        stream: true
+      });
+
+      expect(response.content).toBe('Use the cache.');
+      expect(response.reasoning).toBe('Weigh the options.');
+    });
+
+    it('moves inline <think> blocks out of a non-streaming completion', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          id: 'resp-1',
+          created: 1234567890,
+          choices: [{
+            message: { role: 'assistant', content: '<think>Compare both.</think>\n\nPick the second.' },
+            finish_reason: 'stop'
+          }]
+        })
+      });
+
+      const client = new NVIDIAClient({ apiKey: 'nvapi-test-key', model: 'deepseek-ai/deepseek-v4-pro' });
+      const response = await client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+        stream: false
+      });
+
+      expect(response.content).toBe('Pick the second.');
+      expect(response.reasoning).toBe('Compare both.');
+    });
     it('should handle streaming without reasoning content', async () => {
       const encoder = new TextEncoder();
       const streamData = [
@@ -281,6 +344,34 @@ describe('NVIDIAClient', () => {
 
       expect(response.content).toBe('Just content here');
       expect(response.finishReason).toBe('stop');
+    });
+
+    it('treats a stream that ends without a finish reason as truncated', async () => {
+      const encoder = new TextEncoder();
+      const streamData = [
+        'data: {"id":"stream-test","created":1234567890,"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+        'data: [DONE]\n\n'
+      ];
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            streamData.forEach(chunk => controller.enqueue(encoder.encode(chunk)));
+            controller.close();
+          }
+        })
+      });
+
+      const client = new NVIDIAClient({ apiKey: 'nvapi-test-key', model: 'z-ai/glm-5.1' });
+
+      const response = await client.complete({
+        messages: [{ role: 'user', content: 'Hello' }],
+        stream: true
+      });
+
+      expect(response.content).toBe('partial');
+      expect(response.finishReason).toBe('length');
     });
 
     it('should include Authorization header with nvapi key', async () => {

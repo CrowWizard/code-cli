@@ -5,7 +5,9 @@
  */
 
 import type { LLMProvider, LLMProviderCapabilities } from './LLMProvider.js';
-import type { LLMRequest, LLMResponse, LLMToolCall, LLMUsage, ProviderSettings, FunctionDefinition } from '../types.js';
+import type { LLMRequest, LLMResponse, LLMToolCall, ProviderSettings, FunctionDefinition } from '../types.js';
+import { normalizeLLMUsage } from './usage.js';
+import { normalizeProviderFinishReason } from './finishReason.js';
 import { ApiError, classifyApiError } from './errors.js';
 import {
     getProviderModelIds,
@@ -149,20 +151,14 @@ export class LlamaCppProvider implements LLMProvider {
             }));
         }
 
-        let usage: LLMUsage | undefined;
-        if (data.usage) {
-            usage = {
-                promptTokens: data.usage.prompt_tokens,
-                completionTokens: data.usage.completion_tokens,
-                totalTokens: data.usage.total_tokens
-            };
-        }
+        // Through the shared normalizer rather than by hand, so a cached-prompt
+        // detail is carried when the server reports one, and an impossible
+        // breakdown is discarded instead of passed on.
+        const usage = normalizeLLMUsage(data.usage, 'openai-chat');
 
         const finishReason = toolCalls?.length
             ? 'tool_calls'
-            : (choice?.finish_reason === 'stop' || choice?.finish_reason === 'length' || choice?.finish_reason === 'content_filter')
-                ? choice.finish_reason
-                : 'stop';
+            : normalizeProviderFinishReason(choice?.finish_reason);
 
         return {
             id: data.id || `llamacpp-${Date.now()}`,

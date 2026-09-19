@@ -27,6 +27,7 @@ import * as completion from '../commands/completion.js';
 import * as exportCmd from '../commands/export.js';
 import * as status from '../commands/status.js';
 import * as usage from '../commands/usage.js';
+import * as upgrade from '../commands/upgrade.js';
 import * as login from '../commands/login.js';
 import * as logout from '../commands/logout.js';
 import * as permissions from '../commands/permissions.js';
@@ -72,6 +73,7 @@ import * as featuresCmd from '../commands/features.js';
 import * as goalCmd from '../commands/goal.js';
 import * as squadCmd from '../commands/squad.js';
 import * as sessionBranchingCmd from '../commands/sessionBranching.js';
+import * as renameCmd from '../commands/rename.js';
 import * as whatsnewCmd from '../commands/whatsnew.js';
 import * as changelogCmd from '../commands/changelog.js';
 
@@ -105,6 +107,7 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   exportCmd.metadata,
   status.metadata,
   usage.metadata,
+  upgrade.metadata,
   login.metadata,
   logout.metadata,
   permissions.metadata,
@@ -121,6 +124,7 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   automode.metadata,
   share.metadata,
   goCmd.metadata,
+  handoffWebCmd.handoffMetadata,
   goCmd.handoffSessionMetadata,
   handoffWebCmd.metadata,
   sync.metadata,
@@ -161,6 +165,7 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   sessionBranchingCmd.forkMetadata,
   sessionBranchingCmd.cloneMetadata,
   sessionBranchingCmd.treeMetadata,
+  renameCmd.metadata,
   whatsnewCmd.metadata,
   changelogCmd.metadata,
 ] as (SlashCommand | undefined)[]).filter((cmd): cmd is SlashCommand => cmd != null && typeof cmd.command === 'string');

@@ -4,12 +4,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { bindPeerReference, matchPeerMention, parsePeerInput, resolvePeerInput, type PeerReference, type PeerInstructionMetadata } from './peerMention.js';
+import { getTypedMessageHistory, type TypedMessageHistory, type TypedMessageEntry } from '../session/TypedMessageHistory.js';
+import { safePeerLabel } from '../session/peers/PeerScope.js';
+import type { PeerClient } from '../session/peers/PeerMessaging.js';
+import type { PeerDescriptor, PeerScope } from '../session/peers/PeerProtocol.js';
 import readline from 'node:readline';
 import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, extname } from 'node:path';
 import os from 'node:os';
 import stringWidth from 'string-width';
+import { CommandOutputLineBuffer } from '../utils/commandOutputCapture.js';
 import { TerminalResizeWatcher } from './terminalResize.js';
 import {
   isShellCommand,
@@ -39,6 +45,7 @@ import {
 import { buildFileMentionSuggestions, buildSkillMentionSuggestions, type SkillMentionInfo } from './mentionFilter.js';
 import { themedFg } from './theme/index.js';
 import { stripAnsiCodes, enableBracketedPaste, disableBracketedPaste } from './displayUtils.js';
+import { DEFAULT_KEYBINDINGS } from '../keybindings/profiles.js';
 import { TextBuffer } from './textBuffer.js';
 import { handleTextBufferKey } from './textBufferKeyHandler.js';
 import { calculateLayout, logicalToVisual, visualToLogical } from './textBufferLayout.js';
@@ -62,6 +69,12 @@ export function promptInterrupt(value: string): void {
   promptEvents.emit('interrupt', value);
 }
 
+export interface PromptDraft { text: string; row: number; col: number; metadata: PeerInstructionMetadata; }
+
+export function promptSuspend(): boolean {
+  return promptEvents.emit('suspend');
+}
+
 function writePromptShellCommandHeader(output: NodeJS.WriteStream, command: string): void {
   output.write(`${chalk.cyan(`You ran ${command}`)}\n`);
 }
@@ -73,7 +86,7 @@ function createPromptShellCommandBlockWriter(
   pushStderr: (chunk: string) => void;
   flush: () => void;
 } {
-  let pending = '';
+  const pending = new CommandOutputLineBuffer();
   let pendingStream: 'stdout' | 'stderr' = 'stdout';
   let lineIndex = 0;
 
@@ -85,22 +98,7 @@ function createPromptShellCommandBlockWriter(
 
   const push = (chunk: string, stream: 'stdout' | 'stderr'): void => {
     pendingStream = stream;
-    pending += chunk;
-
-    while (true) {
-      const newlineIndex = pending.indexOf('\n');
-      const carriageIndex = pending.indexOf('\r');
-      const boundaryCandidates = [newlineIndex, carriageIndex].filter((value) => value >= 0);
-      if (boundaryCandidates.length === 0) {
-        break;
-      }
-
-      const boundaryIndex = Math.min(...boundaryCandidates);
-      const boundaryWidth = pending[boundaryIndex] === '\r' && pending[boundaryIndex + 1] === '\n' ? 2 : 1;
-      const line = pending.slice(0, boundaryIndex);
-      pending = pending.slice(boundaryIndex + boundaryWidth);
-      flushLine(line, stream);
-    }
+    pending.push(chunk, (line) => flushLine(line, stream));
   };
 
   return {
@@ -111,11 +109,7 @@ function createPromptShellCommandBlockWriter(
       push(chunk, 'stderr');
     },
     flush(): void {
-      if (!pending) {
-        return;
-      }
-      flushLine(pending, pendingStream);
-      pending = '';
+      pending.flush((line) => flushLine(line, pendingStream));
     },
   };
 }
@@ -154,9 +148,11 @@ interface PromptHotTip {
 interface PromptSuggestion {
   line: string;
   cursor: number;
+  peerReference?: PeerReference;
 }
 
 export interface PromptSuggestionOptions {
+  peersProvider?: () => PeerDescriptor[];
   placeholderText?: string;
   nextPromptSuggestion?: string;
   workspaceRoot?: string;
@@ -293,16 +289,6 @@ export function resetCachedSkillMentions(): void {
   cachedSkillMentions = undefined;
 }
 
-const CONTEXTUAL_HELP_ROWS: Array<{ left: string; right: string }> = [
-  { left: '/ for commands', right: '! for shell commands' },
-  { left: '@ for file paths', right: 'tab accepts suggestion' },
-  { left: '$ for skills', right: 'tab accepts suggestion' },
-  { left: '? toggles this shortcuts panel', right: 'shift + tab cycles interaction modes' },
-  { left: 'shift + enter inserts newline', right: 'alt + enter inserts newline' },
-  { left: 'enter submits prompt', right: 'ctrl + c clears input / exits' },
-  { left: 'esc interrupts active turn', right: 'type /, @, $, or ! to switch mode' },
-];
-
 function truncatePlainText(value: string, width: number): string {
   if (width <= 0) {
     return '';
@@ -408,7 +394,7 @@ export function buildPromptHotTips(
     defaultFileTip,
     { label: 'Type $ for skills' },
     { label: 'Type /, @, $, or ! to switch suggestion mode' },
-    { label: 'Shift+Tab cycles edit, plan, YOLO, and auto modes' },
+    { label: 'Shift+Tab cycles edit, plan, auto, and YOLO modes' },
   ];
 }
 
@@ -421,6 +407,15 @@ export function getPrimaryHotTipSuggestion(
   skillsProvider?: () => SkillMentionInfo[],
 ): PromptSuggestion | null {
   const normalizedOptions = normalizePromptSuggestionOptions(options, workspaceRoot, skillsProvider);
+  const peerMatch = normalizedOptions.peersProvider && matchPeerMention(currentLine, currentLine.length);
+  if (peerMatch) {
+    const query = peerMatch.query.toLowerCase();
+    const peer = normalizedOptions.peersProvider?.().find(candidate => `${candidate.alias} ${candidate.project} ${candidate.peerId}`.toLowerCase().includes(query));
+    if (peer) {
+      const completed = bindPeerReference(currentLine, peerMatch, peer);
+      return { line: completed.text, cursor: completed.cursor, peerReference: completed.binding };
+    }
+  }
   const mentionMatch = /@([A-Za-z0-9_./\\-]*)$/.exec(currentLine);
   if (mentionMatch) {
     const seed = mentionMatch[1] ?? '';
@@ -579,7 +574,7 @@ export function buildContextualHelpPanelLines(
     return truncatePlainText(plain, cellWidth).padEnd(cellWidth, ' ');
   };
 
-  const rowLines = CONTEXTUAL_HELP_ROWS.map((row) => {
+  const rowLines = DEFAULT_KEYBINDINGS.helpRows().map((row) => {
     const left = formatCell(row.left, leftWidth);
     const right = formatCell(row.right, rightWidth);
     return `${left}${' '.repeat(gap)}${right}`;
@@ -1245,13 +1240,26 @@ type ImageDetectedCallback = (
 ) => number;
 
 interface PromptIO {
+  typedMessageHistory?: TypedMessageHistory;
+  initialDraft?: PromptDraft;
+  onSuspend?: (draft: PromptDraft) => void;
+  shouldSuspend?: () => boolean;
   input?: NodeJS.ReadStream;
   output?: NodeJS.WriteStream;
   onCycleInteractionMode?: () => InteractionMode;
 }
 
+export interface PeerPromptOptions {
+  scopes?: PeerScope[];
+  peersProvider: (scope?: PeerScope) => PeerDescriptor[];
+  refresh?: (scope?: PeerScope) => Promise<unknown>;
+  send: PeerClient['send'];
+  onReferences?: (references: PeerReference[]) => void;
+}
+
 type PromptResult =
   | { kind: 'submit'; value: string }
+  | { kind: 'suspend' }
   | { kind: 'abort' };
 
 /**
@@ -1568,7 +1576,8 @@ export async function readInstruction(
   nextPromptSuggestionProvider?: () => string | undefined,
   resolveShellSuggestion?: (input: string) => Promise<string | null>,
   pendingSuggestion?: Promise<void>,
-  skillsProvider?: () => SkillMentionInfo[]
+  skillsProvider?: () => SkillMentionInfo[],
+  peers?: PeerPromptOptions,
 ): Promise<string | null> {
   const stdInput = (io.input ?? process.stdin) as NodeJS.ReadStream & { setRawMode?: (mode: boolean) => void };
   const stdOutput = (io.output ?? process.stdout) as NodeJS.WriteStream;
@@ -1595,12 +1604,18 @@ export async function readInstruction(
         resolveShellSuggestion,
         pendingSuggestion,
         skillsProvider,
+        peers,
+        typedMessageHistory: io.typedMessageHistory ?? getTypedMessageHistory(),
+        initialDraft: io.initialDraft,
+        onSuspend: io.onSuspend,
+        shouldSuspend: io.shouldSuspend,
         onCycleInteractionMode: io.onCycleInteractionMode,
       });
 
       if (result.kind === 'abort') {
         return 'ABORT';
       }
+      if (result.kind === 'suspend') return null;
 
       return result.value;
     }
@@ -1610,6 +1625,11 @@ export async function readInstruction(
 }
 
 interface PromptOnceOptions {
+  typedMessageHistory: TypedMessageHistory;
+  initialDraft?: PromptDraft;
+  onSuspend?: (draft: PromptDraft) => void;
+  shouldSuspend?: () => boolean;
+  peers?: PeerPromptOptions;
   filesProvider: () => string[];
   slashCommands: SlashCommand[];
   statusLine?: string | { left: string; right: string };
@@ -1837,6 +1857,8 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
     pendingSuggestion,
     skillsProvider,
     onCycleInteractionMode,
+    peers,
+    typedMessageHistory,
   } = options;
 
   // Reset module-level render state so stale values from the previous
@@ -1850,8 +1872,9 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
   // Width is inner content width: prompt block width minus 2 for │ borders.
   const tbWidth = Math.max(1, getPromptBlockWidth(stdOutput.columns) - 2);
   const tbMaxVisibleLines = 10;
-  const initialLine = sanitizeRenderLine(initialValue ?? '');
+  const initialLine = sanitizeRenderLine(options.initialDraft?.text ?? initialValue ?? '');
   const textBuffer = new TextBuffer(tbWidth, tbMaxVisibleLines, initialLine || undefined);
+  if (options.initialDraft) textBuffer.setCursorPosition(options.initialDraft.row, options.initialDraft.col);
   activeTextBuffer = textBuffer;
 
   const mentionPreview = new MentionPreview(
@@ -1870,6 +1893,15 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
   // Initialize paste state for bracketed paste detection
   const pasteState = createPasteState();
   let contextualHelpVisible = false;
+  let peerBindings: PeerReference[] = structuredClone(options.initialDraft?.metadata.peerReferences ?? []);
+  let peerSending = false;
+  let peerDismissed: string | undefined;
+  let peerRefreshStart: string | undefined;
+  let peerScope: PeerScope = options.initialDraft?.metadata.peerScope && peers?.scopes?.includes(options.initialDraft.metadata.peerScope) ? options.initialDraft.metadata.peerScope : 'workspace';
+  let peerActiveIndex = 0;
+  let peerReplyTo: string | undefined = options.initialDraft?.metadata.peerReplyTo;
+  let historyNavigation: { entries: readonly TypedMessageEntry[]; index: number; draft: string; row: number; col: number; metadata: PeerInstructionMetadata; hiddenContent?: string } | undefined;
+  void typedMessageHistory.refresh().catch(() => {});
   let llmInlineShellSuggestion: string | null = null;
 
   // Chord state for Ctrl+X sequences
@@ -1926,11 +1958,33 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
     rlAny.cursor = getReadlineCursorOffset();
   };
 
+  function getMatchingPeers(): PeerDescriptor[] {
+    const text = getCurrentText();
+    const match = peers && peerDismissed !== text ? matchPeerMention(text, getReadlineCursorOffset()) : null;
+    if (!match || !peers) return [];
+    const matching = peers.peersProvider(peerScope).filter(peer => `${peer.alias} ${peer.project} ${peer.peerId}`.toLowerCase().includes(match.query.toLowerCase())).slice(0, 5);
+    peerActiveIndex = Math.min(peerActiveIndex, Math.max(0, matching.length - 1));
+    return matching;
+  }
+
+  function getCurrentPeerSuggestion(): PromptSuggestion | null {
+    const text = getCurrentText();
+    const match = peers && peerDismissed !== text ? matchPeerMention(text, getReadlineCursorOffset()) : null;
+    const selected = getMatchingPeers()[peerActiveIndex];
+    if (!match || !selected) return null;
+    const completed = bindPeerReference(text, match, selected);
+    return { line: completed.text, cursor: completed.cursor, peerReference: completed.binding };
+  }
+
   const getInlineGhostSuffix = (): string | undefined => {
     if (contextualHelpVisible) {
       return undefined;
     }
     const currentText = getCurrentText();
+    if (peers && peerDismissed !== currentText) {
+      const suggested = getCurrentPeerSuggestion();
+      if (suggested?.peerReference && suggested.line.startsWith(currentText)) return suggested.line.slice(currentText.length);
+    }
     if (!currentText || currentText.includes('\n') || currentText.includes(NEWLINE_MARKER)) {
       return undefined;
     }
@@ -1953,6 +2007,15 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
   };
 
   const getSlashSuggestionLines = (): string[] | undefined => {
+    const text = getCurrentText();
+    const match = peers && peerDismissed !== text ? matchPeerMention(text, getReadlineCursorOffset()) : null;
+    if (match && peers) {
+      const matching = getMatchingPeers();
+      return [`Peers · ${peerScope}${(peers.scopes?.length ?? 1) > 1 ? ' · Shift+Tab to change scope' : ''}`,
+        ...(matching.length ? matching.map((peer, index) => `${index === peerActiveIndex ? '▸' : ' '} :${safePeerLabel(peer.alias)} · ${safePeerLabel(peer.project)} · ${peer.kind} · ${peer.availability}`) : ['No matching peers']),
+        'Tab or Enter to select · ↑↓ to navigate · Esc to close',
+      ];
+    }
     // Don't show slash suggestions when contextual help panel is visible
     if (contextualHelpVisible) {
       return undefined;
@@ -2053,13 +2116,18 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
         return false;
       }
 
+      if (suggestion.peerReference) peerBindings = [...peerBindings.filter(binding => binding.start !== suggestion.peerReference!.start), suggestion.peerReference];
       textBuffer.setText(suggestion.line);
+      const prefix = suggestion.line.slice(0, suggestion.cursor).split('\n');
+      textBuffer.setCursorPosition(prefix.length - 1, Array.from(prefix.at(-1) ?? '').length);
       syncReadlineFromBuffer();
       renderActivePrompt();
       return true;
     }
 
     function getCurrentPrimarySuggestion(): PromptSuggestion | null {
+      const peer = getCurrentPeerSuggestion();
+      if (peer) return peer;
       return getPrimaryHotTipSuggestion(
         getCurrentText(),
         filesProvider(),
@@ -2070,6 +2138,18 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
           skillsProvider,
         },
       );
+    }
+
+    function refreshPeerPicker(): void {
+      const match = peers ? matchPeerMention(getCurrentText(), getReadlineCursorOffset()) : null;
+      const key = match ? `${peerScope}:${match.start}` : undefined;
+      if (!match) peerRefreshStart = undefined;
+      else if (peers?.refresh && peerRefreshStart !== key) {
+        peerRefreshStart = key;
+        void peers.refresh(peerScope).then(() => { if (!closed) renderActivePrompt(); }, error => {
+          if (!closed) showPromptMessage(safePeerLabel(error instanceof Error ? error.message : String(error), 300));
+        });
+      }
     }
 
     // Coalesce renders: both _refreshLine and keypress handlers trigger renders,
@@ -2115,6 +2195,10 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
         clearTimeout(inlineShellSuggestionTimeout);
         inlineShellSuggestionTimeout = undefined;
       }
+      if (chordTimeout) {
+        clearTimeout(chordTimeout);
+        chordTimeout = null;
+      }
       // Disable bracketed paste mode and restore the terminal cursor shape.
       disableBracketedPaste(stdOutput);
       stdOutput.write('\x1b[0 q\x1b[?25h');
@@ -2125,6 +2209,7 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
       resizeWatcher.dispose();
       promptEvents.off('notify', onPromptNotify);
       promptEvents.off('interrupt', onPromptInterrupt);
+      promptEvents.off('suspend', onPromptSuspend);
       input.off('keypress', handleKeypress);
       input.off('data', handleInputData);
       if (originalRefreshLine) {
@@ -2168,6 +2253,21 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
       resolve({ kind: 'submit', value });
     };
     promptEvents.on('interrupt', onPromptInterrupt);
+
+    const onPromptSuspend = () => {
+      if (closed) return;
+      const draft: PromptDraft = {
+        text: pasteState.hiddenContent ?? getCurrentText(), row: textBuffer.getCursorRow(), col: textBuffer.getCursorCol(),
+        metadata: { peerReferences: structuredClone(peerBindings), peerScope, ...(peerReplyTo ? { peerReplyTo } : {}) },
+      };
+      options.onSuspend?.(draft);
+      mentionPreview.reset();
+      leavePromptSurface(stdOutput, STATUS_LINE_COUNT);
+      cleanup();
+      resolve({ kind: 'suspend' });
+    };
+    promptEvents.on('suspend', onPromptSuspend);
+    queueMicrotask(() => { if (!closed && options.shouldSuspend?.()) onPromptSuspend(); });
 
     const refreshLine = () => {
       renderActivePrompt();
@@ -2522,6 +2622,7 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
 
       // ── Ctrl+C: clear input or exit ───────────────────────────────────
       if (key?.name === 'c' && key.ctrl) {
+        historyNavigation = undefined;
         const currentInput = getCurrentText();
 
         if (currentInput.length > 0) {
@@ -2531,6 +2632,8 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
             setContextualHelpVisible(false);
           }
           textBuffer.setText('');
+          peerBindings = [];
+          peerReplyTo = undefined;
           syncReadlineFromBuffer();
           renderActivePrompt();
           ctrlCCount = 0;
@@ -2562,6 +2665,58 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
         renderActivePrompt();
         return;
       }
+
+      const peerMatch = peers && peerDismissed !== getCurrentText() ? matchPeerMention(getCurrentText(), getReadlineCursorOffset()) : null;
+      if (peerMatch && key?.name === 'escape') {
+        peerDismissed = getCurrentText();
+        renderActivePrompt();
+        return;
+      }
+      if (peerMatch && isShiftTabShortcut(_str, key)) {
+        const scopes = peers?.scopes ?? ['workspace'];
+        peerScope = scopes[(scopes.indexOf(peerScope) + 1) % scopes.length] ?? 'workspace';
+        peerActiveIndex = 0;
+        refreshPeerPicker();
+        renderActivePrompt();
+        return;
+      }
+      if (peerMatch && (key?.name === 'up' || key?.name === 'down')) {
+        const count = getMatchingPeers().length;
+        if (count) peerActiveIndex = (peerActiveIndex + (key.name === 'up' ? -1 : 1) + count) % count;
+        renderActivePrompt();
+        return;
+      }
+      if (peerMatch && ['return', 'enter', 'tab'].includes(key?.name ?? '') && !key.shift && !key.meta) {
+        const suggestion = getCurrentPeerSuggestion();
+        if (suggestion?.peerReference && applyPromptSuggestion(suggestion)) return;
+      }
+
+      if ((key?.name === 'up' || key?.name === 'down') && !key.ctrl && !key.meta && !key.shift) {
+        if (!historyNavigation && key.name === 'up' && textBuffer.getVisualCursor()[0] === 0 && typedMessageHistory.entries().length) {
+          historyNavigation = {
+            entries: [...typedMessageHistory.entries()], index: -1, draft: getCurrentText(),
+            row: textBuffer.getCursorRow(), col: textBuffer.getCursorCol(), hiddenContent: pasteState.hiddenContent,
+            metadata: { peerReferences: structuredClone(peerBindings), peerScope, ...(peerReplyTo ? { peerReplyTo } : {}) },
+          };
+        }
+        if (historyNavigation) {
+          const navigation = historyNavigation;
+          navigation.index = key.name === 'up' ? Math.min(navigation.index + 1, navigation.entries.length - 1) : navigation.index - 1;
+          const entry = navigation.index >= 0 ? navigation.entries[navigation.index] : undefined;
+          const metadata = entry ?? navigation.metadata;
+          textBuffer.setText(entry?.text ?? navigation.draft);
+          peerBindings = structuredClone(metadata.peerReferences ?? []);
+          peerReplyTo = metadata.peerReplyTo;
+          if (metadata.peerScope && (peers?.scopes ?? ['workspace']).includes(metadata.peerScope)) peerScope = metadata.peerScope;
+          pasteState.hiddenContent = entry ? undefined : navigation.hiddenContent;
+          if (!entry) { textBuffer.setCursorPosition(navigation.row, navigation.col); historyNavigation = undefined; }
+          peerDismissed = getCurrentText();
+          syncReadlineFromBuffer();
+          renderActivePrompt();
+          if (peers?.refresh) void peers.refresh(peerScope).then(() => { if (!closed) renderActivePrompt(); }, error => { if (!closed) showPromptMessage(safePeerLabel(error instanceof Error ? error.message : String(error), 300)); });
+          return;
+        }
+      } else historyNavigation = undefined;
 
       // ── Shift+Tab: interaction mode cycle ─────────────────────────────
       if (isShiftTabShortcut(_str, key)) {
@@ -2818,6 +2973,9 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
       }
 
       if (tbResult === 'handled') {
+        if (!getCurrentText()) { peerBindings = []; peerReplyTo = undefined; }
+        peerActiveIndex = 0;
+        refreshPeerPicker();
         syncReadlineFromBuffer();
         renderActivePrompt();
         scheduleInlineImageScan();
@@ -2866,6 +3024,43 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
       // Convert any remaining newline markers back to actual newlines.
       // TextBuffer uses real \n, but legacy code paths may still produce markers.
       finalValue = convertNewlineMarkersToNewlines(finalValue).trim();
+      let submissionMetadata: PeerInstructionMetadata | undefined;
+
+      if (peers) {
+        const parsed = parsePeerInput(finalValue);
+        if (parsed.kind === 'direct' || parsed.references.length) {
+          try {
+            const resolved = resolvePeerInput(finalValue, peerBindings, peers.peersProvider(peerScope));
+            if (resolved.kind === 'direct') {
+              if (peerSending) return;
+              peerSending = true;
+              const replyTo = peerBindings[0]?.peerId === resolved.to ? peerReplyTo : undefined;
+              const metadata = { peerReferences: [resolved.reference], peerScope, ...(replyTo ? { peerReplyTo: replyTo } : {}) };
+              void peers.send({ to: resolved.to, content: resolved.content, ...(replyTo ? { replyTo } : {}) }).then(receipt => {
+                peerSending = false;
+                if (closed) return;
+                if (!['unknown', 'rejected', 'expired'].includes(receipt.state)) void typedMessageHistory.record(finalValue, workspaceRoot ?? process.cwd(), metadata).catch(() => {});
+                if (!['unknown', 'rejected', 'expired'].includes(receipt.state) && getCurrentText().trim() === finalValue) {
+                  textBuffer.setText('');
+                  peerBindings = [];
+                  peerReplyTo = undefined;
+                  syncReadlineFromBuffer();
+                }
+                showPromptMessage(`To :${safePeerLabel(resolved.reference.alias)} · ${receipt.state}${receipt.outcome ? ` · ${safePeerLabel(receipt.outcome)}` : ''}`);
+              }, error => {
+                peerSending = false;
+                if (!closed) showPromptMessage(safePeerLabel(error instanceof Error ? error.message : String(error), 300));
+              });
+              return;
+            }
+            peers.onReferences?.(resolved.references);
+            submissionMetadata = { peerReferences: resolved.references, peerScope };
+          } catch (error) {
+            showPromptMessage(safePeerLabel(error instanceof Error ? error.message : String(error), 300));
+            return;
+          }
+        }
+      }
 
       // Process any embedded images (base64 data URLs or file paths)
       finalValue = processImagesInText(finalValue, onImageDetected, {
@@ -2915,6 +3110,7 @@ async function promptOnce(options: PromptOnceOptions): Promise<PromptResult> {
       if (finalValue && !finalValue.startsWith('/')) {
         stdOutput.write(`${chalk.gray('press ESC to interrupt')}\n`);
       }
+      void typedMessageHistory.record(finalValue, workspaceRoot ?? process.cwd(), submissionMetadata).catch(() => {});
       cleanup();
       resolve({ kind: 'submit', value: finalValue });
     });
@@ -3152,7 +3348,7 @@ function renderPromptLine(
     for (let i = 0; i < blockSize; i++) {
       readline.clearLine(output, 0);
       if (i < blockSize - 1) {
-        readline.moveCursor(output, 0, 1);
+        output.write('\n');
       }
     }
     // Return to starting row

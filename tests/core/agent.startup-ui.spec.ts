@@ -181,16 +181,16 @@ describe('agent startup and active input UI', () => {
       expect(internals.interactiveAutomodeEnabled).toBe(false);
       expect(internals.permissionManager.getMode()).toBe('interactive');
 
-      expect(internals.cycleInteractionMode()).toBe('yolo');
-      expect(planModeManager.isEnabled()).toBe(false);
-      expect(runtime.options.yolo).toBe('allow:*');
-      expect(internals.interactiveAutomodeEnabled).toBe(false);
-      expect(internals.permissionManager.getMode()).toBe('unrestricted');
-
       expect(internals.cycleInteractionMode()).toBe('automode');
       expect(planModeManager.isEnabled()).toBe(false);
       expect(runtime.options.yolo).toBeUndefined();
       expect(internals.interactiveAutomodeEnabled).toBe(true);
+      expect(internals.permissionManager.getMode()).toBe('unrestricted');
+
+      expect(internals.cycleInteractionMode()).toBe('yolo');
+      expect(planModeManager.isEnabled()).toBe(false);
+      expect(runtime.options.yolo).toBe('allow:*');
+      expect(internals.interactiveAutomodeEnabled).toBe(false);
       expect(internals.permissionManager.getMode()).toBe('unrestricted');
 
       expect(internals.cycleInteractionMode()).toBe('default');
@@ -502,14 +502,10 @@ describe('agent startup and active input UI', () => {
     expect(confirmationCallback).not.toHaveBeenCalled();
   });
 
-  it('keeps the first instruction behind MCP registration', async () => {
+  function createInitGateAgent(options: { initDone?: boolean } = {}) {
     const agent = Object.create(AutohandAgent.prototype) as any;
-    let resolveMcp: (() => void) | undefined;
-
     agent.initReady = Promise.resolve();
-    agent.mcpReady = new Promise<void>((resolve) => {
-      resolveMcp = resolve;
-    });
+    agent.initDone = options.initDone ?? true;
     agent.flushMcpStartupSummaryIfPending = vi.fn();
     agent.sessionManager = {
       getCurrentSession: () => ({ metadata: { sessionId: 'session-1' } }),
@@ -517,6 +513,45 @@ describe('agent startup and active input UI', () => {
     agent.hookManager = {
       executeHooks: vi.fn().mockResolvedValue(undefined),
     };
+    agent.mcpStartupCoordinator = {
+      describePendingConnections: vi.fn(() => 'Connecting MCP servers (github)...'),
+    };
+    agent.ui = { setWorking: vi.fn() };
+    return agent;
+  }
+
+  it('keeps the first-turn wait line off the terminal unless AUTOHAND_DEBUG is set', async () => {
+    const agent = createInitGateAgent();
+    agent.writeDebugLine = vi.fn();
+    vi.stubEnv('AUTOHAND_DEBUG', '');
+    try {
+      await (agent as any).ensureInitComplete();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(agent.writeDebugLine).not.toHaveBeenCalled();
+  });
+
+  it('reports the first-turn wait through the debug writer when AUTOHAND_DEBUG is set', async () => {
+    const agent = createInitGateAgent();
+    agent.writeDebugLine = vi.fn();
+    vi.stubEnv('AUTOHAND_DEBUG', '1');
+    try {
+      await (agent as any).ensureInitComplete();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(agent.writeDebugLine).toHaveBeenCalledWith(
+      expect.stringMatching(/^\[DEBUG\] first turn waited \d+ ms on startup init$/),
+    );
+  });
+
+  it('releases the first instruction once MCP registration completes before the deadline', async () => {
+    const agent = createInitGateAgent();
+    let resolveMcp: (() => void) | undefined;
+    agent.mcpReady = new Promise<void>((resolve) => {
+      resolveMcp = resolve;
+    });
 
     let completed = false;
     const completion = (agent as any).ensureInitComplete().then(() => {
@@ -536,6 +571,62 @@ describe('agent startup and active input UI', () => {
       sessionId: 'session-1',
       sessionType: 'startup',
     });
+  });
+
+  it('releases the first instruction after the MCP first-turn deadline when a server never answers', async () => {
+    vi.useFakeTimers();
+    try {
+      const agent = createInitGateAgent();
+      agent.mcpReady = new Promise<void>(() => {});
+
+      let completed = false;
+      const completion = (agent as any).ensureInitComplete().then(() => {
+        completed = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(completed).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(600);
+      await completion;
+
+      expect(completed).toBe(true);
+      expect(agent.initReady).toBeNull();
+      expect(agent.hookManager.executeHooks).toHaveBeenCalledWith('session-start', {
+        sessionId: 'session-1',
+        sessionType: 'startup',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows what startup is waiting on and clears it before the turn starts', async () => {
+    const agent = createInitGateAgent({ initDone: false });
+    let resolveMcp: (() => void) | undefined;
+    agent.mcpReady = new Promise<void>((resolve) => {
+      resolveMcp = resolve;
+    });
+
+    const completion = (agent as any).ensureInitComplete();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(agent.ui.setWorking).toHaveBeenCalledWith(true, 'Connecting MCP servers (github)...');
+
+    resolveMcp?.();
+    await completion;
+
+    expect(agent.ui.setWorking).toHaveBeenLastCalledWith(false);
+  });
+
+  it('does not touch the working state when startup already finished', async () => {
+    const agent = createInitGateAgent();
+    agent.mcpStartupCoordinator.describePendingConnections.mockReturnValue(null);
+    agent.mcpReady = Promise.resolve();
+
+    await (agent as any).ensureInitComplete();
+
+    expect(agent.ui.setWorking).not.toHaveBeenCalled();
   });
 
   it('forceRenderSpinner renders a single-line status to avoid log box artifacts', () => {
@@ -928,6 +1019,24 @@ describe('agent startup and active input UI', () => {
     expect(body).toBe('Great progress on the UI composer.');
   });
 
+  it('does not expose thought-only JSON in a completion notification fallback', () => {
+    const agent = Object.create(AutohandAgent.prototype) as unknown as {
+      lastAssistantResponseForNotification: string;
+      conversation: { history: () => Array<{ role: string; content: string }> };
+      getCompletionNotificationBody(): string;
+    };
+    agent.lastAssistantResponseForNotification = '';
+    agent.conversation = {
+      history: vi.fn(() => [
+        { role: 'assistant', content: '{"thought":"Private reasoning still in progress."}' },
+      ]),
+    };
+
+    const body = agent.getCompletionNotificationBody();
+
+    expect(body).toBe('Task completed');
+  });
+
   it('forceRenderSpinner does not show live typing preview while working', () => {
     const agent = Object.create(AutohandAgent.prototype) as any;
     const spinner = { text: '' };
@@ -1076,7 +1185,93 @@ describe('agent startup and active input UI', () => {
     }
   });
 
-  it('setupEscListener queues line submissions from stdin data fallback', () => {
+  it('setupEscListener runs a slash command typed mid-turn instead of steering it', () => {
+    const agent = Object.create(AutohandAgent.prototype) as any;
+    const originalStdin = process.stdin;
+    const mockInput = new EventEmitter() as NodeJS.ReadStream;
+    (mockInput as any).isTTY = true;
+    (mockInput as any).isRaw = true;
+    (mockInput as any).setRawMode = vi.fn(() => mockInput);
+    (mockInput as any).resume = vi.fn(() => mockInput);
+    (mockInput as any).setEncoding = vi.fn();
+
+    agent.runtime = { config: { agent: { enableRequestQueue: true } }, options: {} };
+    agent.updateInputLine = vi.fn();
+    agent.persistentInput = { queue: [], enqueue: vi.fn(), getQueueLength: () => 0, writeAbove: vi.fn(), setStatusLine: vi.fn(), setActivityLine: vi.fn() };
+    agent.persistentInputActiveTurn = false;
+    agent.queueInput = '';
+    agent.steerActiveInstruction = vi.fn(async () => true);
+    agent.parseSlashCommand = vi.fn(() => ({ command: 'ps', args: [] }));
+    agent.handleSlashCommand = vi.fn(async () => null);
+
+    Object.defineProperty(process, 'stdin', { configurable: true, value: mockInput });
+    try {
+      const cleanup = (agent as any).setupEscListener(new AbortController(), vi.fn());
+      for (const ch of '/ps') mockInput.emit('keypress', ch, { name: ch, sequence: ch });
+      mockInput.emit('keypress', '\r', { name: 'return', sequence: '\r' });
+      expect(agent.steerActiveInstruction).not.toHaveBeenCalled();
+      expect(agent.persistentInput.enqueue).not.toHaveBeenCalled();
+      expect(agent.handleSlashCommand).toHaveBeenCalledWith('ps', []);
+      cleanup();
+    } finally {
+      Object.defineProperty(process, 'stdin', { configurable: true, value: originalStdin });
+    }
+  });
+
+  it('setupEscListener queues line submissions from stdin data fallback when Enter is configured to queue', () => {
+    const agent = Object.create(AutohandAgent.prototype) as any;
+    const originalStdin = process.stdin;
+    const mockInput = new EventEmitter() as NodeJS.ReadStream;
+    const queue: Array<{ text: string; timestamp: number }> = [];
+    (mockInput as any).isTTY = true;
+    (mockInput as any).isRaw = false;
+    (mockInput as any).setRawMode = vi.fn((mode: boolean) => {
+      (mockInput as any).isRaw = mode;
+      return mockInput;
+    });
+    (mockInput as any).resume = vi.fn(() => mockInput);
+    (mockInput as any).setEncoding = vi.fn();
+
+    agent.runtime = {
+      config: {
+        agent: {
+          enableRequestQueue: true,
+        },
+        ui: {
+          enterWhileWorking: 'queue',
+        },
+      },
+    };
+    agent.updateInputLine = vi.fn();
+    agent.persistentInput = {
+      queue,
+      enqueue: (text: string) => queue.push({ text, timestamp: Date.now() }),
+      getQueueLength: () => queue.length,
+      setStatusLine: vi.fn(),
+      setActivityLine: vi.fn(),
+    };
+    agent.queueInput = '';
+
+    Object.defineProperty(process, 'stdin', {
+      configurable: true,
+      value: mockInput,
+    });
+
+    try {
+      const cleanup = (agent as any).setupEscListener(new AbortController(), vi.fn());
+      mockInput.emit('data', 'queued from cooked data mode\n');
+      expect(queue).toHaveLength(1);
+      expect(queue[0]?.text).toBe('queued from cooked data mode');
+      cleanup();
+    } finally {
+      Object.defineProperty(process, 'stdin', {
+        configurable: true,
+        value: originalStdin,
+      });
+    }
+  });
+
+  it('setupEscListener steers the running turn from a stdin data line submission by default', () => {
     const agent = Object.create(AutohandAgent.prototype) as any;
     const originalStdin = process.stdin;
     const mockInput = new EventEmitter() as NodeJS.ReadStream;
@@ -1106,6 +1301,7 @@ describe('agent startup and active input UI', () => {
       setActivityLine: vi.fn(),
     };
     agent.queueInput = '';
+    agent.steerActiveInstruction = vi.fn(async () => true);
 
     Object.defineProperty(process, 'stdin', {
       configurable: true,
@@ -1114,9 +1310,9 @@ describe('agent startup and active input UI', () => {
 
     try {
       const cleanup = (agent as any).setupEscListener(new AbortController(), vi.fn());
-      mockInput.emit('data', 'queued from cooked data mode\n');
-      expect(queue).toHaveLength(1);
-      expect(queue[0]?.text).toBe('queued from cooked data mode');
+      mockInput.emit('data', 'steered from cooked data mode\n');
+      expect(agent.steerActiveInstruction).toHaveBeenCalledWith('steered from cooked data mode');
+      expect(queue).toHaveLength(0);
       cleanup();
     } finally {
       Object.defineProperty(process, 'stdin', {
@@ -2163,6 +2359,37 @@ describe('agent startup and active input UI', () => {
     }
   });
 
+  it('wires the status-row spinner frames into the terminal tab title', () => {
+    const agent = Object.create(AutohandAgent.prototype) as unknown as {
+      useInkRenderer: boolean;
+      ui: { options: { onWorkingSpinnerFrame?: (frame: number) => void } } | null;
+      workspaceFileCollector: { getCachedFiles: () => string[] };
+      skillsRegistry: { listSkills: () => unknown[] };
+      terminalTitle: { setFrame: ReturnType<typeof vi.fn> };
+      initializeUIManager(): void;
+    };
+    let restoreStdoutTTY: () => void = () => {};
+    let restoreStdinTTY: () => void = () => {};
+    agent.useInkRenderer = true;
+    agent.ui = null;
+    agent.workspaceFileCollector = { getCachedFiles: vi.fn(() => []) };
+    agent.skillsRegistry = { listSkills: vi.fn(() => []) };
+    agent.terminalTitle = { setFrame: vi.fn() };
+
+    try {
+      restoreStdoutTTY = overrideStreamTTY(process.stdout, true);
+      restoreStdinTTY = overrideStreamTTY(process.stdin, true);
+      agent.initializeUIManager();
+      const options = agent.ui?.options;
+      expect(options?.onWorkingSpinnerFrame).toBeTypeOf('function');
+      options?.onWorkingSpinnerFrame?.(7);
+      expect(agent.terminalTitle.setFrame).toHaveBeenCalledWith(7);
+    } finally {
+      restoreStdoutTTY();
+      restoreStdinTTY();
+    }
+  });
+
   it('handleInkSubmittedInstruction executes shell commands immediately instead of queueing them', async () => {
     const agent = Object.create(AutohandAgent.prototype) as any;
     agent.inkRenderer = {
@@ -2335,10 +2562,10 @@ describe('agent startup and active input UI', () => {
   it('buildToolLoopCallSignature is stable for key and call ordering', () => {
     const first = buildToolLoopCallSignature([
       { id: '1', tool: 'git_log', args: { max_count: 1, oneline: true } },
-      { id: '2', tool: 'fff_grep', args: { query: 'TODO', path: 'src' } },
+      { id: '2', tool: 'find_grep', args: { query: 'TODO', path: 'src' } },
     ]);
     const second = buildToolLoopCallSignature([
-      { id: '2', tool: 'fff_grep', args: { path: 'src', query: 'TODO' } },
+      { id: '2', tool: 'find_grep', args: { path: 'src', query: 'TODO' } },
       { id: '1', tool: 'git_log', args: { oneline: true, max_count: 1 } },
     ]);
     expect(first).toBe(second);
@@ -2354,7 +2581,7 @@ describe('agent startup and active input UI', () => {
     };
     agent.toolManager = {
       listDefinitions: vi.fn(() => [{
-        name: 'fff_grep',
+        name: 'find_grep',
         description: 'Search code, symbols, and matching context in the workspace',
         parameters: {
           type: 'object',
@@ -2380,14 +2607,14 @@ describe('agent startup and active input UI', () => {
     const prompt = await (agent as any).buildSystemPrompt();
 
     expect(prompt).toContain('Use `fff_find` for file path discovery.');
-    expect(prompt).toContain('Use `fff_grep` for content/code discovery.');
+    expect(prompt).toContain('Use `find_grep` for content/code discovery.');
     expect(prompt).toContain('Use `fff_find` first when you need file discovery by filename, extension, or path pattern.');
-    expect(prompt).toContain('Use `fff_grep` as the default code discovery tool for content, symbols, imports, and regex lookup.');
+    expect(prompt).toContain('Use `find_grep` as the default code discovery tool for content, symbols, imports, and regex lookup.');
     expect(prompt).toContain('Use `read_file` after search identifies the exact file or region you need.');
-    expect(prompt).toContain('Prefer dedicated file tools (`fff_find`, `fff_grep`, `read_file`, `git_status`, `git_diff`) over `run_command` whenever they can accomplish the task.');
+    expect(prompt).toContain('Prefer dedicated file tools (`fff_find`, `find_grep`, `read_file`, `git_status`, `git_diff`) over `run_command` whenever they can accomplish the task.');
     expect(prompt).toContain('The legacy tools `search`, `search_with_context`, and `semantic_search` are compatibility aliases');
     expect(prompt).toContain('File discovery: `fff_find(query="**/*.test.ts")`');
-    expect(prompt).toContain('Content search: `fff_grep(query="UserController")`');
+    expect(prompt).toContain('Content search: `find_grep(query="UserController")`');
     expect(prompt).not.toContain('Legacy glob:');
     expect(prompt).not.toContain('Legacy find:');
     expect(prompt).toContain('Prefer dedicated tools over `run_command` whenever a dedicated tool exists.');

@@ -138,6 +138,9 @@ export const AUTOHAND_FILES = {
   /** Device ID for telemetry */
   deviceId: path.join(AUTOHAND_HOME, 'device-id'),
 
+  /** Workspaces the user trusted to run their project hooks and MCP servers */
+  trustedWorkspaces: path.join(AUTOHAND_HOME, 'trusted-workspaces.json'),
+
   /** Error log */
   errorLog: path.join(AUTOHAND_HOME, 'error.log'),
 
@@ -255,8 +258,6 @@ export function getUserSkillLocations(homeDir = os.homedir(), autohandSkillsDir 
     { basePath: autohandSkillsDir, source: 'autohand-user' as const, recursive: true },
   ];
 }
-
-export const SKILL_LOCATIONS = getUserSkillLocations();
 
 /**
  * Get project-level skill locations for a given workspace root

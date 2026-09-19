@@ -1,15 +1,20 @@
+import { allowedPeerScopes } from '../../session/peers/PeerScope.js';
 /**
  * @license
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { resolveMouseComposerCursor } from '../../ui/mouseReporting.js';
+import { deliverAgentTargetMessage, listAgentMessageTargets } from './AgentMessageTargets.js';
 import os from 'node:os';
 import ora from 'ora';
 import { createInkUIManager } from '../../ui/InkUIManager.js';
 import { createPlainUIManager } from '../../ui/PlainUIManager.js';
+import { setTerminalMarkdownPreference } from '../../ui/terminalMarkdown.js';
 import { getPromptBlockWidth, promptNotify } from '../../ui/inputPrompt.js';
 import { executeShellCommandAsync, executeStreamingShellCommand, isShellCommand, parseShellCommand } from '../../ui/shellCommand.js';
+import { canSteerComposerInput } from '../../ui/composerSteering.js';
 import { createImmediateShellCommandBlockWriter, formatImmediateShellCommandHeader } from '../immediateCommandRouter.js';
 import { SLASH_COMMANDS } from '../slashCommands.js';
 import { buildHostTokenUsageStatus, formatElapsedTime, formatSessionActualTokens, formatTurnUsage } from './AgentFormatter.js';
@@ -17,6 +22,8 @@ import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { buildStatusLineExtension, getConfigStatusLineSettings } from './StatusLineSettings.js';
 import { resolveStatusLineGitLabel } from './AgentContextRuntime.js';
 import { extensionRuntimeHost } from '../../extensions/ExtensionRuntimeHost.js';
+import { resolveKeybindings } from '../../keybindings/profiles.js';
+import { loadExternalKeybindingOverrides } from '../../keybindings/externalKeybindings.js';
 import { t } from '../../i18n/index.js';
 import type { AnnouncementLineState } from '../../ui/ink/AgentUI.js';
 import type { AgentUILineExtensions } from '../../ui/ink/AgentUI.js';
@@ -27,12 +34,16 @@ import {
 import { createQueuedAgentInstruction } from './PostTurnActionCoordinator.js';
 import { renderAgentSlashCommandResult } from './AgentCommandRuntime.js';
 import { GoalManager } from '../../goals/GoalManager.js';
+import { parsePeerInput, type PeerInstructionMetadata } from '../../ui/peerMention.js';
+import type { PeerClient } from '../../session/peers/PeerMessaging.js';
+import { withCommandCoordination } from '../../session/peers/CommandCoordinationGate.js';
 
 export interface AgentUIRuntimeHost {
   [key: string]: any;
 }
 
 const USER_NOTIFICATION_DEDUPE_WINDOW_MS = 10 * 60 * 1000;
+const STATUS_TICK_MS = 1_000;
 const MAX_PENDING_INK_SUBMIT_ECHOES = 20;
 
 export function buildPeerLineExtension(peerCount: number): LineExtension | undefined {
@@ -68,6 +79,9 @@ export function handleAgentCtrlCExitRequest(host: AgentUIRuntimeHost): void {
   }
 
   host.shouldExit = true;
+  // Startup waits (MCP handshakes, background init) park on this signal; without
+  // the abort the exit only lands once those waits time out on their own.
+  host.runtimeResourceShutdownController?.abort();
   host.clearAllQueuesAndAbort();
 }
 
@@ -232,12 +246,22 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
       return; // Already initialized
     }
 
+    // Read on every render so toggling ui.renderMarkdown in /settings applies immediately.
+    setTerminalMarkdownPreference(() => host.runtime.config.ui?.renderMarkdown !== false);
     const isTTY = process.stdout.isTTY && process.stdin.isTTY;
 
     if (host.useInkRenderer && isTTY) {
       // Create Ink UIManager
       const inkUIManager = createInkUIManager({
-        onInstruction: (text: string) => { void host.handleInkSubmittedInstruction(text); },
+        onInstruction: (text, metadata) => { void handleAgentInkSubmittedInstruction(host, text, metadata); },
+        onSteer: (text: string) => { void steerAgentActiveInstruction(host, text); },
+        onWorkingSpinnerFrame: (frame: number) => host.terminalTitle?.setFrame(frame),
+        ...(host.runtime?.config?.sessions?.communication?.enabled === true ? {
+          peerScopes: allowedPeerScopes(host.runtime.config.sessions?.communication?.scope ?? 'workspace'),
+          peersProvider: scope => host.peerMessaging?.cachedPeers(scope) ?? [],
+          onPeersRefresh: scope => host.peerMessaging?.list({ scope }) ?? Promise.resolve(),
+          onPeerMessage: (input: { to: string; content: string; replyTo?: string }) => host.peerMessaging.send(input),
+        } : {}),
         onEscape: () => {
           const ctrl = host.currentInkAbortController;
           if (ctrl && !ctrl.signal.aborted) {
@@ -252,6 +276,7 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
           void host.announcementManager?.dismiss?.(id);
         },
         enableQueueInput: true,
+        enterWhileWorking: host.runtime?.config?.ui?.enterWhileWorking ?? 'steer',
         onImageDetected: (data: Buffer, mimeType: string, filename?: string) =>
           host.imageManager.add(data, mimeType, filename),
         filesProvider: () => host.workspaceFileCollector.getCachedFiles(),
@@ -275,9 +300,19 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
             ? host.resolveLlmShellSuggestion(input)
             : Promise.resolve(null),
         suggestionProvider: () => host.suggestionEngine?.getNextPromptSuggestion() ?? undefined,
+        // Read ui.showTips on every draw so toggling it in /settings applies at the next rotation.
+        tipProvider: host.runtime?.options?.bare
+          ? undefined
+          : (accept) => host.runtime?.config?.ui?.showTips === false
+            ? undefined
+            : host.activityIndicator?.nextTipFitting?.(accept),
         getInteractionMode: () => host.getInteractionMode(),
         onCycleInteractionMode: () => host.cycleInteractionMode(),
-        mouseComposerCursor: host.runtime?.config?.ui?.mouseComposerCursor !== false,
+        mouseComposerCursor: resolveMouseComposerCursor(host.runtime?.config?.ui?.mouseComposerCursor),
+        keybindings: resolveKeybindings(
+          host.runtime?.config?.ui?.keybindingProfile,
+          loadExternalKeybindingOverrides(host.runtime?.config?.ui?.keybindingProfile ?? 'autohand'),
+        ),
         taskListPositionProvider: () =>
           host.runtime?.config?.ui?.taskListPosition ?? 'above-composer',
         onEditGoalObjective: async (request) => {
@@ -291,6 +326,7 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
         },
         onCancelAgentRun: (id) => host.agentRunStore?.requestCancel(id),
         onMessageAgentRun: (id, text) => host.agentRunStore?.sendMessage(id, text) ?? Promise.resolve(false),
+        messageTargetsProvider: () => listAgentMessageTargets(host),
         skillsProvider: () =>
           host.skillsRegistry.listSkills().map((skill: { name: string; description?: string; isActive: boolean; source: string }) => ({
             name: skill.name,
@@ -329,7 +365,14 @@ export async function initializeAgentUI(host: AgentUIRuntimeHost, abortControlle
         await host.ui?.start();
         host.inkRenderer = host.ui?.getInkRenderer?.() ?? host.inkRenderer;
         host.syncProviderModelStatusLine();
-        host.ui?.setWorking(true, 'Gathering context...');
+        // Only a cancellable turn shows the gathering status. The interactive
+        // loop mounts Ink before any instruction exists, and a working state
+        // there makes the composer treat text typed during startup as a
+        // finished turn's draft, hiding the caret until the next keystroke.
+        if (abortController) {
+          host.ui?.setWorking(true, 'Gathering context...');
+          host.terminalTitle?.setState('working');
+        }
         host.runtime.inkRenderer = host.inkRenderer;
         syncAgentAnnouncementLine(host);
         if (host.teamActivitySnapshot) {
@@ -399,6 +442,7 @@ export function setAgentComposerIdle(host: AgentUIRuntimeHost): void {
       host.inkRenderer.setWorking(false);
     }
     host.ui?.setWorking(false);
+    host.terminalTitle?.setState('idle');
   }
 
 export function clearAgentActivityForCompletedTurn(host: AgentUIRuntimeHost): void {
@@ -416,6 +460,7 @@ export function setAgentComposerFinalResponse(host: AgentUIRuntimeHost, response
   }
 
 export function stopAgentUI(host: AgentUIRuntimeHost, failed = false, message?: string): void {
+    host.terminalTitle?.setState(failed ? 'failed' : 'idle');
     if (host.inkRenderer) {
       host.inkRenderer.setElapsed(formatElapsedTime(host.taskStartedAt ?? host.sessionStartedAt));
       const stopTokens = buildHostTokenUsageStatus(
@@ -463,6 +508,7 @@ export function cleanupAgentUI(host: AgentUIRuntimeHost, keepInkAlive = false): 
           }
         }
         writeAutohandDebugLine('[DEBUG] cleanupUI: stopping inkRenderer', host.writeDebugLine?.bind(host));
+        host.terminalTitle?.restore();
         host.inkRenderer.stop();
         host.inkRenderer = null;
         host.runtime.inkRenderer = undefined;
@@ -552,8 +598,8 @@ export async function showAgentFeedbackWithPause(host: AgentUIRuntimeHost, trigg
         host.persistentInput.resume();
       }
       if (needsInkPause) {
-        host.modalActive = false;
         await host.inkRenderer.resume();
+        host.modalActive = false;
       }
     }
   }
@@ -572,9 +618,45 @@ export function addAgentUIToolOutputs(host: AgentUIRuntimeHost, outputs: Array<{
     // For ora mode, we use console.log (handled separately)
   }
 
-export async function handleAgentInkSubmittedInstruction(host: AgentUIRuntimeHost, text: string): Promise<void> {
+/**
+ * Sends a message into the running turn. Outside a turn it is an ordinary
+ * submission, so the chord never loses text.
+ */
+export async function steerAgentActiveInstruction(host: AgentUIRuntimeHost, text: string): Promise<boolean> {
+    const content = text.trim();
+    if (!content) return false;
+    if (!host.isInstructionActive || !host.steering || !canSteerComposerInput(content)) {
+      await host.handleInkSubmittedInstruction(content);
+      return false;
+    }
+    if (!host.steering.push(content)) {
+      host.inkRenderer?.addNotification?.('That message is too long to steer the running turn.');
+      return false;
+    }
+    host.inkRenderer?.addUserMessage?.(content);
+    host.inkRenderer?.addNotification?.('Steering the running turn; the model reads it on its next request.');
+    return true;
+}
+
+export async function handleAgentInkSubmittedInstruction(host: AgentUIRuntimeHost, text: string, metadata?: PeerInstructionMetadata): Promise<void> {
+    const peerInput = parsePeerInput(text);
+    const messaging: PeerClient | undefined = host.peerMessaging;
+    if (peerInput.kind === 'direct' && messaging?.policy.enabled) {
+      const receipt = await messaging.send({ to: peerInput.alias, content: peerInput.content });
+      host.inkRenderer?.addAssistantMessage?.(`To :${peerInput.alias} · ${receipt.state}`);
+      return;
+    }
     if (isShellCommand(text)) {
       await host.executeImmediateShellCommand(parseShellCommand(text));
+      return;
+    }
+
+    // ":alias message" goes straight to that agent, even mid-turn, and never
+    // to the model.
+    const delivery = await deliverAgentTargetMessage(host, text);
+    if (delivery) {
+      host.inkRenderer?.addUserMessage?.(text.trim());
+      host.inkRenderer?.addNotification?.(delivery.receipt);
       return;
     }
 
@@ -595,7 +677,8 @@ export async function handleAgentInkSubmittedInstruction(host: AgentUIRuntimeHos
     }
 
     echoInkSubmittedInstructionImmediately(host, text);
-    host.inkRenderer?.addQueuedInstruction(text);
+    if (metadata?.peerReferences.length) host.inkRenderer?.addQueuedInstruction(text, metadata);
+    else host.inkRenderer?.addQueuedInstruction(text);
 
     // If the interactive loop is idle-waiting for the next Composer input,
     // resolve the promise so it can dequeue and process host instruction.
@@ -610,11 +693,12 @@ export function shouldAgentPreferPtyForImmediateShellCommands(_host: AgentUIRunt
   }
 
 export async function executeAgentImmediateShellCommand(host: AgentUIRuntimeHost, shellCmd: string, routeOpts?: ImmediateShellRouteOptions): Promise<ShellCommandResult> {
-    if (host.inkRenderer) {
-      return host.executeImmediateShellCommandForInk(shellCmd);
-    }
-
-    return host.executeImmediateShellCommandForComposer(shellCmd, routeOpts);
+    const execute = () => host.inkRenderer ? host.executeImmediateShellCommandForInk(shellCmd)
+      : host.executeImmediateShellCommandForComposer(shellCmd, routeOpts);
+    return host.resourceCoordinator ? withCommandCoordination({ coordinator: host.resourceCoordinator,
+      waitTimeoutMs: host.runtime.config.sessions?.communication?.resourceWaitTimeoutMs,
+      onWaiting: activity => host.notifyUser?.(`Waiting for resource ${activity.resource} · ${activity.requestId}`),
+    }, execute) : execute();
   }
 
 export async function executeAgentImmediateShellCommandForComposer(host: AgentUIRuntimeHost, shellCmd: string, routeOpts?: ImmediateShellRouteOptions): Promise<ShellCommandResult> {
@@ -792,17 +876,17 @@ export function startAgentStatusUpdates(host: AgentUIRuntimeHost): void {
     // Reset tracking state
     host.lastRenderedStatus = '';
 
-    // Pick a fresh verb and tip for host working session
+    // Pick a fresh verb for host working session; tips only rotate while idle.
     host.activityIndicator?.next?.();
 
     // Immediate initial render
     host.forceRenderSpinner();
 
     // Update every second for elapsed time, but forceRenderSpinner
-    // handles deduplication so frequent calls are fine
+    // handles deduplication so frequent calls are fine.
     host.statusInterval = setInterval(() => {
       host.forceRenderSpinner();
-    }, 1000); // Once per second is enough for time updates
+    }, STATUS_TICK_MS);
 
     if (process.stdout.isTTY && !host.resizeHandler) {
       host.resizeHandler = () => {

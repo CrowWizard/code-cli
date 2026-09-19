@@ -16,6 +16,20 @@ describe('index SDK mode startup ordering', () => {
     expect(source).toContain('if (!canUseProviderWithoutAccountAuth(authConfig)) {');
   });
 
+  it('refreshes the model catalog in background startup instead of before the banner', () => {
+    const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
+    const runCliStart = source.indexOf('async function runCLI(');
+    const backgroundStartup = source.indexOf('runtimeResourceOwner.startBackgroundStartup(', runCliStart);
+    const catalogRefresh = source.indexOf('refreshModelCatalogOnStartup(', runCliStart);
+    const bannerIndex = source.indexOf('printBanner();', runCliStart);
+
+    expect(source).not.toContain('refreshModelCatalogBeforeAgentStart');
+    expect(source.indexOf('refreshModelCatalogOnStartup(')).toBe(catalogRefresh);
+    expect(bannerIndex).toBeGreaterThan(runCliStart);
+    expect(backgroundStartup).toBeGreaterThan(bannerIndex);
+    expect(catalogRefresh).toBeGreaterThan(backgroundStartup);
+  });
+
   it('routes RPC and ACP before the interactive auth gate can print or prompt', () => {
     const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
 

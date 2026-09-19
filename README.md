@@ -50,8 +50,8 @@ brew install autohandai/code/autohand-code
 ```
 
 The fully qualified command installs and trusts only the Autohand formula. Every
-supported installation exposes the same CLI as `autohand`, `autohand-code`, and
-`agent`; `autohand` remains the canonical name. Because `agent` is a generic
+supported installation exposes the same CLI as `autohand`, `autohand-code`,
+`agent`, and the short `ah`; `autohand` remains the canonical name. Because `agent` is a generic
 name other AI CLIs also use, every Autohand installer (Unix script, Windows
 script, and Homebrew) scans every writable directory on your `PATH` and
 replaces any existing `agent` command it finds — not only the one in
@@ -158,6 +158,7 @@ Features:
 - Type `@` for file autocomplete (e.g., `@src/index.ts`)
 - Type `$` for skill autocomplete (e.g., `$frontend-design`)
 - Type `!` to run terminal commands (e.g., `! git status`, `! ls -la`)
+- Large command results retain the first and last portions of each output stream, up to 1,048,576 characters, with an omission marker. The same limit applies to individual displayed lines; redirect output to a file when you need the complete result.
 - **Smart Paste**: Paste any amount of code (5+ lines shows compact indicator, full content sent to LLM)
 - Press `ESC` to cancel in-flight requests
 - Press `Ctrl+C` twice to exit
@@ -679,6 +680,10 @@ docker run -it autohand
 - [Autohand Code extensions](docs/extensions.md) - Validate, install, inspect, and manage declarative extension packages
 - [Extension authoring](docs/extension-authoring.md) - Package tools and agents for the public extension ecosystem
 - [Model catalog updates](docs/model-catalog.md) - Automatic refresh, offline fallback, Pi-compatible publication, and admin PR workflow
+- [Local peer communication](docs/peer-communication.md) - Colon composer, exact recipients, inbox and replies
+- [Build resource coordination](docs/peer-resource-coordination.md) - Controllers, grants and process ownership
+- [Peer protocol and runtime](docs/peer-communication-protocol.md) - Security, storage, worker adapters and limits
+- [Two-session peer lab](docs/peer-communication-lab.md) - Verify the complete terminal workflow
 - [Configuration Reference](docs/config-reference.md) - All config options
   - [English](docs/config-reference.md)
   - [日本語](docs/config-reference_ja.md)

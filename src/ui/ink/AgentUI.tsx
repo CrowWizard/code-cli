@@ -18,6 +18,13 @@ import { ThinkingOutput } from './ThinkingOutput.js';
 import { FileMentionDropdown, parseFileSuggestions, matchFileMention, type FileMentionSuggestion } from './FileMentionDropdown.js';
 import { SlashCommandDropdown, matchSlashCommand, buildSlashSuggestions, buildSubcommandSuggestions, type SlashCommandSuggestion } from './SlashCommandDropdown.js';
 import { SkillMentionDropdown, matchSkillMention, buildSkillSuggestions, type SkillSuggestion } from './SkillMentionDropdown.js';
+import { MessageTargetDropdown } from './MessageTargetDropdown.js';
+import { buildTargetSuggestions, matchTargetMention, type MessageTarget, type MessageTargetSuggestion } from '../messageTargets.js';
+import { canSteerComposerInput } from '../composerSteering.js';
+import { usePeerComposer } from './usePeerComposer.js';
+import { PeerMentionDropdown } from './PeerMentionDropdown.js';
+import type { PeerDescriptor, PeerReceipt, PeerScope } from '../../session/peers/PeerProtocol.js';
+import type { PeerComposerDraft, PeerInstructionMetadata } from '../peerMention.js';
 import type { SlashCommand } from '../../core/slashCommandTypes.js';
 import type { ExtensionKeybinding } from '../../extensions/ExtensionRuntimeHost.js';
 import type { SkillMentionInfo } from '../mentionFilter.js';
@@ -29,7 +36,7 @@ import { TeamPanel } from './TeamPanel.js';
 import { AgentRunsPanel } from './AgentRunsPanel.js';
 import type { AgentRunsSnapshot, AgentRunSource } from '../../core/agents/AgentRunStore.js';
 import type { TeamActivitySnapshot } from '../../core/teams/types.js';
-import { GoalPanel, getEditableGoalItems, type GoalEditRequest } from './GoalPanel.js';
+import { GoalPanel, getEditableGoalItems, goalTargetKey, type GoalEditRequest } from './GoalPanel.js';
 import type { GoalSessionSnapshot } from '../../goals/types.js';
 import { useTheme } from '../theme/ThemeContext.js';
 import { useTranslation } from '../i18n/index.js';
@@ -39,6 +46,14 @@ import { PLAN_BORDER_COLOR, hexToAnsiRgb } from '../box.js';
 import { TextBuffer } from '../textBuffer.js';
 import { handleTextBufferKey, type KeyHandlerResult } from '../textBufferKeyHandler.js';
 import {
+  DEFAULT_KEYBINDINGS,
+  matchesChord,
+  normalizeChord,
+  parseChord,
+  type KeyEvent,
+  type ResolvedKeybindings,
+} from '../../keybindings/profiles.js';
+import {
   getInlineGhostCompletionSuffix,
   getPrimaryHotTipSuggestion,
   getPromptBlockWidth,
@@ -47,6 +62,7 @@ import {
   resolveComposerCursorPosition,
 } from '../inputPrompt.js';
 import { renderTerminalMarkdown } from '../../core/immediateCommandRouter.js';
+import { MarkdownText } from './components/MarkdownText.js';
 import { buildFileMentionSuggestions } from '../mentionFilter.js';
 import { getContentDisplay } from '../displayUtils.js';
 import type { ChatLogMessage } from '../../session/chatLog.js';
@@ -59,6 +75,7 @@ import {
   type InteractionMode,
 } from '../../core/agent/InteractionModeController.js';
 import { AnnouncementLine } from './AnnouncementLine.js';
+import { IdleTipRow, TipLine } from './TipLine.js';
 import {
   REQUEST_CURSOR_POSITION,
   parseCursorPositionReport,
@@ -118,13 +135,33 @@ export interface AnnouncementLineState {
   visible: boolean;
 }
 
+/** A tip rotating beside the idle composer, or an upgrade hint pinned under the status line. */
+export interface TipLineState {
+  text: string;
+  kind: 'tip' | 'upgrade';
+}
+
+/** The "Completed in 0m 4s · ↑1.2k ↓40" line a finished turn leaves above the composer. */
+export function formatCompletionSummary(stats: { elapsed: string; tokens: string; status?: TurnCompletionStatus }): string {
+  return `${stats.status === 'failed' ? 'Failed' : 'Completed'} in ${stats.elapsed} · ${stats.tokens}`;
+}
+
 /** A slash-command result held in the fixed composer area until the next turn. */
 export interface CommandResultState {
   command: string;
   output: string;
 }
 
+/**
+ * Renderer-side retention limits. The renderer lives for the whole session, so
+ * anything appended to its state without a cap grows for hours. These bounds
+ * match what the UI can actually draw; older entries are never shown again.
+ */
+export const MAX_TOOL_OUTPUT_ENTRIES = 50;
+export const MAX_VISIBLE_NOTIFICATIONS = 3;
+
 export interface AgentUIState {
+  peerDirectoryVersion?: number;
   isWorking: boolean;
   status: string;
   elapsed: string;
@@ -133,6 +170,7 @@ export interface AgentUIState {
   liveCommands: LiveCommandEntry[];
   thinking: string | null;
   queuedInstructions: string[];
+  queuedInstructionMetadata?: Array<PeerInstructionMetadata | undefined>;
   /** User messages displayed in the conversation */
   userMessages: string[];
   /** Completed user/assistant turns displayed in order. */
@@ -144,7 +182,10 @@ export interface AgentUIState {
   /** Changes whenever canonical chat history is replaced so Ink Static keys stay unique. */
   chatHistoryEpoch: number;
   currentInput: string;
+  peerInputMetadata?: PeerInstructionMetadata;
+  peerDraft?: PeerComposerDraft;
   finalResponse: string | null;
+  streamingResponse?: string | null;
   /** Completion stats shown after work finishes */
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
   /** Plan mode indicator (e.g., '[PLAN]' or '[EXEC]') */
@@ -193,6 +234,8 @@ export interface AgentUIState {
   goalPanelVisible: boolean;
   /** Highest-priority active CLI announcement rendered above status. */
   announcement?: AnnouncementLineState;
+  /** Rotating tip while working, or a pinned upgrade hint, rendered under the status line. */
+  tip?: TipLineState;
   /** Compact command result placed below the status line instead of transcript history. */
   commandResult?: CommandResultState;
 }
@@ -205,7 +248,17 @@ export interface AgentUILineExtensions {
 export interface AgentUIProps {
   state: AgentUIState;
   typedMessageHistory?: TypedMessageHistory;
-  onInstruction: (text: string) => void;
+  /** Sends the composer text into the running turn (Shift+Enter while working). */
+  onSteer?: (text: string) => void;
+  /** Each status-row spinner frame, so the terminal tab can animate in step. */
+  onWorkingSpinnerFrame?: (frame: number) => void;
+  /** Enter while working steers (default) or queues; Shift+Enter does the other. */
+  enterWhileWorking?: 'steer' | 'queue';
+  onInstruction: (text: string, metadata?: PeerInstructionMetadata) => void;
+  peerScopes?: PeerScope[];
+  peersProvider?: (scope?: PeerScope) => PeerDescriptor[];
+  onPeersRefresh?: (scope?: PeerScope) => Promise<unknown>;
+  onPeerMessage?: (input: { to: string; content: string; replyTo?: string }) => Promise<PeerReceipt>;
   onEscape: () => void;
   onCtrlC: () => void;
   /** Dismiss the currently rendered announcement without changing composer input. */
@@ -220,7 +273,7 @@ export interface AgentUIProps {
   onToggleGoalPanel?: () => void;
   /** Persist a composer edit for an active or queued goal. */
   onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
-  onInputChange?: (input: string) => void;
+  onInputChange?: (input: string, metadata?: PeerInstructionMetadata) => void;
   enableQueueInput?: boolean;
   /** Called when a dragged/dropped image is detected in the input */
   onImageDetected?: (data: Buffer, mimeType: string, filename?: string) => number;
@@ -230,6 +283,8 @@ export interface AgentUIProps {
   slashCommands?: SlashCommand[];
   /** Provider for skills used in $ mention autocomplete */
   skillsProvider?: () => SkillMentionInfo[];
+  /** Actors the user can address with `:alias`: running sub-agents, teammates, peers. */
+  messageTargetsProvider?: () => MessageTarget[];
   /** Base path used for shell path completion. Defaults to process.cwd(). */
   workspaceRoot?: string;
   /** Lazy provider for the model-generated empty-input next-prompt suggestion. */
@@ -241,7 +296,7 @@ export interface AgentUIProps {
   /** Trusted extension shortcuts routed through registered slash commands. */
   extensionKeybindings?: ExtensionKeybinding[];
   /** Replace a queued instruction owned by the renderer. */
-  onReplaceQueuedInstruction?: (index: number, text: string) => void;
+  onReplaceQueuedInstruction?: (index: number, text: string, metadata?: PeerInstructionMetadata) => void;
   /** Remove a queued instruction owned by the renderer. */
   onRemoveQueuedInstruction?: (index: number) => void;
   /** Read the canonical interaction mode owned by the agent session. */
@@ -250,6 +305,8 @@ export interface AgentUIProps {
   onCycleInteractionMode?: () => InteractionMode;
   /** Enable click-to-position composer input. */
   mouseComposerCursor?: boolean;
+  /** Resolved shortcut profile; defaults to Autohand's own chords. */
+  keybindings?: ResolvedKeybindings;
   /** Place the task list above status or directly above the composer. */
   taskListPosition?: TaskListPosition;
 }
@@ -262,51 +319,58 @@ interface TextBufferKeyInfo {
   sequence?: string;
 }
 
-const RESERVED_EXTENSION_KEYBINDINGS = new Set([
-  'ctrl+c',
-  'ctrl+d',
-  'ctrl+g',
-  'ctrl+x',
-  'ctrl+t',
-  'meta+g',
-  'meta+t',
-  'shift+tab',
-  'escape',
-  'enter',
-  'return',
-]);
+/** Chords no extension may take, whichever profile is active. */
+const FIXED_RESERVED_KEYBINDINGS = ['ctrl+c', 'ctrl+d', 'ctrl+x', 'escape', 'enter', 'return'];
+
+/** Normalises an Ink keypress into the shape the keybinding matcher reads. */
+export function toInkKeyEvent(input: string, key: InkKey): KeyEvent {
+  const name = key.return
+    ? 'return'
+    : key.tab
+      ? 'tab'
+      : key.escape
+        ? 'escape'
+        : key.upArrow
+          ? 'up'
+          : key.downArrow
+            ? 'down'
+            : key.leftArrow
+              ? 'left'
+              : key.rightArrow
+                ? 'right'
+                : key.backspace
+                  ? 'backspace'
+                  : key.delete
+                    ? 'delete'
+                    : input === ' '
+                      ? 'space'
+                      : undefined;
+  return { input, name, ctrl: key.ctrl, shift: key.shift, meta: key.meta };
+}
 
 export function isTeamViewShortcut(input: string, key: InkKey): boolean {
-  return input.toLowerCase() === 't' && (key.meta || key.ctrl);
+  return DEFAULT_KEYBINDINGS.matches('toggleTeamPanel', toInkKeyEvent(input, key));
 }
 
 export function isGoalViewShortcut(input: string, key: InkKey): boolean {
-  return input.toLowerCase() === 'g' && (key.meta || key.ctrl);
+  return DEFAULT_KEYBINDINGS.matches('toggleGoals', toInkKeyEvent(input, key));
 }
 
 export function matchesExtensionKeybinding(
   input: string,
   key: InkKey,
   binding: Pick<ExtensionKeybinding, 'key' | 'command'>,
+  reserved: ReadonlySet<string> = DEFAULT_KEYBINDINGS.reservedChords(),
 ): boolean {
-  const normalized = binding.key.toLowerCase();
-  if (RESERVED_EXTENSION_KEYBINDINGS.has(normalized)) {
+  const chord = parseChord(binding.key);
+  if (!chord) {
     return false;
   }
-  const parts = normalized.split('+');
-  const primary = parts.at(-1);
-  const modifiers = new Set(parts.slice(0, -1));
-  const expectsMeta = modifiers.has('meta') || modifiers.has('alt');
-  if (key.ctrl !== modifiers.has('ctrl') || key.shift !== modifiers.has('shift') || key.meta !== expectsMeta) {
+  const normalized = normalizeChord(chord);
+  if (reserved.has(normalized) || FIXED_RESERVED_KEYBINDINGS.includes(normalized)) {
     return false;
   }
-  if (primary === 'tab') return key.tab;
-  if (primary === 'up') return key.upArrow;
-  if (primary === 'down') return key.downArrow;
-  if (primary === 'left') return key.leftArrow;
-  if (primary === 'right') return key.rightArrow;
-  if (primary === 'space') return input === ' ';
-  return input.toLowerCase() === primary;
+  return matchesChord(chord, toInkKeyEvent(input, key));
 }
 
 const INK_TEXTBUFFER_VIEWPORT_HEIGHT = 10;
@@ -523,7 +587,9 @@ export function getTextBufferCursorOffset(buffer: TextBuffer): number {
   return offset + Array.from(cursorLine).slice(0, col).join('').length;
 }
 
-const COMPOSER_TRIGGER_CHARS = new Set(['/', '@', '$', '!', '#']);
+const COMPOSER_TRIGGER_CHARS = new Set(['/', '@', '$', '!', '#', ':']);
+/** How often a `$` typed before skills loaded is re-checked while they stay absent. */
+const SKILL_RECHECK_INTERVAL_MS = 250;
 const INVISIBLE_OR_WHITESPACE_RE = /[\s\u200B-\u200D\uFEFF]/u;
 
 function compactComposerTriggerText(text: string): string {
@@ -652,12 +718,17 @@ export function clearInkComposerInputForSubmit(
   options.onInputChange?.('');
 }
 
+export function isShiftEnterKey(input: string, key: InkKey): boolean {
+  return (key.return && key.shift === true) || isShiftEnterResidualSequence(input);
+}
+
 export function handleInkTextBufferInput(
   buffer: TextBuffer,
   input: string,
-  key: InkKey
+  key: InkKey,
+  keybindings: ResolvedKeybindings = DEFAULT_KEYBINDINGS,
 ): KeyHandlerResult {
-  if (isShiftEnterResidualSequence(input)) {
+  if (isShiftEnterResidualSequence(input) || keybindings.matches('newline', toInkKeyEvent(input, key))) {
     buffer.insert('\n');
     return 'handled';
   }
@@ -753,6 +824,8 @@ export function AgentUI({
   state,
   typedMessageHistory,
   onInstruction,
+  onSteer,
+  onWorkingSpinnerFrame,
   onEscape,
   onCtrlC,
   onDismissAnnouncement,
@@ -765,10 +838,16 @@ export function AgentUI({
   onEditGoalObjective,
   onInputChange,
   enableQueueInput = true,
+  enterWhileWorking = 'steer',
   onImageDetected,
   filesProvider,
   slashCommands: slashCommandProps,
   skillsProvider,
+  messageTargetsProvider,
+  peerScopes,
+  peersProvider,
+  onPeersRefresh,
+  onPeerMessage,
   workspaceRoot,
   suggestionProvider,
   lineExtensions,
@@ -777,7 +856,8 @@ export function AgentUI({
   onRemoveQueuedInstruction,
   getInteractionMode,
   onCycleInteractionMode,
-  mouseComposerCursor = true,
+  mouseComposerCursor = false,
+  keybindings = DEFAULT_KEYBINDINGS,
   taskListPosition = 'above-composer',
 }: AgentUIProps) {
   const { stdout } = useStdout();
@@ -796,6 +876,7 @@ export function AgentUI({
     col: number;
     hiddenContent: string | null;
     hiddenPastes: InkPasteState['hiddenPastes'];
+    peerMetadata: PeerInstructionMetadata;
   } | null>(null);
   useEffect(() => { void inputHistory.refresh().catch(() => {}); }, [inputHistory]);
   const [isReadingHistory, setIsReadingHistory] = useState(false);
@@ -808,8 +889,12 @@ export function AgentUI({
   );
   const [queueSelectionIndex, setQueueSelectionIndex] = useState<number | null>(null);
   const [editingQueueIndex, setEditingQueueIndex] = useState<number | null>(null);
-  const [goalSelectionIndex, setGoalSelectionIndex] = useState<number | null>(null);
+  const [goalSelectionKey, setGoalSelectionKey] = useState<string | null>(null);
   const [editingGoal, setEditingGoal] = useState<GoalEditRequest | null>(null);
+  const goalItems = useMemo(() => getEditableGoalItems(state.goalActivity), [state.goalActivity]);
+  const selectedGoalPosition = goalItems.findIndex((item) => goalTargetKey(item) === goalSelectionKey);
+  const goalSelectionIndex = selectedGoalPosition < 0 ? null : selectedGoalPosition;
+  const editedGoalUnavailable = editingGoal !== null && !goalItems.some((item) => goalTargetKey(item) === goalTargetKey(editingGoal));
   
   // File mention autocomplete state
   const [fileMentionSuggestions, setFileMentionSuggestions] = useState<FileMentionSuggestion[]>([]);
@@ -830,6 +915,11 @@ export function AgentUI({
   const [skillActiveIndex, setSkillActiveIndex] = useState(0);
   const [skillVisible, setSkillVisible] = useState(false);
   const skillStartIndexRef = useRef<number | null>(null);
+  // Message target (:) mention autocomplete state
+  const [targetSuggestions, setTargetSuggestions] = useState<MessageTargetSuggestion[]>([]);
+  const [targetActiveIndex, setTargetActiveIndex] = useState(0);
+  const [targetVisible, setTargetVisible] = useState(false);
+  const targetStartIndexRef = useRef<number | null>(null);
   const textBufferRef = useRef<TextBuffer>(
     new TextBuffer(
       getInkTextBufferViewportWidth(process.stdout.columns),
@@ -891,10 +981,14 @@ export function AgentUI({
   liveCommandsRef.current = state.liveCommands;
   const enableQueueInputRef = useRef(enableQueueInput);
   enableQueueInputRef.current = enableQueueInput;
+  const enterWhileWorkingRef = useRef(enterWhileWorking);
+  enterWhileWorkingRef.current = enterWhileWorking;
   const onEscapeRef = useRef(onEscape);
   onEscapeRef.current = onEscape;
   const onCtrlCRef = useRef(onCtrlC);
   onCtrlCRef.current = onCtrlC;
+  const keybindingsRef = useRef(keybindings);
+  keybindingsRef.current = keybindings;
   const onDismissAnnouncementRef = useRef(onDismissAnnouncement);
   onDismissAnnouncementRef.current = onDismissAnnouncement;
   const announcementRef = useRef(state.announcement);
@@ -908,6 +1002,8 @@ export function AgentUI({
   const onEditGoalObjectiveRef = useRef(onEditGoalObjective);
   onEditGoalObjectiveRef.current = onEditGoalObjective;
   const onInstructionRef = useRef(onInstruction);
+  const onSteerRef = useRef(onSteer);
+  onSteerRef.current = onSteer;
   onInstructionRef.current = onInstruction;
   const onInputChangeRef = useRef(onInputChange);
   onInputChangeRef.current = onInputChange;
@@ -921,6 +1017,8 @@ export function AgentUI({
   onCycleInteractionModeRef.current = onCycleInteractionMode;
   const queuedInstructionsRef = useRef(state.queuedInstructions);
   queuedInstructionsRef.current = state.queuedInstructions;
+  const queuedInstructionMetadataRef = useRef(state.queuedInstructionMetadata);
+  queuedInstructionMetadataRef.current = state.queuedInstructionMetadata;
   const queueSelectionIndexRef = useRef(queueSelectionIndex);
   queueSelectionIndexRef.current = queueSelectionIndex;
   const editingQueueIndexRef = useRef(editingQueueIndex);
@@ -929,8 +1027,12 @@ export function AgentUI({
   goalSelectionIndexRef.current = goalSelectionIndex;
   const editingGoalRef = useRef(editingGoal);
   editingGoalRef.current = editingGoal;
-  const goalItemsRef = useRef(getEditableGoalItems(state.goalActivity));
-  goalItemsRef.current = getEditableGoalItems(state.goalActivity);
+  const goalItemsRef = useRef(goalItems);
+  goalItemsRef.current = goalItems;
+  const setGoalSelectionIndex = useCallback((index: number | null) => {
+    const target = index === null ? undefined : goalItemsRef.current[index];
+    setGoalSelectionKey(target ? goalTargetKey(target) : null);
+  }, []);
   const goalPanelVisibleRef = useRef(state.goalPanelVisible);
   goalPanelVisibleRef.current = state.goalPanelVisible;
   const onImageDetectedRef = useRef(onImageDetected);
@@ -947,6 +1049,9 @@ export function AgentUI({
   slashSuggestionsRef.current = slashSuggestions;
   const slashActiveIndexRef = useRef(slashActiveIndex);
   slashActiveIndexRef.current = slashActiveIndex;
+  // Enter on a bare registered command runs it even while its subcommands are
+  // listed for discovery; only arrow navigation turns Enter into "accept".
+  const slashNavigatedRef = useRef(false);
   const showShortcutsRef = useRef(showShortcuts);
   showShortcutsRef.current = showShortcuts;
   const skillsProviderRef = useRef(skillsProvider);
@@ -961,6 +1066,14 @@ export function AgentUI({
   skillSuggestionsRef.current = skillSuggestions;
   const skillActiveIndexRef = useRef(skillActiveIndex);
   skillActiveIndexRef.current = skillActiveIndex;
+  const messageTargetsProviderRef = useRef(messageTargetsProvider);
+  messageTargetsProviderRef.current = messageTargetsProvider;
+  const targetVisibleRef = useRef(targetVisible);
+  targetVisibleRef.current = targetVisible;
+  const targetSuggestionsRef = useRef(targetSuggestions);
+  targetSuggestionsRef.current = targetSuggestions;
+  const targetActiveIndexRef = useRef(targetActiveIndex);
+  targetActiveIndexRef.current = targetActiveIndex;
   // The TextBuffer is the keystroke source of truth. Sync it into React and
   // the renderer owner immediately so pause/resume, submit, and external
   // status updates cannot observe a stale composer draft.
@@ -974,7 +1087,8 @@ export function AgentUI({
     pendingInputSyncRef.current = null;
     setInput(pending.text);
     setCursorOffset(pending.offset);
-    onInputChangeRef.current?.(pending.text);
+    if (peersProviderRef.current) onInputChangeRef.current?.(pending.text, pending.text ? peerComposerRef.current.snapshotMetadata() : undefined);
+    else onInputChangeRef.current?.(pending.text);
   }, []);
 
   const syncInputFromBuffer = useCallback(() => {
@@ -994,7 +1108,7 @@ export function AgentUI({
     setEditingGoal(target);
     setGoalSelectionIndex(index);
     syncInputFromBuffer();
-  }, [syncInputFromBuffer]);
+  }, [setGoalSelectionIndex, syncInputFromBuffer]);
 
   const lastColumnsRef = useRef(process.stdout.columns);
 
@@ -1011,6 +1125,7 @@ export function AgentUI({
   const dismissAutocompleteState = useCallback(() => {
     slashVisibleRef.current = false;
     slashSuggestionsRef.current = [];
+    slashNavigatedRef.current = false;
     slashStartIndexRef.current = null;
     slashFullMatchRef.current = null;
     setSlashVisible(false);
@@ -1021,6 +1136,12 @@ export function AgentUI({
     skillStartIndexRef.current = null;
     setSkillVisible(false);
     setSkillSuggestions([]);
+
+    targetVisibleRef.current = false;
+    targetSuggestionsRef.current = [];
+    targetStartIndexRef.current = null;
+    setTargetVisible(false);
+    setTargetSuggestions([]);
 
     fileMentionVisibleRef.current = false;
     fileMentionSuggestionsRef.current = [];
@@ -1062,8 +1183,13 @@ export function AgentUI({
 
       const buffer = textBufferRef.current;
       const currentText = buffer.getText();
-      if (options?.preserveExactSlashSubmit && currentText.trim() === suggestion.command) {
-        return false;
+      if (options?.preserveExactSlashSubmit) {
+        const typedCommand = currentText.trim();
+        const typedBareRegisteredCommand = !slashNavigatedRef.current
+          && (slashCommandsRef.current ?? []).some((command) => command.implemented && command.command === typedCommand);
+        if (typedCommand === suggestion.command || typedBareRegisteredCommand) {
+          return false;
+        }
       }
 
       const beforeSlash = currentText.slice(0, slashStartIndexRef.current);
@@ -1076,6 +1202,25 @@ export function AgentUI({
       setSlashSuggestions([]);
       slashStartIndexRef.current = null;
       slashFullMatchRef.current = null;
+      return true;
+    }
+
+    if (targetVisibleRef.current && targetSuggestionsRef.current.length > 0 && targetStartIndexRef.current !== null) {
+      const suggestion = targetSuggestionsRef.current[targetActiveIndexRef.current];
+      if (!suggestion) {
+        return false;
+      }
+
+      const buffer = textBufferRef.current;
+      const currentText = buffer.getText();
+      const beforeMention = currentText.slice(0, targetStartIndexRef.current);
+      const afterCursor = currentText.slice(getTextBufferCursorOffset(buffer));
+      buffer.setText(`${beforeMention}${suggestion.alias} ${afterCursor}`);
+      syncInputFromBuffer();
+
+      setTargetVisible(false);
+      setTargetSuggestions([]);
+      targetStartIndexRef.current = null;
       return true;
     }
 
@@ -1154,7 +1299,8 @@ export function AgentUI({
 
   // Sync input changes to parent for preservation across pause/resume
   useEffect(() => {
-    onInputChange?.(input);
+    if (peersProviderRef.current) onInputChange?.(input, input ? peerComposerRef.current.snapshotMetadata() : undefined);
+    else onInputChange?.(input);
   }, [input, onInputChange]);
 
   // Sync viewport on every render. Terminal resize flows through
@@ -1195,22 +1341,10 @@ export function AgentUI({
   }, [state.queuedInstructions.length]);
 
   useEffect(() => {
-    const goalItems = getEditableGoalItems(state.goalActivity);
-    const goalCount = goalItems.length;
-    setGoalSelectionIndex((current) => {
-      if (current === null || goalCount === 0) {
-        return null;
-      }
-      return Math.min(current, goalCount - 1);
-    });
-    const activeEdit = editingGoalRef.current;
-    if (activeEdit && !goalItems.some((item) => (
-      item.id === activeEdit.id && item.kind === activeEdit.kind
-    ))) {
-      editingGoalRef.current = null;
-      setEditingGoal(null);
+    if (goalSelectionKey !== null && !goalItems.some((item) => goalTargetKey(item) === goalSelectionKey)) {
+      setGoalSelectionKey(null);
     }
-  }, [state.goalActivity]);
+  }, [goalItems, goalSelectionKey]);
 
   // Reset ctrl+c count after 2 seconds
   useEffect(() => {
@@ -1271,6 +1405,27 @@ export function AgentUI({
       }
     };
   }, [input, onImageDetected, syncInputFromBuffer]);
+
+  const peerComposer = usePeerComposer({
+    initialMetadata: state.peerInputMetadata,
+    peerScopes, peersProvider, onPeersRefresh, onPeerMessage, onInstruction,
+    read: () => ({ text: textBufferRef.current.getText(), cursor: getTextBufferCursorOffset(textBufferRef.current) }),
+    replace: (text, cursor) => {
+      const buffer = textBufferRef.current;
+      buffer.setText(text);
+      const prefix = text.slice(0, cursor).split('\n');
+      buffer.setCursorPosition(prefix.length - 1, prefix.at(-1)?.length ?? 0);
+      if (!text) clearInkHiddenPastes(pasteStateRef.current);
+      syncInputFromBuffer();
+    },
+    onSubmitted: (text, metadata) => { void inputHistory.record(text, workspaceRootRef.current ?? process.cwd(), metadata).catch(() => {}); },
+  });
+  const peerComposerRef = useRef(peerComposer);
+  peerComposerRef.current = peerComposer;
+  const peersProviderRef = useRef(peersProvider);
+  peersProviderRef.current = peersProvider;
+  useEffect(() => { peerComposer.update(input, cursorOffset); }, [input, cursorOffset, peersProvider, state.peerDirectoryVersion, peerComposer.update]);
+  useEffect(() => { if (state.peerDraft) peerComposer.applyDraft(state.peerDraft); }, [state.peerDraft, peerComposer.applyDraft]);
 
   // Update file mention suggestions when input changes
   useEffect(() => {
@@ -1380,6 +1535,16 @@ export function AgentUI({
     setSlashActiveIndex(prev => Math.min(prev, suggestions.length - 1));
   }, [input, cursorOffset]);
 
+  // A `$` typed before the skills registry has loaded finds nothing; re-check
+  // the pending mention for a while so the dropdown appears once skills arrive.
+  const [skillRecheckTick, setSkillRecheckTick] = useState(0);
+  const skillRecheckRef = useRef<{ timer?: ReturnType<typeof setTimeout> }>({});
+  const clearSkillRecheck = useCallback(() => {
+    if (skillRecheckRef.current.timer) clearTimeout(skillRecheckRef.current.timer);
+    skillRecheckRef.current = {};
+  }, []);
+  useEffect(() => clearSkillRecheck, [clearSkillRecheck]);
+
   // Update skill ($) mention suggestions when input changes
   useEffect(() => {
     if (historyNavigationRef.current) return;
@@ -1400,6 +1565,7 @@ export function AgentUI({
 
     const mention = matchSkillMention(input, cursorOffset);
     if (!mention) {
+      clearSkillRecheck();
       if (skillVisibleRef.current) {
         setSkillVisible(false);
         setSkillSuggestions([]);
@@ -1415,13 +1581,61 @@ export function AgentUI({
         setSkillSuggestions([]);
         skillStartIndexRef.current = null;
       }
+      // Keep polling while the registry is still empty; the timer is cleared as
+      // soon as the mention goes away or suggestions appear.
+      if (provider().length === 0 && !skillRecheckRef.current.timer) {
+        skillRecheckRef.current.timer = setTimeout(() => {
+          skillRecheckRef.current.timer = undefined;
+          setSkillRecheckTick((tick) => tick + 1);
+        }, SKILL_RECHECK_INTERVAL_MS);
+      }
       return;
     }
 
+    clearSkillRecheck();
     skillStartIndexRef.current = mention.startIndex;
     setSkillSuggestions(suggestions);
     setSkillVisible(true);
     setSkillActiveIndex(prev => Math.min(prev, suggestions.length - 1));
+  }, [input, cursorOffset, skillRecheckTick, clearSkillRecheck]);
+
+  // Update message target (:) suggestions when input changes
+  useEffect(() => {
+    if (historyNavigationRef.current) return;
+    const provider = messageTargetsProviderRef.current;
+    const hide = () => {
+      if (targetVisibleRef.current) {
+        setTargetVisible(false);
+        setTargetSuggestions([]);
+        targetStartIndexRef.current = null;
+      }
+    };
+    if (!provider) {
+      hide();
+      return;
+    }
+
+    const buffer = textBufferRef.current;
+    if (input !== buffer.getText() || cursorOffset !== getTextBufferCursorOffset(buffer)) {
+      return;
+    }
+
+    const mention = matchTargetMention(input, cursorOffset);
+    if (!mention) {
+      hide();
+      return;
+    }
+
+    const suggestions = buildTargetSuggestions(mention.seed, provider());
+    if (suggestions.length === 0) {
+      hide();
+      return;
+    }
+
+    targetStartIndexRef.current = mention.startIndex;
+    setTargetSuggestions(suggestions);
+    setTargetVisible(true);
+    setTargetActiveIndex(prev => Math.min(prev, suggestions.length - 1));
   }, [input, cursorOffset]);
 
   // Stable input handler that reads mutable values from refs.
@@ -1429,6 +1643,8 @@ export function AgentUI({
   // a major source of flicker during rapid keystrokes.
   const handleInput = useCallback((char: string, key: InkKey) => {
     syncBufferViewport();
+    const keyEvent = toInkKeyEvent(char, key);
+    const activeKeybindings = keybindingsRef.current;
 
     if (mouseComposerCursor) {
       const mouseInput = parseSgrMouseInput(char);
@@ -1537,26 +1753,29 @@ export function AgentUI({
       return;
     }
 
-    if (isTeamViewShortcut(char, key)) {
+    if (activeKeybindings.matches('toggleTeamPanel', keyEvent)) {
       onToggleTeamPanelRef.current?.();
       return;
     }
 
-    if (isGoalViewShortcut(char, key)) {
+    if (activeKeybindings.matches('toggleGoals', keyEvent)) {
       onToggleGoalPanelRef.current?.();
       return;
     }
 
+    const reservedChords = activeKeybindings.reservedChords();
     const extensionKeybinding = extensionKeybindingsRef.current.find((binding) =>
-      matchesExtensionKeybinding(char, key, binding)
+      matchesExtensionKeybinding(char, key, binding, reservedChords)
       && (binding.when === 'always' || textBufferRef.current.getText().trim().length === 0));
     if (extensionKeybinding) {
       onInstructionRef.current(extensionKeybinding.command);
       return;
     }
 
-    // Handle Shift+Tab for interaction mode cycling
-    if (key.tab && key.shift) {
+    if (peerComposerRef.current.handleKey(key)) return;
+
+    // Cycle the interaction mode (Shift+Tab in every profile)
+    if (activeKeybindings.matches('cycleMode', keyEvent)) {
       const cycleInteractionMode = onCycleInteractionModeRef.current;
       if (cycleInteractionMode) {
         setInteractionMode(cycleInteractionMode());
@@ -1571,7 +1790,7 @@ export function AgentUI({
     // Handle escape - cancel current operation
     if (key.escape) {
       // Close any open dropdowns/menus first before calling onEscape
-      if (slashVisibleRef.current || skillVisibleRef.current || fileMentionVisibleRef.current) {
+      if (slashVisibleRef.current || skillVisibleRef.current || targetVisibleRef.current || fileMentionVisibleRef.current) {
         dismissAutocompleteState();
         if (clearBareComposerTrigger(textBufferRef.current)) {
           syncInputFromBuffer();
@@ -1654,8 +1873,22 @@ export function AgentUI({
       return;
     }
 
-    if (key.ctrl && char === 'o' && liveCommandsRef.current.length > 0) {
+    if (activeKeybindings.matches('toggleLiveOutput', keyEvent) && liveCommandsRef.current.length > 0) {
       onToggleLiveCommandExpandedRef.current?.();
+      return;
+    }
+
+    // Profile-only chords: an exit key on an empty composer takes the same path
+    // as the second Ctrl+C, and a history key opens the typed-message history.
+    if (activeKeybindings.matches('exit', keyEvent)) {
+      if (textBufferRef.current.getText().length === 0) {
+        setImmediate(() => onCtrlCRef.current());
+      }
+      return;
+    }
+
+    if (activeKeybindings.matches('openHistory', keyEvent)) {
+      onInstructionRef.current('/whatityped');
       return;
     }
 
@@ -1737,6 +1970,7 @@ export function AgentUI({
       const selectedInstruction = queuedInstructionsRef.current[selectedQueueIndex];
       if (selectedInstruction !== undefined) {
         textBufferRef.current.setText(selectedInstruction);
+        peerComposerRef.current.restoreMetadata(queuedInstructionMetadataRef.current?.[selectedQueueIndex]);
         editingQueueIndexRef.current = selectedQueueIndex;
         setEditingQueueIndex(selectedQueueIndex);
         syncInputFromBuffer();
@@ -1749,14 +1983,29 @@ export function AgentUI({
     // Priority: slash > skill > file mention > shell (only one is ever visible)
     if (slashVisibleRef.current && slashSuggestionsRef.current.length > 0) {
       if (key.upArrow) {
+        slashNavigatedRef.current = true;
         setSlashActiveIndex(prev =>
           prev > 0 ? prev - 1 : slashSuggestionsRef.current.length - 1
         );
         return;
       }
       if (key.downArrow) {
+        slashNavigatedRef.current = true;
         setSlashActiveIndex(prev =>
           prev < slashSuggestionsRef.current.length - 1 ? prev + 1 : 0
+        );
+        return;
+      }
+    } else if (targetVisibleRef.current && targetSuggestionsRef.current.length > 0) {
+      if (key.upArrow) {
+        setTargetActiveIndex(prev =>
+          prev > 0 ? prev - 1 : targetSuggestionsRef.current.length - 1
+        );
+        return;
+      }
+      if (key.downArrow) {
+        setTargetActiveIndex(prev =>
+          prev < targetSuggestionsRef.current.length - 1 ? prev + 1 : 0
         );
         return;
       }
@@ -1799,6 +2048,7 @@ export function AgentUI({
           row: buffer.getCursorRow(), col: buffer.getCursorCol(),
           hiddenContent: pasteStateRef.current.hiddenContent,
           hiddenPastes: [...(pasteStateRef.current.hiddenPastes ?? [])],
+          peerMetadata: peerComposerRef.current.snapshotMetadata(),
         };
         historyNavigationRef.current = navigation;
       }
@@ -1812,9 +2062,11 @@ export function AgentUI({
           buffer.setCursor(navigation.row, navigation.col);
           pasteStateRef.current.hiddenContent = navigation.hiddenContent;
           pasteStateRef.current.hiddenPastes = navigation.hiddenPastes;
+          peerComposerRef.current.restoreMetadata(navigation.peerMetadata);
           historyNavigationRef.current = null;
         } else {
           buffer.setText(navigation.entries[navigation.index].text);
+          peerComposerRef.current.restoreMetadata(navigation.entries[navigation.index]);
         }
         dismissAutocompleteState();
         syncInputFromBuffer();
@@ -1892,8 +2144,8 @@ export function AgentUI({
       }
     }
 
-    // ── Toggle shortcut help on '?' when input is empty ──
-    if (char === '?' && !key.ctrl && !key.meta && !key.shift) {
+    // ── Toggle shortcut help on the profile's help chord when input is empty ──
+    if (activeKeybindings.matches('toggleShortcutsHelp', keyEvent)) {
       const currentText = textBufferRef.current.getText();
       if (currentText.trim() === '' || currentText.trim() === '?') {
         if (currentText.trim() === '?') {
@@ -1917,7 +2169,33 @@ export function AgentUI({
 
     const buffer = textBufferRef.current;
     const textBeforeKey = buffer.getText();
-    const result = handleInkTextBufferInput(buffer, char, key);
+    // While a turn runs, Enter and Shift+Enter split between steering the
+    // turn and queueing for after it; ui.enterWhileWorking decides which is
+    // which. When idle Shift+Enter still inserts a newline.
+    let submitChar = char;
+    let submitKey = key;
+    // Shell, slash, and :alias inputs skip this split and run at once.
+    if (isWorkingRef.current && enableQueueInputRef.current && onSteerRef.current && textBeforeKey.trim().length > 0 && canSteerComposerInput(textBeforeKey)) {
+      const shiftEnter = isShiftEnterKey(char, key);
+      const plainEnter = !shiftEnter && key.return === true && !key.meta && !key.ctrl;
+      const steerKey = enterWhileWorkingRef.current === 'queue' ? shiftEnter : plainEnter;
+      if (steerKey) {
+        const steered = textBeforeKey;
+        buffer.setText('');
+        clearInkHiddenPastes(pasteStateRef.current);
+        dismissAutocompleteState();
+        syncInputFromBuffer();
+        setCtrlCCount(0);
+        onSteerRef.current(steered);
+        return;
+      }
+      if (enterWhileWorkingRef.current !== 'queue' && shiftEnter) {
+        // Shift+Enter queues: hand the buffer a plain Enter so the submit path runs.
+        submitChar = '\r';
+        submitKey = { ...key, return: true, shift: false, meta: false };
+      }
+    }
+    const result = handleInkTextBufferInput(buffer, submitChar, submitKey, activeKeybindings);
     if (buffer.getText() !== textBeforeKey) historyNavigationRef.current = null;
 
     if (result === 'submit') {
@@ -1931,6 +2209,7 @@ export function AgentUI({
       const goalEdit = editingGoalRef.current;
 
       if (goalEdit !== null) {
+        if (!goalItemsRef.current.some((item) => goalTargetKey(item) === goalTargetKey(goalEdit))) return;
         clearInkComposerInputForSubmit(buffer, pasteState, {
           setInput,
           setCursorOffset,
@@ -1958,6 +2237,18 @@ export function AgentUI({
       const editingIndex = editingQueueIndexRef.current;
 
       if (editingIndex !== null) {
+        if (text && peerComposerRef.current.submit(text, {
+          onInstruction: (value, metadata) => onReplaceQueuedInstructionRef.current?.(editingIndex, value, metadata),
+          onAccepted: kind => {
+            if (kind === 'direct') onRemoveQueuedInstructionRef.current?.(editingIndex);
+            if (editingQueueIndexRef.current !== editingIndex) return;
+            dismissAutocompleteState();
+            queueSelectionIndexRef.current = null;
+            editingQueueIndexRef.current = null;
+            setQueueSelectionIndex(null);
+            setEditingQueueIndex(null);
+          },
+        })) return;
         clearInkComposerInputForSubmit(buffer, pasteState, {
           setInput,
           setCursorOffset,
@@ -1987,6 +2278,7 @@ export function AgentUI({
       if (!text) {
         return;
       }
+      if (peerComposerRef.current.submit(text)) return;
       clearInkComposerInputForSubmit(buffer, pasteState, {
         setInput,
         setCursorOffset,
@@ -2013,6 +2305,7 @@ export function AgentUI({
       // before React effects have run the derived suggestion pass.
       const currentText = buffer.getText();
       const currentOffset = getTextBufferCursorOffset(buffer);
+      peerComposerRef.current.update(currentText, currentOffset);
       if (currentText.trim() === '') {
         dismissAutocompleteState();
         return;
@@ -2049,6 +2342,7 @@ export function AgentUI({
 
       // Immediate slash command detection (same pattern as file mentions)
       const cmds = slashCommandsRef.current;
+      slashNavigatedRef.current = false;
       if (cmds && cmds.length > 0) {
         const trimmed = currentText.replace(/^\s+/, '');
         if (trimmed.startsWith('/')) {
@@ -2136,6 +2430,30 @@ export function AgentUI({
           setSkillSuggestions([]);
         }
       }
+
+      const targetProvider = messageTargetsProviderRef.current;
+      if (targetProvider) {
+        const hideTargets = () => {
+          targetVisibleRef.current = false;
+          targetSuggestionsRef.current = [];
+          targetStartIndexRef.current = null;
+          setTargetVisible(false);
+          setTargetSuggestions([]);
+        };
+        const targetMention = matchTargetMention(currentText, currentOffset);
+        const targetSuggs = targetMention ? buildTargetSuggestions(targetMention.seed, targetProvider()) : [];
+        if (targetMention && targetSuggs.length > 0) {
+          targetStartIndexRef.current = targetMention.startIndex;
+          targetSuggestionsRef.current = targetSuggs;
+          targetVisibleRef.current = true;
+          targetActiveIndexRef.current = Math.min(targetActiveIndexRef.current, targetSuggs.length - 1);
+          setTargetSuggestions(targetSuggs);
+          setTargetVisible(true);
+          setTargetActiveIndex(prev => Math.min(prev, targetSuggs.length - 1));
+        } else if (targetVisibleRef.current) {
+          hideTargets();
+        }
+      }
       return;
     }
   }, [
@@ -2174,7 +2492,7 @@ export function AgentUI({
   // Memoize tool outputs to prevent unnecessary re-renders
   // Static items use the entry id as key and never re-render
   const toolOutputItems = useMemo(() =>
-    state.toolOutputs.slice(-50), // Limit to last 50 for performance
+    state.toolOutputs.slice(-MAX_TOOL_OUTPUT_ENTRIES),
     [state.toolOutputs]
   );
   const liveCommandItems = useMemo(() =>
@@ -2274,10 +2592,6 @@ export function AgentUI({
       message.role === 'assistant' && message.content === finalResponse
     );
   }, [state.chatMessages, state.finalResponse, state.isWorking]);
-  const chatIncludesCompletion = useMemo(() =>
-    state.chatMessages.some((message) => message.role === 'completion'),
-    [state.chatMessages]
-  );
 
   // Compute border style to match readline/terminal regions behavior
   const inputBorderStyle: InputBorderStyle = (() => {
@@ -2326,11 +2640,14 @@ export function AgentUI({
       {/* Dynamic content section */}
       <DynamicContent
         thinking={state.thinking}
+        streamingResponse={state.streamingResponse}
         finalResponse={chatIncludesFinalResponse ? null : state.finalResponse}
         isWorking={state.isWorking}
       />
 
       <NotificationStack notifications={state.notifications} />
+
+      {editedGoalUnavailable ? <Text color={colors.warning}>Goal is unavailable. Draft kept; Esc cancels.</Text> : null}
 
       {/* Fixed bottom section - always renders for layout stability */}
       {state.agentRunsPanelVisible ? (
@@ -2345,7 +2662,9 @@ export function AgentUI({
           onCtrlC={onCtrlC}
         />
       ) : <FixedBottom
+        onWorkingSpinnerFrame={onWorkingSpinnerFrame}
         announcement={state.announcement}
+        tip={state.tip}
         terminalColumns={windowSize.columns ?? process.stdout.columns ?? 80}
         terminalRows={windowSize.rows}
         isWorking={state.isWorking}
@@ -2354,7 +2673,11 @@ export function AgentUI({
         tokens={state.tokens}
         queuedInstructions={state.queuedInstructions}
         selectedQueueIndex={queueSelectionIndex}
-        completionStats={chatIncludesCompletion ? null : state.completionStats}
+        completionStats={
+          // The renderer archives a summary into the transcript and clears this
+          // in the same update, so every finished turn keeps its own row.
+          state.completionStats
+        }
         activityItems={state.activityItems ?? []}
         teamActivity={state.teamActivity}
         teamPanelVisible={state.teamPanelVisible}
@@ -2379,14 +2702,22 @@ export function AgentUI({
           <FileMentionDropdown
             suggestions={fileMentionSuggestions}
             activeIndex={fileMentionActiveIndex}
-            visible={fileMentionVisible && !state.isWorking}
+            visible={fileMentionVisible && enableQueueInput}
           />
         }
+        peerMentionDropdown={<PeerMentionDropdown {...peerComposer.view} />}
         skillMentionDropdown={
           <SkillMentionDropdown
             suggestions={skillSuggestions}
             activeIndex={skillActiveIndex}
-            visible={skillVisible && !state.isWorking}
+            visible={skillVisible && enableQueueInput}
+          />
+        }
+        messageTargetDropdown={
+          <MessageTargetDropdown
+            suggestions={targetSuggestions}
+            activeIndex={targetActiveIndex}
+            visible={targetVisible}
           />
         }
         slashCommandDropdown={
@@ -2401,6 +2732,7 @@ export function AgentUI({
         nextPromptSuggestion={composerNextPromptSuggestion}
         inlineGhostSuffix={composerInlineGhostSuffix}
         mouseComposerCursor={mouseComposerCursor}
+        keybindings={keybindings}
         isReadingHistory={isReadingHistory}
         enableMouseTargetControls={mouseComposerCursor && (
           liveCommandItems.length > 0
@@ -2424,12 +2756,14 @@ export function AgentUI({
 interface DynamicContentProps {
   thinking: string | null;
   finalResponse: string | null;
+  streamingResponse?: string | null;
   isWorking: boolean;
 }
 
 const DynamicContent = memo(function DynamicContent({
   thinking,
   finalResponse,
+  streamingResponse,
   isWorking
 }: DynamicContentProps) {
   // Parse final response to detect SITREP sections
@@ -2457,15 +2791,19 @@ const DynamicContent = memo(function DynamicContent({
 
   return (
     <>
-      {/* Thinking output */}
-      <ThinkingOutput thought={isWorking ? thinking : null} />
+      {/* Thinking output: a final-turn thought stays above its reply while idle */}
+      <ThinkingOutput thought={thinking} />
+
+      {isWorking && streamingResponse && (
+        <Box marginTop={1}><Text wrap="truncate-end">{streamingResponse}</Text></Box>
+      )}
 
       {/* Final response (when not working) */}
       {content && (
         <>
           {content.before && (
             <Box marginTop={1}>
-              <MarkdownDiffContent content={content.before} />
+              <MarkdownDiffContent content={content.before} markdown />
             </Box>
           )}
           {content.sitrep && (
@@ -2479,7 +2817,7 @@ const DynamicContent = memo(function DynamicContent({
           )}
           {content.after && (
             <Box marginTop={1}>
-              <MarkdownDiffContent content={content.after} />
+              <MarkdownDiffContent content={content.after} markdown />
             </Box>
           )}
         </>
@@ -2489,6 +2827,7 @@ const DynamicContent = memo(function DynamicContent({
 }, (prev, next) => {
   return prev.thinking === next.thinking &&
          prev.finalResponse === next.finalResponse &&
+         prev.streamingResponse === next.streamingResponse &&
          prev.isWorking === next.isWorking;
 });
 
@@ -2543,13 +2882,17 @@ const ChatHistoryMessage = memo(function ChatHistoryMessage({
     return <CompletionHistoryMessage content={message.content} />;
   }
 
+  if (message.role === 'thinking') {
+    return <ThinkingHistoryMessage content={message.content} />;
+  }
+
   if (message.role === 'notification') {
     return <NotificationHistoryMessage content={message.content} />;
   }
 
   return (
     <Box marginTop={1}>
-      <MarkdownDiffContent content={message.content} />
+      <MarkdownDiffContent content={message.content} markdown />
     </Box>
   );
 });
@@ -2574,22 +2917,29 @@ const ToolCallHistoryMessage = memo(function ToolCallHistoryMessage({
 
 const MarkdownDiffContent = memo(function MarkdownDiffContent({
   content,
+  markdown = false,
 }: {
   content: string;
+  /** Assistant text: render as terminal markdown when `ui.renderMarkdown` is on. */
+  markdown?: boolean;
 }) {
   const segments = useMemo(() => splitMarkdownDiffFences(content), [content]);
 
   return (
     <Box flexDirection="column">
-      {segments.map((segment, index) => (
-        segment.type === 'diff'
-          ? <ThemedDiffOutput key={`diff-${index}`} output={segment.content} />
-          : (
-            <Text key={`text-${index}`}>
-              {renderTerminalMarkdown(segment.content.trim())}
-            </Text>
-          )
-      ))}
+      {segments.map((segment, index) => {
+        if (segment.type === 'diff') {
+          return <ThemedDiffOutput key={`diff-${index}`} output={segment.content} />;
+        }
+        if (markdown) {
+          return <MarkdownText key={`text-${index}`} content={segment.content.trim()} />;
+        }
+        return (
+          <Text key={`text-${index}`}>
+            {renderTerminalMarkdown(segment.content.trim())}
+          </Text>
+        );
+      })}
     </Box>
   );
 });
@@ -2612,7 +2962,7 @@ const NotificationStack = memo(function NotificationStack({
 }: {
   notifications: string[];
 }) {
-  const recentNotifications = notifications.slice(-3);
+  const recentNotifications = notifications.slice(-MAX_VISIBLE_NOTIFICATIONS);
   if (recentNotifications.length === 0) {
     return null;
   }
@@ -2625,6 +2975,20 @@ const NotificationStack = memo(function NotificationStack({
     </Box>
   );
 }, (prev, next) => prev.notifications === next.notifications);
+
+const ThinkingHistoryMessage = memo(function ThinkingHistoryMessage({
+  content,
+}: {
+  content: string;
+}) {
+  const { colors } = useTheme();
+  const { t } = useTranslation();
+  return (
+    <Box marginTop={1}>
+      <Text color={colors.dim} dimColor>{t('ui.thinking')}: {content}</Text>
+    </Box>
+  );
+});
 
 const CompletionHistoryMessage = memo(function CompletionHistoryMessage({
   content,
@@ -2645,6 +3009,7 @@ const CompletionHistoryMessage = memo(function CompletionHistoryMessage({
  */
 interface StatusSectionProps {
   terminalRows?: number;
+  onWorkingSpinnerFrame?: (frame: number) => void;
   isWorking: boolean;
   status: string;
   elapsed: string;
@@ -2670,6 +3035,8 @@ interface StatusSectionProps {
   modeDescription?: string;
   taskListPosition: TaskListPosition;
   lineExtension?: LineExtension;
+  tip?: TipLineState;
+  columns: number;
 }
 
 interface QueuedInstructionsPanelProps {
@@ -2743,6 +3110,7 @@ const CommandResultPanel = memo(function CommandResultPanel({
 
 const StatusSection = memo(function StatusSection({
   terminalRows,
+  onWorkingSpinnerFrame,
   isWorking,
   status,
   elapsed,
@@ -2766,6 +3134,8 @@ const StatusSection = memo(function StatusSection({
   modeDescription,
   taskListPosition,
   lineExtension,
+  tip,
+  columns,
 }: StatusSectionProps) {
   const { colors } = useTheme();
 
@@ -2793,7 +3163,9 @@ const StatusSection = memo(function StatusSection({
         model={model}
         teamActivity={teamActivity}
         lineExtension={lineExtension}
+        onSpinnerFrame={onWorkingSpinnerFrame}
       />
+      <TipLine tip={tip} columns={columns} />
 
       {/* Keep interactive panels adjacent to the status line, before the composer. */}
       {commandResult && <CommandResultPanel commandResult={commandResult} />}
@@ -2828,13 +3200,11 @@ const StatusSection = memo(function StatusSection({
           selectedQueueIndex={selectedQueueIndex}
         />
       )}
-      {showCompletionStats && (
-        <Box marginTop={1}>
-          <Text color={colors.muted}>
-            {completionStats.status === 'failed' ? 'Failed' : 'Completed'} in {completionStats.elapsed} · {completionStats.tokens}
-          </Text>
-        </Box>
-      )}
+      <IdleTipRow
+        summary={showCompletionStats ? formatCompletionSummary(showCompletionStats) : undefined}
+        tip={!isWorking && tip?.kind === 'tip' ? tip.text : undefined}
+        columns={columns}
+      />
     </>
   );
 }, (prev, next) => {
@@ -2865,6 +3235,8 @@ const StatusSection = memo(function StatusSection({
          prev.model === next.model &&
          prev.modeIndicator === next.modeIndicator &&
          prev.modeDescription === next.modeDescription &&
+         prev.tip === next.tip &&
+         prev.columns === next.columns &&
          prev.taskListPosition === next.taskListPosition &&
          prev.lineExtension === next.lineExtension;
 });
@@ -2952,6 +3324,8 @@ interface HelpLineSectionProps {
   lineExtension?: LineExtension;
   interactionMode?: InteractionMode;
   showModeLabel?: boolean;
+  /** Row width; the composer reserves the last terminal column and so must this line. */
+  width?: number;
 }
 
 const HelpLineSection = memo(function HelpLineSection({
@@ -2964,6 +3338,7 @@ const HelpLineSection = memo(function HelpLineSection({
   lineExtension,
   interactionMode = 'default',
   showModeLabel = true,
+  width,
 }: HelpLineSectionProps) {
   const { colors } = useTheme();
   const { t } = useTranslation();
@@ -2985,9 +3360,11 @@ const HelpLineSection = memo(function HelpLineSection({
     ? getInteractionModeLabel(interactionMode)
     : '';
   return (
-    <Box>
+    <Box width={width}>
       {glyphColor ? (
-        <Text>{colorizeGlyphText(glyphColor, modeLabel ? `● ${modeLabel} ` : '● ')}</Text>
+        <Box flexShrink={0}>
+          <Text>{colorizeGlyphText(glyphColor, modeLabel ? `● ${modeLabel} ` : '● ')}</Text>
+        </Box>
       ) : null}
       <Text color={colors.dim}>
         {getComposerHelpLine(isWorking, providerDisplay, contextDisplay, t('ui.commandHint'), lineExtension)}
@@ -3004,6 +3381,7 @@ const HelpLineSection = memo(function HelpLineSection({
          prev.planLabel === next.planLabel &&
          prev.interactionMode === next.interactionMode &&
          prev.showModeLabel === next.showModeLabel &&
+         prev.width === next.width &&
          prev.lineExtension === next.lineExtension;
 });
 
@@ -3078,21 +3456,34 @@ const SlashCommandWrapper = memo(function SlashCommandWrapper({
  */
 interface SkillMentionWrapperProps {
   skillMentionDropdown?: React.ReactNode;
+  messageTargetDropdown?: React.ReactNode;
 }
 
 const SkillMentionWrapper = memo(function SkillMentionWrapper({
   skillMentionDropdown,
+  messageTargetDropdown,
 }: SkillMentionWrapperProps) {
   return skillMentionDropdown ?? null;
 }, (prev, next) => {
   return prev.skillMentionDropdown === next.skillMentionDropdown;
 });
 
+interface MessageTargetWrapperProps {
+  messageTargetDropdown?: React.ReactNode;
+}
+
+const MessageTargetWrapper = memo(function MessageTargetWrapper({
+  messageTargetDropdown,
+}: MessageTargetWrapperProps) {
+  return messageTargetDropdown ?? null;
+}, (prev, next) => prev.messageTargetDropdown === next.messageTargetDropdown);
+
 /**
  * Fixed bottom section - status line, queue, input
  * Split into StatusSection and InputSection for better memoization
  */
 interface FixedBottomProps {
+  onWorkingSpinnerFrame?: (frame: number) => void;
   announcement?: AnnouncementLineState;
   terminalColumns: number;
   terminalRows?: number;
@@ -3111,6 +3502,7 @@ interface FixedBottomProps {
   selectedGoalIndex: number | null;
   onGoalRowLayoutChange?: (target: GoalEditRequest, layout: OutputLayout | null) => void;
   commandResult?: CommandResultState;
+  tip?: TipLineState;
   enableQueueInput: boolean;
   input: string;
   cursorOffset: number;
@@ -3124,8 +3516,10 @@ interface FixedBottomProps {
   configuredLineExtensions?: AgentUILineExtensions;
   runtimeLineExtensions?: AgentUILineExtensions;
   fileMentionDropdown?: React.ReactNode;
+  peerMentionDropdown?: React.ReactNode;
   slashCommandDropdown?: React.ReactNode;
   skillMentionDropdown?: React.ReactNode;
+  messageTargetDropdown?: React.ReactNode;
   /** Terminal width for InputLine */
   inputWidth: number;
   /** Border style for the input box */
@@ -3140,6 +3534,7 @@ interface FixedBottomProps {
   onComposerLayoutChange?: (layout: ComposerOutputLayout | null) => void;
   /** Whether the shortcuts help panel is visible */
   showShortcuts: boolean;
+  keybindings: ResolvedKeybindings;
   /** Current mutually-exclusive editing interaction mode, rendered as a colored glyph. */
   interactionMode?: InteractionMode;
   /** Whether to show the mode word (PLAN/YOLO/AUTO) next to the glyph. */
@@ -3204,6 +3599,7 @@ function useUserDrivenComposerCursor(
 }
 
 const FixedBottom = memo(function FixedBottom({
+  onWorkingSpinnerFrame,
   announcement,
   terminalColumns,
   terminalRows,
@@ -3222,6 +3618,7 @@ const FixedBottom = memo(function FixedBottom({
   selectedGoalIndex,
   onGoalRowLayoutChange,
   commandResult,
+  tip,
   enableQueueInput,
   input,
   cursorOffset,
@@ -3235,8 +3632,10 @@ const FixedBottom = memo(function FixedBottom({
   configuredLineExtensions,
   runtimeLineExtensions,
   fileMentionDropdown,
+  peerMentionDropdown,
   slashCommandDropdown,
   skillMentionDropdown,
+  messageTargetDropdown,
   inputWidth,
   borderStyle,
   placeholderText,
@@ -3247,6 +3646,7 @@ const FixedBottom = memo(function FixedBottom({
   enableMouseTargetControls,
   onComposerLayoutChange,
   showShortcuts,
+  keybindings,
   interactionMode,
   showModeLabel,
   modeIndicator,
@@ -3267,6 +3667,7 @@ const FixedBottom = memo(function FixedBottom({
       ) : null}
       <StatusSection
         terminalRows={terminalRows}
+        onWorkingSpinnerFrame={onWorkingSpinnerFrame}
         isWorking={isWorking}
         status={status}
         elapsed={elapsed}
@@ -3282,6 +3683,8 @@ const FixedBottom = memo(function FixedBottom({
         selectedGoalIndex={selectedGoalIndex}
         onGoalRowLayoutChange={onGoalRowLayoutChange}
         commandResult={commandResult}
+        tip={tip}
+        columns={terminalColumns}
         contextPercent={contextPercent}
         contextTokens={contextTokens}
         provider={provider}
@@ -3309,10 +3712,6 @@ const FixedBottom = memo(function FixedBottom({
         enableMouseCursor={mouseComposerCursor && !isReadingHistory}
         onLayoutChange={onComposerLayoutChange}
       />
-      <FileMentionWrapper fileMentionDropdown={fileMentionDropdown} />
-      <SlashCommandWrapper slashCommandDropdown={slashCommandDropdown} />
-      <SkillMentionWrapper skillMentionDropdown={skillMentionDropdown} />
-      <ShortcutsHelpPanel visible={showShortcuts && !isWorking} />
       <HelpLineSection
         isWorking={isWorking}
         contextPercent={contextPercent}
@@ -3322,12 +3721,19 @@ const FixedBottom = memo(function FixedBottom({
         planLabel={planLabel}
         interactionMode={interactionMode}
         showModeLabel={showModeLabel}
+        width={inputWidth}
         lineExtension={mergeLineExtensions(
           configuredLineExtensions?.help,
           lineExtensions?.help,
           runtimeLineExtensions?.help,
         )}
       />
+      <FileMentionWrapper fileMentionDropdown={fileMentionDropdown} />
+      {peerMentionDropdown}
+      <SlashCommandWrapper slashCommandDropdown={slashCommandDropdown} />
+      <SkillMentionWrapper skillMentionDropdown={skillMentionDropdown} />
+      <MessageTargetWrapper messageTargetDropdown={messageTargetDropdown} />
+      <ShortcutsHelpPanel visible={showShortcuts && !isWorking} keybindings={keybindings} />
       <CtrlCWarning ctrlCCount={ctrlCCount} />
       <FooterClearance />
     </>
@@ -3354,6 +3760,7 @@ export function createInitialUIState(): AgentUIState {
     chatHistoryEpoch: 0,
     currentInput: '',
     finalResponse: null,
+    streamingResponse: null,
     completionStats: null,
     // Default to 100% before any tokens are consumed so the welcome helpline
     // shows "100% context left" right after startup, before the first prompt.

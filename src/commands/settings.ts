@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
-import { t } from '../i18n/index.js';
+import { resolveMouseComposerCursor } from '../ui/mouseReporting.js';
+import { KEYBINDING_PROFILE_IDS } from '../keybindings/profiles.js';
+import { getCurrentLocale, t } from '../i18n/index.js';
+import { getTheme, initTheme, isThemeInitialized, listAvailableThemes } from '../ui/theme/index.js';
+import { getDefaultThemeName } from '../ui/theme/themes.js';
 import { showModal, showInput, showConfirm, showPassword, type ModalOption } from '../ui/ink/components/Modal.js';
 import { saveConfig } from '../config.js';
 import type { BuiltInProviderName, LoadedConfig } from '../types.js';
@@ -23,9 +27,24 @@ export interface SettingDef {
   category: SettingCategory;
   type: SettingType;
   enumValues?: string[];
+  /** Enum choices that are only known at runtime (installed themes, for example). */
+  enumValuesProvider?: () => string[];
   validate?: (v: string) => boolean | string;
   defaultValue?: unknown;
+  /** The value in effect when the config key is unset, when it differs from `defaultValue`. */
+  resolveCurrent?: (config: LoadedConfig) => unknown;
+  /** Applies a saved value to the running process so the change shows without a restart. */
+  apply?: (value: unknown) => void;
   redirect?: string;
+}
+
+export function resolveSettingEnumValues(setting: SettingDef): string[] {
+  return setting.enumValuesProvider?.() ?? setting.enumValues ?? [];
+}
+
+/** The value a row shows when the config key is unset. */
+export function resolveSettingFallback(setting: SettingDef, config: LoadedConfig): unknown {
+  return setting.resolveCurrent?.(config) ?? setting.defaultValue;
 }
 
 export interface CategoryDef {
@@ -40,6 +59,8 @@ export interface SettingsCommandContext {
 const SETTING_KEY_ALIASES: Record<string, string> = {
   max_agents: 'features.multi_agent_v2.max_concurrent_threads_per_session',
   silent_tool_output: 'ui.silentToolOutput',
+  render_markdown: 'ui.renderMarkdown',
+  markdown_rendering: 'ui.renderMarkdown',
   tool_output_silent: 'ui.silentToolOutput',
   ui_silent_tool_output: 'ui.silentToolOutput',
   'task_list position': 'ui.taskListPosition',
@@ -109,20 +130,32 @@ export const SETTING_CATEGORIES: CategoryDef[] = [
 
 export const SETTINGS_REGISTRY: SettingDef[] = [
   // UI & Display
-  { key: 'ui.theme', labelKey: 'commands.settings.ui.theme', category: 'ui', type: 'string', redirect: '/theme' },
-  { key: 'ui.locale', labelKey: 'commands.settings.ui.locale', category: 'ui', type: 'string', redirect: '/language' },
+  {
+    key: 'ui.theme',
+    labelKey: 'commands.settings.ui.theme',
+    category: 'ui',
+    type: 'enum',
+    enumValuesProvider: listAvailableThemes,
+    defaultValue: getDefaultThemeName(),
+    resolveCurrent: () => (isThemeInitialized() ? getTheme().name : undefined),
+    apply: (value) => { initTheme(String(value)); },
+  },
+  { key: 'ui.locale', labelKey: 'commands.settings.ui.locale', category: 'ui', type: 'string', resolveCurrent: () => getCurrentLocale(), redirect: '/language' },
   { key: 'ui.autoConfirm', labelKey: 'commands.settings.ui.autoConfirm', descriptionKey: 'commands.settings.ui.autoConfirmDesc', category: 'ui', type: 'boolean', defaultValue: false },
   { key: 'ui.silentToolOutput', labelKey: 'commands.settings.ui.silentToolOutput', descriptionKey: 'commands.settings.ui.silentToolOutputDesc', category: 'ui', type: 'boolean', defaultValue: false },
   { key: 'ui.taskListPosition', labelKey: 'commands.settings.ui.taskListPosition', descriptionKey: 'commands.settings.ui.taskListPositionDesc', category: 'ui', type: 'enum', enumValues: ['up', 'above-composer'], defaultValue: 'above-composer' },
-  { key: 'ui.showThinking', labelKey: 'commands.settings.ui.showThinking', descriptionKey: 'commands.settings.ui.showThinkingDesc', category: 'ui', type: 'boolean', defaultValue: true },
+  { key: 'ui.showThinking', labelKey: 'commands.settings.ui.showThinking', descriptionKey: 'commands.settings.ui.showThinkingDesc', category: 'ui', type: 'boolean', defaultValue: false },
+  { key: 'ui.renderMarkdown', labelKey: 'commands.settings.ui.renderMarkdown', descriptionKey: 'commands.settings.ui.renderMarkdownDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.terminalBell', labelKey: 'commands.settings.ui.terminalBell', descriptionKey: 'commands.settings.ui.terminalBellDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.checkForUpdates', labelKey: 'commands.settings.ui.checkForUpdates', descriptionKey: 'commands.settings.ui.checkForUpdatesDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.showCompletionNotification', labelKey: 'commands.settings.ui.showCompletionNotification', descriptionKey: 'commands.settings.ui.showCompletionNotificationDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.completionReportEnabled', labelKey: 'commands.settings.ui.completionReportEnabled', descriptionKey: 'commands.settings.ui.completionReportEnabledDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.promptSuggestions', labelKey: 'commands.settings.ui.promptSuggestions', descriptionKey: 'commands.settings.ui.promptSuggestionsDesc', category: 'ui', type: 'boolean', defaultValue: true },
-  { key: 'ui.mouseComposerCursor', labelKey: 'commands.settings.ui.mouseComposerCursor', descriptionKey: 'commands.settings.ui.mouseComposerCursorDesc', category: 'ui', type: 'boolean', defaultValue: true },
+  { key: 'ui.mouseComposerCursor', labelKey: 'commands.settings.ui.mouseComposerCursor', descriptionKey: 'commands.settings.ui.mouseComposerCursorDesc', category: 'ui', type: 'boolean', defaultValue: resolveMouseComposerCursor(undefined) },
+  { key: 'ui.keybindingProfile', labelKey: 'commands.settings.ui.keybindingProfile', descriptionKey: 'commands.settings.ui.keybindingProfileDesc', category: 'ui', type: 'enum', enumValues: [...KEYBINDING_PROFILE_IDS], defaultValue: 'autohand' },
   { key: 'ui.activityVerbsEnabled', labelKey: 'commands.settings.ui.activityVerbsEnabled', descriptionKey: 'commands.settings.ui.activityVerbsEnabledDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.activitySymbol', labelKey: 'commands.settings.ui.activitySymbol', descriptionKey: 'commands.settings.ui.activitySymbolDesc', category: 'ui', type: 'string', defaultValue: '\u2733' },
+  { key: 'ui.showTips', labelKey: 'commands.settings.ui.showTips', descriptionKey: 'commands.settings.ui.showTipsDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.statusLine', labelKey: 'commands.settings.ui.statusLine', descriptionKey: 'commands.settings.ui.statusLineDesc', category: 'ui', type: 'string', redirect: '/statusline' },
   { key: 'ui.updateCheckInterval', labelKey: 'commands.settings.ui.updateCheckInterval', descriptionKey: 'commands.settings.ui.updateCheckIntervalDesc', category: 'ui', type: 'number', defaultValue: 24 },
 
@@ -276,11 +309,13 @@ export function parseSettingValue(setting: SettingDef, rawValue: string): unknow
       }
       return value;
     }
-    case 'enum':
-      if (!setting.enumValues?.includes(rawValue)) {
-        throw new Error(`Expected one of ${setting.enumValues?.join(', ') ?? '(none)'} for ${setting.key}.`);
+    case 'enum': {
+      const choices = resolveSettingEnumValues(setting);
+      if (!choices.includes(rawValue)) {
+        throw new Error(`Expected one of ${choices.length > 0 ? choices.join(', ') : '(none)'} for ${setting.key}.`);
       }
       return rawValue;
+    }
     case 'password':
     case 'string':
       return rawValue;
@@ -322,6 +357,7 @@ export function setConfigSetting(config: LoadedConfig, keyInput: string, rawValu
 
   const value = parseSettingValue(setting, rawValue);
   setNestedValue(config, setting.key, value);
+  setting.apply?.(value);
   return { key: setting.key, value };
 }
 
@@ -343,10 +379,11 @@ export function getSettingsForCategory(category: SettingCategory): SettingDef[] 
   return SETTINGS_REGISTRY.filter(s => s.category === category);
 }
 
-export function formatSettingValue(value: unknown, type: SettingType): string {
+export function formatSettingValue(value: unknown, type: SettingType, fallback?: unknown): string {
   if (value == null || value === undefined) {
     if (type === 'password') return chalk.gray('(not set)');
-    return chalk.gray('(default)');
+    if (fallback == null) return chalk.gray('(default)');
+    return `${formatSettingValue(fallback, type)} ${chalk.gray('(default)')}`;
   }
 
   switch (type) {
@@ -384,14 +421,17 @@ export async function editSetting(setting: SettingDef, config: LoadedConfig): Pr
     }
 
     case 'enum': {
-      const options: ModalOption[] = (setting.enumValues ?? []).map(v => ({
-        label: v === String(currentValue) ? `${v} (current)` : v,
+      const choices = resolveSettingEnumValues(setting);
+      const effective = String(currentValue ?? resolveSettingFallback(setting, config) ?? '');
+      // The effective value is current even when it comes from the default.
+      const options: ModalOption[] = choices.map(v => ({
+        label: v === effective ? `${v} (current)` : v,
         value: v,
       }));
       const result = await showModal({
         title: t(setting.labelKey),
         options,
-        initialIndex: setting.enumValues?.indexOf(String(currentValue ?? setting.defaultValue)) ?? 0,
+        initialIndex: Math.max(0, choices.indexOf(effective)),
       });
       if (result && result.value !== String(currentValue)) {
         setNestedValue(config, setting.key, result.value);
@@ -457,7 +497,7 @@ async function showCategorySettings(category: SettingCategory, config: LoadedCon
 
     const options: ModalOption[] = settings.map(s => {
       const value = getNestedValue(config, s.key);
-      const display = formatSettingValue(value, s.type);
+      const display = formatSettingValue(value, s.type, resolveSettingFallback(s, config));
       const label = s.redirect
         ? `${t(s.labelKey)}: ${display} (${s.redirect})`
         : `${t(s.labelKey)}: ${display}`;
@@ -490,7 +530,9 @@ async function showCategorySettings(category: SettingCategory, config: LoadedCon
     const changed = await editSetting(setting, updated);
     if (changed) {
       await saveConfig(updated);
-      setNestedValue(config, setting.key, getNestedValue(updated, setting.key));
+      const value = getNestedValue(updated, setting.key);
+      setNestedValue(config, setting.key, value);
+      setting.apply?.(value);
       console.log(chalk.green(`\n${t('commands.settings.saved')}\n`));
     }
   }

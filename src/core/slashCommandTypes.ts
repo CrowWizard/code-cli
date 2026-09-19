@@ -35,6 +35,7 @@ import type { PendingPostTurnAction, QueuedInstructionPolicy } from './agent/Pos
 import type { InteractionMode } from './agent/InteractionModeController.js';
 import type { AnnouncementManagerContract } from '../announcements/AnnouncementManager.js';
 import type { AccountEntitlement } from '../auth/AuthClient.js';
+import type { GoalEventData } from '../telemetry/types.js';
 
 export interface SlashCommandContext {
     listWorkspaceFiles?: () => Promise<void>;
@@ -48,6 +49,8 @@ export interface SlashCommandContext {
     setComposerInput?: (text: string) => void;
     sessionManager: SessionManager;
     currentSession?: Session;
+    /** Called after /rename so surfaces such as the terminal title pick up the new name. */
+    onSessionRenamed?: () => void;
     memoryManager: MemoryManager;
     permissionManager: PermissionManager;
     /** Hook manager for /hooks commands */
@@ -76,6 +79,12 @@ export interface SlashCommandContext {
     isFeatureEnabled?: (key: string, localDefault?: boolean) => boolean;
     /** Track feature activation without affecting command behavior */
     trackFeatureActivation?: (key: string, metadata?: Record<string, unknown>) => void | Promise<void>;
+    /**
+     * Reports a goal transition. Separate from `trackFeatureActivation`,
+     * which reaches the feature-flag manager rather than telemetry, so a
+     * goal reported through it would never leave the machine.
+     */
+    trackGoalEvent?: (data: GoalEventData) => void | Promise<void>;
     /** Refresh feature-gated runtime surfaces after a feature toggle changes config. */
     refreshFeatureGatedTools?: () => void;
     /** Refresh the active composer status/help line after display settings change. */
@@ -132,6 +141,8 @@ export interface SlashCommandContext {
     onToggleGoalView?: (visible: boolean) => void;
     /** Peer awareness manager for /peers command */
     peerAwareness?: import('../session/peers/PeerAwarenessManager.js').PeerAwarenessManager;
+    peerMessaging?: import('../session/peers/PeerMessaging.js').PeerClient;
+    onPeerDraft?: (draft: import('../ui/peerMention.js').PeerComposerDraft) => void;
     /** Repeat manager for /repeat recurring prompt scheduling */
     repeatManager?: RepeatManager;
     /** Queue an instruction to be sent to the LLM on the next turn (not displayed to user) */

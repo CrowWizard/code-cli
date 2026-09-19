@@ -68,4 +68,34 @@ describe('ActivityIndicator', () => {
     expect(tip).toBeTruthy();
     expect(typeof tip).toBe('string');
   });
+
+  it('rotates the tip without changing the verb', () => {
+    const custom = new ActivityIndicator({ activityVerbs: ['Hacking'] });
+    custom.next();
+    const seen = new Set([custom.getTip()]);
+    for (let i = 0; i < 5; i++) seen.add(custom.nextTip());
+    expect(seen.size).toBeGreaterThan(1);
+    expect(custom.getVerb()).toBe('Hacking');
+  });
+
+  it('forwards the tip context so installed skills can be suggested', () => {
+    const custom = new ActivityIndicator({
+      tipContext: { listSkills: () => [{ name: 'deploy', description: 'Ship it' }] },
+    });
+    const tips = new Set<string>();
+    // The bag holds every static tip plus the skill expansions, and hands each
+    // one out once per refill, so one full cycle is guaranteed to include it.
+    for (let i = 0; i < 200; i++) tips.add(custom.nextTip());
+    expect([...tips].some((tip) => tip.includes('$deploy'))).toBe(true);
+  });
+
+  it('rotates to the next tip that passes the caller filter', () => {
+    const custom = new ActivityIndicator({
+      tipContext: { listCommands: () => [{ command: '/undo', description: 'Revert the last change' }] },
+    });
+    const wanted = 'Type /undo to revert the last change';
+    expect(custom.nextTipFitting((tip) => tip === wanted)).toBe(wanted);
+    expect(custom.getTip()).toBe(wanted);
+    expect(custom.nextTipFitting(() => false)).toBeUndefined();
+  });
 });

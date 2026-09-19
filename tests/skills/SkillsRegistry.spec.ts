@@ -83,6 +83,8 @@ ${body}
       expect(goalWriter?.source).toBe('builtin');
       expect(goalWriter?.path).toContain('src/skills/builtin/goal-writer/SKILL.md');
       expect(goalWriter?.body).toContain('completion contract');
+      expect(goalWriter?.body).toContain('acceptance_criteria');
+      expect(goalWriter?.body).toContain('Never\n   add criteria the user did not approve');
 
       const deepResearch = registry.getSkill('deep-research');
       expect(deepResearch).not.toBeNull();
@@ -103,6 +105,35 @@ ${body}
       expect(brainstorm?.body).toContain('Software Architect');
       expect(brainstorm?.body).toContain('Product Owner');
       expect(brainstorm?.body).toContain('Product Manager');
+      expect(brainstorm?.body).toContain('Leave a decision record');
+
+      for (const name of ['systematic-debugging', 'root-cause-analysis', 'data-scientist', 'architecture-breakdown', 'performance-analysis', 'git-analysis', 'pull-request-review']) {
+        const skill = registry.getSkill(name);
+        expect(skill, name).not.toBeNull();
+        expect(skill?.source, name).toBe('builtin');
+        expect(skill?.description.length, name).toBeGreaterThan(40);
+        expect(skill?.body.length, name).toBeGreaterThan(400);
+      }
+      expect(registry.getSkill('code-reviewer')?.body).toContain('Evidence and confidence');
+    });
+
+    it('falls back to the embedded built-in skills when no packaged directory exists, as in a compiled binary', async () => {
+      const testDir = path.join(tempRoot, 'test-embedded-builtin-skills');
+      const embeddedRoot = path.join(tempRoot, 'embedded-builtin-root');
+      await fs.ensureDir(testDir);
+
+      const registry = new SkillsRegistry(testDir, 'autohand-user', {
+        builtinSkillDirectories: [path.join(tempRoot, 'missing', 'skills', 'builtin')],
+        embeddedBuiltinAssetsRoot: embeddedRoot,
+      });
+      await registry.initialize();
+
+      const extensionBuilder = registry.getSkill('extension-builder');
+      expect(extensionBuilder).not.toBeNull();
+      expect(extensionBuilder?.source).toBe('builtin');
+      expect(extensionBuilder?.path.startsWith(embeddedRoot)).toBe(true);
+      expect(extensionBuilder?.body).toContain('Pi');
+      expect(registry.getSkill('goal-writer')?.source).toBe('builtin');
     });
 
     it('loads skills recursively when configured', async () => {

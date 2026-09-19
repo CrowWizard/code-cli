@@ -39,6 +39,8 @@ $REPO = "autohandai/code-cli"
 $BINARY_NAME = "autohand.exe"
 $COMPAT_BINARY_NAME = "autohand-code.cmd"
 $AGENT_ALIAS_NAME = "agent.cmd"
+$SHORT_ALIAS_NAME = "ah.cmd"
+$FIRST_RUN_MESSAGE = "hello world"
 
 function Write-Logo {
     $logo = @"
@@ -92,6 +94,8 @@ Environment variables:
   AUTOHAND_VERSION      Install specific version (e.g., 0.7.3)
   AUTOHAND_INSTALL_DIR  Custom installation directory
   AUTOHAND_CHANNEL      Set to "alpha" for pre-release builds
+  AUTOHAND_INSTALL_FIRST_RUN  "yes" starts Autohand with a first message after
+                        installing without asking; "no" never offers to
 
 Examples:
   iwr -useb https://autohand.ai/install.ps1 | iex
@@ -233,15 +237,19 @@ function Remove-ExistingInstallation {
         "$env:LOCALAPPDATA\autohand\autohand.exe",
         "$env:LOCALAPPDATA\autohand\autohand-code.cmd",
         "$env:LOCALAPPDATA\autohand\agent.cmd",
+        "$env:LOCALAPPDATA\autohand\ah.cmd",
         "$env:LOCALAPPDATA\Programs\autohand\autohand.exe",
         "$env:LOCALAPPDATA\Programs\autohand\autohand-code.cmd",
         "$env:LOCALAPPDATA\Programs\autohand\agent.cmd",
+        "$env:LOCALAPPDATA\Programs\autohand\ah.cmd",
         "$env:ProgramFiles\autohand\autohand.exe",
         "$env:ProgramFiles\autohand\autohand-code.cmd",
         "$env:ProgramFiles\autohand\agent.cmd",
+        "$env:ProgramFiles\autohand\ah.cmd",
         "$env:USERPROFILE\.local\bin\autohand.exe",
         "$env:USERPROFILE\.local\bin\autohand-code.cmd",
-        "$env:USERPROFILE\.local\bin\agent.cmd"
+        "$env:USERPROFILE\.local\bin\agent.cmd",
+        "$env:USERPROFILE\.local\bin\ah.cmd"
     )
 
     foreach ($loc in $locations) {
@@ -555,6 +563,92 @@ function Claim-PathWideAgentAlias {
     }
 }
 
+# Offers to start Autohand right away with a first message, so a new user
+# sees it answer before reading any docs. Skipped when input or output is not
+# a console, inside a running Autohand (`autohand upgrade`), or when
+# AUTOHAND_INSTALL_FIRST_RUN is "no"; "yes" starts without asking. Returns
+# whether Autohand was started; the installer's result never depends on it.
+function Start-FirstRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinaryPath,
+        [string]$Answer = $env:AUTOHAND_INSTALL_FIRST_RUN
+    )
+
+    $normalized = if ($null -eq $Answer) { "" } else { $Answer.Trim().ToLowerInvariant() }
+    if ($normalized -match '^(n|no|0|false)$') {
+        return $false
+    }
+    if ($normalized -notmatch '^(y|yes|1|true)$') {
+        if ($env:AUTOHAND_CLI -or [Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+            return $false
+        }
+        $reply = Read-Host "Start Autohand now and send it a first message (`"$FIRST_RUN_MESSAGE`")? [Y/n]"
+        if ($reply -match '^\s*n') {
+            Write-Host "Run 'autohand' whenever you are ready."
+            return $false
+        }
+    }
+
+    Write-Host ""
+    Write-Success "Starting Autohand with your first message: `"$FIRST_RUN_MESSAGE`""
+    Write-Host ""
+    try {
+        & $BinaryPath $FIRST_RUN_MESSAGE
+    }
+    catch {
+        Write-Host "Autohand exited: $($_.Exception.Message)"
+    }
+    return $true
+}
+
+function Install-BinaryFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    # `autohand update` runs this script from inside a running autohand.exe.
+    # Windows refuses to overwrite or delete a running executable but allows
+    # renaming it, so stage the new file beside the destination, move the old
+    # binary aside, rename the new one into place and only then retire the old
+    # copy. A copy over the live file would fail with "being used by another
+    # process" and leave the installation half updated.
+    $staged = "$Destination.new"
+    $retired = "$Destination.old"
+
+    foreach ($leftover in @($staged, $retired)) {
+        if (Test-Path -LiteralPath $leftover) {
+            Remove-Item -LiteralPath $leftover -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path -LiteralPath $retired) {
+        # Still locked by a previous version that has not exited yet.
+        $retired = "$Destination." + [System.Guid]::NewGuid().ToString("N") + ".old"
+    }
+
+    Copy-Item -LiteralPath $Source -Destination $staged -Force
+
+    $hadExisting = Test-Path -LiteralPath $Destination
+    if ($hadExisting) {
+        Move-Item -LiteralPath $Destination -Destination $retired -Force
+    }
+
+    try {
+        Move-Item -LiteralPath $staged -Destination $Destination -Force
+    }
+    catch {
+        if ($hadExisting -and -not (Test-Path -LiteralPath $Destination)) {
+            Move-Item -LiteralPath $retired -Destination $Destination -Force
+        }
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        throw
+    }
+
+    if ($hadExisting) {
+        Remove-Item -LiteralPath $retired -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-Autohand {
     Write-Logo
 
@@ -624,6 +718,7 @@ function Install-Autohand {
     $binaryPath = Join-Path $installPath $BINARY_NAME
     $compatBinaryPath = Join-Path $installPath $COMPAT_BINARY_NAME
     $agentAliasPath = Join-Path $installPath $AGENT_ALIAS_NAME
+    $shortAliasPath = Join-Path $installPath $SHORT_ALIAS_NAME
     $agentCollisionNames = @("agent.com", "agent.exe", "agent.bat", "agent.cmd")
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("autohand-install-" + [System.Guid]::NewGuid().ToString("N"))
     $archivePath = Join-Path $tempRoot $archiveName
@@ -681,7 +776,7 @@ function Install-Autohand {
             throw "Bundle does not contain autohand.exe"
         }
 
-        Copy-Item -Path $extractedAutohand -Destination $binaryPath -Force
+        Install-BinaryFile -Source $extractedAutohand -Destination $binaryPath
         foreach ($agentCollisionName in $agentCollisionNames) {
             $agentCollisionPath = Join-Path $installPath $agentCollisionName
             if (Test-Path -LiteralPath $agentCollisionPath) {
@@ -695,9 +790,11 @@ function Install-Autohand {
         )
         [System.IO.File]::WriteAllLines($compatBinaryPath, $compatShim, [System.Text.Encoding]::ASCII)
         [System.IO.File]::WriteAllLines($agentAliasPath, $compatShim, [System.Text.Encoding]::ASCII)
+        [System.IO.File]::WriteAllLines($shortAliasPath, $compatShim, [System.Text.Encoding]::ASCII)
         Write-Success "Installed to $binaryPath"
         Write-Success "Installed compatibility alias to $compatBinaryPath"
         Write-Success "Installed agent alias to $agentAliasPath"
+        Write-Success "Installed short alias to $shortAliasPath"
         Claim-PathWideAgentAlias -OwnInstallPath $installPath -CanonicalBinaryPath $binaryPath -AgentCollisionNames $agentCollisionNames
     }
     finally {
@@ -737,6 +834,8 @@ function Install-Autohand {
     Write-Host "  autohand --help       # Show all options"
     Write-Host "  autohand login        # Sign in to your account"
     Write-Host ""
+
+    [void](Start-FirstRun -BinaryPath $binaryPath)
 }
 
 # Run installer

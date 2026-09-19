@@ -40,6 +40,41 @@ describe('AgentRegistry built-in agents', () => {
     return registry;
   }
 
+  it('falls back to the embedded built-in agents when no packaged directory exists, as in a compiled binary', async () => {
+    const { root, userDir } = await createTempAgentDirs();
+    const registry = AgentRegistry.getInstance();
+    (registry as any).agentsDir = userDir;
+    registry.setBuiltinAgentDirectories([path.join(root, 'missing', 'agents', 'builtin')], path.join(root, 'embedded'));
+    await registry.loadAgents();
+
+    const builtins = registry.getAgentsBySource('builtin');
+    expect(builtins.map((agent) => agent.name)).toContain('researcher');
+    expect(builtins.length).toBeGreaterThanOrEqual(12);
+  });
+
+  it('reads the reasoning depth from agent frontmatter and ignores unknown levels', async () => {
+    const { userDir } = await createTempAgentDirs();
+    await fs.writeFile(path.join(userDir, 'judge.md'), '---\ndescription: Judges\nreasoning: High\n---\nJudge things.');
+    await fs.writeFile(path.join(userDir, 'sloppy.md'), '---\ndescription: Sloppy\nreasoning: maximum\n---\nDo things.');
+    const registry = AgentRegistry.getInstance();
+    (registry as any).agentsDir = userDir;
+    await registry.loadAgents();
+
+    expect(registry.getAgent('judge')?.reasoning).toBe('high');
+    expect(registry.getAgent('sloppy')?.reasoning).toBeUndefined();
+    expect(registry.getAgent('reviewer')?.reasoning).toBe('high');
+    expect(registry.getAgent('implementer')?.reasoning).toBeUndefined();
+  });
+
+  it('declares skills for the built-in debugger, reviewers, and architect', async () => {
+    const registry = await loadIsolatedRegistry();
+    expect(registry.getAgent('debugger')?.skills).toEqual(['systematic-debugging', 'root-cause-analysis']);
+    expect(registry.getAgent('reviewer')?.skills).toEqual(['pull-request-review', 'code-reviewer']);
+    expect(registry.getAgent('autohand-review')?.skills).toEqual(['pull-request-review', 'code-reviewer']);
+    expect(registry.getAgent('software-architect')?.skills).toEqual(['architecture-breakdown']);
+    expect(registry.getAgent('tester')?.skills).toBeUndefined();
+  });
+
   it('should load built-in agents', async () => {
     const registry = await loadIsolatedRegistry();
     const builtins = registry.getAgentsBySource('builtin');
@@ -75,7 +110,7 @@ describe('AgentRegistry built-in agents', () => {
     });
     expect(review?.tools).toEqual(expect.arrayContaining([
       'read_file',
-      'fff_grep',
+      'find_grep',
       'fff_find',
       'list_tree',
       'git_status',
@@ -101,7 +136,7 @@ describe('AgentRegistry built-in agents', () => {
     expect(researcher).toBeDefined();
     expect(researcher!.description).toContain('searching and understanding');
     expect(researcher!.tools).toContain('read_file');
-    expect(researcher!.tools).toContain('fff_grep');
+    expect(researcher!.tools).toContain('find_grep');
     expect(researcher!.tools).toContain('fff_find');
     expect(researcher!.source).toBe('builtin');
   });
@@ -182,7 +217,7 @@ describe('AgentRegistry built-in agents', () => {
     await fs.writeFile(path.join(externalDir, 'code-reviewer.json'), JSON.stringify({
       description: 'Expert code reviewer',
       systemPrompt: 'Review code with care.',
-      tools: ['read_file', 'fff_grep'],
+      tools: ['read_file', 'find_grep'],
       model: 'review-model'
     }));
 
@@ -204,7 +239,7 @@ describe('AgentRegistry built-in agents', () => {
     expect(jsonAgent).toMatchObject({
       description: 'Expert code reviewer',
       source: 'external',
-      tools: ['read_file', 'fff_grep'],
+      tools: ['read_file', 'find_grep'],
       model: 'review-model'
     });
   });

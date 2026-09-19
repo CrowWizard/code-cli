@@ -10,7 +10,7 @@ import { AutohandAgent } from '../../core/agent.js';
 import { ConversationManager } from '../../core/conversationManager.js';
 import { FileActionManager } from '../../actions/filesystem.js';
 import { ProviderFactory } from '../../providers/ProviderFactory.js';
-import { loadConfig, saveConfig } from '../../config.js';
+import { applyCliProviderOverride, loadConfig, saveConfig } from '../../config.js';
 import { checkAuthenticated } from '../../auth/index.js';
 import { prepareBareModeConfig } from '../../runtime/bareMode.js';
 import { checkWorkspaceSafety } from '../../startup/workspaceSafety.js';
@@ -93,6 +93,7 @@ import {
   createSetupOnlyRuntimeProfile,
 } from './blueprintSetup.js';
 import { handleBlueprintSetupRpcRequest } from './blueprintSetupRpc.js';
+import { resolveWorkspaceTrust } from '../../startup/workspaceTrustPrompt.js';
 
 // Store original console methods
 const originalConsole = {
@@ -523,11 +524,16 @@ export async function runRpcMode(options: CLIOptions): Promise<0 | 1> {
 
     // Load configuration
     const config = await prepareBareModeConfig(
-      (options as CLIOptions & { _authConfig?: LoadedConfig })._authConfig
-        ?? await loadConfig(options.config, process.cwd()),
+      applyCliProviderOverride((options as CLIOptions & { _authConfig?: LoadedConfig })._authConfig
+        ?? await loadConfig(options.config, process.cwd()), options.provider),
       options
     );
     configureSearchFromSettings(config.search, options.searchEngine);
+
+    // RPC clients cannot answer a trust prompt; the warning goes to stderr, never the protocol stream.
+    if (!options.bare) {
+      await resolveWorkspaceTrust(config, { interactive: false });
+    }
 
     // Process --yolo flag BEFORE creating runtime (same as main CLI flow)
     const normalizedYolo = normalizeYoloInput(options.yolo as string | boolean | undefined);
@@ -1404,6 +1410,11 @@ async function handleSingleRequest(
 
       case RPC_METHODS.GET_SUPPORTED_COMMANDS: {
         result = await adapter.handleGetSupportedCommands();
+        break;
+      }
+
+      case RPC_METHODS.GET_SUPPORTED_AGENTS: {
+        result = adapter.handleGetSupportedAgents();
         break;
       }
 

@@ -2,11 +2,14 @@
  * Hook Manager - Executes lifecycle hooks based on config
  * @license Apache-2.0
  */
-import { spawn } from 'node:child_process';
+import { buildAutohandChildProcessEnv } from '../utils/childProcessEnv.js';
+import type { ChildProcess } from 'node:child_process';
+import { spawnCoordinatedProcess, waitForProcessPublication } from '../session/peers/CommandCoordinationGate.js';
 import { matchesImportedHook, importedHookInput, importedHookEnvironment, importedHookResponse } from './ImportedHookAdapter.js';
-import { HOOK_EVENTS } from './hookEvents.js';
+import { HOOK_EVENTS, canonicalHookEvent, hookIdentifier } from './hookEvents.js';
+import { legacyHookMatches, normalizeHooksSettings, renderHookCommandTemplate, resolveHookEvents } from './legacyHookEvents.js';
 import { minimatch } from 'minimatch';
-import type { HooksSettings, HookDefinition, HookEvent, HookFilter, HookResponse } from '../types.js';
+import type { HooksSettings, HookDefinition, HookEvent, HookFilter, HookResponse, HookEventName } from '../types.js';
 import type { ExtensionRuntimeHook } from '../extensions/ExtensionRuntimeHost.js';
 
 /** Context passed to hooks via environment variables and JSON stdin */
@@ -270,7 +273,7 @@ export class HookManager {
   private extensionHooks: ExtensionRuntimeHook[] = [];
 
   constructor(options: HookManagerOptions) {
-    this.settings = options.settings ?? { enabled: true, hooks: [] };
+    this.settings = normalizeHooksSettings(options.settings) ?? { enabled: true, hooks: [] };
     this.workspaceRoot = options.workspaceRoot;
     this.onPersist = options.onPersist;
     this.onHookOutput = options.onHookOutput;
@@ -340,16 +343,7 @@ export class HookManager {
    * Uses script filename for script-based hooks, or event+description for inline commands
    */
   private getHookIdentifier(hook: HookDefinition): string {
-    // For script-based hooks, use the script filename
-    const scriptMatch = hook.command.match(/([^/]+\.sh)$/);
-    if (scriptMatch) {
-      return `script:${scriptMatch[1]}`;
-    }
-    // For inline commands, use event + description (if available) or command hash
-    if (hook.description) {
-      return `${hook.event}:${hook.description}`;
-    }
-    return `${hook.event}:${hook.command}`;
+    return hookIdentifier(hook);
   }
 
   /**
@@ -472,6 +466,14 @@ export class HookManager {
   }
 
   /**
+   * Replace the in-memory settings with a freshly merged set without
+   * persisting; the caller already wrote the file that changed.
+   */
+  replaceSettings(settings: HooksSettings): void {
+    this.settings = normalizeHooksSettings(settings) ?? { enabled: true, hooks: [] };
+  }
+
+  /**
    * Add a new hook
    */
   async addHook(hook: HookDefinition): Promise<void> {
@@ -488,7 +490,7 @@ export class HookManager {
   /**
    * Remove a hook by index within its event type
    */
-  async removeHook(event: HookEvent, index: number): Promise<boolean> {
+  async removeHook(event: HookEventName, index: number): Promise<boolean> {
     const hooks = this.settings.hooks ?? [];
     const eventHooks = hooks.filter(h => h.event === event);
 
@@ -513,7 +515,7 @@ export class HookManager {
   /**
    * Toggle a hook's enabled status
    */
-  async toggleHook(event: HookEvent, index: number): Promise<boolean> {
+  async toggleHook(event: HookEventName, index: number): Promise<boolean> {
     const hooks = this.settings.hooks ?? [];
     const eventHooks = hooks.filter(h => h.event === event);
 
@@ -524,7 +526,7 @@ export class HookManager {
     return this.setHookEnabled(event, index, eventHooks[index].enabled === false);
   }
 
-  async setHookEnabled(event: HookEvent, index: number, enabled: boolean): Promise<boolean> {
+  async setHookEnabled(event: HookEventName, index: number, enabled: boolean): Promise<boolean> {
     const hooks = this.settings.hooks ?? [];
     const hook = hooks.filter(candidate => candidate.event === event)[index];
     if (!Number.isInteger(index) || index < 0 || !hook) return false;
@@ -681,8 +683,10 @@ export class HookManager {
    * Build environment variables from hook context
    */
   private buildEnvironment(context: HookContext): Record<string, string> {
+    // Hooks inherit the same child environment as shell tools, so the
+    // shell.env policy applies here too.
     const env: Record<string, string> = {
-      ...process.env,
+      ...(buildAutohandChildProcessEnv() as Record<string, string>),
       HOOK_EVENT: context.event,
       HOOK_WORKSPACE: context.workspace,
     };
@@ -982,15 +986,16 @@ export class HookManager {
       };
     }
 
-    return new Promise((resolve) => {
-      const child = spawn(hook.command, [], {
-        shell: true,
-        detached: process.platform !== 'win32',
-        cwd: hook.importedFrom?.workingDirectory ?? this.workspaceRoot,
-        env,
-        stdio: ['pipe', 'pipe', 'pipe'], // stdin enabled for JSON input
-      });
+    let child: ChildProcess;
+    try {
+      child = await spawnCoordinatedProcess({ file: hook.command, args: [], cwd: hook.importedFrom?.workingDirectory ?? this.workspaceRoot }, {
+        shell: true, detached: process.platform !== 'win32', env, stdio: ['pipe', 'pipe', 'pipe'],
+      }, options.signal);
+    } catch (error) {
+      return { hook, success: false, aborted: options.signal?.aborted, error: error instanceof Error ? error.message : String(error), duration: Date.now() - startTime, exitCode: -1 };
+    }
 
+    return new Promise<HookExecutionResult>((resolve) => {
       let stdout = '';
       let stderr = '';
       let stdinError: Error | undefined;
@@ -1014,7 +1019,7 @@ export class HookManager {
         if (!options.signal?.aborted) {
           this.onHookOutput?.(result);
         }
-        resolve(result);
+        void waitForProcessPublication(child).then(() => resolve(result), error => resolve({ ...result, success: false, error: error instanceof Error ? error.message : String(error) }));
       };
 
       const signalHook = (signal: NodeJS.Signals): void => {
@@ -1051,6 +1056,7 @@ export class HookManager {
       const timeoutId = setTimeout(() => terminate('timeout'), timeout);
       timeoutId.unref?.();
       options.signal?.addEventListener('abort', handleAbort, { once: true });
+      if (options.signal?.aborted) handleAbort();
 
       child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
         // Hooks may exit without reading their context; their exit status still applies.
@@ -1129,17 +1135,8 @@ export class HookManager {
    * Get hooks for an event, including alias handling
    */
   getHooksForEvent(event: HookEvent): HookDefinition[] {
-    const hooks = this.getHooks().filter(h => h.enabled !== false);
-
-    // Handle 'stop' and 'post-response' as aliases (backward compatibility)
-    if (event === 'stop') {
-      return hooks.filter(h => h.event === 'stop' || h.event === 'post-response');
-    }
-    if (event === 'post-response') {
-      return hooks.filter(h => h.event === 'stop' || h.event === 'post-response');
-    }
-
-    return hooks.filter(h => h.event === event);
+    const [canonical] = resolveHookEvents(event);
+    return this.getHooks().filter(h => h.enabled !== false && resolveHookEvents(h.event).includes(canonical));
   }
 
   /**
@@ -1181,8 +1178,10 @@ export class HookManager {
 
     // Get hooks for event, then filter by both filter and matcher
     const hooks = this.getHooksForEvent(event).filter(h =>
-      this.matchesFilter(h.filter, fullContext) && (h.importedFrom ? matchesImportedHook(h, fullContext) : this.matchesMatcher(h, fullContext))
-    );
+      legacyHookMatches(h.event, fullContext)
+      && this.matchesFilter(h.filter, fullContext)
+      && (h.importedFrom ? matchesImportedHook(h, fullContext) : this.matchesMatcher(h, fullContext))
+    ).map(h => ({ ...h, event: fullContext.event, command: renderHookCommandTemplate(h.command, fullContext) }));
 
     if (hooks.length === 0) {
       return runtimeResults;
@@ -1270,7 +1269,7 @@ export class HookManager {
    */
   async testHook(hook: HookDefinition, options: HookExecutionOptions = {}): Promise<HookExecutionResult> {
     const context: HookContext = {
-      event: hook.event,
+      event: canonicalHookEvent(hook.event),
       workspace: this.workspaceRoot,
       tool: 'test_tool',
       toolCallId: 'test_123',
@@ -1292,7 +1291,7 @@ export class HookManager {
     const summary: Record<HookEvent, { total: number; enabled: number }> = {} as Record<HookEvent, { total: number; enabled: number }>;
 
     for (const event of HOOK_EVENTS) {
-      const eventHooks = this.getHooks().filter(h => h.event === event);
+      const eventHooks = this.getHooks().filter(h => resolveHookEvents(h.event).includes(event));
       summary[event] = {
         total: eventHooks.length,
         enabled: eventHooks.filter(h => h.enabled !== false).length,

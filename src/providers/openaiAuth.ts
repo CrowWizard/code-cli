@@ -8,6 +8,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { OpenAIChatGPTAuth } from '../types.js';
+import {
+  buildTokenBody,
+  fetchWithTimeout,
+  openBrowser,
+  parseJsonResponse,
+  parseResponseBody,
+  sleep,
+} from './oauthHttp.js';
 
 const OPENAI_AUTH_BASE_URL = 'https://auth.openai.com';
 const OPENAI_OAUTH_AUTHORIZE_URL = `${OPENAI_AUTH_BASE_URL}/oauth/authorize`;
@@ -17,7 +25,6 @@ const OPENAI_DEVICE_TOKEN_URL = `${OPENAI_AUTH_BASE_URL}/api/accounts/deviceauth
 const OPENAI_DEVICE_VERIFICATION_URL = `${OPENAI_AUTH_BASE_URL}/codex/device`;
 const OPENAI_DEVICE_CALLBACK_URL = `${OPENAI_AUTH_BASE_URL}/deviceauth/callback`;
 const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
-const OPENAI_AUTH_REQUEST_TIMEOUT_MS = 15_000;
 const OPENAI_BROWSER_AUTH_TIMEOUT_MS = 5 * 60_000;
 const OPENAI_BROWSER_AUTH_SCOPE = 'openid profile email offline_access';
 const OPENAI_BROWSER_CALLBACK_HOST = '127.0.0.1';
@@ -63,11 +70,6 @@ interface OAuthTokenResponse {
   error_description?: string;
 }
 
-interface ParsedResponse {
-  payload: unknown;
-  detail?: string;
-}
-
 interface OpenAIChatGPTBrowserAuthOptions {
   onPrompt?: (prompt: OpenAIChatGPTBrowserPrompt) => void | Promise<void>;
 }
@@ -97,10 +99,6 @@ function decodeJwtExpiry(token: string): string | undefined {
   return new Date(payload.exp * 1000).toISOString();
 }
 
-function buildTokenBody(params: Record<string, string>): string {
-  return new URLSearchParams(params).toString();
-}
-
 function toBase64Url(buffer: Buffer): string {
   return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
@@ -117,101 +115,6 @@ function createState(): string {
   return randomBytes(16).toString('hex');
 }
 
-async function fetchWithTimeout(
-  input: string,
-  init: RequestInit,
-  context: string,
-  timeoutMs = OPENAI_AUTH_REQUEST_TIMEOUT_MS,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(input, {
-      ...init,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`${context} timed out. Check your connection and try again.`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function extractErrorDetail(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== 'object') return undefined;
-
-  const candidate = payload as Record<string, unknown>;
-  const direct = candidate.error_description ?? candidate.error ?? candidate.message ?? candidate.detail;
-  if (typeof direct === 'string' && direct.trim()) {
-    return direct.trim();
-  }
-
-  const nestedError = candidate.error;
-  if (nestedError && typeof nestedError === 'object') {
-    const nested = nestedError as Record<string, unknown>;
-    for (const key of ['message', 'error_description', 'detail', 'code']) {
-      const value = nested[key];
-      if (typeof value === 'string' && value.trim()) {
-        return value.trim();
-      }
-    }
-  }
-
-  return undefined;
-}
-
-async function parseJsonResponse<T>(response: Response, context: string): Promise<T> {
-  const { payload, detail } = await parseResponseBody(response);
-
-  if (!response.ok) {
-    throw new Error(
-      detail
-        ? `${context} failed with status ${response.status}: ${detail}`
-        : `${context} failed with status ${response.status}.`,
-    );
-  }
-
-  if (payload === undefined) {
-    throw new Error(`${context} returned an empty response.`);
-  }
-
-  return payload as T;
-}
-
-async function parseResponseBody(response: Response): Promise<ParsedResponse> {
-  const rawText = await response.text();
-  let payload: unknown;
-
-  if (rawText.trim()) {
-    try {
-      payload = JSON.parse(rawText) as unknown;
-    } catch {
-      payload = rawText;
-    }
-  }
-
-  const detail = extractErrorDetail(payload) ?? (typeof payload === 'string' && payload.trim() ? payload.trim() : undefined);
-  return { payload, detail };
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function openBrowser(url: string): Promise<boolean> {
-  try {
-    const open = await import('open').then((mod) => mod.default);
-    await open(url);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function callbackSuccessHtml(): string {
   return '<!doctype html><html><body><h1>OpenAI sign-in complete.</h1><p>You can close this window.</p></body></html>';
 }
@@ -220,7 +123,8 @@ function callbackErrorHtml(message: string): string {
   return `<!doctype html><html><body><h1>OpenAI sign-in failed.</h1><p>${message}</p></body></html>`;
 }
 
-async function listenForOAuthCallback(expectedState: string): Promise<{
+/** Exported for tests; the browser sign-in flow is the only production caller. */
+export async function listenForOAuthCallback(expectedState: string): Promise<{
   redirectUri: string;
   waitForResult: () => Promise<OAuthCallbackResult>;
   close: () => Promise<void>;
@@ -313,22 +217,30 @@ async function listenForOAuthCallback(expectedState: string): Promise<{
       });
     });
 
+  let callbackPort: number;
   try {
-    await listenOnPort(OPENAI_BROWSER_CALLBACK_PORT);
-  } catch (error) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EADDRINUSE') {
-      throw error;
+    try {
+      await listenOnPort(OPENAI_BROWSER_CALLBACK_PORT);
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'EADDRINUSE') {
+        throw error;
+      }
+
+      await listenOnPort(0);
     }
 
-    await listenOnPort(0);
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Failed to determine OpenAI OAuth callback address.');
+    }
+    callbackPort = (address as AddressInfo).port;
+  } catch (error) {
+    // Nobody receives the close() handle when listening fails, so release the
+    // five-minute deadline and the socket here instead of leaking both.
+    clearTimeout(timeoutId);
+    server.close();
+    throw error;
   }
-
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    throw new Error('Failed to determine OpenAI OAuth callback address.');
-  }
-
-  const callbackPort = (address as AddressInfo).port;
 
   return {
     redirectUri: `http://${OPENAI_BROWSER_CALLBACK_URL_HOST}:${callbackPort}${OPENAI_BROWSER_CALLBACK_PATH}`,

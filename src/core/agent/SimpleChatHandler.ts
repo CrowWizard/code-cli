@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
-import type { LLMMessage, TurnUsage } from '../../types.js';
+import type { LLMMessage, LLMUsage, TurnUsage } from '../../types.js';
 import type { LLMProvider } from '../../providers/LLMProvider.js';
 import { getSessionPromptCacheDirective } from './PromptCache.js';
 import type { ReactionParser } from './ReactionParser.js';
+import { StreamingResponsePreview } from './StreamingResponsePreview.js';
 
 interface SimpleChatConversation {
   addMessage(message: LLMMessage): void;
@@ -18,6 +19,8 @@ export interface SimpleChatAgent {
   isInstructionActive: boolean;
   conversation: SimpleChatConversation;
   llm: LLMProvider;
+  inkRenderer?: { setStreamingResponse?(response: string | null): void } | null;
+  runBudget?: { assertRequestAllowed(): void; recordRequest(): void; recordUsage(usage: LLMUsage | undefined): void };
   totalTokensUsed: number;
   currentTurnActualUsage: TurnUsage;
   currentTurnHadUnavailableUsage: boolean;
@@ -57,6 +60,10 @@ export class SimpleChatHandler {
 
   async handle(instruction: string): Promise<boolean> {
     this.agent.isInstructionActive = true;
+    const supportsStreaming = this.agent.llm.getCapabilities?.().streaming === true;
+    const preview = supportsStreaming && this.agent.inkRenderer?.setStreamingResponse
+      ? new StreamingResponsePreview((text) => this.agent.inkRenderer?.setStreamingResponse?.(text))
+      : undefined;
 
     try {
       this.agent.conversation.addMessage({ role: 'user', content: instruction });
@@ -66,14 +73,18 @@ export class SimpleChatHandler {
       const promptCache = this.agent.isPromptCachingEnabled?.() === true
         ? getSessionPromptCacheDirective(sessionId)
         : undefined;
+      this.agent.runBudget?.assertRequestAllowed();
+      this.agent.runBudget?.recordRequest();
       const completion = await this.agent.llm.complete({
         messages: this.agent.conversation.history(),
         tools: [],
         maxTokens: 1000,
         temperature: 0.7,
         ...(promptCache ? { promptCache } : {}),
+        ...(supportsStreaming ? { stream: true, onDelta: preview?.onDelta } : {}),
       });
 
+      this.agent.runBudget?.recordUsage(completion.usage);
       const payload = this.agent.getReactionParser().parseAssistantResponse(completion);
       const rawContent = (payload.finalResponse ?? payload.response ?? completion.content).trim();
       const content = this.agent.cleanupModelResponse(rawContent);
@@ -90,6 +101,12 @@ export class SimpleChatHandler {
           promptTokens: completion.usage.promptTokens,
           completionTokens: completion.usage.completionTokens,
           totalTokens: completion.usage.totalTokens,
+          ...(completion.usage.cacheReadTokens === undefined
+            ? {}
+            : { cacheReadTokens: completion.usage.cacheReadTokens }),
+          ...(completion.usage.cacheWriteTokens === undefined
+            ? {}
+            : { cacheWriteTokens: completion.usage.cacheWriteTokens }),
         };
       } else {
         this.agent.currentTurnHadUnavailableUsage = true;
@@ -107,6 +124,7 @@ export class SimpleChatHandler {
       }
       return false;
     } finally {
+      preview?.dispose();
       this.agent.isInstructionActive = false;
     }
   }

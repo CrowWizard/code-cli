@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { isStartupTimingEnabled, startupTimeline } from '../../startup/startupTimeline.js';
+import { buildOutputSchemaInstruction, buildOutputSchemaRepairInstruction, checkOutputAgainstSchema, type OutputSchemaSpec } from '../../modes/outputSchema.js';
+import { autoNameAgentSessionFromInstruction, refineAgentSessionTitle, syncAgentTerminalTitleName } from './AgentSessionTitle.js';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -49,7 +52,7 @@ import {
   type SequencedQueuedAgentInstruction,
   type QueuedMobileComposerCommand,
 } from './PostTurnActionCoordinator.js';
-import type { MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
+import { stopMobileRelay, type MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
 import type { MobileImageAttachment } from '../../mobile/MobileHandoffClient.js';
 import { validateMobileCommandInvocationForWorkspace } from '../../mobile/MobileCommandPolicy.js';
 import { executeReviewWithLifecycle } from '../../review/reviewLifecycle.js';
@@ -67,6 +70,13 @@ const RUNTIME_RESOURCE_SHUTDOWN_TIMEOUT_MS = 2_500;
 const BACKGROUND_PROCESS_KILL_GRACE_MS = 1_000;
 const COMMAND_FINALIZATION_TIMEOUT_MS = 2_500;
 const COMMAND_HOOK_KILL_GRACE_PERIOD_MS = 100;
+/**
+ * How long the first instruction waits for MCP servers that are still doing
+ * their handshake. Servers that answer later register through syncMcpTools and
+ * reach the next model request; a dead server must never hold the first turn.
+ */
+const MCP_FIRST_TURN_DEADLINE_MS = 2_000;
+const STARTUP_WAIT_STATUS = 'Finishing startup...';
 
 export interface AgentLifecycleHost {
   [key: string]: any;
@@ -75,6 +85,8 @@ export interface AgentLifecycleHost {
 export interface RunAgentCommandModeOptions {
   signal?: AbortSignal;
   keepAlive?: boolean;
+  /** --output-schema: the final answer must validate; one repair turn is attempted. */
+  outputSchema?: OutputSchemaSpec;
   review?: {
     request: ReviewRequest;
     surface: ReviewExecutionSurface;
@@ -82,6 +94,7 @@ export interface RunAgentCommandModeOptions {
 }
 
 export interface ExecuteAgentInstructionTurnOptions {
+  peerReferences?: import('../../ui/peerMention.js').PeerReference[];
   echoInTranscript?: boolean;
   postTurnAction?: PendingPostTurnAction;
   mobileTurn?: MobileClaimedTurnContext;
@@ -94,6 +107,12 @@ export async function executeAgentInstructionTurn(
   options: ExecuteAgentInstructionTurnOptions = {},
 ): Promise<boolean> {
   const execute = (): Promise<boolean> => {
+    if (options.peerReferences?.length) {
+      return host.runInstruction(instruction, { ...options.executionPolicy, peerReferences: options.peerReferences,
+        ...(options.mobileTurn ? { mobileTurn: options.mobileTurn } : {}),
+        ...(options.echoInTranscript === false ? { echoInTranscript: false } : {}),
+      });
+    }
     if (options.mobileTurn) {
       return host.runInstruction(instruction, {
         ...options.executionPolicy,
@@ -546,6 +565,9 @@ export async function runAgentInteractive(host: AgentLifecycleHost, initialInstr
     // The user can start typing while managers initialize.
     // When they submit, we await initReady before processing.
     host.initReady = host.performBackgroundInit();
+    // The rejection is consumed when the first instruction awaits initReady;
+    // without this the process error reporter logs it as unhandled first.
+    host.initReady.catch(() => undefined);
 
     // Fire startup suggestion LLM call immediately so the first prompt
     // shows contextual ghost text. Git context is gathered asynchronously
@@ -595,8 +617,10 @@ export function installAgentExitSignalHandlers(host: AgentLifecycleHost): void {
 
     const handleExitSignal = () => {
       if (host.shouldExit) {
-        // Second signal - force immediate exit
+        // Second signal - force immediate exit. process.exit skips the async
+        // shutdown path, so detached background children must be signalled here.
         console.log(formatForceExit());
+        callResourceCleanupSync(() => host.backgroundProcessRegistry?.killAllSync());
         process.exit(0);
       }
       host.shouldExit = true;
@@ -712,6 +736,7 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       host.goalActivityUnsubscribe = null;
 
       callResourceCleanupSync(() => host.repeatManager?.shutdown());
+      callResourceCleanupSync(() => stopMobileRelay());
       host.persistentInputActiveTurn = false;
       callResourceCleanupSync(() => host.persistentInput?.dispose?.());
       callResourceCleanupSync(() => process.stdin.pause());
@@ -733,6 +758,11 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       host.activeAgentHeartbeat = null;
 
       if (heartbeat) cleanupTasks.push(callResourceCleanup(() => heartbeat.stop()));
+      if (host.peerRuntime) {
+        const peers = host.peerRuntime;
+        host.peerRuntime = undefined;
+        cleanupTasks.push(callResourceCleanup(() => peers.close()));
+      }
       if (host.teamManager) cleanupTasks.push(callResourceCleanup(() => host.teamManager.shutdown()));
       if (host.mcpManager) cleanupTasks.push(callResourceCleanup(() => host.mcpManager.disconnectAll()));
       if (host.backgroundProcessRegistry) {
@@ -803,6 +833,7 @@ export async function performAgentBackgroundInit(
       // Phase 1: Parallel manager initialization
       await awaitLifecycleStep(Promise.resolve(host.initializeManagers()), signal);
       if (isRuntimeResourceShutdownStarted(host)) return;
+      startupTimeline.mark('managers ready (sessions, memory, skills, hooks, workspace files)');
 
       // Fire MCP connections in background (non-blocking, like Claude Code).
       // Servers connect asynchronously; tools become available once ready.
@@ -842,6 +873,7 @@ export async function performAgentBackgroundInit(
         host.sessionManager.createSession(host.runtime.workspaceRoot, model),
       ]), signal);
       if (isRuntimeResourceShutdownStarted(host)) return;
+      syncAgentTerminalTitleName(host);
       await awaitLifecycleStep(startHostActiveAgentHeartbeat(host), signal);
       if (isRuntimeResourceShutdownStarted(host)) return;
 
@@ -872,32 +904,45 @@ export async function performAgentBackgroundInit(
       }
     } finally {
       host.initDone = true;
+      startupTimeline.mark('background init done (system prompt, session, bootstrap)');
     }
+  }
+
+function describeStartupWait(host: AgentLifecycleHost): string | null {
+    const pendingMcp = host.mcpStartupCoordinator?.describePendingConnections?.() ?? null;
+    if (pendingMcp) return pendingMcp;
+    return host.initDone ? null : STARTUP_WAIT_STATUS;
+  }
+
+function waitForMcpFirstTurnDeadline(mcpReady: Promise<void>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, MCP_FIRST_TURN_DEADLINE_MS);
+      timer.unref?.();
+    });
+    return Promise.race([mcpReady, deadline]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
   }
 
 export async function ensureAgentInitComplete(
   host: AgentLifecycleHost,
   signal?: AbortSignal,
 ): Promise<void> {
-    if (host.initReady) {
-      try {
-        await awaitLifecycleStep(host.initReady, signal);
-      } catch (error) {
-        if (signal?.aborted && error instanceof Error && error.name === 'AbortError') return;
-        throw error;
-      }
+    if (!host.initReady) return;
+
+    const waitStatus = describeStartupWait(host);
+    if (waitStatus) host.ui?.setWorking?.(true, waitStatus);
+    try {
+      await awaitLifecycleStep(host.initReady, signal);
       host.initReady = null;
       if (isRuntimeResourceShutdownStarted(host)) return;
 
-      // Connection starts while the user is typing, but the first model request
-      // must see the final registered MCP tool set.
+      // Connection starts while the user is typing. The first model request gets
+      // a short window to see the final tool set; a server that is still silent
+      // after that registers later through syncMcpTools instead of holding the turn.
       if (host.mcpReady) {
-        try {
-          await awaitLifecycleStep(host.mcpReady, signal);
-        } catch (error) {
-          if (signal?.aborted && error instanceof Error && error.name === 'AbortError') return;
-          throw error;
-        }
+        await awaitLifecycleStep(waitForMcpFirstTurnDeadline(host.mcpReady), signal);
       }
       if (isRuntimeResourceShutdownStarted(host)) return;
       host.flushMcpStartupSummaryIfPending();
@@ -909,6 +954,16 @@ export async function ensureAgentInitComplete(
           sessionId: session?.metadata.sessionId,
           sessionType: 'startup',
         }), signal);
+      }
+    } catch (error) {
+      if (signal?.aborted && error instanceof Error && error.name === 'AbortError') return;
+      throw error;
+    } finally {
+      if (waitStatus) host.ui?.setWorking?.(false);
+      const gate = startupTimeline.mark('first turn released');
+      writeAutohandDebugLine(`[DEBUG] first turn waited ${Math.round(gate.delta)} ms on startup init`, host.writeDebugLine?.bind(host));
+      if (isStartupTimingEnabled() && gate.delta >= 1_000) {
+        host.inkRenderer?.addNotification?.(`Startup timing: the first turn waited ${Math.round(gate.delta)} ms for background init (${waitStatus ?? 'init'}).`);
       }
     }
   }
@@ -1057,6 +1112,35 @@ export async function initializeAgentForRPC(
     }), signal);
   }
 
+/**
+ * Checks the run's final answer against the output schema. A first failure
+ * gets one repair turn that only asks for the corrected document; a second
+ * failure ends the run with the violations as its error.
+ */
+async function enforceCommandOutputSchema(
+  host: AgentLifecycleHost,
+  spec: OutputSchemaSpec,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  let check = checkOutputAgainstSchema(host.lastEmittedMessage, spec);
+  if (!check.ok) {
+    const repaired = await awaitLifecycleStep(
+      Promise.resolve(host.runInstruction(buildOutputSchemaRepairInstruction(check.errors), { signal })),
+      signal,
+    );
+    check = repaired ? checkOutputAgainstSchema(host.lastEmittedMessage, spec) : check;
+  }
+  if (check.ok && check.json !== undefined) {
+    host.emitCommandOutput?.({ type: 'message', content: check.json });
+    return true;
+  }
+  host.emitCommandOutput?.({
+    type: 'error',
+    content: `The final response did not match the output schema (${spec.path}):\n${check.errors.map((error) => `- ${error}`).join('\n')}`,
+  });
+  return false;
+}
+
 export async function runAgentCommandMode(
   host: AgentLifecycleHost,
   instruction: string,
@@ -1148,8 +1232,11 @@ export async function runAgentCommandMode(
       }
 
       turnStartedAt = Date.now();
+      const effectiveInstruction = options.outputSchema && !options.review
+        ? `${instruction}\n\n${buildOutputSchemaInstruction(options.outputSchema)}`
+        : instruction;
       const executeInstruction = (): Promise<boolean> => awaitLifecycleStep(
-        Promise.resolve(host.runInstruction(instruction, {
+        Promise.resolve(host.runInstruction(effectiveInstruction, {
           signal,
           ...(options.review ? { echoInTranscript: false } : {}),
         })),
@@ -1166,6 +1253,10 @@ export async function runAgentCommandMode(
             execute: executeInstruction,
           })
         : await executeInstruction();
+
+      if (succeeded && options.outputSchema && !options.review) {
+        succeeded = await enforceCommandOutputSchema(host, options.outputSchema, signal);
+      }
 
       if (!succeeded) {
         finalizationDeadline.start();
@@ -1501,6 +1592,10 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
       }
       // Set to idle state so the Composer accepts input immediately
       host.setComposerIdle();
+      startupTimeline.mark('composer ready');
+      if (isStartupTimingEnabled()) {
+        host.inkRenderer?.addNotification?.(startupTimeline.format());
+      }
       host.inkRenderer?.setPendingSuggestion?.(host.pendingSuggestion ?? undefined);
     }
 
@@ -1515,6 +1610,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         let instruction: string | null = null;
         let echoInTranscript: boolean | undefined;
         let executionPolicy: QueuedInstructionPolicy | undefined;
+        let peerReferences: ExecuteAgentInstructionTurnOptions['peerReferences'];
         let postTurnAction: PendingPostTurnAction | undefined;
         let mobileTurn: MobileClaimedTurnContext | undefined;
         let mobileCommand: QueuedMobileComposerCommand | undefined;
@@ -1530,6 +1626,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
           instruction = nextQueuedWork.queued.text ?? null;
           echoInTranscript = nextQueuedWork.queued.echoInTranscript;
           executionPolicy = nextQueuedWork.queued.executionPolicy;
+          peerReferences = nextQueuedWork.queued.peerReferences;
           postTurnAction = nextQueuedWork.queued.postTurnAction;
           mobileTurn = nextQueuedWork.queued.mobileTurn;
           mobileCommand = nextQueuedWork.queued.mobileCommand;
@@ -1599,6 +1696,8 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
             }
             writeAutohandDebugLine('[DEBUG] Calling promptForInstruction in readline mode', host.writeDebugLine?.bind(host));
             instruction = await host.promptForInstruction();
+            peerReferences = host.promptPeerReferences;
+            host.promptPeerReferences = undefined;
             writeAutohandDebugLine(`[DEBUG] promptForInstruction returned: ${instruction}`, host.writeDebugLine?.bind(host));
           }
         }
@@ -1708,7 +1807,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
               );
               if (host.ui || host.inkRenderer) {
                 host.setComposerIdle();
-                if (command !== '/whatityped') host.clearComposerInput();
+                if (command !== '/whatityped' && command !== '/peers') host.clearComposerInput();
                 // Return to the top of the loop so the idle-wait path can await
                 // the next Composer submission without falling through to
                 // instruction.startsWith('/') which would throw on null.
@@ -1773,7 +1872,9 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         }
 
         const turnStartTime = Date.now();
+        await autoNameAgentSessionFromInstruction(host, instruction);
         const turnSucceeded = await executeAgentInstructionTurn(host, instruction, {
+          ...(peerReferences?.length ? { peerReferences } : {}),
           ...(executionPolicy ? { executionPolicy } : {}),
           ...(mobileTurn ? { mobileTurn } : {}),
           ...(echoInTranscript !== undefined ? { echoInTranscript } : {}),
@@ -1823,6 +1924,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
           host.persistentInput.setPendingSuggestion(host.pendingSuggestion);
           host.inkRenderer?.setPendingSuggestion?.(host.pendingSuggestion);
         }
+        void refineAgentSessionTitle(host, host.runtimeResourceShutdownController?.signal);
 
         // Fire stop hook after turn completes (non-blocking)
         const turnDuration = Date.now() - turnStartTime;

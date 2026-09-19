@@ -53,6 +53,101 @@ describe('SubAgent', () => {
     }
   });
 
+  it('gives a delegated agent its declared skills and a working skill tool when a registry is provided', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const requests: Array<Parameters<LLMProvider['complete']>[0]> = [];
+    const skill = (name: string, body: string) => ({ name, description: `${name} help`, body, path: `/s/${name}`, source: 'builtin' as const, isActive: false });
+    const skillsRegistry = {
+      list: [skill('systematic-debugging', 'Reproduce before fixing.'), skill('pull-request-review', 'Read the whole diff.')],
+      listSkills() { return this.list; },
+      getSkill(name: string) { return this.list.find((entry) => entry.name === name) ?? null; },
+    };
+    let turn = 0;
+    const agent = new SubAgent({
+      name: 'debugger', description: 'Debug', systemPrompt: 'Find the bug.',
+      tools: ['read_file', 'skill'], path: '/tmp/debugger.md', skills: ['systematic-debugging'],
+    }, {
+      getName: () => 'autohandai',
+      complete: async request => {
+        requests.push(request);
+        turn += 1;
+        if (turn === 1) {
+          return { id: 'r1', created: 0, raw: null, content: '', toolCalls: [nativeToolCall('skill', { command: 'activate', name: 'pull-request-review' })] };
+        }
+        if (turn === 2) {
+          // A reflection accompanies the second call so the loop guard lets it run.
+          return { id: 'r2', created: 0, raw: null, content: 'The review skill covers this task; the debugging skill is no longer needed.', toolCalls: [nativeToolCall('skill', { command: 'deactivate', name: 'systematic-debugging' }, 'call-deactivate')] };
+        }
+        return { id: 'r3', created: 0, raw: null, content: 'Diagnosed.' };
+      },
+      getCapabilities: () => ({ nativeToolCalling: true }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, {} as ActionExecutor, { clientContext: 'cli', depth: 1, maxDepth: 1, skillsRegistry });
+    const systemText = (index: number) => requests[index].messages.filter((message) => message.role === 'system').map((message) => String(message.content)).join('\n');
+    try {
+      await expect(agent.run('Why does login fail?')).resolves.toBe('Diagnosed.');
+      expect(systemText(0)).toContain('### Skill: systematic-debugging\nReproduce before fixing.');
+      expect(systemText(0)).toContain('- **pull-request-review**: pull-request-review help');
+      expect(String(requests[0].messages[0].content)).toContain('skill(');
+      const toolResult = requests[1].messages.find((message) => message.role === 'tool');
+      expect(String(toolResult?.content)).toContain('Activated skill: pull-request-review\n\nRead the whole diff.');
+      // The prompt follows the agent's activation state on every request.
+      expect(systemText(1)).toContain('### Skill: pull-request-review\nRead the whole diff.');
+      expect(systemText(2)).not.toContain('### Skill: systematic-debugging');
+      expect(systemText(2)).toContain('- **systematic-debugging**: systematic-debugging help');
+      expect(requests[2].messages.filter((message) => message.role === 'system' && String(message.content).includes('<!-- subagent-skills -->'))).toHaveLength(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('charges every sub-agent request to the shared run budget and stops when it is spent', async () => {
+    const { RunBudget, RunBudgetExceededError } = await import('../../../src/core/agent/RunBudget.js');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const budget = new RunBudget({ maxRequests: 2 });
+    budget.recordRequest(); // the lead already spent one
+    let turn = 0;
+    const agent = new SubAgent({
+      name: 'worker', description: 'Work', systemPrompt: 'Work.', tools: ['read_file'], path: '/tmp/worker.md',
+    }, {
+      getName: () => 'autohandai',
+      complete: async () => {
+        turn += 1;
+        if (turn === 1) return { id: 'r1', created: 0, raw: null, content: '', usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+          toolCalls: [nativeToolCall('read_file', { path: 'a.ts' })] };
+        return { id: 'r2', created: 0, raw: null, content: 'Read it.' };
+      },
+      getCapabilities: () => ({ nativeToolCalling: true }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, { executeForTool: async () => ({ success: true, output: 'contents' }) } as unknown as ActionExecutor, { clientContext: 'cli', depth: 1, maxDepth: 1, runBudget: budget });
+    try {
+      await expect(agent.run('Read a.ts')).rejects.toBeInstanceOf(RunBudgetExceededError);
+      expect(turn).toBe(1);
+      expect(budget.status()).toMatchObject({ requests: 2, tokens: 10 });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('does not advertise the skill tool to a delegated agent without a registry', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const requests: Array<Parameters<LLMProvider['complete']>[0]> = [];
+    const agent = new SubAgent({
+      name: 'plain', description: 'Plain', systemPrompt: 'Work.', tools: ['*'], path: '/tmp/plain.md',
+    }, {
+      getName: () => 'autohandai',
+      complete: async request => { requests.push(request); return { id: 'r', created: 0, raw: null, content: 'Done.' }; },
+      getCapabilities: () => ({ nativeToolCalling: true }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, {} as ActionExecutor, { clientContext: 'cli', depth: 1, maxDepth: 1 });
+    try {
+      await agent.run('Go.');
+      expect((requests[0].tools ?? []).map((tool) => tool.function?.name ?? (tool as { name?: string }).name)).not.toContain('skill');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('provides installed role names to a child that may delegate further', async () => {
     const roster = vi.spyOn(AgentRegistry.getInstance(), 'getAllAgents').mockReturnValue([{
       name: 'security-reviewer', description: 'Review trust boundaries.', systemPrompt: 'Review security.',
@@ -214,6 +309,111 @@ describe('SubAgent', () => {
     });
 
     await expect(agent.run('Keep reading')).rejects.toThrow('within 10 iterations');
+  });
+
+  it('does not accept a progress update as the delegated task result', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const executeForTool = vi.fn().mockResolvedValue({ success: true, output: 'verified source' });
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ content: 'I will inspect the source now.' })
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [nativeToolCall('read_file', { path: 'src/index.ts' }, 'call-read')],
+      })
+      .mockResolvedValueOnce({ content: 'Inspection completed with verified evidence.' });
+    const agent = new SubAgent({
+      name: 'reader', description: 'Read source', systemPrompt: 'Inspect source.',
+      tools: ['read_file'], path: '/tmp/reader.md',
+    }, {
+      getName: () => 'autohandai', complete,
+      getCapabilities: () => ({ nativeToolCalling: true }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, { executeForTool } as unknown as ActionExecutor, {
+      clientContext: 'cli', depth: 1, maxDepth: 1,
+    });
+
+    try {
+      await expect(agent.run('Inspect src/index.ts')).resolves.toBe('Inspection completed with verified evidence.');
+      expect(complete).toHaveBeenCalledTimes(3);
+      expect(executeForTool).toHaveBeenCalledOnce();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('preserves a truncated fragment for a bounded replacement attempt', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ content: 'Partial delegated result.', finishReason: 'length' as const })
+      .mockResolvedValueOnce({ content: 'Complete delegated result.' });
+    const agent = new SubAgent({
+      name: 'writer', description: 'Write result', systemPrompt: 'Produce a complete result.',
+      tools: [], path: '/tmp/writer.md',
+    }, {
+      getName: () => 'autohandai', complete,
+      getCapabilities: () => ({ nativeToolCalling: true }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, {} as ActionExecutor, { clientContext: 'cli', depth: 1, maxDepth: 1 });
+
+    try {
+      await expect(agent.run('Write the result')).resolves.toBe('Complete delegated result.');
+      expect(complete.mock.calls[1]?.[0]?.messages).toContainEqual({
+        role: 'assistant',
+        content: 'Partial delegated result.',
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('fails explicitly after bounded consecutive truncation repairs', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ content: 'First fragment.', finishReason: 'length' as const })
+      .mockResolvedValueOnce({ content: 'Second fragment.', finishReason: 'length' as const })
+      .mockResolvedValueOnce({ content: 'Third fragment.', finishReason: 'length' as const })
+      .mockResolvedValueOnce({ content: 'Unreachable complete result.' });
+    const agent = new SubAgent({
+      name: 'writer', description: 'Write result', systemPrompt: 'Produce a complete result.',
+      tools: [], path: '/tmp/writer.md',
+    }, {
+      getName: () => 'autohandai', complete,
+      getCapabilities: () => ({ nativeToolCalling: true }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, {} as ActionExecutor, { clientContext: 'cli', depth: 1, maxDepth: 1 });
+
+    try {
+      await expect(agent.run('Write the result')).rejects.toThrow(/truncated 3 consecutive responses/i);
+      expect(complete).toHaveBeenCalledTimes(3);
+      const secondRecoveryNote = (complete.mock.calls[2]?.[0]?.messages as Array<{ role: string; content: string }>)
+        .filter((message) => message.role === 'system')
+        .at(-1);
+      expect(secondRecoveryNote?.content).toContain('Recovery 2/3');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('rejects reasoning-only output instead of exposing it as a delegated result', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ content: '{"thought":"I still need to verify the result."}' })
+      .mockResolvedValueOnce({ content: 'Verified delegated result.' });
+    const agent = new SubAgent({
+      name: 'reviewer', description: 'Review result', systemPrompt: 'Verify before answering.',
+      tools: [], path: '/tmp/reviewer.md',
+    }, {
+      getName: () => 'legacy', complete,
+      getCapabilities: () => ({ nativeToolCalling: false }),
+      listModels: async () => [], isAvailable: async () => true, setModel: () => {},
+    }, {} as ActionExecutor, { clientContext: 'cli', depth: 1, maxDepth: 1 });
+
+    try {
+      await expect(agent.run('Review the result')).resolves.toBe('Verified delegated result.');
+      expect(complete).toHaveBeenCalledTimes(2);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('includes context queued by a progress hook in the immediately following provider request', async () => {
@@ -741,7 +941,7 @@ describe('SubAgent', () => {
     }
   });
 
-  it('stops when reflection reports missing tool outputs instead of blindly retrying', async () => {
+  it('rejects integrity recovery calls once and restores delegated tool access afterward', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const executeForTool = vi.fn().mockResolvedValue({ success: true, output: 'package contents' });
     const complete = vi.fn()
@@ -760,9 +960,23 @@ describe('SubAgent', () => {
         raw: {},
       })
       .mockResolvedValueOnce({
-        id: 'answer',
+        id: 'withheld-retry',
         created: 3,
-        content: 'Stopped without repeating the read.',
+        content: '',
+        toolCalls: [nativeToolCall('read_file', { path: 'withheld.ts' }, 'call-3')],
+        raw: {},
+      })
+      .mockResolvedValueOnce({
+        id: 'restored-read',
+        created: 4,
+        content: '',
+        toolCalls: [nativeToolCall('read_file', { path: 'restored.ts' }, 'call-4')],
+        raw: {},
+      })
+      .mockResolvedValueOnce({
+        id: 'answer',
+        created: 5,
+        content: 'Recovered without blindly repeating the read.',
         raw: {},
       });
     const llm = {
@@ -787,12 +1001,18 @@ describe('SubAgent', () => {
     });
 
     try {
-      await expect(subAgent.run('Read package.json')).resolves.toBe('Stopped without repeating the read.');
-      expect(executeForTool).toHaveBeenCalledTimes(1);
+      await expect(subAgent.run('Read package.json')).resolves.toBe('Recovered without blindly repeating the read.');
+      expect(executeForTool).toHaveBeenCalledTimes(2);
       expect(complete.mock.calls[2]?.[0]?.tools).toBeUndefined();
+      expect(complete.mock.calls[3]?.[0]?.tools).toBeDefined();
       expect(complete.mock.calls[2]?.[0]?.messages).toContainEqual(expect.objectContaining({
         role: 'tool',
         tool_call_id: 'call-2',
+        content: expect.stringContaining('not executed'),
+      }));
+      expect(complete.mock.calls[3]?.[0]?.messages).toContainEqual(expect.objectContaining({
+        role: 'tool',
+        tool_call_id: 'call-3',
         content: expect.stringContaining('not executed'),
       }));
     } finally {
@@ -800,7 +1020,7 @@ describe('SubAgent', () => {
     }
   });
 
-  it('requires reflection before a delegated agent can call another tool', async () => {
+  it('executes consecutive native delegated tool calls without synthetic reflection prose', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const executedIds: string[] = [];
     const executeForTool = vi.fn().mockImplementation((_action, context) => {
@@ -853,11 +1073,11 @@ describe('SubAgent', () => {
 
     try {
       await expect(subAgent.run('Inspect dependencies')).resolves.toBe('Done.');
-      expect(executedIds).toEqual(['call-1', 'call-3']);
+      expect(executedIds).toEqual(['call-1', 'call-2', 'call-3']);
       expect(complete.mock.calls[2]?.[0]?.messages).toContainEqual(expect.objectContaining({
         role: 'tool',
         tool_call_id: 'call-2',
-        content: expect.stringContaining('not executed'),
+        content: 'observed output',
       }));
     } finally {
       logSpy.mockRestore();

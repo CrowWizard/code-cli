@@ -158,6 +158,11 @@
       "alreadyExists": "AGENTS.md already exists in {{path}}",
       "overwritePrompt": "Overwrite existing AGENTS.md?"
     },
+    "upgrade": {
+      "signIn": "Sign in with /login to see upgrade options.",
+      "opening": "Opening {{url}}",
+      "link": "Upgrade your Autohand plan: {{url}}"
+    },
     "undo": {
       "description": "revert the last file mutation",
       "success": "Reverted changes to {{file}}",
@@ -207,6 +212,10 @@
         "taskListPositionDesc": "Place active tasks above status or directly above the composer",
         "showThinking": "Show LLM thinking",
         "showThinkingDesc": "Display the model reasoning process",
+        "renderMarkdown": "Render markdown",
+        "renderMarkdownDesc": "Show assistant headings, lists, code, and tables formatted instead of raw markdown",
+        "showTips": "Idle tips",
+        "showTipsDesc": "Rotate tips about slash commands, @ $ ! : triggers, and shortcuts beside the idle composer",
         "terminalBell": "Terminal bell",
         "terminalBellDesc": "Ring bell when task completes",
         "checkForUpdates": "Check for updates",
@@ -219,6 +228,8 @@
         "promptSuggestionsDesc": "Show LLM-generated next-step suggestions",
         "mouseComposerCursor": "Mouse composer cursor",
         "mouseComposerCursorDesc": "Click in composer text to position the cursor",
+        "keybindingProfile": "Keyboard shortcuts",
+        "keybindingProfileDesc": "Follow another coding agent's shortcuts (Ctrl+J newline, Ctrl+D exit, Ctrl+R history)",
         "activityVerbsEnabled": "Activity verbs",
         "activityVerbsEnabledDesc": "Show rotating activity verbs while the agent is working",
         "activitySymbol": "Activity symbol",
@@ -390,8 +401,11 @@
         "denyOnce": "Deny Once",
         "allowAlways": "Allow Always",
         "denyAlways": "Deny Always",
-        "alternative": "Enter alternative...",
-        "alternativeTitle": "Enter alternative action (or empty to cancel)",
+        "allowPrefixAlways": "Always allow `{{prefix}}` commands",
+        "alternativeCommand": "Run a different command instead...",
+        "alternativeCommandTitle": "Replacement command to run instead (empty to cancel)",
+        "alternativePath": "Use a different path instead...",
+        "alternativePathTitle": "Replacement path to use instead (empty to cancel)",
         "scopeTitle": "Choose where to save this decision",
         "scopeProject": "Project",
         "scopeUser": "User",
@@ -664,6 +678,23 @@
       "title": "Advanced Settings",
       "description": "Configure notifications, network, search, MCP, agent behavior, and community skills.",
       "prompt": "Would you like to configure advanced settings?"
+    },
+    "keybindings": {
+      "title": "Keyboard Shortcuts",
+      "description": "{{agents}} found on this machine. Autohand can follow the shortcuts you already know; change this any time in /settings.",
+      "prompt": "Which keyboard shortcuts should the composer use?",
+      "autohandOption": "Autohand defaults (recommended)",
+      "autohandDescription": "Shift+Tab cycles modes, Shift+Enter or Alt+Enter inserts a newline, Ctrl+C twice exits",
+      "agentOption": "Same as {{agent}}",
+      "agentDescription": "Adds that agent's chords such as Ctrl+J for a newline, Ctrl+D to exit and Ctrl+R for history"
+    },
+    "importAgents": {
+      "title": "Import From Other Agents",
+      "description": "Memories, sessions and skills can be brought across with the same /import command you can run later.",
+      "prompt": "Import memories, sessions and skills from {{agents}}?",
+      "running": "Importing from {{agents}}...",
+      "skipped": "Skipped. Run /import whenever you want to bring them across.",
+      "failed": "Import did not finish: {{error}}. Setup continues; run /import later to retry."
     },
     "registration": {
       "title": "Autohand Account",
@@ -1082,7 +1113,9 @@
   "ui": {
     "cancel": "Cancel",
     "escToCancel": "esc to cancel",
-    "commandHint": "? shortcuts · / commands · @ mention files · $ skills · ! terminal",
+    "upgradeHint": "You've reached your {{plan}} plan limit. Run /upgrade to move to {{next}}.",
+    "upgradeHintManaged": "You've reached your plan limit. Run /upgrade to review your plan.",
+    "commandHint": "? shortcuts · / commands · @ mention files · $ skills · : message agents · ! terminal",
     "ctrlCToExit": "Press Ctrl+C again to exit",
     "noMatchingCommands": "No matching commands.",
     "selectFile": "Select a file",

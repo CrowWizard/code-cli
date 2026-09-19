@@ -10,29 +10,37 @@
  * instead of calling instance.rerender() on every state change. This eliminates
  * flickering by letting React handle efficient DOM updates.
  */
+import { disableKittyProtocol, enableKittyProtocol, KITTY_DISAMBIGUATE_FLAG } from '../kittyProtocol.js';
 import React, { useState, useImperativeHandle, forwardRef, useCallback, useRef } from 'react';
 import { render, type Instance } from 'ink';
 import {
   AgentUI,
   createInitialUIState,
+  formatCompletionSummary,
+  MAX_TOOL_OUTPUT_ENTRIES,
+  MAX_VISIBLE_NOTIFICATIONS,
   type ActivityItem,
   type AnnouncementLineState,
+  type TipLineState,
   type AgentUILineExtensions,
   type AgentUIState,
   type CommandResultState,
   type ContextTokenDisplay,
-  type TurnCompletionStatus,
 } from './AgentUI.js';
 import type { GoalEditRequest } from './GoalPanel.js';
 import type { LiveCommandEntry, ToolOutputEntry, ToolOutputBatchEntry, ToolOutputItem, BatchToolItem } from './ToolOutput.js';
 import type { SlashCommand } from '../../core/slashCommandTypes.js';
+import type { ResolvedKeybindings } from '../../keybindings/profiles.js';
 import type { SkillMentionInfo } from '../mentionFilter.js';
+import type { MessageTarget } from '../messageTargets.js';
 import type { ExtensionKeybinding } from '../../extensions/ExtensionRuntimeHost.js';
 import { ThemeProvider } from '../theme/ThemeContext.js';
 import { getTypedMessageHistory } from '../../session/TypedMessageHistory.js';
 import { I18nProvider } from '../i18n/index.js';
 import { inkRenderOptions } from '../inkRenderOptions.js';
 import { stripAnsiCodes } from '../displayUtils.js';
+import { TIP_ROTATION_MS } from '../tips.js';
+import { fitsIdleTip, idleTipWidth } from './TipLine.js';
 import { safeSetRawMode } from '../rawMode.js';
 import type { ChatLogMessage } from '../../session/chatLog.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
@@ -45,6 +53,8 @@ import type { TeamActivitySnapshot } from '../../core/teams/types.js';
 import type { AgentRunsSnapshot, AgentRunSource } from '../../core/agents/AgentRunStore.js';
 import type { GoalSessionSnapshot } from '../../goals/types.js';
 import type { TaskListPosition } from '../../types.js';
+import type { PeerDescriptor, PeerReceipt, PeerScope } from '../../session/peers/PeerProtocol.js';
+import type { PeerComposerDraft, PeerInstructionMetadata, PeerReference } from '../peerMention.js';
 import type { LineExtension, LineSegment } from './StatusLine.js';
 import {
   createSequencedQueuedWork,
@@ -52,7 +62,13 @@ import {
 } from '../../utils/queuedWorkSequence.js';
 
 export interface InkRendererOptions {
-  onInstruction: (text: string) => void;
+  onSteer?: (text: string) => void;
+  onWorkingSpinnerFrame?: (frame: number) => void;
+  onInstruction: (text: string, metadata?: PeerInstructionMetadata) => void;
+  peerScopes?: PeerScope[];
+  peersProvider?: (scope?: PeerScope) => PeerDescriptor[];
+  onPeersRefresh?: (scope?: PeerScope) => Promise<unknown>;
+  onPeerMessage?: (input: { to: string; content: string; replyTo?: string }) => Promise<PeerReceipt>;
   onEscape: () => void;
   onCtrlC: () => void;
   onDismissAnnouncement?: (id: string) => void;
@@ -65,6 +81,7 @@ export interface InkRendererOptions {
   slashCommands?: SlashCommand[];
   /** Provider for skill list used in $ mention autocomplete */
   skillsProvider?: () => SkillMentionInfo[];
+  messageTargetsProvider?: () => MessageTarget[];
   /** Base path used for shell path completion. Defaults to process.cwd(). */
   workspaceRoot?: string;
   /** Lazy provider for the current next-step suggestion shown as ghost text. */
@@ -78,10 +95,13 @@ export interface InkRendererOptions {
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
   mouseComposerCursor?: boolean;
+  keybindings?: ResolvedKeybindings;
   taskListPositionProvider?: () => TaskListPosition;
   onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
   onCancelAgentRun?: (id: string) => void | Promise<unknown>;
   onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
+  /** Draws the next tip `accept` allows; tips rotate beside the composer while no turn runs. */
+  tipProvider?: (accept: (tip: string) => boolean) => string | undefined;
 }
 
 export interface SetWorkingOptions {
@@ -138,10 +158,6 @@ function formatCompletedLiveOutput(
   ].join('\n');
 }
 
-function completionLabel(status?: TurnCompletionStatus): string {
-  return status === 'failed' ? 'Failed' : 'Completed';
-}
-
 function stringArraysEqual(left: string[] = [], right: string[] = []): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -190,7 +206,13 @@ export interface AgentUIWrapperHandle {
 
 interface AgentUIWrapperProps {
   initialState: AgentUIState;
-  onInstruction: (text: string) => void;
+  onSteer?: (text: string) => void;
+  onWorkingSpinnerFrame?: (frame: number) => void;
+  onInstruction: InkRendererOptions['onInstruction'];
+  peerScopes?: InkRendererOptions['peerScopes'];
+  peersProvider?: InkRendererOptions['peersProvider'];
+  onPeersRefresh?: InkRendererOptions['onPeersRefresh'];
+  onPeerMessage?: InkRendererOptions['onPeerMessage'];
   onEscape: () => void;
   onCtrlC: () => void;
   onDismissAnnouncement?: (id: string) => void;
@@ -201,22 +223,24 @@ interface AgentUIWrapperProps {
   onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
   onToggleGoalPanel: () => void;
   onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
-  onInputChange: (input: string) => void;
+  onInputChange: (input: string, metadata?: PeerInstructionMetadata) => void;
   enableQueueInput?: boolean;
   onImageDetected?: (data: Buffer, mimeType: string, filename?: string) => number;
   filesProvider?: () => string[];
   slashCommands?: SlashCommand[];
   skillsProvider?: () => SkillMentionInfo[];
+  messageTargetsProvider?: () => MessageTarget[];
   workspaceRoot?: string;
   suggestionProvider?: () => string | undefined;
   resolveShellSuggestion?: (input: string) => Promise<string | null>;
   lineExtensions?: AgentUILineExtensions;
   extensionKeybindings?: ExtensionKeybinding[];
-  onReplaceQueuedInstruction: (index: number, text: string) => void;
+  onReplaceQueuedInstruction: (index: number, text: string, metadata?: PeerInstructionMetadata) => void;
   onRemoveQueuedInstruction: (index: number) => void;
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
   mouseComposerCursor?: boolean;
+  keybindings?: ResolvedKeybindings;
   taskListPositionProvider?: () => TaskListPosition;
 }
 
@@ -229,6 +253,8 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
     const {
       initialState,
       onInstruction,
+      onSteer,
+      onWorkingSpinnerFrame,
       onEscape,
       onCtrlC,
       onDismissAnnouncement,
@@ -245,6 +271,11 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       filesProvider,
       slashCommands,
       skillsProvider,
+      messageTargetsProvider,
+      peerScopes,
+  peersProvider,
+      onPeersRefresh,
+      onPeerMessage,
       workspaceRoot,
       suggestionProvider,
       resolveShellSuggestion,
@@ -255,6 +286,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       getInteractionMode,
       onCycleInteractionMode,
       mouseComposerCursor,
+      keybindings,
       taskListPositionProvider,
     } = props;
 
@@ -273,9 +305,9 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
     }), []); // Empty deps - functions are stable
 
     // Handle input changes - sync to parent for pause/resume preservation
-    const handleInputChange = useCallback((input: string) => {
-      setState(prev => ({ ...prev, currentInput: input }));
-      onInputChange(input);
+    const handleInputChange = useCallback((input: string, metadata?: PeerInstructionMetadata) => {
+      setState(prev => ({ ...prev, currentInput: input, peerInputMetadata: metadata, peerDraft: undefined }));
+      onInputChange(input, metadata);
     }, [onInputChange]);
 
     return (
@@ -283,6 +315,8 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         state={state}
         typedMessageHistory={getTypedMessageHistory()}
         onInstruction={onInstruction}
+        onSteer={onSteer}
+        onWorkingSpinnerFrame={onWorkingSpinnerFrame}
         onEscape={onEscape}
         onCtrlC={onCtrlC}
         onDismissAnnouncement={onDismissAnnouncement}
@@ -299,6 +333,11 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         filesProvider={filesProvider}
         slashCommands={slashCommands}
         skillsProvider={skillsProvider}
+        messageTargetsProvider={messageTargetsProvider}
+        peerScopes={peerScopes}
+        peersProvider={peersProvider}
+        onPeersRefresh={onPeersRefresh}
+        onPeerMessage={onPeerMessage}
         workspaceRoot={workspaceRoot}
         suggestionProvider={suggestionProvider}
         resolveShellSuggestion={resolveShellSuggestion}
@@ -309,6 +348,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         getInteractionMode={getInteractionMode}
         onCycleInteractionMode={onCycleInteractionMode}
         mouseComposerCursor={mouseComposerCursor}
+        keybindings={keybindings}
         taskListPosition={taskListPositionProvider?.() ?? 'above-composer'}
       />
     );
@@ -387,6 +427,8 @@ export class InkRenderer {
   /** Pending live command output buffers (accumulated between flushes) */
   private pendingLiveOutput = new Map<string, { stdout: string; stderr: string }>();
   /** Timer for throttling live command output flushes */
+  /** Set when the elapsed or token counters move; cleared once a summary row reports them. */
+  private countersChangedSinceSummary = false;
   private liveOutputFlushTimer: ReturnType<typeof setTimeout> | null = null;
   /** Flush interval in ms - batches rapid output to prevent flickering */
   private static readonly LIVE_OUTPUT_FLUSH_INTERVAL_MS = 100;
@@ -399,6 +441,9 @@ export class InkRenderer {
   /** Debounce timer for drag-resize events */
   private resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Rotates tips beside the composer while no turn runs. */
+  private idleTipTimer: ReturnType<typeof setInterval> | null = null;
+
   /** Debounce time for resize events (ms) - longer to batch drag-resize */
   private static readonly RESIZE_DEBOUNCE_MS = 150;
 
@@ -406,7 +451,7 @@ export class InkRenderer {
   private unpatchedStdout: (() => void) | null = null;
 
   private lastQueuedInstruction: { text: string; at: number } | null = null;
-  private queuedInstructionEntries: SequencedQueuedWork[] = [];
+  private queuedInstructionEntries: Array<SequencedQueuedWork & Partial<PeerInstructionMetadata>> = [];
 
   constructor(options: InkRendererOptions) {
     this.options = options;
@@ -423,8 +468,8 @@ export class InkRenderer {
   /**
    * Handle input changes from AgentUI to preserve across pause/resume
    */
-  private handleInputChange = (input: string): void => {
-    this.state = { ...this.state, currentInput: input };
+  private handleInputChange = (input: string, metadata?: PeerInstructionMetadata): void => {
+    this.state = { ...this.state, currentInput: input, peerInputMetadata: metadata, peerDraft: undefined };
   };
 
 /**
@@ -454,6 +499,13 @@ export class InkRenderer {
     // frame updates. Must happen before Ink starts writing to stdout.
     this.unpatchedStdout = patchStdoutForSyncOutput();
 
+    // Shift+Enter, Alt+Enter and Esc are only distinguishable when the
+    // terminal encodes modified keys. Ink parses the kitty CSI u form; iTerm2,
+    // Ghostty, kitty and WezTerm honour the request, others ignore it.
+    if (process.stdout.isTTY) {
+      enableKittyProtocol(process.stdout, KITTY_DISAMBIGUATE_FLAG);
+    }
+
     // Install our resize guard BEFORE Ink registers its own handler.
     // Node.js event listeners fire in registration order.
     this.resizeHandler = this.onResize;
@@ -461,13 +513,26 @@ export class InkRenderer {
       process.stdout.on('resize', this.resizeHandler);
     }
 
-    this.instance = render(
+    // Seed the idle tip before the first frame so it does not pop in a render later.
+    this.syncIdleTips();
+
+    this.instance = this.mountAgentUI();
+  }
+
+  /**
+   * Render a fresh Ink instance for the agent UI from the current state.
+   * Shared by the initial start() and by resume() after a modal.
+   */
+  private mountAgentUI(): Instance {
+    return render(
       <ThemeProvider>
         <I18nProvider>
           <AgentUIWrapper
             ref={this.wrapperRef}
             initialState={this.state}
             onInstruction={this.options.onInstruction}
+            onSteer={this.options.onSteer}
+            onWorkingSpinnerFrame={this.options.onWorkingSpinnerFrame}
             onEscape={this.options.onEscape}
             onCtrlC={this.options.onCtrlC}
             onDismissAnnouncement={this.options.onDismissAnnouncement}
@@ -484,16 +549,22 @@ export class InkRenderer {
             filesProvider={this.options.filesProvider}
             slashCommands={this.options.slashCommands}
             skillsProvider={this.options.skillsProvider}
+            messageTargetsProvider={this.options.messageTargetsProvider}
+            peerScopes={this.options.peerScopes}
+            peersProvider={this.options.peersProvider}
+            onPeersRefresh={this.options.onPeersRefresh}
+            onPeerMessage={this.options.onPeerMessage}
             workspaceRoot={this.options.workspaceRoot}
             suggestionProvider={this.options.suggestionProvider}
             resolveShellSuggestion={this.options.resolveShellSuggestion}
             lineExtensions={this.options.lineExtensions}
             extensionKeybindings={this.options.extensionKeybindings}
-            onReplaceQueuedInstruction={(index, text) => this.replaceQueuedInstruction(index, text)}
+            onReplaceQueuedInstruction={(index, text, metadata) => this.replaceQueuedInstruction(index, text, metadata)}
             onRemoveQueuedInstruction={(index) => this.removeQueuedInstruction(index)}
             getInteractionMode={this.options.getInteractionMode}
             onCycleInteractionMode={this.options.onCycleInteractionMode}
             mouseComposerCursor={this.options.mouseComposerCursor}
+            keybindings={this.options.keybindings}
             taskListPositionProvider={this.options.taskListPositionProvider}
           />
         </I18nProvider>
@@ -513,6 +584,9 @@ export class InkRenderer {
    * Stop the Ink renderer and cleanup
    */
   stop(): void {
+    if (this.instance && process.stdout.isTTY) {
+      disableKittyProtocol(process.stdout);
+    }
     if (this.instance) {
       const instance = this.instance;
       try {
@@ -535,6 +609,13 @@ export class InkRenderer {
       clearTimeout(this.resizeDebounceTimer);
       this.resizeDebounceTimer = null;
     }
+
+    this.stopIdleTips();
+    if (this.liveOutputFlushTimer) {
+      clearTimeout(this.liveOutputFlushTimer);
+      this.liveOutputFlushTimer = null;
+    }
+    this.pendingLiveOutput.clear();
 
     if (this.unpatchedStdout) {
       this.unpatchedStdout();
@@ -561,7 +642,8 @@ export class InkRenderer {
   private archiveCompletedTurnMessages(
     messages: ChatLogMessage[],
     finalResponse: string | undefined,
-    completionStats: AgentUIState['completionStats']
+    completionStats: AgentUIState['completionStats'],
+    thinking: string | null = null,
   ): ChatLogMessage[] {
     let nextMessages = messages;
 
@@ -571,15 +653,19 @@ export class InkRenderer {
           message.role === 'assistant' && message.content === finalResponse
         );
       if (!alreadyArchived) {
+        // The thought is only set when show-thinking is on; keep it ahead of
+        // the reply it belongs to so the transcript reads in order.
+        const thought = thinking?.trim();
         nextMessages = [
           ...nextMessages,
+          ...(thought ? [{ role: 'thinking' as const, content: thought }] : []),
           { role: 'assistant', content: finalResponse },
         ];
       }
     }
 
     if (completionStats) {
-      const content = `${completionLabel(completionStats.status)} in ${completionStats.elapsed} · ${completionStats.tokens}`;
+      const content = formatCompletionSummary(completionStats);
       const alreadyArchived = nextMessages
         .some((message) =>
           message.role === 'completion' && message.content === content
@@ -608,6 +694,7 @@ export class InkRenderer {
       status,
       // Clear final response when starting new work
       finalResponse: isWorking ? null : this.state.finalResponse,
+      streamingResponse: null,
       thinking: isWorking ? null : this.state.thinking,
     };
 
@@ -615,15 +702,22 @@ export class InkRenderer {
       const archivedMessages = this.archiveCompletedTurnMessages(
         this.state.chatMessages,
         archivedFinalResponse,
-        this.state.completionStats
+        this.state.completionStats,
+        this.state.thinking,
       );
       if (archivedMessages !== this.state.chatMessages) {
         updates.chatMessages = archivedMessages;
       }
+    } else {
+      Object.assign(updates, this.archiveIdleReply(this.state.chatMessages, this.state.finalResponse, this.state.thinking));
     }
 
-    // When stopping work, save completion stats from current elapsed/tokens
-    if (!isWorking && (this.state.elapsed || this.state.tokens)) {
+    // When stopping work, save completion stats from current elapsed/tokens.
+    // Only a turn that actually ran gets a summary: an idle transition after a
+    // slash command would otherwise reuse the previous turn's counters and
+    // label them "Completed" even when that turn failed.
+    const turnEnded = options.succeeded !== undefined || this.countersChangedSinceSummary;
+    if (!isWorking && turnEnded && (this.state.elapsed || this.state.tokens)) {
       const completionStatus = options.succeeded === false
         ? 'failed'
         : this.state.completionStats?.status;
@@ -632,6 +726,7 @@ export class InkRenderer {
         tokens: this.state.tokens || '0 tokens',
         ...(completionStatus ? { status: completionStatus } : {})
       };
+      this.countersChangedSinceSummary = false;
     }
 
     // When starting new work, clear completion stats
@@ -640,7 +735,13 @@ export class InkRenderer {
       updates.commandResult = undefined;
     }
 
+    // Tips rotate only while idle; an upgrade hint stays until the next turn starts.
+    if (isWorking && this.state.tip) {
+      updates.tip = undefined;
+    }
+
     this.updateState(updates);
+    this.syncIdleTips();
   }
 
   /**
@@ -658,6 +759,7 @@ export class InkRenderer {
    * Update elapsed time display
    */
   setElapsed(elapsed: string): void {
+    this.countersChangedSinceSummary = true;
     this.updateState({ elapsed });
   }
 
@@ -665,6 +767,7 @@ export class InkRenderer {
    * Update token count display
    */
   setTokens(tokens: string): void {
+    this.countersChangedSinceSummary = true;
     this.updateState({ tokens });
   }
 
@@ -675,13 +778,15 @@ export class InkRenderer {
     const archivedMessages = this.archiveCompletedTurnMessages(
       this.state.chatMessages,
       this.state.finalResponse?.trim() || undefined,
-      this.state.completionStats
+      this.state.completionStats,
+      this.state.thinking,
     );
 
     this.updateState({
       userMessages: [...this.state.userMessages, message],
       chatMessages: [...archivedMessages, { role: 'user', content: message }],
       finalResponse: this.state.finalResponse ? null : this.state.finalResponse,
+      thinking: this.state.thinking ? null : this.state.thinking,
       completionStats: this.state.completionStats ? null : this.state.completionStats,
     });
   }
@@ -717,8 +822,18 @@ export class InkRenderer {
     }
 
     this.updateState({
-      notifications: [...this.state.notifications, content],
+      notifications: this.appendNotifications(content),
     });
+  }
+
+  /** Only the newest notifications are ever drawn, so older ones are released immediately. */
+  private appendNotifications(content: string): string[] {
+    return [...this.state.notifications, content].slice(-MAX_VISIBLE_NOTIFICATIONS);
+  }
+
+  /** Only the newest tool outputs are ever drawn, so older ones are released immediately. */
+  private appendToolOutputs(...entries: ToolOutputItem[]): ToolOutputItem[] {
+    return [...this.state.toolOutputs, ...entries].slice(-MAX_TOOL_OUTPUT_ENTRIES);
   }
 
   upsertNotification(key: string, message: string): void {
@@ -736,7 +851,7 @@ export class InkRenderer {
       ? -1
       : this.state.notifications.lastIndexOf(previousContent);
     const notifications = previousIndex === -1
-      ? [...this.state.notifications, content]
+      ? this.appendNotifications(content)
       : this.state.notifications.map((notification, index) =>
         index === previousIndex ? content : notification,
       );
@@ -778,7 +893,7 @@ export class InkRenderer {
       thought
     };
     this.updateState({
-      toolOutputs: [...this.state.toolOutputs, entry],
+      toolOutputs: this.appendToolOutputs(entry),
       chatMessages: [
         ...this.state.chatMessages,
         { role: 'tool', tool, success, content: output },
@@ -804,7 +919,7 @@ export class InkRenderer {
       thought: i === 0 ? o.thought : undefined
     }));
     this.updateState({
-      toolOutputs: [...this.state.toolOutputs, ...entries],
+      toolOutputs: this.appendToolOutputs(...entries),
       chatMessages: [
         ...this.state.chatMessages,
         ...entries.map((entry) => ({
@@ -847,7 +962,7 @@ export class InkRenderer {
     };
 
     this.updateState({
-      toolOutputs: [...this.state.toolOutputs, entry],
+      toolOutputs: this.appendToolOutputs(entry),
       chatMessages: [
         ...this.state.chatMessages,
         {
@@ -1026,7 +1141,7 @@ export class InkRenderer {
 
     this.updateState({
       liveCommands: this.state.liveCommands.filter((item) => item.id !== id),
-      toolOutputs: [...this.state.toolOutputs, finalizedEntry],
+      toolOutputs: this.appendToolOutputs(finalizedEntry),
       chatMessages: [
         ...this.state.chatMessages,
         {
@@ -1100,6 +1215,41 @@ export class InkRenderer {
 
   setAnnouncement(announcement: AnnouncementLineState | undefined): void {
     this.updateState({ announcement });
+  }
+
+  setTip(tip: TipLineState | undefined): void {
+    this.updateState({ tip });
+  }
+
+  private syncIdleTips(): void {
+    if (this.state.isWorking) {
+      this.stopIdleTips();
+      return;
+    }
+    if (this.idleTipTimer || !this.options.tipProvider) {
+      return;
+    }
+    this.showNextIdleTip();
+    this.idleTipTimer = setInterval(() => this.showNextIdleTip(), TIP_ROTATION_MS);
+    this.idleTipTimer.unref?.();
+  }
+
+  private stopIdleTips(): void {
+    if (this.idleTipTimer) {
+      clearInterval(this.idleTipTimer);
+      this.idleTipTimer = null;
+    }
+  }
+
+  /** Draws a tip that fits the room left beside the completion summary; a pinned upgrade hint wins. */
+  private showNextIdleTip(): void {
+    if (this.state.isWorking || this.state.tip?.kind === 'upgrade') {
+      return;
+    }
+    const stats = this.state.completionStats;
+    const width = idleTipWidth(process.stdout.columns ?? 80, stats ? formatCompletionSummary(stats) : undefined);
+    const text = this.options.tipProvider?.((tip) => fitsIdleTip(tip, width));
+    this.updateState({ tip: text ? { kind: 'tip', text } : undefined });
   }
 
   /**
@@ -1230,11 +1380,27 @@ export class InkRenderer {
    * Clear the composer input (e.g. after a slash command completes)
    */
   clearInput(): void {
-    this.updateState({ currentInput: '' });
+    this.updateState({ currentInput: '', peerDraft: undefined, peerInputMetadata: undefined });
   }
 
   setInput(text: string): void {
-    this.updateState({ currentInput: text });
+    this.updateState({ currentInput: text, peerDraft: undefined, peerInputMetadata: undefined });
+  }
+
+  setPeerDraft(draft: PeerComposerDraft): void {
+    this.updateState({
+      currentInput: draft.text ?? `:${draft.reference.alias} `,
+      peerDraft: structuredClone(draft),
+      peerInputMetadata: {
+        peerReferences: [structuredClone(draft.reference)],
+        peerScope: draft.scope ?? this.state.peerInputMetadata?.peerScope ?? 'workspace',
+        ...(draft.replyTo ? { peerReplyTo: draft.replyTo } : {}),
+      },
+    });
+  }
+
+  refreshPeers(): void {
+    this.updateState({ peerDirectoryVersion: (this.state.peerDirectoryVersion ?? 0) + 1 });
   }
 
   setPendingSuggestion(pendingSuggestion?: Promise<void>): void {
@@ -1327,6 +1493,7 @@ export class InkRenderer {
 
       // Create fresh ref for new instance
       this.wrapperRef = React.createRef<AgentUIWrapperHandle>();
+      this.lastQueuedInstruction = null;
 
       // Unmounting the previous Ink instance removes its visible primary-screen
       // frame before the alternate-screen modal opens. Replay the canonical
@@ -1341,51 +1508,7 @@ export class InkRenderer {
         notifications: [],
       };
 
-      this.instance = render(
-        <ThemeProvider>
-          <I18nProvider>
-            <AgentUIWrapper
-              ref={this.wrapperRef}
-              initialState={this.state}
-              onInstruction={this.options.onInstruction}
-              onEscape={this.options.onEscape}
-              onCtrlC={this.options.onCtrlC}
-              onDismissAnnouncement={this.options.onDismissAnnouncement}
-              onToggleLiveCommandExpanded={(id) => this.toggleActiveLiveCommandExpanded(id)}
-              onToggleTeamPanel={() => this.toggleTeamPanel()}
-              onCloseAgentRunsPanel={() => this.setAgentRunsPanelVisible(false)}
-              onCancelAgentRun={this.options.onCancelAgentRun}
-              onMessageAgentRun={this.options.onMessageAgentRun}
-              onToggleGoalPanel={() => this.toggleGoalPanel()}
-              onEditGoalObjective={this.options.onEditGoalObjective}
-              onInputChange={this.handleInputChange}
-              enableQueueInput={this.options.enableQueueInput}
-              onImageDetected={this.options.onImageDetected}
-              filesProvider={this.options.filesProvider}
-              slashCommands={this.options.slashCommands}
-              skillsProvider={this.options.skillsProvider}
-              workspaceRoot={this.options.workspaceRoot}
-              suggestionProvider={this.options.suggestionProvider}
-              resolveShellSuggestion={this.options.resolveShellSuggestion}
-              lineExtensions={this.options.lineExtensions}
-              extensionKeybindings={this.options.extensionKeybindings}
-              onReplaceQueuedInstruction={(index, text) => this.replaceQueuedInstruction(index, text)}
-              onRemoveQueuedInstruction={(index) => this.removeQueuedInstruction(index)}
-              getInteractionMode={this.options.getInteractionMode}
-              onCycleInteractionMode={this.options.onCycleInteractionMode}
-              mouseComposerCursor={this.options.mouseComposerCursor}
-              taskListPositionProvider={this.options.taskListPositionProvider}
-            />
-          </I18nProvider>
-        </ThemeProvider>,
-        inkRenderOptions({
-          stdin: process.stdin,
-          stdout: process.stdout,
-          stderr: process.stderr,
-          // Let AgentUI handle Ctrl+C (clear text / warn-then-exit) instead of Ink forcing exit
-          exitOnCtrlC: false
-        })
-      );
+      this.instance = this.mountAgentUI();
       writeAutohandDebugLine('[DEBUG] InkRenderer.resume: instance created successfully');
     }
   }
@@ -1393,7 +1516,7 @@ export class InkRenderer {
   /**
    * Add a queued instruction
    */
-  addQueuedInstruction(instruction: string): void {
+  addQueuedInstruction(instruction: string, metadata?: PeerInstructionMetadata): void {
     const now = Date.now();
     if (
       this.lastQueuedInstruction?.text === instruction &&
@@ -1403,9 +1526,10 @@ export class InkRenderer {
     }
 
     this.lastQueuedInstruction = { text: instruction, at: now };
-    this.queuedInstructionEntries.push(createSequencedQueuedWork(instruction));
+    this.queuedInstructionEntries.push({ ...createSequencedQueuedWork(instruction), ...(metadata?.peerReferences.length ? structuredClone(metadata) : {}) });
     this.updateState({
-      queuedInstructions: [...this.state.queuedInstructions, instruction]
+      queuedInstructions: [...this.state.queuedInstructions, instruction],
+      queuedInstructionMetadata: this.queueMetadata()
     });
     // Resolve any pending waiter so the main loop can continue
     if (this._instructionWaiter) {
@@ -1418,7 +1542,7 @@ export class InkRenderer {
   /**
    * Replace an existing queued instruction while preserving queue order.
    */
-  replaceQueuedInstruction(index: number, instruction: string): boolean {
+  replaceQueuedInstruction(index: number, instruction: string, metadata?: PeerInstructionMetadata): boolean {
     if (index < 0 || index >= this.state.queuedInstructions.length) {
       return false;
     }
@@ -1428,11 +1552,12 @@ export class InkRenderer {
     const queuedEntry = this.queuedInstructionEntries[index];
     if (queuedEntry) {
       this.queuedInstructionEntries[index] = {
-        ...queuedEntry,
+        sequence: queuedEntry.sequence,
         text: instruction,
+        ...(metadata?.peerReferences.length ? structuredClone(metadata) : {}),
       };
     }
-    this.updateState({ queuedInstructions });
+    this.updateState({ queuedInstructions, queuedInstructionMetadata: this.queueMetadata() });
     return true;
   }
 
@@ -1446,27 +1571,31 @@ export class InkRenderer {
 
     const queuedInstructions = this.state.queuedInstructions.filter((_, idx) => idx !== index);
     this.queuedInstructionEntries = this.queuedInstructionEntries.filter((_, idx) => idx !== index);
-    this.updateState({ queuedInstructions });
+    this.updateState({ queuedInstructions, queuedInstructionMetadata: this.queueMetadata() });
     return true;
   }
 
   /**
    * Remove and return the next queued instruction
    */
+  private queueMetadata(): Array<PeerInstructionMetadata | undefined> {
+    return this.queuedInstructionEntries.map(entry => entry.peerReferences ? { peerReferences: structuredClone(entry.peerReferences), ...(entry.peerScope ? { peerScope: entry.peerScope } : {}) } : undefined);
+  }
+
   dequeueInstruction(): string | undefined {
     return this.dequeueQueuedInstruction()?.text;
   }
 
   /** Inspect the oldest queued instruction without mutating the editable UI queue. */
-  peekQueuedInstruction(): Readonly<SequencedQueuedWork> | undefined {
+  peekQueuedInstruction(): Readonly<SequencedQueuedWork & Partial<PeerInstructionMetadata>> | undefined {
     return this.queuedInstructionEntries[0];
   }
 
   /** Remove the oldest queued instruction while retaining its global FIFO ordinal. */
-  dequeueQueuedInstruction(): SequencedQueuedWork | undefined {
+  dequeueQueuedInstruction(): (SequencedQueuedWork & Partial<PeerInstructionMetadata>) | undefined {
     const next = this.queuedInstructionEntries.shift();
     if (!next) return undefined;
-    this.updateState({ queuedInstructions: this.state.queuedInstructions.slice(1) });
+    this.updateState({ queuedInstructions: this.state.queuedInstructions.slice(1), queuedInstructionMetadata: this.queueMetadata() });
     return next;
   }
 
@@ -1489,7 +1618,7 @@ export class InkRenderer {
    */
   clearQueue(): void {
     this.queuedInstructionEntries = [];
-    this.updateState({ queuedInstructions: [] });
+    this.updateState({ queuedInstructions: [], queuedInstructionMetadata: [] });
   }
 
   /**
@@ -1513,7 +1642,37 @@ export class InkRenderer {
    * Set the final response (displayed when not working)
    */
   setFinalResponse(response: string): void {
-    this.updateState({ finalResponse: response });
+    const updates: Partial<AgentUIState> = { finalResponse: response, streamingResponse: null };
+    if (!this.state.isWorking) {
+      Object.assign(updates, this.archiveIdleReply(this.state.chatMessages, response, this.state.thinking));
+    }
+    this.updateState(updates);
+  }
+
+  /**
+   * Move a finished reply (and the thought ahead of it) into the transcript.
+   * A reply left in the dynamic frame makes Ink clear the screen and scrollback
+   * on every repaint once it is taller than the viewport.
+   */
+  private archiveIdleReply(
+    messages: ChatLogMessage[],
+    finalResponse: string | null | undefined,
+    thinking: string | null,
+  ): Partial<AgentUIState> {
+    const reply = finalResponse?.trim();
+    if (!reply) {
+      return {};
+    }
+    const archived = this.archiveCompletedTurnMessages(messages, reply, null, thinking);
+    return {
+      thinking: null,
+      ...(archived !== messages ? { chatMessages: archived } : {}),
+    };
+  }
+
+  /** A transient, bounded view of streamed content while the turn is still running. */
+  setStreamingResponse(response: string | null): void {
+    this.updateState({ streamingResponse: response });
   }
 
   /**
@@ -1548,11 +1707,4 @@ export class InkRenderer {
   isRunning(): boolean {
     return this.instance !== null;
   }
-}
-
-/**
- * Create an InkRenderer instance
- */
-export function createInkRenderer(options: InkRendererOptions): InkRenderer {
-  return new InkRenderer(options);
 }

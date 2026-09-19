@@ -5,11 +5,12 @@
  *
  * Domain types for the context-compaction module.
  */
-import type { LLMMessage, FunctionDefinition, MessagePriority, MessageMetadata } from '../../types.js';
+import type { LLMMessage, FunctionDefinition } from '../../types.js';
 import type { LLMProvider } from '../../providers/LLMProvider.js';
 import type { MemoryManager } from '../../memory/MemoryManager.js';
 import type { ConversationManager } from '../conversationManager.js';
 import type { ContextUsage } from './tokenizer.js';
+import type { ContextCompactionData } from '../../telemetry/types.js';
 
 // ── Compaction Entry ──────────────────────────────────────────────────────────
 
@@ -57,28 +58,6 @@ export interface CompactionResult {
   entry?: CompactionEntry;
 }
 
-// ── Structured Summary (pi-mono inspired) ────────────────────────────────────
-
-/** Structured summary format for rich context preservation across compactions. */
-export interface StructuredSummary {
-  /** The user's original goal / intent. */
-  goal: string;
-  /** Constraints discovered during the session. */
-  constraints: string[];
-  /** What has been accomplished so far. */
-  progress: string[];
-  /** Key decisions made. */
-  keyDecisions: string[];
-  /** What remains to be done. */
-  nextSteps: string[];
-  /** Critical context that must not be lost. */
-  criticalContext: string[];
-  /** Files read across compactions (cumulative). */
-  readFiles: string[];
-  /** Files modified across compactions (cumulative). */
-  modifiedFiles: string[];
-}
-
 // ── Orchestrator Options ─────────────────────────────────────────────────────
 
 /** Options for constructing a ContextOrchestrator. */
@@ -103,6 +82,17 @@ export interface ContextOrchestratorOptions {
   onOverflow?: (usage: ContextUsage) => void;
   /** Callback for context lifecycle hook events. */
   onHookEvent?: (context: ContextHookContext) => void | Promise<void>;
+  /** Narrowed to the one event the orchestrator reports. */
+  telemetryManager?: {
+    trackContextCompaction(data: ContextCompactionData): Promise<unknown>;
+  };
+  /**
+   * The skill spans still carried after a compaction.
+   *
+   * Injected rather than imported so the context layer keeps knowing nothing
+   * about the skills registry: it reports a list of ids it never interprets.
+   */
+  getSurvivingSkillSpanIds?: () => string[];
 }
 
 // ── Hook Context Types ───────────────────────────────────────────────────────
@@ -148,16 +138,6 @@ export type ContextHookContext =
 
 // ── RPC Types ────────────────────────────────────────────────────────────────
 
-/** Request params for autohand.setContextCompact RPC method. */
-export interface SetContextCompactRequest {
-  enabled: boolean;
-}
-
-/** Response for autohand.setContextCompact RPC method. */
-export interface SetContextCompactResponse {
-  enabled: boolean;
-}
-
 /** Extended context usage result with all fields needed by RPC. */
 export interface ExtendedContextUsageResult {
   systemPrompt: number;
@@ -183,16 +163,3 @@ export const CONTEXT_ENV_VARS = {
   /** Tokens to reserve for model output (number). */
   RESERVE_TOKENS: 'AUTOHAND_RESERVE_TOKENS',
 } as const;
-
-// ── Re-exports for convenience ───────────────────────────────────────────────
-
-export type {
-  LLMMessage,
-  FunctionDefinition,
-  MessagePriority,
-  MessageMetadata,
-  LLMProvider,
-  MemoryManager,
-  ConversationManager,
-  ContextUsage,
-};

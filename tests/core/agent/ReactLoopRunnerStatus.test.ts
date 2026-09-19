@@ -5,12 +5,31 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+
+// The real capture snapshots this repository through git under a 3 s budget.
+// On a loaded host the budget trips, previews disappear and outputs regroup,
+// so the grouping assertions below would depend on machine load.
+vi.mock('../../../src/core/agent/WorkspaceChangeCapture.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/core/agent/WorkspaceChangeCapture.js')>();
+  return {
+    ...actual,
+    WorkspaceChangeCapture: {
+      create: vi.fn(async () => ({
+        hasExceededBudget: () => false,
+        begin: async () => ({ token: 'stub-checkpoint' }),
+        finish: async () => ({ files: [], omittedFiles: 0 }),
+        dispose: async () => {},
+      })),
+    },
+  };
+});
 import {
   type AgentReactLoopHost,
   collapseToolCallLogLines,
   createRetryWaitStatus,
   formatComposerToolCallStatus,
   isDeferredFinalResponse,
+  MAX_TRACKED_SEARCH_QUERIES,
   runAgentReactLoop,
   shouldDisplayToolOutput,
 } from '../../../src/core/agent/ReactLoopRunner.js';
@@ -37,6 +56,46 @@ describe('ReactLoopRunner composer status', () => {
     expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'Hello ' });
     expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'world.' });
     expect(host.emitOutput).not.toHaveBeenCalledWith({ type: 'message', content: 'Hello world.' });
+  });
+
+  it('stops before the model request that would exceed the run budget and records usage', async () => {
+    const { RunBudget, RunBudgetExceededError } = await import('../../../src/core/agent/RunBudget.js');
+    const llmComplete = vi.fn()
+      .mockResolvedValueOnce({ id: 'first', created: 1, raw: {}, usage: { promptTokens: 50, completionTokens: 10, totalTokens: 60 },
+        content: JSON.stringify({ toolCalls: [{ tool: 'list_tree', args: { path: '.' } }] }) })
+      .mockResolvedValueOnce({ id: 'second', created: 2, raw: {}, content: '{"finalResponse":"Done."}' });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    host.toolManager.execute = vi.fn().mockResolvedValue([{ tool: 'list_tree', success: true, output: 'src/' }]);
+    const budget = new RunBudget({ maxRequests: 1 });
+    host.runBudget = budget;
+    await expect(runAgentReactLoop(host, new AbortController())).rejects.toBeInstanceOf(RunBudgetExceededError);
+    expect(llmComplete).toHaveBeenCalledTimes(1);
+    expect(budget.status()).toMatchObject({ requests: 1, tokens: 60 });
+  });
+
+  it('renders cloud content deltas before completion without exposing reasoning or duplicating history', async () => {
+    const preview = vi.fn();
+    const complete = vi.fn(async (request) => {
+      expect(request.stream).toBe(true);
+      request.onDelta({ type: 'reasoning', text: 'private reasoning' });
+      expect(preview).not.toHaveBeenCalledWith('private reasoning');
+      request.onDelta({ type: 'content', text: 'The answer' });
+      expect(preview).toHaveBeenCalledWith('The answer');
+      expect(host.saveAssistantMessage).not.toHaveBeenCalled();
+      return { id: 'streamed', created: 1, content: 'The answer is ready.', raw: {} };
+    });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, streaming: true });
+    host.inkRenderer = {
+      setStatus: vi.fn(), addToolCall: vi.fn(), addToolOutputBatch: vi.fn(),
+      addToolOutput: vi.fn(), setThinking: vi.fn(), setElapsed: vi.fn(),
+      setTokens: vi.fn(), setWorking: vi.fn(), setFinalResponse: vi.fn(),
+      setStreamingResponse: preview,
+    };
+    await runAgentReactLoop(host, new AbortController());
+    expect(preview).toHaveBeenLastCalledWith(null);
+    expect(host.saveAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledWith('The answer is ready.');
   });
 
   it.each([
@@ -996,7 +1055,7 @@ describe('ReactLoopRunner composer status', () => {
 
       expect(llmComplete).toHaveBeenCalledTimes(3);
       expect(addSystemNote).toHaveBeenCalledTimes(2);
-      expect(addSystemNote).toHaveBeenLastCalledWith(expect.stringContaining('Tools are unavailable for this recovery response'));
+      expect(addSystemNote).toHaveBeenLastCalledWith(expect.stringContaining('Tools are unavailable for one recovery response'));
       expect(reportError).not.toHaveBeenCalled();
       expect(emitOutput).toHaveBeenCalledWith({
         type: 'message',
@@ -1017,7 +1076,7 @@ describe('ReactLoopRunner composer status', () => {
     const emitOutput = vi.fn();
     const toolListAnswer = [
       "I'll provide the tools I have for you:",
-      '- read_file and fff_grep for source inspection',
+      '- read_file and find_grep for source inspection',
       '- apply_patch for focused edits',
       '- shell for validation commands',
     ].join('\n');
@@ -1602,3 +1661,143 @@ function createReactLoopTestHost(
     writeDebugLine: vi.fn(),
   } satisfies AgentReactLoopHost;
 }
+
+describe('thinking display default', () => {
+  function createThinkingHost(ui: { showThinking?: boolean }) {
+    const llmComplete = vi.fn().mockResolvedValueOnce({
+      id: 'answer',
+      created: 1,
+      content: '{"thought":"Weigh two jokes.","finalResponse":"Light attracts bugs."}',
+      raw: {},
+    });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    host.runtime.config.ui = ui;
+    host.inkRenderer = {
+      setStatus: vi.fn(),
+      addToolCall: vi.fn(),
+      addToolOutputBatch: vi.fn(),
+      addToolOutput: vi.fn(),
+      setThinking: vi.fn(),
+      setElapsed: vi.fn(),
+      setTokens: vi.fn(),
+      setWorking: vi.fn(),
+      setFinalResponse: vi.fn(),
+    };
+    return host;
+  }
+
+  it('hides the thought unless ui.showThinking is explicitly on', async () => {
+    const host = createThinkingHost({});
+    await runAgentReactLoop(host, new AbortController());
+
+    expect(host.inkRenderer.setThinking).not.toHaveBeenCalled();
+    expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledWith('Light attracts bugs.');
+  });
+
+  it('shows the thought when ui.showThinking is on', async () => {
+    const host = createThinkingHost({ showThinking: true });
+    await runAgentReactLoop(host, new AbortController());
+
+    expect(host.inkRenderer.setThinking).toHaveBeenCalledWith('Weigh two jokes.');
+  });
+
+  it('keeps the tracked search history bounded across a long session', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const parser = new ReactionParser();
+    const llmComplete = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: 'search',
+        created: 1,
+        content: JSON.stringify({
+          thought: 'Look for the handler.',
+          toolCalls: [
+            { tool: 'search', args: { query: 'brand new query' } },
+          ],
+        }),
+        raw: {},
+      })
+      .mockResolvedValueOnce({
+        id: 'answer',
+        created: 2,
+        content: '{"finalResponse":"Found it."}',
+        raw: {},
+      });
+
+    const host = createReactLoopTestHost(llmComplete, parser);
+    host.searchQueries = Array.from({ length: MAX_TRACKED_SEARCH_QUERIES }, (_, index) => `old query ${index}`);
+    host.toolManager.execute = vi.fn(async (_calls, onResult) => {
+      const result = { tool: 'search' as const, success: true, output: 'match' };
+      onResult(0, result);
+      return [result];
+    });
+
+    try {
+      await runAgentReactLoop(host, new AbortController());
+
+      expect(host.searchQueries).toHaveLength(MAX_TRACKED_SEARCH_QUERIES);
+      expect(host.searchQueries[host.searchQueries.length - 1]).toBe('brand new query');
+      expect(host.searchQueries).not.toContain('old query 0');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
+describe('steering messages during a turn', () => {
+  function inkStub() {
+    return {
+      setStatus: vi.fn(), addToolCall: vi.fn(), addToolOutputBatch: vi.fn(), addToolOutput: vi.fn(),
+      setThinking: vi.fn(), setElapsed: vi.fn(), setTokens: vi.fn(), setWorking: vi.fn(), setFinalResponse: vi.fn(),
+    };
+  }
+
+  it('adds a steered message to the conversation before the next model request', async () => {
+    const { SteeringQueue } = await import('../../../src/core/agent/SteeringQueue.js');
+    const steering = new SteeringQueue();
+    const llmComplete = vi.fn()
+      .mockImplementationOnce(async () => {
+        steering.push('Only touch the tests.');
+        return { id: 'step', created: 1, content: '{"toolCalls":[{"tool":"read_file","args":{"path":"src/index.ts"}}]}', raw: {} };
+      })
+      .mockResolvedValueOnce({ id: 'answer', created: 2, content: '{"finalResponse":"Done."}', raw: {} });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    host.inkRenderer = inkStub();
+    host.steering = steering;
+    host.toolManager.execute = vi.fn(async (_calls, onResult) => {
+      const result = { tool: 'read_file' as const, success: true, output: 'ok' };
+      onResult(0, result);
+      return [result];
+    });
+
+    await runAgentReactLoop(host, new AbortController());
+
+    const addMessage = host.conversation.addMessage as ReturnType<typeof vi.fn>;
+    const steerCall = addMessage.mock.calls.findIndex(([message]) => message.role === 'user' && message.content === 'Only touch the tests.');
+    expect(steerCall).toBeGreaterThanOrEqual(0);
+    expect(addMessage.mock.invocationCallOrder[steerCall]).toBeLessThan(llmComplete.mock.invocationCallOrder[1]);
+    const toolResultCall = addMessage.mock.calls.findIndex(([message]) => message.role === 'tool');
+    expect(addMessage.mock.invocationCallOrder[toolResultCall]).toBeLessThan(addMessage.mock.invocationCallOrder[steerCall]);
+  });
+
+  it('turns a final answer into another iteration when a steer arrived during it', async () => {
+    const { SteeringQueue } = await import('../../../src/core/agent/SteeringQueue.js');
+    const steering = new SteeringQueue();
+    const llmComplete = vi.fn()
+      .mockImplementationOnce(async () => {
+        steering.push('Also update the changelog.');
+        return { id: 'first', created: 1, content: '{"finalResponse":"First answer."}', raw: {} };
+      })
+      .mockResolvedValueOnce({ id: 'second', created: 2, content: '{"finalResponse":"Second answer with changelog."}', raw: {} });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    host.inkRenderer = inkStub();
+    host.steering = steering;
+
+    await runAgentReactLoop(host, new AbortController());
+
+    expect(llmComplete).toHaveBeenCalledTimes(2);
+    expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledTimes(1);
+    expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledWith('Second answer with changelog.');
+    expect(host.conversation.addMessage).toHaveBeenCalledWith({ role: 'user', content: 'Also update the changelog.' });
+  });
+});

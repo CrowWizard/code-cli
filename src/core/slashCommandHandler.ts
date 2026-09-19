@@ -136,7 +136,7 @@ export class SlashCommandHandler {
         }
         case '/init': {
           const { init } = await import('../commands/init.js');
-          return init(this.ctx);
+          return init(this.ctx, args);
         }
         case '/quit': {
           const { quit } = await import('../commands/quit.js');
@@ -230,6 +230,10 @@ export class SlashCommandHandler {
         case '/session': {
           const { session } = await import('../commands/session.js');
           return session({ sessionManager: this.ctx.sessionManager });
+        }
+        case '/rename': {
+          const { rename } = await import('../commands/rename.js');
+          return rename({ sessionManager: this.ctx.sessionManager, onRenamed: this.ctx.onSessionRenamed }, args);
         }
         case '/undo': {
           const { undo } = await import('../commands/undo.js');
@@ -371,6 +375,18 @@ export class SlashCommandHandler {
             applyPermissionMode: this.ctx.applyMobilePermissionMode,
           }, args);
         }
+        case '/handoff': {
+          const surface = args[0]?.toLowerCase();
+          if (surface === 'web' || surface === 'session') {
+            return this.handle(`/handoff ${surface}`, args.slice(1));
+          }
+          const lines = ['Hand this session to another Autohand surface:'];
+          for (const name of ['/handoff web', '/handoff session']) {
+            const description = this.commandMap.get(name)?.description ?? '';
+            lines.push(`  ${name.padEnd(18)}${description}`.trimEnd());
+          }
+          return lines.join('\n');
+        }
         case '/handoff web': {
           const { handoffWeb } = await import('../commands/handoff-web.js');
           return handoffWeb({
@@ -454,6 +470,10 @@ export class SlashCommandHandler {
         case '/usage': {
           const { usage } = await import('../commands/usage.js');
           return usage(this.ctx, args);
+        }
+        case '/upgrade': {
+          const { upgrade } = await import('../commands/upgrade.js');
+          return upgrade(this.ctx);
         }
         case '/login': {
           const { login } = await import('../commands/login.js');
@@ -697,9 +717,11 @@ export class SlashCommandHandler {
           const { peers } = await import('../commands/peers.js');
           return peers({
             peerAwareness: this.ctx.peerAwareness,
+            peerMessaging: this.ctx.peerMessaging,
+            onPeerDraft: this.ctx.onPeerDraft,
             onBeforeModal: this.ctx.onBeforeModal,
             onAfterModal: this.ctx.onAfterModal,
-          });
+          }, args);
         }
         case '/message': {
           const { message } = await import('../commands/message.js');
@@ -819,8 +841,4 @@ export class SlashCommandHandler {
       console.log(chalk.gray(`PRD: ${command.prd}`));
     }
   }
-}
-
-export function formatSlashCommandList(commands: SlashCommand[]): SlashCommand[] {
-  return [...commands].sort((a, b) => a.command.localeCompare(b.command));
 }

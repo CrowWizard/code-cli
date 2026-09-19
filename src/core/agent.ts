@@ -4,8 +4,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import type { RunBudget } from './agent/RunBudget.js';
+import { SteeringQueue } from './agent/SteeringQueue.js';
+import { syncAgentTerminalTitleName } from './agent/AgentSessionTitle.js';
+import { shouldWriteTerminalTitle, TerminalTitleController } from '../ui/terminalTitle.js';
+import { isITerm2 } from '../ui/mouseReporting.js';
+import type { SessionAutoNamer } from './agent/SessionAutoNamer.js';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
+import path from 'node:path';
+import { AUTOHAND_HOME } from '../constants.js';
+import { AgentPeerRuntime } from './agent/AgentPeerRuntime.js';
+import { withCommandCoordination } from '../session/peers/CommandCoordinationGate.js';
 import { showModal, type ModalOption } from '../ui/ink/components/Modal.js';
 import { FileActionManager } from '../actions/filesystem.js';
 import { getProviderConfig, saveConfig } from '../config.js';
@@ -13,6 +23,7 @@ import { resolveAutohandAIModelForTier } from './agent/AutohandAIModelTierPolicy
 import { getAuthClient } from '../auth/index.js';
 import {
   formatComposerPlanLabel,
+  formatUpgradeHint,
   planSummaryFromEntitlement,
   type PlanSummary,
 } from '../billing/planSummary.js';
@@ -247,6 +258,7 @@ import {
   stopAgentUI,
   updateAgentInputLine,
   withAgentModalPause,
+  steerAgentActiveInstruction,
 } from './agent/AgentUIRuntime.js';
 import {
   buildAgentUserMessage,
@@ -332,6 +344,7 @@ import {
 import { TerminalResearchPublicationPrompts } from '../research/TerminalResearchPublicationPrompts.js';
 import {
   executePendingPostTurnAction,
+  createQueuedAgentInstruction,
   type PendingAgentInstruction,
   type PendingPostTurnAction,
   type PostTurnActionHost,
@@ -431,12 +444,34 @@ export class AutohandAgent {
   private accountPlanRefresh?: Promise<void>;
   private accountPlanTimer?: ReturnType<typeof setInterval>;
   private activeAgentHeartbeat: ActiveAgentHeartbeat | null = null;
+  private peerRuntime?: AgentPeerRuntime;
+  private instructionAdmission?: Promise<void>;
+  private instructionAdmissionCount = 0;
+  private admittedInstructionAbort?: AbortController;
+  private promptPeerReferences?: import('../ui/peerMention.js').PeerReference[];
+  private promptSeedDraft?: import('../ui/inputPrompt.js').PromptDraft;
+  private get peerMessaging() { return this.peerRuntime?.messaging; }
+  private get resourceCoordinator() { return this.peerRuntime?.coordinator; }
+  private get peerCommunicationRuntime() { return this.peerRuntime?.scheduler; }
+  private async recordPeerReferences(instruction: string, references: import('../ui/peerMention.js').PeerReference[]): Promise<void> {
+    await this.peerRuntime?.recordReferences(instruction, references);
+  }
   private readonly peerAwareness: PeerAwarenessManager;
   private currentPeerToolName?: string;
   private currentPeerCommand?: string;
   private currentInstructionText?: string;
   private peerActiveToolCount = 0;
   private peerAwaitingInputCount = 0;
+  /** Messages steered into the running turn with Shift+Enter. */
+  readonly steering = new SteeringQueue();
+  /** Terminal tab title: session name plus working / waiting / idle marker. */
+  readonly terminalTitle = new TerminalTitleController(
+    (text) => { process.stdout.write(text); },
+    shouldWriteTerminalTitle(process.argv, process.stdout.isTTY),
+    { tabColour: isITerm2() },
+  );
+  sessionAutoNamer: SessionAutoNamer | null = null;
+  sessionTitleRefined = false;
   private readonly runtimeResourceShutdownController = new AbortController();
   private runtimeResourceShutdownPromise: Promise<void> | null = null;
 
@@ -466,7 +501,12 @@ export class AutohandAgent {
   private restoredChatMessages: ChatLogMessage[] = [];
   private inkInstructionResolver: (() => void) | null = null;
   private readlinePromptActive = false;
-  private modalActive = false;
+  private modalVisible = false;
+  private get modalActive(): boolean { return this.modalVisible; }
+  private set modalActive(visible: boolean) {
+    this.modalVisible = visible;
+    this.peerCommunicationRuntime?.setPaused('permission', visible || this.peerAwaitingInputCount > 0);
+  }
   private deferredDebugLines: string[] = [];
   private queueInput = '';
   private promptSeedInput = '';
@@ -750,7 +790,8 @@ export class AutohandAgent {
   }
 
   async resumeSession(sessionId: string): Promise<void> {
-    return resumeAgentSession(this, sessionId);
+    await resumeAgentSession(this, sessionId);
+    syncAgentTerminalTitleName(this);
   }
 
   private lastErrorMessage: string | null = null;
@@ -765,13 +806,22 @@ export class AutohandAgent {
   }
 
   private async promptForInstruction(): Promise<string | null> {
-    return promptForAgentInstruction(this.createPromptInstructionHost());
+    const read = () => promptForAgentInstruction(this.createPromptInstructionHost());
+    return this.peerRuntime ? withCommandCoordination({ coordinator: this.peerRuntime.coordinator,
+      waitTimeoutMs: this.peerRuntime.messaging.policy.resourceWaitTimeoutMs,
+      onWaiting: activity => this.notifyUser(`Waiting for resource ${activity.resource} · ${activity.requestId}`),
+    }, read) : read();
   }
 
   private createPromptInstructionHost(): AgentPromptInstructionHost {
     const agent = this;
 
     return {
+      get peerMessaging() { return agent.peerMessaging; },
+      setPeerReferences: references => { agent.promptPeerReferences = references; },
+      get promptSeedDraft() { return agent.promptSeedDraft; },
+      set promptSeedDraft(value) { agent.promptSeedDraft = value; },
+      hasPendingInstruction: () => agent.pendingInkInstructions.length > 0,
       flushDeferredDebugLines: () => agent.flushDeferredDebugLines(),
       formatStatusLine: () => agent.formatStatusLine(),
       handleMemoryStore: (content: string) => agent.handleMemoryStore(content),
@@ -860,7 +910,7 @@ export class AutohandAgent {
   }
 
   private shouldRunTurnMemoryReflection(): boolean {
-    if (this.runtime.options?.bare) return false;
+    if (this.runtime.options?.bare || this.runtime.options?.ephemeral) return false;
     if (this.runtime.isCommandMode || this.runtime.options?.prompt) return false;
     return this.runtime.config?.agent?.autoMemory !== false;
   }
@@ -997,9 +1047,37 @@ export class AutohandAgent {
   }
 
   async runInstruction(instruction: string, options?: RunInstructionOptions): Promise<boolean> {
+    this.instructionAdmissionCount = (this.instructionAdmissionCount ?? 0) + 1;
+    const execution = (this.instructionAdmission ?? Promise.resolve()).then(async () => {
+      const controller = new AbortController();
+      const signals = [controller.signal, options?.signal, this.runtimeResourceShutdownController?.signal].filter((signal): signal is AbortSignal => !!signal);
+      const signal = AbortSignal.any(signals);
+      this.admittedInstructionAbort = controller;
+      try {
+        if (signal.aborted || this.shouldExit) return false;
+        return await this.executeAdmittedInstruction(instruction, { ...options, signal });
+      } finally {
+        if (this.admittedInstructionAbort === controller) this.admittedInstructionAbort = undefined;
+        this.instructionAdmissionCount--;
+      }
+    });
+    this.instructionAdmission = execution.then(() => {}, () => {});
+    return execution;
+  }
+
+  private async executeAdmittedInstruction(instruction: string, options?: RunInstructionOptions): Promise<boolean> {
     await this.refreshAccountPlan();
+    if (options?.signal?.aborted || this.shouldExit) return false;
     this.currentInstructionText = instruction;
     try {
+      if (this.peerRuntime) {
+        this.peerRuntime.automatic = options?.peerAutomatic === true;
+        return await withCommandCoordination({ coordinator: this.peerRuntime.coordinator,
+          signal: options?.signal,
+          waitTimeoutMs: this.peerMessaging?.policy.resourceWaitTimeoutMs,
+          onWaiting: snapshot => this.notifyUser(`Waiting for resource ${snapshot.resource} · ${snapshot.requestId ?? ''}`),
+        }, () => this.runInstructionWithPeerActivity(instruction, options));
+      }
       return await this.runInstructionWithPeerActivity(instruction, options);
     } finally {
       if (this.currentInstructionText === instruction) {
@@ -1234,8 +1312,8 @@ export class AutohandAgent {
     this.actionExecutor?.beginTodoActivityTurn();
   }
 
-  private async completeTodoActivityForSuccessfulTurn(): Promise<boolean> {
-    return this.actionExecutor?.completeTodoActivityForSuccessfulTurn() ?? false;
+  private hasIncompleteTodoActivity(): boolean {
+    return this.actionExecutor?.hasIncompleteTodoActivity() ?? false;
   }
 
   private clearActivityForCompletedTurn(): void {
@@ -1248,6 +1326,9 @@ export class AutohandAgent {
     return {
       get activeProvider() { return agent.activeProvider; },
       autoReportManager: agent.autoReportManager,
+      steering: agent.steering,
+      get permissionManager() { return agent.permissionManager; },
+      get runBudget() { return agent.runBudget; },
       get consecutiveCancellations() { return agent.consecutiveCancellations; },
       set consecutiveCancellations(value) { agent.consecutiveCancellations = value; },
       contextOrchestrator: agent.contextOrchestrator,
@@ -1291,6 +1372,7 @@ export class AutohandAgent {
       attachToolImages: (message, imagePaths, signal) => agent.getToolImageStore().attach(message, imagePaths, signal),
       getReactionParser: () => agent.getReactionParser(),
       handleSmartContextCrop: (call) => agent.handleSmartContextCrop(call),
+      hasIncompleteTodoActivity: () => agent.hasIncompleteTodoActivity(),
       isContextOverflowError: (errorOrMessage) => agent.isContextOverflowError(errorOrMessage),
       isPromptCachingEnabled: () => agent.isPromptCachingEnabled(),
       saveAssistantMessage: (content, toolCalls) => agent.saveAssistantMessage(content, toolCalls),
@@ -1889,6 +1971,9 @@ export class AutohandAgent {
         model,
         provider: this.activeProvider,
       });
+      if (this.activeProvider === 'autohandai') {
+        this.ui?.setTip?.({ kind: 'upgrade', text: formatUpgradeHint(this.accountPlan) });
+      }
     }
   }
 
@@ -2088,6 +2173,8 @@ export class AutohandAgent {
    * Used by ACP/RPC adapters to propagate session/cancel.
    */
   cancelCurrentInstruction(): void {
+    this.peerCommunicationRuntime?.setPaused('cancelled', true);
+    this.admittedInstructionAbort?.abort();
     this.activeAbortController?.abort();
   }
 
@@ -2659,15 +2746,32 @@ export class AutohandAgent {
     );
   }
 
+  steerActiveInstruction(text: string): Promise<boolean> {
+    return steerAgentActiveInstruction(this, text);
+  }
+
+  /** Marks the tab amber while a confirmation or question waits on the user. */
+  private beginAwaitingInput(): void {
+    this.peerAwaitingInputCount += 1;
+    this.terminalTitle?.setState('waiting');
+    this.peerCommunicationRuntime?.setPaused('permission', true);
+  }
+
+  private endAwaitingInput(): void {
+    this.peerAwaitingInputCount = Math.max(0, this.peerAwaitingInputCount - 1);
+    if (this.peerAwaitingInputCount === 0) this.terminalTitle?.setState('working');
+    this.peerCommunicationRuntime?.setPaused('permission', this.modalActive || this.peerAwaitingInputCount > 0);
+  }
+
   private async confirmDangerousAction(
     message: string,
     context?: { tool?: string; path?: string; command?: string }
   ): Promise<PermissionPromptResult> {
-    this.peerAwaitingInputCount += 1;
+    this.beginAwaitingInput();
     try {
       return await confirmAgentDangerousAction(this, message, context);
     } finally {
-      this.peerAwaitingInputCount = Math.max(0, this.peerAwaitingInputCount - 1);
+      this.endAwaitingInput();
     }
   }
 
@@ -2694,11 +2798,11 @@ export class AutohandAgent {
     question: string,
     suggestedAnswers?: string[]
   ): Promise<string> {
-    this.peerAwaitingInputCount += 1;
+    this.beginAwaitingInput();
     try {
       return await executeAgentAskFollowupQuestion(this, question, suggestedAnswers);
     } finally {
-      this.peerAwaitingInputCount = Math.max(0, this.peerAwaitingInputCount - 1);
+      this.endAwaitingInput();
     }
   }
 
@@ -2758,6 +2862,17 @@ export class AutohandAgent {
 
   setOutputListener(listener?: (event: AgentOutputEvent) => void): void {
     return setAgentOutputListener(this as unknown as AgentSessionAccountingHost, listener);
+  }
+
+  /** The last final message this run emitted; command mode validates it against --output-schema. */
+  lastEmittedMessage?: string;
+
+  /** Requests, tokens, and time this run may spend; undefined when no limit is set. */
+  runBudget?: RunBudget;
+
+  /** Command mode uses this to publish a validated result or a terminal error. */
+  emitCommandOutput(event: AgentOutputEvent): void {
+    this.emitOutput(event);
   }
 
   /**
@@ -2849,20 +2964,67 @@ export class AutohandAgent {
 
     const previousHeartbeat = this.activeAgentHeartbeat;
     await previousHeartbeat?.stop().catch(() => {});
+    const previousPeers = this.peerRuntime;
+    this.peerRuntime = undefined;
+    await previousPeers?.close();
     if (this.runtimeResourceShutdownPromise || this.runtimeResourceShutdownController?.signal.aborted) return;
 
-    const sessionId = this.sessionManager.getCurrentSession()?.metadata.sessionId;
+    const session = this.sessionManager.getCurrentSession();
+    const sessionId = session?.metadata.sessionId;
     if (sessionId) {
       this.peerAwareness.setSessionId(sessionId);
     }
     await this.peerAwareness.adoptRepoBaseline().catch(() => {});
 
+    if (session && this.runtime.config.sessions?.communication?.enabled) {
+      let activatePeerRuntime = () => {};
+      const peerRuntimeReady = new Promise<void>(resolve => { activatePeerRuntime = resolve; });
+      this.peerRuntime = await AgentPeerRuntime.start({
+        home: AUTOHAND_HOME, workspaceRoot: this.runtime.workspaceRoot, sessionId: session.metadata.sessionId,
+        policy: this.runtime.config.sessions.communication, heartbeatManagedExternally: true,
+        activity: () => ({ phase: this.peerAwaitingInputCount ? 'waiting_input' : this.isInstructionActive ? 'thinking' : 'idle' }),
+        appendContext: (message, recordId) => session.appendContext(message, recordId),
+        addContext: content => this.conversation.addMessage({ role: 'user', content }),
+        notify: message => { if (this.inkRenderer) this.inkRenderer.addNotification(message); else this.notifyUser(message); },
+        emitOutput: event => this.emitOutput(event),
+        requestAutoTurn: async () => {
+          await peerRuntimeReady;
+          if (!this.peerRuntime || this.shouldExit || this.runtimeResourceShutdownController.signal.aborted) return;
+          const text = 'Process the newly received external peer messages within the existing user goal and local permissions. Reply through peer tools only when useful.';
+          if (this.runtime.isRpcMode || this.runtime.isCommandMode) {
+            if (!this.isInstructionActive && !this.instructionAdmissionCount) await this.runInstruction(text, { peerAutomatic: true, echoInTranscript: false, environmentBootstrap: 'skip' });
+          } else {
+            this.pendingInkInstructions.push(createQueuedAgentInstruction({ text, echoInTranscript: false,
+              executionPolicy: { environmentBootstrap: 'skip', peerAutomatic: true } }));
+            this.inkInstructionResolver?.();
+            this.inkInstructionResolver = null;
+            if (this.readlinePromptActive) {
+              const { promptSuspend } = await import('../ui/inputPrompt.js');
+              promptSuspend();
+            }
+          }
+        },
+        onError: error => this.notifyUser(`Peer communication: ${error instanceof Error ? error.message : String(error)}`),
+      }).catch(error => {
+        this.notifyUser(`Peer communication unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        return undefined;
+      });
+      activatePeerRuntime();
+    }
+    if (this.runtimeResourceShutdownPromise || this.runtimeResourceShutdownController.signal.aborted) {
+      await this.peerRuntime?.close();
+      this.peerRuntime = undefined;
+      return;
+    }
+
     const heartbeat = new ActiveAgentHeartbeat(
-      new ActiveAgentRegistry(),
+      new ActiveAgentRegistry(this.peerMessaging?.policy.coordinationDirectory
+        ? path.join(this.peerMessaging.policy.coordinationDirectory, 'active-agents') : undefined),
       {
         runtime: this.runtime,
         getProvider: () => this.activeProvider,
         getSession: () => this.sessionManager.getCurrentSession(),
+        getCommunication: () => this.peerMessaging?.getAdvertisement(),
         getStatusSnapshot: () => this.getStatusSnapshot(),
         getActivity: () => buildActivity({
           isInstructionActive: this.isInstructionActive,
@@ -2874,9 +3036,11 @@ export class AutohandAgent {
           claims: this.peerAwareness.getClaims(),
           headRef: this.peerAwareness.getRepoBaseline(),
         }),
-        onHeartbeat: (record) => {
+        onHeartbeat: async (record) => {
           this.peerAwareness.setSessionId(record.sessionId);
-          return this.refreshPeerAwareness();
+          await this.refreshPeerAwareness();
+          await this.peerMessaging?.list().catch(() => {});
+          this.inkRenderer?.refreshPeers();
         },
       },
     );
@@ -2896,6 +3060,9 @@ export class AutohandAgent {
     const heartbeat = this.activeAgentHeartbeat;
     this.activeAgentHeartbeat = null;
     await heartbeat?.stop().catch(() => {});
+    const peers = this.peerRuntime;
+    this.peerRuntime = undefined;
+    await peers?.close();
   }
 
   private async updateActiveAgentHeartbeat(status?: 'idle' | 'working'): Promise<void> {

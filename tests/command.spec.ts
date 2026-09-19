@@ -9,6 +9,7 @@ import {
   runShellCommand,
   type BackgroundProcessCompletion,
 } from '../src/actions/command.js';
+import { configureChildProcessEnvPolicy } from '../src/utils/childProcessEnv.js';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -85,6 +86,28 @@ describe('runCommand', () => {
     const result = await runCommand('node', ['-e', 'console.error("err")'], testDir);
     expect(result.stderr.trim()).toBe('err');
     expect(result.code).toBe(0);
+  });
+
+  it('bounds large newline-free output while preserving both ends and delivering every stream chunk', async () => {
+    const count = 2 * 1024 * 1024;
+    let stdoutLength = 0;
+    let stderrLength = 0;
+    const script = `process.stdout.write('stdout-start' + 'x'.repeat(${count}) + 'stdout-end'); process.stderr.write('stderr-start' + 'y'.repeat(${count}) + 'stderr-end')`;
+
+    const result = await runCommand(process.execPath, ['-e', script], testDir, {
+      onStdout: (chunk) => { stdoutLength += chunk.length; },
+      onStderr: (chunk) => { stderrLength += chunk.length; },
+    });
+
+    expect(result.code).toBe(0);
+    for (const [text, label] of [[result.stdout, 'stdout'], [result.stderr, 'stderr']]) {
+      expect(text.length).toBeLessThanOrEqual(1024 * 1024 + 128);
+      expect(text.startsWith(`${label}-start`)).toBe(true);
+      expect(text.endsWith(`${label}-end`)).toBe(true);
+      expect(text).toContain('[output truncated:');
+    }
+    expect(stdoutLength).toBe(count + 'stdout-startstdout-end'.length);
+    expect(stderrLength).toBe(count + 'stderr-startstderr-end'.length);
   });
 
   it('preserves UTF-8 code points split across foreground output chunks', async () => {
@@ -703,5 +726,23 @@ describe('needsShell', () => {
     // Args are NOT checked — only the command string
     // A commit message like 'fix: handle $variables' should not trigger
     expect(needsShell('git')).toBe(false);
+  });
+});
+
+describe('runCommand child environment policy', () => {
+  afterAll(() => configureChildProcessEnvPolicy(undefined));
+
+  it('withholds excluded variables from a real child process while keeping PATH', async () => {
+    process.env.ZZ_TEST_SENTINEL_SECRET = 'do-not-leak';
+    configureChildProcessEnvPolicy({ exclude: ['ZZ_TEST_SENTINEL_*'], set: { ZZ_TEST_PINNED: 'pinned' } });
+    try {
+      const result = await runCommand(process.execPath, [
+        '-e',
+        'process.stdout.write(JSON.stringify({ secret: process.env.ZZ_TEST_SENTINEL_SECRET ?? null, pinned: process.env.ZZ_TEST_PINNED ?? null, hasPath: Boolean(process.env.PATH), cli: process.env.AUTOHAND_CLI ?? null }))',
+      ], tmpdir());
+      expect(JSON.parse(result.stdout)).toEqual({ secret: null, pinned: 'pinned', hasPath: true, cli: '1' });
+    } finally {
+      delete process.env.ZZ_TEST_SENTINEL_SECRET;
+    }
   });
 });

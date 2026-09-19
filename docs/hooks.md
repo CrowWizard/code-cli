@@ -107,11 +107,61 @@ Hooks are useful for:
 ### 1. Config-Based Hooks (CLI)
 Define shell commands in your `~/.autohand/config.json` that run automatically on lifecycle events. These hooks run in your local shell environment.
 
+Projects can add their own hooks under a `hooks` key in `<project>/.autohand/config.json` (shareable, commit it) or `<project>/.autohand/settings.local.json` (personal, gitignore it). Both the array form and the event-keyed form work in either file:
+
+```json
+{
+  "hooks": {
+    "hooks": [{ "event": "session-start", "command": "echo project session" }],
+    "pre-prompt": ["node scripts/check-prompt.cjs"]
+  }
+}
+```
+
+- Project hooks are appended to the global list. A project hook with the same identity (same script file name, or same event plus description/command) replaces the global one, and `settings.local.json` wins over `config.json`.
+- A `hooks.enabled` value in a project file overrides the global toggle for that project.
+- The project is the workspace the session targets: `--path` when given, otherwise the current directory.
+## Asking Autohand to set up a hook
+
+With the Autohand AI provider, the model can install hooks for you. Ask in
+plain English, for example "every time you finish a tool call, run
+`bun run lint`", and it calls the `set_lifecycle_hook` tool with the event,
+the command, and a level:
+
+| Level | File | Scope |
+|-------|------|-------|
+| `project` | `<workspace>/.autohand/config.json` (or `.toml`/`.yaml` if present) | Shared with the repository |
+| `local` | `<workspace>/.autohand/settings.local.json` | This machine only |
+| `user` (also `global`) | `~/.autohand/config.json` | Every workspace |
+
+Before anything is written you see the event, command, level, and file in the
+approval prompt. A hook with the same event and description at that level is
+updated in place; otherwise it is appended. The running session picks the hook
+up immediately, and a project or local hook you approve this way extends the
+workspace trust entry so it keeps running after a restart. `create_hook` still
+generates a script for automation that a single command cannot express and
+accepts the same `level`, defaulting to `user` as before.
+
+- Project hooks are never written into `~/.autohand/config.json`. Toggling or editing a project hook from `/hooks` lasts for the session only; change the project file to make it permanent.
+
+#### Workspace trust
+
+A cloned repository can ship these files, so project hooks and project MCP servers only run in a workspace you trust.
+
+- The first interactive launch in such a workspace lists every project hook command and how each project MCP server starts, then asks you to choose **Trust this workspace** or **Not now**.
+- **Trust this workspace** runs them now and in later sessions. The decision is stored in `~/.autohand/trusted-workspaces.json` with a fingerprint of the declared hooks and servers.
+- Any change to a project hook or project MCP server changes the fingerprint, so Autohand asks again. Permission approvals saved to `settings.local.json` do not.
+- **Not now**, Escape, or Ctrl+C starts the session without them, and Autohand asks again next launch.
+- Runs that cannot show a prompt, such as `-p`, auto mode, patch mode, RPC, and ACP, skip untrusted project hooks and servers and print a warning to stderr.
+- While a workspace that declares project hooks or servers is untrusted, the `hooks` and `mcp` sections of its project files are ignored entirely, including their `enabled` switches. Project files that only set those switches need no trust.
+
 ### 2. Runtime extension hooks
 Enabled, trusted extensions register lifecycle handlers through `api.hooks.on(event, handler)`. The `/hooks` browser includes these handlers and identifies the owning extension.
 
 ### 3. JSON-RPC 2.0 Notifications (IDE Integration)
 When running in RPC mode (VS Code, Zed, etc.), hook events are also emitted as JSON-RPC 2.0 notifications that IDE extensions can subscribe to.
+
+Native ACP clients receive hook events as `autohand.hook.*` notifications, including permission requests, notifications, sub-agent completion, and the end of a turn. The hooks themselves run identically in every mode, so a configured hook fires whether the session is interactive, RPC, or ACP. When an ACP connection closes, the `session-end` hook runs for every live session before the process exits.
 
 ---
 
@@ -136,6 +186,7 @@ When running in RPC mode (VS Code, Zed, etc.), hook events are also emitted as J
 | `subagent-cancel-requested` | When a worker stop is requested | run identity, status |
 | `subagent-stop` | When a worker completes, fails, or is cancelled | run identity, status, success, duration, error |
 | `permission-request` | Before showing permission dialog | tool, path, permission type |
+| `permission-denied` | After the user refuses a permission request | tool, path, command, refusing decision |
 | `notification` | When a notification is sent to user | notification type, message |
 | `automode:start` | When auto-mode starts | auto-mode session id, prompt, max iterations |
 | `automode:iteration` | On each auto-mode iteration | iteration, actions, files created/modified, cost |
@@ -301,6 +352,98 @@ What the matcher matches against depends on the event type:
 | `team-created`, `team-shutdown` | Team name |
 | `teammate-spawned`, `teammate-idle` | Team name, teammate name, or teammate agent name |
 | `task-assigned`, `task-completed` | Task id, task owner, or task result |
+
+---
+
+## Legacy Event Names, Config Shape, and Template Variables
+
+The first hooks documentation described an event-keyed config shape, `on_*` /
+`before_*` / `after_*` event names, and `{{variable}}` placeholders. All three
+still work and are rewritten onto the lifecycle events above, so an older
+configuration keeps firing without changes.
+
+### Legacy config shape
+
+Commands may be listed directly under an event name. Each string (or object
+with a `command`) becomes a hook definition for that event; the array form and
+the event-keyed form can be mixed. The next time hooks are saved from `/hooks`
+the file is written in the array form.
+
+```json
+{
+  "hooks": {
+    "on_file_change": [
+      "eslint {{file}} --fix",
+      { "command": "prettier --write {{file}}", "async": true }
+    ],
+    "on_session_end": ["notify-send \"Autohand session finished\""]
+  }
+}
+```
+
+### Legacy event names
+
+| Legacy name | Fires on | Only when |
+|-------------|----------|-----------|
+| `on_session_start` | `session-start` | — |
+| `on_session_end` | `session-end` | — |
+| `on_session_resume` | `session-start` | session type is `resume` |
+| `before_tool_call` | `pre-tool` | — |
+| `after_tool_call` | `post-tool` | — |
+| `on_tool_error` | `post-tool` | the tool failed |
+| `on_file_change` | `file-modified` | — |
+| `on_file_create` | `file-modified` | change type is `create` |
+| `on_file_delete` | `file-modified` | change type is `delete` |
+| `on_file_read` | `post-tool` | tool is `read_file` |
+| `before_command` | `pre-tool` | tool is `run_command`, `shell`, or `custom_command` |
+| `after_command` | `post-tool` | tool is `run_command`, `shell`, or `custom_command` |
+| `on_user_message` | `pre-prompt` | — |
+| `on_agent_response` | `stop` | — |
+| `on_error` | `session-error` | — |
+| `on_permission_denied` | `permission-denied` | — |
+| `on_automode_start` | `automode:start` | — |
+| `on_automode_stop` | `automode:complete`, `automode:cancel`, `automode:error` | — |
+| `on_automode_iteration` | `automode:iteration` | — |
+| `on_subagent_start` | `subagent-start` | — |
+| `on_subagent_stop` | `subagent-stop` | — |
+| `on_permission_request` | `permission-request` | — |
+| `on_notification` | `notification` | — |
+
+Legacy hooks receive the same environment variables and JSON input as the
+lifecycle event they map to, and their results are reported under that event.
+`/hooks` lists them under the mapped event.
+
+### Template variables
+
+Any hook command may contain `{{variable}}` placeholders. They are replaced
+before the command runs, so they work alongside the `$HOOK_*` environment
+variables. Values that are not a single plain word are single-quoted for the
+shell, so `eslint {{file}}` is safe for paths with spaces. Unknown variables
+become empty strings.
+
+| Variable | Value | Source |
+|----------|-------|--------|
+| `{{file}}`, `{{path}}`, `{{resource}}` | File path | `HOOK_PATH` |
+| `{{action}}` | Change type (`create`, `modify`, `delete`) or permission decision | `HOOK_CHANGE_TYPE`, `HOOK_PERMISSION_TYPE` |
+| `{{tool}}` | Tool name | `HOOK_TOOL` |
+| `{{args}}` | JSON-encoded tool arguments | `HOOK_ARGS` |
+| `{{command}}` | Shell command being run or approved | `HOOK_ARGS` (`command`), permission context |
+| `{{cwd}}`, `{{project}}` | Workspace root | `HOOK_WORKSPACE` |
+| `{{session_id}}` | Session ID | `HOOK_SESSION_ID` |
+| `{{timestamp}}` | ISO timestamp at execution | — |
+| `{{duration}}` | Duration in ms (tool, turn, or subagent) | `HOOK_DURATION`, `HOOK_TURN_DURATION`, `HOOK_SUBAGENT_DURATION` |
+| `{{result}}`, `{{output}}`, `{{response}}` | Tool output | `HOOK_OUTPUT` |
+| `{{exit_code}}` | `0` when the tool succeeded, `1` when it failed | `HOOK_SUCCESS` |
+| `{{error}}` | Error message | `HOOK_ERROR`, `HOOK_SUBAGENT_ERROR`, `HOOK_REVIEW_ERROR` |
+| `{{context}}` | Error code | `HOOK_ERROR_CODE` |
+| `{{message}}` | User instruction, notification message, or queued subagent message | `HOOK_INSTRUCTION`, `HOOK_NOTIFICATION_MSG` |
+| `{{tokens}}` | Tokens used in the turn | `HOOK_TOKENS` |
+| `{{level}}` | Notification type | `HOOK_NOTIFICATION_TYPE` |
+| `{{agent}}` | Subagent name or type | `HOOK_SUBAGENT_NAME`, `HOOK_SUBAGENT_TYPE` |
+| `{{task}}` | Subagent task or auto-mode prompt | `HOOK_AUTOMODE_PROMPT` |
+| `{{iteration}}`, `{{iterations}}` | Current auto-mode or auto-research iteration | `HOOK_AUTOMODE_ITERATION` |
+| `{{total}}`, `{{max_iterations}}` | Maximum iterations | `HOOK_AUTOMODE_MAX_ITERATIONS` |
+| `{{reason}}` | Cancel reason, context reason, or session end reason | `HOOK_AUTOMODE_CANCEL_REASON`, `HOOK_SESSION_END_REASON` |
 
 ---
 
@@ -480,13 +623,13 @@ When your hook command executes, these environment variables are available:
 | `HOOK_EVENT` | Event name (e.g., "pre-tool") | All events |
 | `HOOK_WORKSPACE` | Workspace root path | All events |
 | `HOOK_SESSION_ID` | Current session ID | All events |
-| `HOOK_TOOL` | Tool name | pre-tool, post-tool, permission-request |
+| `HOOK_TOOL` | Tool name | pre-tool, post-tool, permission-request, permission-denied |
 | `HOOK_TOOL_CALL_ID` | Unique tool call ID | pre-tool, post-tool |
 | `HOOK_ARGS` | JSON-encoded tool arguments | pre-tool, post-tool |
 | `HOOK_SUCCESS` | "true" or "false" | post-tool |
 | `HOOK_OUTPUT` | Tool output/result | post-tool |
 | `HOOK_DURATION` | Execution time in ms | post-tool, stop, session-end |
-| `HOOK_PATH` | File path | file-modified, permission-request |
+| `HOOK_PATH` | File path | file-modified, permission-request, permission-denied |
 | `HOOK_CHANGE_TYPE` | "create", "modify", or "delete" | file-modified |
 | `HOOK_INSTRUCTION` | User instruction | pre-prompt |
 | `HOOK_MENTIONED_FILES` | JSON array of mentioned files | pre-prompt |
@@ -513,7 +656,7 @@ When your hook command executes, these environment variables are available:
 | `HOOK_SUBAGENT_SUCCESS` | "true" or "false" | subagent-stop |
 | `HOOK_SUBAGENT_ERROR` | Error message if failed | subagent-stop |
 | `HOOK_SUBAGENT_DURATION` | Duration in ms | subagent-stop |
-| `HOOK_PERMISSION_TYPE` | Permission type being requested | permission-request |
+| `HOOK_PERMISSION_TYPE` | Permission type being requested, or the refusing decision (`deny_once`, `deny_session`, ...) | permission-request, permission-denied |
 | `HOOK_NOTIFICATION_TYPE` | Type of notification | notification |
 | `HOOK_NOTIFICATION_MSG` | Notification message | notification |
 | `HOOK_AUTOMODE_SESSION_ID` | Auto-mode session ID | automode:* |

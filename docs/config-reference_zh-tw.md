@@ -686,6 +686,29 @@ export AUTOHAND_SKIP_UPDATE_CHECK=1
 ```
 ---
 
+### 鍵盤快捷鍵設定檔
+
+如果你已經在使用其他程式碼代理，撰寫區可以沿用它的快捷鍵。可在設定精靈中選擇設定檔（當 Autohand 偵測到該代理時提供）、在 `/settings` → UI → 鍵盤快捷鍵中選擇，或直接執行：
+
+```sh
+autohand config set ui.keybindingProfile codex
+```
+
+| 設定檔 | 換行 | 離開 | 歷史 |
+| --- | --- | --- | --- |
+| `autohand` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+| `claude-code`, `codex`, `devin` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | Ctrl+R |
+| `cursor`, `antigravity` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | `/whatityped` |
+| `factory` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+
+Ctrl+D 只在撰寫區為空時離開。`?` 面板永遠列出目前設定檔的快捷鍵。使用 `claude-code` 時會套用 `~/.claude/keybindings.json` 中的自訂對應；使用 `codex` 時則套用 `~/.codex/config.toml` 的 `[tui.keymap.*]`。
+
+哪些快捷鍵能送達由終端機決定：Shift+Enter 需要 kitty 鍵盤協定（Ghostty、kitty、WezTerm、iTerm2 3.5 以上），Alt+Enter 需要在 macOS 將 Option 設為 Meta，Ctrl+J 在任何終端機（包含 tmux）都可用。
+
+**設定時匯入。** 當設定精靈偵測到其他代理時，也會提議以與 `/import` 相同的方式匯入記憶、工作階段與技能；匯入失敗不會中斷設定。
+
+---
+
 ## 代理設定
 
 控制代理行為和迭代限制。
@@ -730,7 +753,7 @@ export AUTOHAND_SKIP_UPDATE_CHECK=1
 
 Autohand 不會在每個 LLM 請求上傳送每個完整的工具架構。系統提示包含一個緊湊的工具功能目錄，每個請求僅公開選自以下內容的一小組特定模式：
 
-- 核心發現工具，如 `tool_search`、`read_file`、`fff_find` 和 `fff_grep`
+- 核心發現工具，如 `tool_search`、`read_file`、`fff_find` 和 `find_grep`
 - 用於編輯、驗證、git、瀏覽器、網路、依賴項或專案追蹤工作的意圖匹配工具
 - 透過最近的 `tool_search` 呼叫請求的工具或透過名稱明確提及的工具
 
@@ -2018,6 +2041,7 @@ Autohand 提供了一組豐富的斜線命令供互動式使用。在 REPL 中�
 | `/status` |顯示會話狀態 |
 | `/usage` |顯示模型、提供者、上下文和使用限制 |
 
+| `/upgrade`| 開啟主控台以升級 Autohand 方案|
 ### 型號和提供者
 
 |命令 |描述 |

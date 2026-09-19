@@ -7,7 +7,14 @@ import fs from 'fs-extra';
 import path from 'node:path';
 import { PROJECT_DIR_NAME } from '../constants.js';
 import type { PermissionSettings } from './types.js';
-import type { ProviderName, AgentSettings, NetworkSettings, TelemetrySettings } from '../types.js';
+import type {
+  ProviderName,
+  AgentSettings,
+  NetworkSettings,
+  TelemetrySettings,
+  HooksSettings,
+  McpSettings,
+} from '../types.js';
 
 const LOCAL_SETTINGS_FILE = 'settings.local.json';
 
@@ -25,6 +32,10 @@ export interface LocalProjectSettings {
   network?: NetworkSettings;
   /** Telemetry settings override */
   telemetry?: TelemetrySettings;
+  /** Project lifecycle hooks, appended to (and able to override) global hooks */
+  hooks?: HooksSettings;
+  /** Project MCP servers, appended to (and able to override) global servers by name */
+  mcp?: McpSettings;
 }
 
 function normalizePermissionSettings(settings: PermissionSettings | undefined): PermissionSettings | undefined {
@@ -141,14 +152,6 @@ export async function addToLocalDenyList(
       }
     });
   }
-}
-
-export async function addToLocalWhitelist(workspaceRoot: string, pattern: string): Promise<void> {
-  await addToLocalAllowList(workspaceRoot, pattern);
-}
-
-export async function addToLocalBlacklist(workspaceRoot: string, pattern: string): Promise<void> {
-  await addToLocalDenyList(workspaceRoot, pattern);
 }
 
 /**

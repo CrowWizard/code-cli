@@ -4,10 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import fs from 'fs-extra';
+import { execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GoalManager } from '../../src/goals/GoalManager.js';
+
+const execFileAsync = promisify(execFile);
 
 describe('GoalManager', () => {
   let workspaceRoot: string;
@@ -18,6 +22,7 @@ describe('GoalManager', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
     await fs.remove(workspaceRoot);
   });
 
@@ -34,6 +39,66 @@ describe('GoalManager', () => {
     expect(snapshot.goals['session-current']?.goalId).toBe(created.goal?.goalId);
     expect(snapshot.goals['session-current']?.status).toBe('active');
     expect(await fs.pathExists(path.join(workspaceRoot, '.autohand', 'goals.local.json'))).toBe(true);
+  });
+
+  it('preserves both goals when separate sessions create them simultaneously', async () => {
+    const first = new GoalManager(workspaceRoot, { sessionId: 'session-first' });
+    const second = new GoalManager(workspaceRoot, { sessionId: 'session-second' });
+
+    const results = await Promise.all([
+      first.createGoal({ objective: 'first concurrent goal' }),
+      second.createGoal({ objective: 'second concurrent goal' }),
+    ]);
+
+    expect(results.map((result) => result.ok)).toEqual([true, true]);
+    const reloaded = await new GoalManager(workspaceRoot).getSnapshot();
+    expect(Object.values(reloaded.goals).map((goal) => goal.objective).sort()).toEqual([
+      'first concurrent goal',
+      'second concurrent goal',
+    ]);
+  });
+
+  it('creates one goal and queues the other when the same session starts both simultaneously', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'session-current' });
+    const results = await Promise.all([
+      manager.createOrQueueGoal({ objective: 'first goal', source: 'tool' }),
+      manager.createOrQueueGoal({ objective: 'second goal', source: 'rpc' }),
+    ]);
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    const snapshot = await manager.getSessionSnapshot();
+    expect([snapshot.goal?.objective, ...snapshot.queue.map((item) => item.objective)].sort())
+      .toEqual(['first goal', 'second goal']);
+  });
+
+  it('preserves every usage increment when turns are recorded simultaneously', async () => {
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'count every turn' });
+
+    await Promise.all([11, 23, 37].map((tokensUsed) => manager.recordTurnUsage({ tokensUsed })));
+
+    expect((await manager.getSessionSnapshot()).goal?.tokensUsed).toBe(71);
+  });
+
+  it('preserves queue entries written by separate CLI processes', async () => {
+    const moduleUrl = new URL('../../src/goals/GoalManager.ts', import.meta.url).href;
+    const script = [
+      `import { GoalManager } from ${JSON.stringify(moduleUrl)};`,
+      'const manager = new GoalManager(process.argv[1], { sessionId: process.argv[2] });',
+      'for (let i = 0; i < 4; i++) {',
+      '  const result = await manager.enqueueGoal({ objective: process.argv[2] + "-" + i, source: "cli" });',
+      '  if (!result.ok) throw new Error(result.message);',
+      '}',
+    ].join('\n');
+    await Promise.all(['first', 'second'].map((sessionId) => execFileAsync(process.execPath, [
+      '--import', 'tsx', '--input-type=module', '--eval', script, workspaceRoot, sessionId,
+    ], { timeout: 15_000 })));
+
+    const snapshot = await new GoalManager(workspaceRoot).getSessionSnapshot();
+    expect(snapshot.queue.map((item) => item.objective).sort()).toEqual([
+      'first-0', 'first-1', 'first-2', 'first-3',
+      'second-0', 'second-1', 'second-2', 'second-3',
+    ]);
   });
 
   it('migrates a v1 active goal into its owning session', async () => {
@@ -102,6 +167,7 @@ describe('GoalManager', () => {
   });
 
   it('keeps a prior-session goal isolated until the current session creates its own', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
     const priorSession = new GoalManager(workspaceRoot, { sessionId: 'session-prior' });
     await priorSession.createGoal({ objective: 'finish the prior report' });
     const before = await priorSession.getSnapshot();
@@ -221,6 +287,80 @@ describe('GoalManager', () => {
     expect((await manager.getSnapshot()).queue).toEqual([]);
   });
 
+  it.each(['paused', 'complete'] as const)('counts ten active seconds once when a goal becomes %s', async (status) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'measure active time' });
+
+    clock.mockReturnValue(1_010_000);
+    const updated = await manager.updateGoal({ status });
+
+    expect(updated.goal?.timeUsedSeconds).toBe(10);
+  });
+
+  it('preserves elapsed time when editing the active objective', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    const manager = new GoalManager(workspaceRoot);
+    const created = await manager.createGoal({ objective: 'original objective' });
+    if (!created.goal) throw new Error('Expected a created goal');
+
+    clock.mockReturnValue(1_010_000);
+    await manager.editGoalObjective(created.goal.goalId, 'refined objective');
+    clock.mockReturnValue(1_015_000);
+
+    expect((await manager.getSessionSnapshot()).goal?.timeUsedSeconds).toBe(15);
+  });
+
+  it('does not discard fractional seconds between frequent usage updates', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'measure short turns' });
+
+    for (const now of [1_000_400, 1_000_800, 1_001_200]) {
+      clock.mockReturnValue(now);
+      await manager.recordTurnUsage({ tokensUsed: 1 });
+    }
+
+    expect((await manager.getSessionSnapshot()).goal?.timeUsedSeconds).toBeCloseTo(1.2);
+  });
+
+  it('does not charge a goal created after a turn started without one', async () => {
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'newly created goal' });
+
+    await manager.recordTurnUsage({ goalId: null, tokensUsed: 123 });
+
+    expect((await manager.getSessionSnapshot()).goal?.tokensUsed).toBe(0);
+  });
+
+  it.each(['paused', 'complete'] as const)('records the final usage without reactivating a %s goal', async (status) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'owner' });
+    const created = await manager.createGoal({ objective: 'finish owned work' });
+    if (!created.goal) throw new Error('Expected a created goal');
+    clock.mockReturnValue(1_010_000);
+    await manager.updateGoal({ status });
+    clock.mockReturnValue(1_020_000);
+
+    await manager.recordTurnUsage({ goalId: created.goal.goalId, tokensUsed: 123 });
+
+    const snapshot = await manager.getSessionSnapshot();
+    expect(snapshot.goal).toMatchObject({ status, tokensUsed: 123, timeUsedSeconds: 10 });
+    if (status === 'complete') expect(snapshot.completed[0]?.tokensUsed).toBe(123);
+  });
+
+  it('cannot charge another session completed goal by supplying its ID', async () => {
+    const owner = new GoalManager(workspaceRoot, { sessionId: 'owner' });
+    const created = await owner.createGoal({ objective: 'owned goal' });
+    if (!created.goal) throw new Error('Expected a created goal');
+    await owner.updateGoal({ status: 'complete' });
+
+    await new GoalManager(workspaceRoot, { sessionId: 'other' })
+      .recordTurnUsage({ goalId: created.goal.goalId, tokensUsed: 123 });
+
+    expect((await owner.getSessionSnapshot()).completed[0]?.tokensUsed).toBe(0);
+  });
+
   it('tracks active elapsed time and refuses to resume exhausted time budgets', async () => {
     const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(new Date('2026-05-13T00:00:00.000Z').getTime());
 
@@ -249,6 +389,42 @@ describe('GoalManager', () => {
     const complete = await manager.updateGoal({ status: 'complete' });
     expect(complete.ok).toBe(true);
     expect(complete.goal?.status).toBe('complete');
+  });
+
+  it.each(['create', 'create-or-queue'] as const)('starts a new goal after budget exhaustion through %s and preserves terminal history', async (operation) => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'budget-owner' });
+    const first = await manager.createGoal({ objective: 'bounded first goal', tokenBudget: 10 });
+    await manager.recordTurnUsage({ tokensUsed: 12 });
+    const result = operation === 'create'
+      ? await manager.createGoal({ objective: 'fresh approved goal' })
+      : await manager.createOrQueueGoal({ objective: 'fresh approved goal', source: 'tool' });
+
+    expect(result.ok).toBe(true);
+    expect(result.goal).toMatchObject({ objective: 'fresh approved goal', status: 'active', tokensUsed: 0 });
+    expect(result.queue).toEqual([]);
+    const snapshot = await new GoalManager(workspaceRoot).getSnapshot();
+    expect(snapshot.completed).toEqual([expect.objectContaining({
+      goalId: first.goal?.goalId, sessionId: 'budget-owner', status: 'budgetLimited', tokensUsed: 12,
+    })]);
+  });
+
+  it('leaves an exhausted goal and its history unchanged when the replacement is invalid', async () => {
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'bounded goal', tokenBudget: 1 });
+    await manager.recordTurnUsage({ tokensUsed: 1 });
+    const before = await manager.getSnapshot();
+
+    expect((await manager.createOrQueueGoal({ objective: ' ', source: 'tool' })).ok).toBe(false);
+    expect(await manager.getSnapshot()).toEqual(before);
+  });
+
+  it('does not duplicate completed history when starting a new goal', async () => {
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'finished goal' });
+    await manager.updateGoal({ status: 'complete' });
+    await manager.createGoal({ objective: 'next approved goal' });
+
+    expect((await manager.getSnapshot()).completed).toHaveLength(1);
   });
 
   it('automatically starts the next queued goal when the active goal completes', async () => {
@@ -285,6 +461,29 @@ describe('GoalManager', () => {
     expect(formatted).toContain('Completed goals this session (2):');
     expect(formatted).toContain('first goal');
     expect(formatted).toContain('second goal');
+  });
+
+  it('preserves completion when the next template cannot resolve and permits a later queue retry', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'completion-owner' });
+    await manager.createGoal({ objective: 'finished work' });
+    await manager.enqueueGoal({ objective: 'template work', source: 'tool', template: 'missing-next' });
+
+    const result = await manager.updateGoal({ status: 'complete' });
+
+    const reloaded = new GoalManager(workspaceRoot, { sessionId: 'completion-owner' });
+    expect((await reloaded.getSessionSnapshot()).goal?.status).toBe('complete');
+    expect(result.ok).toBe(true);
+    expect(result.queueError).toContain('missing-next');
+    expect(result.completed?.objective).toBe('finished work');
+    expect((await reloaded.getSnapshot()).completed).toHaveLength(1);
+    expect(result.queue).toHaveLength(1);
+
+    await fs.outputFile(path.join(workspaceRoot, '.pi-goals', 'missing-next.md'), 'Resolved next objective');
+    const retry = await reloaded.startQueuedGoal();
+
+    expect(retry.goal?.objective).toBe('Resolved next objective');
+    expect(retry.queue).toEqual([]);
+    expect((await reloaded.getSnapshot()).completed).toHaveLength(1);
   });
 
   it('runs goals concurrently across sessions without abandoning or queueing behind peers', async () => {

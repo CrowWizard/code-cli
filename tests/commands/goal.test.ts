@@ -7,7 +7,7 @@ import fs from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { goal, metadata } from '../../src/commands/goal.js';
+import { goal, metadata, runGoalCli } from '../../src/commands/goal.js';
 import type { SlashCommandContext } from '../../src/core/slashCommandTypes.js';
 import { GoalManager } from '../../src/goals/GoalManager.js';
 import { ActiveAgentRegistry } from '../../src/session/ActiveAgentRegistry.js';
@@ -48,6 +48,59 @@ describe('/goal command', () => {
     await fs.remove(workspaceRoot);
   });
 
+  it('creates a non-interactive goal when the supplied configuration enables goals', async () => {
+    const result = await runGoalCli(workspaceRoot, 'create a reliable CLI goal', ctx.config);
+
+    expect(result).toContain('Goal created.');
+    expect((await new GoalManager(workspaceRoot).getSessionSnapshot()).goal?.objective)
+      .toBe('create a reliable CLI goal');
+  });
+
+  it('preserves JSON completion evidence through the non-interactive command parser', async () => {
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'CLI evidence', acceptanceCriteria: ['Tests pass'] });
+    expect(await runGoalCli(workspaceRoot, 'complete', ctx.config)).toContain('completion evidence');
+    const evidence = { summary: 'CLI verification', checks: [{ criterion: 'Tests pass', status: 'passed', evidence: '12 passed; report "one"' }] };
+
+    expect(await runGoalCli(workspaceRoot, `complete ${JSON.stringify(evidence)}`, ctx.config)).toContain('Reported completion evidence: CLI verification');
+    expect((await manager.getSessionSnapshot()).goal?.completionReceipt?.checks[0].evidence).toBe('12 passed; report "one"');
+  });
+
+  it('does not change interaction permissions for non-interactive goal commands', async () => {
+    ctx.isNonInteractive = true;
+
+    await goal(ctx, ['approved non-interactive goal']);
+
+    expect(ctx.setInteractionMode).not.toHaveBeenCalled();
+  });
+
+  it('saves a waiting checkpoint through the CLI flag without starting more work', async () => {
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'wait for approved credentials' });
+    const progress = { stopReason: 'Need credentials', resumeWhen: 'Credentials arrive', checkpoint: { summary: 'Tests prepared', nextStep: 'Run tests' } };
+    const result = await runGoalCli(workspaceRoot, `waiting ${JSON.stringify(progress)}`, ctx.config);
+    expect(result).toContain('Status: waiting');
+    expect(result).toContain('Resume when: Credentials arrive');
+    expect(result).toContain('Checkpoint: Tests prepared');
+    expect(queued).toEqual([]);
+  });
+
+  it('saves checkpoint-only commands and refuses malformed progress without mutating the goal', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'session-current' });
+    await manager.createGoal({ objective: 'checkpoint command' });
+    expect(await goal(ctx, ['checkpoint', '{"summary":"Saved command progress"}'])).toContain('Checkpoint: Saved command progress');
+    expect(await goal(ctx, ['blocked', '{invalid'])).toContain('Invalid goal progress');
+    expect((await manager.getSessionSnapshot()).goal).toMatchObject({ status: 'active', checkpoint: { summary: 'Saved command progress' } });
+    expect(queued).toEqual([]);
+  });
+
+  it('explains that the goal writer requires an interactive session when called through the CLI flag', async () => {
+    const result = await runGoalCli(workspaceRoot, 'writer rough objective', ctx.config);
+
+    expect(result).toContain('requires an interactive session');
+    expect((await new GoalManager(workspaceRoot).getSessionSnapshot()).goal).toBeNull();
+  });
+
   it('registers slash metadata', () => {
     expect(metadata.command).toBe('/goal');
     expect(metadata.implemented).toBe(true);
@@ -55,6 +108,49 @@ describe('/goal command', () => {
     expect(metadata.subcommands?.map((item) => item.name)).toContain('writer');
     expect(metadata.subcommands?.map((item) => item.name)).toContain('view');
     expect(metadata.subcommands?.map((item) => item.name)).toContain('edit');
+  });
+
+  it('repairs damaged storage explicitly without starting autonomous work', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'session-current' });
+    await manager.createGoal({ objective: 'repair this saved goal' });
+    await fs.writeFile(path.join(workspaceRoot, '.autohand', 'goals.local.json'), '{damaged');
+
+    const result = await goal(ctx, ['repair']);
+
+    expect(result).toContain('Goal storage restored');
+    expect((await manager.getSessionSnapshot()).goal?.status).toBe('paused');
+    expect(queued).toEqual([]);
+    expect(ctx.setInteractionMode).not.toHaveBeenCalled();
+  });
+
+  it('shows the warning if a goal was saved without a refreshed backup', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'session-current' });
+    await manager.createGoal({ objective: 'existing saved goal' });
+    const backupPath = path.join(workspaceRoot, '.autohand', 'goals.local.json.backup');
+    await fs.move(backupPath, `${backupPath}.saved-for-test`);
+    await fs.ensureDir(backupPath);
+
+    expect(await goal(ctx, ['save the goal'])).toContain('backup could not be refreshed');
+  });
+
+  it('retries the queue after completion without reactivating the finished goal', async () => {
+    const manager = new GoalManager(workspaceRoot, { sessionId: 'session-current' });
+    await manager.createGoal({ objective: 'finished goal' });
+    await manager.enqueueGoal({ objective: 'pending template', source: 'command', template: 'missing-next' });
+    await manager.updateGoal({ status: 'complete' });
+
+    const missing = await goal(ctx, ['resume']);
+
+    expect(missing).toContain('missing-next');
+    expect((await manager.getSessionSnapshot()).goal?.status).toBe('complete');
+    expect(queued).toEqual([]);
+
+    await fs.outputFile(path.join(workspaceRoot, '.pi-goals', 'missing-next.md'), 'Recovered next goal');
+    const result = await goal(ctx, ['resume']);
+
+    expect(result).toContain('Started queued goal');
+    expect(queued).toEqual([expect.stringContaining('Recovered next goal')]);
+    expect((await manager.getSnapshot()).completed).toHaveLength(1);
   });
 
   it('opens the live goals view without creating another goal', async () => {

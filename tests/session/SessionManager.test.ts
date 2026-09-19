@@ -429,4 +429,60 @@ describe('SessionManager', () => {
     const nextPage = await manager.listRecentSessions(undefined, 2, 2);
     expect(nextPage.sessions.map((session) => session.sessionId)).toEqual(['oldest']);
   });
+
+  it('orders a recent page by last activity, not creation', async () => {
+    const manager = new SessionManager(tmpDir);
+    const older = await manager.createSession('/workspace/cli-3', 'test-model');
+    Object.assign(older.metadata, {
+      createdAt: '2026-01-01T00:00:00.000Z',
+      lastActiveAt: '2026-01-05T00:00:00.000Z', // used again just now
+    });
+    await older.save();
+    const newer = await manager.createSession('/workspace/cli-3', 'test-model');
+    Object.assign(newer.metadata, {
+      createdAt: '2026-01-03T00:00:00.000Z',
+      lastActiveAt: '2026-01-03T00:00:00.000Z',
+    });
+    await newer.save();
+
+    const page = await manager.listRecentSessions(undefined, 10);
+
+    expect(page.sessions.map((session) => session.sessionId)).toEqual([
+      older.metadata.sessionId, newer.metadata.sessionId,
+    ]);
+  });
+});
+
+describe('session index lock contention', () => {
+  it('initializes read-only when another live process holds the index lock', async () => {
+    const { acquireFileLock } = await import('../../src/utils/atomicFile.js');
+    const { Session, SessionManager } = await import('../../src/session/SessionManager.js');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const fs = (await import('fs-extra')).default;
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-index-lock-'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const lease = await acquireFileLock(path.join(dir, 'index.json.lock'));
+    try {
+      const metadata = {
+        sessionId: 'held-1', createdAt: '2026-01-01T00:00:00.000Z', lastActiveAt: '2026-01-02T00:00:00.000Z',
+        projectPath: '/p', projectName: 'p', model: 'm', messageCount: 0, status: 'completed' as const, summary: 'Held session',
+      };
+      await new Session(path.join(dir, 'held-1'), metadata).save();
+      await fs.writeJson(path.join(dir, 'index.json'), {
+        sessions: [{ id: 'held-1', projectPath: '/p', createdAt: metadata.createdAt }], byProject: { '/p': ['held-1'] },
+      });
+
+      const manager = new SessionManager(dir);
+      const started = Date.now();
+      await expect(manager.initialize()).resolves.toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('index.json.lock'));
+      expect((await manager.listSessions()).map((session) => session.sessionId)).toEqual(['held-1']);
+    } finally {
+      warn.mockRestore();
+      await lease?.release();
+      await fs.remove(dir);
+    }
+  }, 30_000);
 });

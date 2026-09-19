@@ -29,6 +29,7 @@ import { I18nProvider } from '../../../src/ui/i18n/index.js';
 import { ThemeProvider } from '../../../src/ui/theme/ThemeContext.js';
 import { getPromptBlockWidth } from '../../../src/ui/inputPrompt.js';
 import { GoalPanel } from '../../../src/ui/ink/GoalPanel.js';
+import { DEFAULT_KEYBINDINGS, resolveKeybindings } from '../../../src/keybindings/profiles.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '');
@@ -82,6 +83,35 @@ afterEach(() => {
 });
 
 describe('AgentUI TextBuffer integration helpers', () => {
+  it('updates streamed text without another working-state transition', async () => {
+    const state = { ...createInitialUIState(), isWorking: true };
+    const frame = (streamingResponse: string | null) => React.createElement(I18nProvider, null,
+      React.createElement(ThemeProvider, null, React.createElement(AgentUI, {
+        state: { ...state, streamingResponse },
+        onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {},
+      })),
+    );
+    const instance = render(frame(null));
+    instance.rerender(frame('First incremental answer'));
+    await vi.waitFor(() => expect(instance.lastFrame()).toContain('First incremental answer'));
+    instance.rerender(frame('First incremental answer continues'));
+    await vi.waitFor(() => expect(instance.lastFrame()).toContain('answer continues'));
+    instance.rerender(frame(null));
+    await vi.waitFor(() => expect(instance.lastFrame()).not.toContain('First incremental answer'));
+  });
+
+  it('renders a partial assistant response while the turn is still working', async () => {
+    const instance = render(React.createElement(I18nProvider, null,
+      React.createElement(ThemeProvider, null, React.createElement(AgentUI, {
+        state: { ...createInitialUIState(), isWorking: true, streamingResponse: 'First visible token', finalResponse: 'Not complete yet' },
+        onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {},
+      })),
+    ));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('First visible token');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('Not complete yet');
+  });
+
   it('recognizes Cmd+T and Ctrl+T as team view shortcuts', () => {
     expect(isTeamViewShortcut('t', createInkKey({ meta: true }))).toBe(true);
     expect(isTeamViewShortcut('t', createInkKey({ ctrl: true }))).toBe(true);
@@ -287,7 +317,7 @@ describe('AgentUI TextBuffer integration helpers', () => {
     expect(buffer.getText()).toBe('/');
   });
 
-  it.each(['/', '@', '$', '!', '#'])(
+  it.each(['/', '@', '$', '!', '#', ':'])(
     'recognizes bare composer trigger %s as dismissible',
     trigger => {
       expect(isBareComposerTrigger(trigger)).toBe(true);
@@ -295,7 +325,7 @@ describe('AgentUI TextBuffer integration helpers', () => {
     }
   );
 
-  it.each(['/', '@', '$', '!', '#'])(
+  it.each(['/', '@', '$', '!', '#', ':'])(
     'does not treat %s inside normal text as a bare composer trigger',
     trigger => {
       expect(isBareComposerTrigger(`run ${trigger}`)).toBe(false);
@@ -303,7 +333,7 @@ describe('AgentUI TextBuffer integration helpers', () => {
     }
   );
 
-  it.each(['/', '@', '$', '!', '#'])(
+  it.each(['/', '@', '$', '!', '#', ':'])(
     'clears bare composer trigger %s for escape dismissal',
     trigger => {
       const buffer = new TextBuffer(20, 10, trigger);
@@ -313,7 +343,7 @@ describe('AgentUI TextBuffer integration helpers', () => {
     }
   );
 
-  it.each(['/', '@', '$', '!', '#'])(
+  it.each(['/', '@', '$', '!', '#', ':'])(
     'treats forward Delete at the end of bare trigger %s as removal',
     trigger => {
       const buffer = new TextBuffer(20, 10, `  ${trigger}`);
@@ -442,6 +472,50 @@ describe('AgentUI interaction mode shortcut', () => {
     const statusIndex = frame.indexOf('Working... (esc to interrupt)');
     const indicatorIndex = frame.indexOf('[AUTO]');
     expect(indicatorIndex).toBeGreaterThan(statusIndex);
+  });
+
+  it('keeps every help-line row short of the last terminal column and preserves the mode glyph space', async () => {
+    // A row that fills the final column wraps on terminals without deferred
+    // wrap; Ink then miscounts the frame, the caret lands one row below the
+    // composer text and every repaint scrolls one line. The composer already
+    // reserves that column (getPromptBlockWidth); the help line must too.
+    const widths = Array.from({ length: 41 }, (_, index) => 80 + index);
+    for (const columns of widths) {
+      const { lastFrame, stdout, unmount } = render(
+        React.createElement(
+          I18nProvider,
+          null,
+          React.createElement(
+            ThemeProvider,
+            null,
+            React.createElement(AgentUI, {
+              state: {
+                ...createInitialUIState(),
+                provider: 'autohandai',
+                model: 'auto',
+                planLabel: 'Max',
+                contextTokens: { used: 114_300, total: 262_100 },
+              },
+              onInstruction: () => {},
+              onEscape: () => {},
+              onCtrlC: () => {},
+              getInteractionMode: () => 'automode',
+            })
+          )
+        )
+      );
+      setStdoutColumns(stdout, columns);
+      stdout.emit('resize');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const frame = stripAnsi(lastFrame() ?? '');
+      unmount();
+
+      const helpIndex = frame.indexOf('● AUTO');
+      expect(helpIndex, `help line missing at ${columns} columns`).toBeGreaterThan(-1);
+      expect(frame, `glyph space lost at ${columns} columns`).toContain('● AUTO Autohand (Max)');
+      const widest = Math.max(...frame.split('\n').map((line) => line.length));
+      expect(widest, `a row reached the last column at ${columns} columns`).toBeLessThan(columns);
+    }
   });
 
   it('colors the mode glyph per mode, labels it, and hides it in default mode', async () => {
@@ -783,6 +857,38 @@ describe('AgentUI composer suggestions', () => {
     const frame = stripAnsi(lastFrame() ?? '');
     expect(frame).toContain('/help');
     expect(frame).toContain('Tab to accept');
+  });
+
+  it('keeps the composer status line directly under the composer while the slash dropdown is open', async () => {
+    const state = {
+      ...createInitialUIState(),
+      currentInput: '/',
+    };
+    const { lastFrame } = render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state,
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+            slashCommands,
+          })
+        )
+      )
+    );
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    const frame = stripAnsi(lastFrame() ?? '');
+    const helpIndex = frame.indexOf('context left');
+    const dropdownIndex = frame.indexOf('Tab to accept');
+    expect(helpIndex, frame).toBeGreaterThan(-1);
+    expect(dropdownIndex, frame).toBeGreaterThan(helpIndex);
   });
 
   it('renders slash command suggestions while the assistant is working', async () => {
@@ -2224,5 +2330,236 @@ describe('AgentUI idle composer input handling', () => {
 
     // The old broken pattern must NOT be present
     expect(src).not.toContain('!isWorkingRef.current || !enableQueueInputRef.current');
+  });
+});
+
+describe('AgentUI keybinding profiles', () => {
+  function renderComposer(options: {
+    profile?: 'autohand' | 'codex';
+    currentInput?: string;
+    onCtrlC?: () => void;
+    onInstruction?: (text: string) => void;
+  } = {}) {
+    return render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state: { ...createInitialUIState(), currentInput: options.currentInput ?? '' },
+            onInstruction: options.onInstruction ?? (() => {}),
+            onEscape: () => {},
+            onCtrlC: options.onCtrlC ?? (() => {}),
+            keybindings: resolveKeybindings(options.profile ?? 'autohand'),
+          }),
+        ),
+      ),
+    );
+  }
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('inserts a newline on Ctrl+J under the Codex profile', async () => {
+    const instance = renderComposer({ profile: 'codex', currentInput: 'one' });
+    await tick();
+    instance.stdin.write('\n');
+    await tick();
+    instance.stdin.write('two');
+    await tick();
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('❯ one');
+    expect(frame).toMatch(/\n\s*two/);
+  });
+
+  it('keeps Ctrl+J as a plain submit-neutral key under the Autohand defaults', async () => {
+    const onInstruction = vi.fn();
+    const instance = renderComposer({ profile: 'autohand', currentInput: 'one', onInstruction });
+    await tick();
+    instance.stdin.write('\n');
+    await tick();
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toMatch(/❯ one\n\s*\n/);
+    expect(onInstruction).not.toHaveBeenCalled();
+  });
+
+  it('requests exit on Ctrl+D with an empty composer under the Codex profile only', async () => {
+    const codexExit = vi.fn();
+    const codex = renderComposer({ profile: 'codex', onCtrlC: codexExit });
+    await tick();
+    codex.stdin.write('\x04');
+    await tick();
+    await tick();
+    expect(codexExit).toHaveBeenCalledTimes(1);
+    codex.unmount();
+
+    const defaultExit = vi.fn();
+    const defaults = renderComposer({ profile: 'autohand', onCtrlC: defaultExit });
+    await tick();
+    defaults.stdin.write('\x04');
+    await tick();
+    await tick();
+    expect(defaultExit).not.toHaveBeenCalled();
+  });
+
+  it('does not exit on Ctrl+D while the composer has text', async () => {
+    const onCtrlC = vi.fn();
+    const instance = renderComposer({ profile: 'codex', currentInput: 'draft', onCtrlC });
+    await tick();
+    instance.stdin.write('\x04');
+    await tick();
+    await tick();
+    expect(onCtrlC).not.toHaveBeenCalled();
+  });
+
+  it('opens the typed history on Ctrl+R under the Codex profile', async () => {
+    const onInstruction = vi.fn();
+    const instance = renderComposer({ profile: 'codex', onInstruction });
+    await tick();
+    instance.stdin.write('\x12');
+    await tick();
+    expect(onInstruction).toHaveBeenCalledWith('/whatityped');
+  });
+
+  it('lists the profile chords in the ? shortcuts panel', async () => {
+    const instance = renderComposer({ profile: 'codex' });
+    await tick();
+    instance.stdin.write('?');
+    await tick();
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('ctrl + j inserts newline');
+    expect(frame).toContain('ctrl + d exits');
+  });
+
+  it('handles Ctrl+J in the text buffer bridge only when the profile binds it', () => {
+    const codexBuffer = new TextBuffer(80, 10, 'test');
+    expect(handleInkTextBufferInput(codexBuffer, '\n', createInkKey(), resolveKeybindings('codex'))).toBe('handled');
+    expect(codexBuffer.getText()).toBe('test\n');
+
+    const defaultBuffer = new TextBuffer(80, 10, 'test');
+    handleInkTextBufferInput(defaultBuffer, '\n', createInkKey(), DEFAULT_KEYBINDINGS);
+    expect(defaultBuffer.getText()).toBe('test');
+  });
+
+  it('reserves the active profile chords from extension keybindings', () => {
+    const binding = { key: 'ctrl+d', command: 'ext.deploy' };
+    expect(matchesExtensionKeybinding('d', createInkKey({ ctrl: true }), binding, DEFAULT_KEYBINDINGS.reservedChords())).toBe(false);
+    expect(matchesExtensionKeybinding('d', createInkKey({ ctrl: true }), binding, resolveKeybindings('codex').reservedChords())).toBe(false);
+    expect(matchesExtensionKeybinding('k', createInkKey({ ctrl: true }), { key: 'ctrl+k', command: 'ext.k' })).toBe(true);
+  });
+});
+
+describe('AgentUI slash command Enter with subcommand suggestions open', () => {
+  const slashCommands = [
+    {
+      command: '/experiments',
+      description: 'list and toggle Autohand experiments',
+      implemented: true,
+      subcommands: [
+        { name: 'list', description: 'List experiments and current state' },
+        { name: 'status', description: 'Show one experiment' },
+        { name: 'enable', description: 'Enable an experiment' },
+      ],
+    },
+  ];
+
+  function renderComposer(onInstruction: (text: string) => void) {
+    const state = {
+      ...createInitialUIState(),
+      currentInput: '/experiments ',
+    };
+    return render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state,
+            onInstruction,
+            onEscape: () => {},
+            onCtrlC: () => {},
+            slashCommands,
+          })
+        )
+      )
+    );
+  }
+
+  it('submits the bare command on Enter while its subcommands are only being shown', async () => {
+    const onInstruction = vi.fn();
+    const { stdin, lastFrame } = renderComposer(onInstruction);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(stripAnsi(lastFrame() ?? '')).toContain('/experiments list');
+
+    stdin.write('\r');
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(onInstruction).toHaveBeenCalledWith('/experiments');
+  });
+
+  it('still accepts a subcommand the user highlighted with the arrow keys', async () => {
+    const onInstruction = vi.fn();
+    const { stdin, lastFrame } = renderComposer(onInstruction);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    stdin.write('\x1b[B');
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    stdin.write('\r');
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(onInstruction).not.toHaveBeenCalled();
+    expect(stripAnsi(lastFrame() ?? '')).toContain('/experiments status');
+  });
+});
+
+describe('AgentUI thinking display', () => {
+  function renderState(state: Partial<ReturnType<typeof createInitialUIState>>) {
+    return render(
+      React.createElement(
+        I18nProvider,
+        null,
+        React.createElement(
+          ThemeProvider,
+          null,
+          React.createElement(AgentUI, {
+            state: { ...createInitialUIState(), ...state },
+            onInstruction: () => {},
+            onEscape: () => {},
+            onCtrlC: () => {},
+          })
+        )
+      )
+    );
+  }
+
+  it('shows the final-turn thought above the reply while idle', async () => {
+    const { lastFrame } = renderState({
+      isWorking: false,
+      thinking: 'Weigh two jokes.',
+      finalResponse: 'Light attracts bugs.',
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    const frame = stripAnsi(lastFrame() ?? '');
+    expect(frame).toContain('Thinking: Weigh two jokes.');
+    expect(frame.indexOf('Thinking: Weigh two jokes.')).toBeLessThan(frame.indexOf('Light attracts bugs.'));
+  });
+
+  it('renders an archived thinking entry dimly in the transcript', async () => {
+    const { lastFrame } = renderState({
+      chatMessages: [
+        { role: 'user' as const, content: 'tell me a joke' },
+        { role: 'thinking' as const, content: 'Weigh two jokes.' },
+        { role: 'assistant' as const, content: 'Light attracts bugs.' },
+      ],
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(stripAnsi(lastFrame() ?? '')).toContain('Thinking: Weigh two jokes.');
   });
 });

@@ -37,13 +37,6 @@ export interface ToolPolicy {
 }
 
 /**
- * Extended tool definition with category
- */
-export interface CategorizedToolDefinition extends ToolDefinition {
-  category: ToolCategory;
-}
-
-/**
  * Map of tool names to their categories
  */
 const TOOL_CATEGORIES: Record<string, ToolCategory> = {
@@ -80,6 +73,10 @@ const TOOL_CATEGORIES: Record<string, ToolCategory> = {
   exit_worktree: 'meta',
   team_status: 'meta',
   send_team_message: 'meta',
+  list_peers: 'read',
+  send_peer_message: 'write',
+  peer_messages: 'read',
+  coordinate_resource: 'write',
   ask_followup_question: 'meta',
   find_agent_skills: 'meta',
   request_directory_access: 'meta',
@@ -92,7 +89,7 @@ const TOOL_CATEGORIES: Record<string, ToolCategory> = {
   // Read operations
   read_file: 'read',
   fff_find: 'read',
-  fff_grep: 'read',
+  find_grep: 'read',
   find: 'read',
   glob: 'read',
   search: 'read',
@@ -262,7 +259,7 @@ export const CONTEXT_POLICIES: Record<ClientContext, ToolPolicy> = {
       'browser_get_tab_groups',
       ...BROWSER_V2_TOOL_NAMES,
       // Basic file ops — restricted scope
-      'read_file', 'write_file', 'fff_grep', 'fff_find', 'search', 'list_tree',
+      'read_file', 'write_file', 'find_grep', 'fff_find', 'search', 'list_tree',
       // Web
       'web_search', 'fetch_url',
       // Communication
@@ -406,16 +403,6 @@ export function createToolFilter(
   return new ToolFilter(context, customPolicy);
 }
 
-/**
- * Annotate tool definitions with their categories
- */
-export function categorizeTools(definitions: ToolDefinition[]): CategorizedToolDefinition[] {
-  return definitions.map(def => ({
-    ...def,
-    category: getToolCategory(def.name)
-  }));
-}
-
 // ============================================================================
 // Relevance-based filtering (reduces token overhead)
 // ============================================================================
@@ -443,10 +430,14 @@ export type RelevanceCategory =
  * Map tools to relevance categories
  */
 const RELEVANCE_CATEGORIES: Record<string, RelevanceCategory> = {
+  list_peers: 'always',
+  send_peer_message: 'always',
+  peer_messages: 'always',
+  coordinate_resource: 'always',
   // Always include
   read_file: 'always',
   fff_find: 'always',
-  fff_grep: 'always',
+  find_grep: 'always',
   tool_search: 'always',
   ask_followup_question: 'always',
   find_agent_skills: 'always',
@@ -827,29 +818,4 @@ export function formatToolCapabilityCatalog(tools: ToolDefinition[]): string {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([label, names]) => `- ${label}: ${[...new Set(names)].sort().join(', ')}`)
     .join('\n');
-}
-
-/**
- * Get summary of filtering for debugging
- */
-export function getRelevanceFilteringSummary(
-  originalCount: number,
-  filteredCount: number,
-  categories: Set<RelevanceCategory>
-): string {
-  const saved = originalCount - filteredCount;
-  const percent = originalCount > 0 ? Math.round((saved / originalCount) * 100) : 0;
-  return `Tools: ${filteredCount}/${originalCount} (-${percent}%, categories: ${[...categories].join(', ')})`;
-}
-
-/**
- * Estimate token savings from filtering
- */
-export function estimateTokenSavings(
-  originalTools: FunctionDefinition[],
-  filteredTools: FunctionDefinition[]
-): number {
-  const originalSize = JSON.stringify(originalTools).length;
-  const filteredSize = JSON.stringify(filteredTools).length;
-  return Math.floor((originalSize - filteredSize) / 4);
 }

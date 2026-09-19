@@ -19,6 +19,17 @@ describe('XAIProvider', () => {
     vi.stubEnv('AUTOHAND_HOME', authDirectory);
   });
 
+  it('reports an HTTP 400 incorrect API key as an authentication failure (GH #545)', async () => {
+    const provider = new XAIProvider({ apiKey: 'invalid-test-key', model: 'grok-4.20-0309-non-reasoning' });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      error: 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.',
+    }), { status: 400 }));
+
+    await expect(provider.complete({ messages: [{ role: 'user', content: 'hello' }] }))
+      .rejects.toMatchObject({ code: 'auth_failed', httpStatus: 400, retryable: false, message: expect.stringContaining('xAI') });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   afterEach(async () => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -224,6 +235,36 @@ describe('XAIProvider', () => {
 
     expect(result.content).toBe('Partial xAI completion');
     expect(result.finishReason).toBe('length');
+  });
+
+  it.each([
+    ['max_output_tokens', 'length'],
+    ['content_filter', 'content_filter'],
+    [undefined, 'stop'],
+  ] as const)('normalizes an incomplete_details reason of %s to %s', async (reason, expected) => {
+    const provider = new XAIProvider({ apiKey: 'xai-key', model: 'grok-4.20-reasoning' });
+    const eventName = reason ? 'response.incomplete' : 'response.completed';
+    const sseBody = [
+      `event: ${eventName}`,
+      `data: ${JSON.stringify({
+        type: eventName,
+        response: {
+          id: 'resp-finish',
+          created_at: 1234567890,
+          output_text: 'answer',
+          output: [],
+          ...(reason ? { incomplete_details: { reason } } : {}),
+        },
+      })}`,
+      '',
+    ].join('\n');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(sseBody, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    );
+
+    const result = await provider.complete({ messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(result.finishReason).toBe(expected);
   });
 
   it('surfaces response.failed stream errors instead of a missing completion error', async () => {

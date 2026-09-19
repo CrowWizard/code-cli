@@ -27,8 +27,11 @@ prd/
 plans/
 package-lock.json
 bin/
-scripts/
+scripts/*
+# The build runs this generator; keep it tracked despite the scripts rule.
+!scripts/embed-builtin-assets.ts
 autohand
+docs/reports/
 docs/plans/
 !docs/plans/
 docs/plans/

@@ -74,6 +74,7 @@ import {
   resolveToolDisplayName,
 } from './types.js';
 import { createPermissionBridge } from './permissions.js';
+import { resolveWorkspaceTrust } from '../../startup/workspaceTrustPrompt.js';
 
 import packageJson from '../../../package.json' with { type: 'json' };
 
@@ -195,6 +196,7 @@ export class AutohandAcpAdapter implements Agent {
   private permissionBridges = new Map<string, ReturnType<typeof createPermissionBridge>>();
   private sessionConfigOptions = new Map<string, SessionConfigOption[]>();
   private cancelledSessions = new Set<string>();
+  private hookForwarders = new Map<string, () => void>();
   private config: LoadedConfig | null = null;
   private clientCapabilities?: InitializeRequest['clientCapabilities'];
   private toolStartTimes = new Map<string, number>();
@@ -213,6 +215,10 @@ export class AutohandAcpAdapter implements Agent {
         this.cliOptions
       );
       configureSearchFromSettings(this.config.search, this.cliOptions.searchEngine);
+      // ACP clients cannot answer a trust prompt; the warning goes to stderr, never the protocol stream.
+      if (!this.cliOptions.bare) {
+        await resolveWorkspaceTrust(this.config, { interactive: false });
+      }
     }
     return this.config;
   }
@@ -399,6 +405,9 @@ export class AutohandAcpAdapter implements Agent {
       workspaceRoot,
       options: {
         bare: this.cliOptions.bare,
+        allowedTools: this.cliOptions.allowedTools,
+        disallowedTools: this.cliOptions.disallowedTools,
+        ephemeral: this.cliOptions.ephemeral,
         yes: modeId === 'yolo' || modeId === 'automode',
         unrestricted: modeId === 'yolo' || modeId === 'automode',
         restricted: false,
@@ -430,8 +439,13 @@ export class AutohandAcpAdapter implements Agent {
       promptCount: 0,
     };
 
+    const previousAgent = this.agents.get(managedSessionId);
+    if (previousAgent && previousAgent !== agent) {
+      void this.shutdownAgent(previousAgent);
+    }
     this.sessions.set(managedSessionId, state);
     this.agents.set(managedSessionId, agent);
+    this.forwardHookLifecycle(managedSessionId, agent);
     this.sessionConfigOptions.set(managedSessionId, buildConfigOptions(config));
 
     agent.setOutputListener((event: AgentOutputEvent) => {
@@ -590,10 +604,7 @@ export class AutohandAcpAdapter implements Agent {
       this.sessions.set(sessionId, state);
       return { config, state, messages };
     } catch (error) {
-      this.sessions.delete(sessionId);
-      this.agents.delete(sessionId);
-      this.permissionBridges.delete(sessionId);
-      this.sessionConfigOptions.delete(sessionId);
+      this.forgetSession(sessionId);
       throw error;
     }
   }
@@ -632,6 +643,8 @@ export class AutohandAcpAdapter implements Agent {
         version: packageJson.version,
       },
       authMethods: AUTOHAND_ACP_AUTH_METHODS,
+      ...(this.config.sessions?.communication?.enabled && this.clientCapabilities?._meta?.autohandPeerEvents === 1
+        ? { _meta: { peerCommunication: { version: 1 } } } : {}),
     };
   }
 
@@ -896,6 +909,35 @@ export class AutohandAcpAdapter implements Agent {
   // ACP Agent Interface: cancel
   // ==========================================================================
 
+  /**
+   * Release every session's agent (MCP connections, background processes,
+   * telemetry) when the ACP connection closes. Without this the process exit
+   * orphans the MCP servers each session spawned.
+   */
+  async dispose(): Promise<void> {
+    const agents = [...this.agents.values()];
+    this.sessions.clear();
+    this.agents.clear();
+    this.permissionBridges.clear();
+    this.sessionConfigOptions.clear();
+    this.cancelledSessions.clear();
+    await Promise.all(agents.map((agent) => this.shutdownAgent(agent)));
+  }
+
+  private async shutdownAgent(agent: AutohandAgent): Promise<void> {
+    try {
+      await agent.shutdown({
+        sessionEndReason: 'completed',
+        telemetryReason: 'completed',
+        showSessionSummary: false,
+      });
+    } catch {
+      // Session finalization is best-effort; runtime resources still need teardown.
+    } finally {
+      await agent.shutdownRuntimeResources().catch(() => {});
+    }
+  }
+
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.get(params.sessionId);
     const agent = this.agents.get(params.sessionId);
@@ -1149,6 +1191,83 @@ export class AutohandAcpAdapter implements Agent {
    * Safely emit a hook notification via extNotification.
    * Hook notifications must never crash the agent — errors are logged and swallowed.
    */
+  /**
+   * Mirror hook events to the client for the notifications ACP declares but
+   * never sent. Events the adapter already emits by hand are skipped so a
+   * client never sees the same event twice.
+   */
+  private forwardHookLifecycle(sessionId: string, agent: AutohandAgent): void {
+    this.hookForwarders.get(sessionId)?.();
+    const unsubscribe = agent.getHookManager?.()?.subscribeLifecycle?.((context) => {
+      switch (context.event) {
+        case 'permission-request':
+          this.emitHookPermissionRequest(sessionId, context.tool ?? '', context.path, context.command, context.args);
+          break;
+        case 'notification':
+          this.emitHookNotification(sessionId, context.notificationType ?? '', context.notificationMessage ?? '');
+          break;
+        case 'subagent-stop':
+          this.emitHookSubagentStop(
+            sessionId,
+            context.subagentId ?? '',
+            context.subagentName ?? '',
+            context.subagentType ?? '',
+            context.subagentSuccess ?? false,
+            context.subagentDuration ?? 0,
+            context.subagentError,
+          );
+          break;
+        case 'post-response':
+          this.emitHookPostResponse(sessionId, context.tokensUsed ?? 0, context.toolCallsCount ?? 0, context.duration ?? 0);
+          break;
+        default:
+          break;
+      }
+    });
+    if (unsubscribe) {
+      this.hookForwarders.set(sessionId, unsubscribe);
+    }
+  }
+
+  private forgetSession(sessionId: string): void {
+    this.hookForwarders.get(sessionId)?.();
+    this.hookForwarders.delete(sessionId);
+    this.sessions.delete(sessionId);
+    this.agents.delete(sessionId);
+    this.permissionBridges.delete(sessionId);
+    this.sessionConfigOptions.delete(sessionId);
+  }
+
+  /**
+   * End every live session when the connection closes. Without this, hooks that
+   * clean up or record the end of a session never run for ACP clients.
+   */
+  async shutdown(reason: 'quit' | 'exit' | 'error' = 'exit'): Promise<void> {
+    const sessions = [...this.sessions.entries()];
+    const agents: AutohandAgent[] = [];
+    for (const [sessionId, state] of sessions) {
+      const duration = Math.max(0, Date.now() - state.createdAt);
+      const agent = this.agents.get(sessionId);
+      if (agent) agents.push(agent);
+      try {
+        await agent?.getHookManager?.()?.executeHooks('session-end', {
+          sessionId,
+          sessionEndReason: reason,
+          duration,
+        });
+      } catch (error) {
+        process.stderr.write(
+          `[ACP] Session end hook failed: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+      this.emitHookSessionEnd(sessionId, reason, duration);
+      this.forgetSession(sessionId);
+    }
+    // The hooks above already ended the session; only the MCP servers, relays
+    // and background processes each agent still owns need releasing.
+    await Promise.all(agents.map((agent) => agent.shutdownRuntimeResources().catch(() => {})));
+  }
+
   private async emitHookSafe(method: string, params: Record<string, unknown>): Promise<void> {
     try {
       await this.connection.extNotification(method, params);
@@ -1273,6 +1392,15 @@ export class AutohandAcpAdapter implements Agent {
   private async handleAgentOutput(sessionId: string, event: AgentOutputEvent): Promise<void> {
     try {
       switch (event.type) {
+        case 'peer_update':
+        case 'resource_update': {
+          const update = event.type === 'peer_update' ? event.peerEvent : event.resourceEvent;
+          if (update && this.sessions.has(sessionId) && this.config?.sessions?.communication?.enabled
+            && this.clientCapabilities?._meta?.autohandPeerEvents === 1) {
+            await this.connection.extNotification(event.type === 'peer_update' ? 'autohand.peerUpdate' : 'autohand.resourceUpdate', { sessionId, event: update });
+          }
+          break;
+        }
         case 'thinking':
           if (event.thought) {
             await this.connection.sessionUpdate({

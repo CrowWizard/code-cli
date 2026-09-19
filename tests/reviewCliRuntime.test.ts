@@ -16,7 +16,6 @@ const authenticatedConfig = {
 function dependencies(overrides: Record<string, unknown> = {}) {
   return {
     cwd: () => '/workspace',
-    refreshModelCatalog: vi.fn().mockResolvedValue(undefined),
     loadConfig: vi.fn().mockResolvedValue(config),
     resolveWorkspaceRoot: vi.fn().mockReturnValue('/workspace/repo'),
     validateWorkspacePath: vi.fn().mockResolvedValue({ valid: true }),
@@ -51,8 +50,7 @@ describe('review CLI runtime', () => {
       },
     }, deps);
 
-    expect(deps.refreshModelCatalog).toHaveBeenCalledWith({ bare: true, offline: true });
-    expect(deps.loadConfig).toHaveBeenCalledWith('/workspace/config.json', '/workspace');
+    expect(deps.loadConfig).toHaveBeenCalledWith('/workspace/config.json', '/workspace/repo');
     expect(deps.authenticate).toHaveBeenCalledWith(config, { bare: true });
     expect(deps.buildInstruction).toHaveBeenCalledWith('/workspace/repo', request);
     expect(deps.run).toHaveBeenCalledWith({
@@ -70,6 +68,18 @@ describe('review CLI runtime', () => {
       }),
       review: { request, surface: 'cli' },
     });
+  });
+
+  it('loads project overlays from the current directory when no --path is given', async () => {
+    const deps = dependencies();
+
+    await executeReviewCliInvocation({
+      interactive: false,
+      request: { kind: 'changes', audience: 'mixed', format: 'markdown' },
+      runtimeOptions: { config: '/workspace/config.json' },
+    }, deps);
+
+    expect(deps.loadConfig).toHaveBeenCalledWith('/workspace/config.json', '/workspace');
   });
 
   it('rejects an inaccessible workspace before authentication', async () => {

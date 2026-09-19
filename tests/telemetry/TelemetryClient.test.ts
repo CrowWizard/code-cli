@@ -160,6 +160,8 @@ describe('TelemetryClient session sync', () => {
           totalTokens: 123,
           promptTokens: 50,
           completionTokens: 73,
+          cacheReadTokens: 40,
+          cacheWriteTokens: 10,
           turnCount: 1,
           tokenUsageStatus: 'actual',
           updatedAt: '2026-05-13T10:00:00.000Z',
@@ -169,12 +171,16 @@ describe('TelemetryClient session sync', () => {
 
     const request = vi.mocked(fetch).mock.calls.at(-1)?.[1];
     const body = JSON.parse(String(request?.body)) as {
-      metadata?: { projectName?: string; status?: string; usage?: { totalTokens?: number } };
+      metadata?: {
+        projectName?: string;
+        status?: string;
+        usage?: { totalTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number };
+      };
     };
     expect(body.metadata).toMatchObject({
       projectName: 'project',
       status: 'completed',
-      usage: { totalTokens: 123 },
+      usage: { totalTokens: 123, cacheReadTokens: 40, cacheWriteTokens: 10 },
     });
   });
 
@@ -218,6 +224,21 @@ describe('TelemetryClient session sync', () => {
           metadata: {
             additions: 'many',
             deletions: 2,
+          },
+        }]),
+      ],
+      [
+        'invalid cache usage metadata',
+        JSON.stringify([{
+          ...sessionSnapshot('invalid-cache-usage'),
+          metadata: {
+            usage: {
+              totalTokens: 123,
+              turnCount: 1,
+              tokenUsageStatus: 'actual',
+              updatedAt: '2026-07-14T00:00:00.000Z',
+              cacheReadTokens: 'lots',
+            },
           },
         }]),
       ],
@@ -453,6 +474,23 @@ describe('TelemetryClient session sync', () => {
       expect((await fs.readdir(`${tempRoot}/telemetry`)).some(
         (entry) => entry.startsWith('queue.json.corrupt-')
       )).toBe(false);
+    });
+
+    it('releases the health and telemetry response bodies after a flush', async () => {
+      const healthResponse = new Response('ok', { status: 200 });
+      const telemetryResponse = new Response('{}', { status: 200 });
+      const healthCancel = vi.spyOn(healthResponse.body!, 'cancel');
+      const telemetryCancel = vi.spyOn(telemetryResponse.body!, 'cancel');
+      vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+        String(input).endsWith('/health') ? healthResponse : telemetryResponse
+      )));
+      const client = createEnabledClient();
+      await client.track(event);
+
+      await client.flush();
+
+      expect(healthCancel).toHaveBeenCalledOnce();
+      expect(telemetryCancel).toHaveBeenCalledOnce();
     });
 
     it('awaits a successful queued-event flush', async () => {

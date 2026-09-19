@@ -704,6 +704,29 @@ export AUTOHAND_SKIP_UPDATE_CHECK=1
 ```
 ---
 
+### Profily klávesových zkratek
+
+Pokud už používáte jiného kódovacího agenta, skladatel může sledovat jeho zkratky. Profil vyberete při nastavení (nabídne se, když Autohand agenta najde), v `/settings` → UI → Klávesové zkratky, nebo příkazem:
+
+```sh
+autohand config set ui.keybindingProfile codex
+```
+
+| Profil | Nový řádek | Ukončení | Historie |
+| --- | --- | --- | --- |
+| `autohand` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+| `claude-code`, `codex`, `devin` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | Ctrl+R |
+| `cursor`, `antigravity` | Shift+Enter, Alt+Enter, Ctrl+J | Ctrl+D | `/whatityped` |
+| `factory` | Shift+Enter, Alt+Enter | Ctrl+C ×2 | `/whatityped` |
+
+Ctrl+D ukončí program jen s prázdným skladatelem. Panel `?` vždy vypisuje zkratky aktivního profilu. U `claude-code` se použijí i vlastní přemapování ze souboru `~/.claude/keybindings.json`, u `codex` z `[tui.keymap.*]` v `~/.codex/config.toml`.
+
+Terminál rozhoduje, které zkratky dorazí: Shift+Enter vyžaduje protokol klávesnice kitty (Ghostty, kitty, WezTerm, iTerm2 3.5+), Alt+Enter vyžaduje Option jako Meta na macOS, Ctrl+J funguje v každém terminálu včetně tmux.
+
+**Import při nastavení.** Když nastavení najde jiného agenta, nabídne také import pamětí, relací a dovedností stejným způsobem jako `/import`; neúspěšný import nastavení nezablokuje.
+
+---
+
 ## Nastavení agenta
 
 Řízení chování agenta a limity iterací.
@@ -748,7 +771,7 @@ export AUTOHAND_SKIP_UPDATE_CHECK=1
 
 Autohand neodesílá každé úplné schéma nástroje na každý požadavek LLM. Systémová výzva obsahuje kompaktní katalog funkcí nástrojů a každý požadavek odhaluje pouze malou sadu konkrétních schémat vybraných z:
 
-– Základní nástroje pro zjišťování, jako jsou `tool_search`, `read_file`, `fff_find` a `fff_grep`
+– Základní nástroje pro zjišťování, jako jsou `tool_search`, `read_file`, `fff_find` a `find_grep`
 - Nástroje přizpůsobené záměru pro editaci, ověřování, git, prohlížeč, web, závislost nebo práci se sledováním projektu
 - Nástroje požadované prostřednictvím nedávných volání `tool_search` nebo výslovně uvedené jménem
 
@@ -2036,6 +2059,7 @@ Autohand poskytuje bohatou sadu příkazů lomítka pro interaktivní použití.
 | `/status` | Zobrazit stav relace |
 | `/usage` | Zobrazit model, poskytovatele, kontext a limity využití |
 
+| `/upgrade`| Otevřít konzoli a upgradovat plán Autohand              |
 ### Model a poskytovatel
 
 | Příkaz | Popis |

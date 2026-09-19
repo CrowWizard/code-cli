@@ -7,6 +7,7 @@ import chalk from 'chalk';
 import type { HookManager, HookExecutionResult } from '../HookManager.js';
 import { ProviderNotConfiguredError } from '../../providers/ProviderFactory.js';
 import { ApiError } from '../../providers/errors.js';
+import { formatRecoveryWait, resolveSessionRecoveryDelay } from './sessionRecoveryDelay.js';
 import {
   checkAndPromptForDirectoryPermissions,
   type DirectoryPermissionOptions,
@@ -20,6 +21,8 @@ import type { SessionMessage, SessionTurnUsageInput } from '../../session/types.
 import type { MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
 import type { TurnMemoryReflectionOutcome } from '../../memory/extractSessionMemories.js';
 import type { QueuedInstructionPolicy } from './PostTurnActionCoordinator.js';
+import type { PeerCommunicationRuntime } from './PeerCommunicationRuntime.js';
+import type { PeerReference } from '../../ui/peerMention.js';
 import type {
   AgentLoopStep,
   ReactLoopControl,
@@ -30,6 +33,11 @@ import {
   finalizeDeepResearchRun,
   markDeepResearchRunStarted,
 } from '../../deepResearch/session.js';
+
+const INCOMPLETE_LOOP_REASONS: Record<Extract<ReactLoopResult, { status: 'incomplete' }>['reason'], string> = {
+  iteration_limit: 'The agent loop reached its iteration limit before completion',
+  pending_todos: 'The turn ended with unfinished todo items',
+};
 
 interface InstructionConversation {
   addMessage(message: { role: 'user'; content: string }): void;
@@ -81,6 +89,8 @@ function readCompletedTurnUsage(host: AgentInstructionHost): TurnUsage {
 }
 
 export interface AgentInstructionHost {
+  peerCommunicationRuntime?: PeerCommunicationRuntime;
+  recordPeerReferences?: (instruction: string, references: PeerReference[]) => Promise<void>;
   isInstructionActive: boolean;
   filesModifiedThisSession: boolean;
   lastAssistantResponseForNotification: string;
@@ -164,13 +174,13 @@ export interface AgentInstructionHost {
   emitOutput(event: AgentOutputEvent): void;
   printCompletionSummary(regionsStillActive: boolean, succeeded?: boolean): void;
   beginTodoActivityTurn?(): void;
-  completeTodoActivityForSuccessfulTurn?(): Promise<boolean>;
   clearActivityForCompletedTurn?(): void;
   scheduleTurnMemoryReflection(outcome: TurnMemoryReflectionOutcome): void;
   writeDebugLine?(message: string): void;
 }
 
 export interface RunInstructionOptions extends QueuedInstructionPolicy {
+  peerReferences?: PeerReference[];
   mentionedFiles?: string[];
   hookInstruction?: string;
   signal?: AbortSignal;
@@ -193,6 +203,13 @@ export class InstructionRunner {
   constructor(private readonly host: AgentInstructionHost) {}
 
   async run(instruction: string, options: RunInstructionOptions = {}): Promise<boolean> {
+    while (true) {
+      const result = await this.runAttempt(instruction, options);
+      if (result !== 'retry-provider') return result;
+    }
+  }
+
+  private async runAttempt(instruction: string, options: RunInstructionOptions): Promise<boolean | 'retry-provider'> {
     if (options.signal?.aborted) {
       return false;
     }
@@ -237,6 +254,10 @@ export class InstructionRunner {
       forwardExternalAbort();
     }
 
+    host.peerCommunicationRuntime?.beginTurn();
+    const pausePeers = () => host.peerCommunicationRuntime?.setPaused('cancelled', true);
+    abortController.signal.addEventListener('abort', pausePeers, { once: true });
+
     try {
       return await this.runWithController(
         instruction,
@@ -246,6 +267,8 @@ export class InstructionRunner {
         finalizeResearch,
       );
     } finally {
+      abortController.signal.removeEventListener('abort', pausePeers);
+      host.peerCommunicationRuntime?.endTurn(abortController.signal.aborted);
       options.signal?.removeEventListener('abort', forwardExternalAbort);
       if (deepResearch.runId && !deepResearch.finalized && !deepResearch.deferFinalization) {
         await finalizeResearch(false);
@@ -259,7 +282,7 @@ export class InstructionRunner {
     options: RunInstructionOptions,
     deepResearch: DeepResearchInstructionState,
     finalizeResearch: FinalizeResearch,
-  ): Promise<boolean> {
+  ): Promise<boolean | 'retry-provider'> {
     const host = this.host;
 
     if (abortController.signal.aborted) {
@@ -375,6 +398,13 @@ export class InstructionRunner {
       }
     }
 
+    const turnGoalManager = new GoalManager(host.runtime.workspaceRoot, {
+      sessionId: host.sessionManager?.getCurrentSession()?.metadata?.sessionId,
+    });
+    const turnGoalId = await turnGoalManager.getActiveGoalForSession()
+      .then((goal) => goal?.goalId ?? null)
+      .catch(() => null);
+
     host.activeAbortController = abortController;
     let canceledByUser = false;
     let success = true;
@@ -385,6 +415,12 @@ export class InstructionRunner {
       reason: string,
     ): void => {
       failureOutcome ??= { status: 'failed', category, reason };
+    };
+    const recordIncompleteLoop = (result: Extract<ReactLoopResult, { status: 'incomplete' }>): false => {
+      success = false;
+      recordReflectionFailure('incomplete', INCOMPLETE_LOOP_REASONS[result.reason]);
+      host.clearActivityForCompletedTurn?.();
+      return false;
     };
     const finalizeResearchForTurn = async (turnSucceeded: boolean): Promise<boolean> => {
       const finalized = await finalizeResearch(turnSucceeded);
@@ -460,17 +496,21 @@ export class InstructionRunner {
         ? host.setupPersistentInputInterruptHandlers(abortController, handleCancel)
         : host.setupEscListener(abortController, handleCancel, true);
 
-    const specialistResults = await host.prepareSpecialists?.(instruction);
-    if (specialistResults) {
-      host.conversation.addSystemNote(specialistResults, '[Specialist Results]');
-    }
-    if (abortController.signal.aborted) {
-      success = false;
-      return false;
-    }
-
-    const stopPreparation = host.startPreparationStatus(instruction);
+    // Everything after the interrupt listener is registered runs inside this
+    // try so the finally below always releases it, including the early abort
+    // return and any failure raised while preparing specialists.
+    let stopPreparation: () => void = () => {};
     try {
+      const specialistResults = await host.prepareSpecialists?.(instruction);
+      if (specialistResults) {
+        host.conversation.addSystemNote(specialistResults, '[Specialist Results]');
+      }
+      if (abortController.signal.aborted) {
+        success = false;
+        return false;
+      }
+
+      stopPreparation = host.startPreparationStatus(instruction);
       const userMessage = await host.buildUserMessage(instruction);
       stopPreparation();
       host.setUIStatus('Reasoning with the AI (ReAct loop)...');
@@ -478,6 +518,7 @@ export class InstructionRunner {
 
       // Save user message to session
       await host.saveUserMessage(instruction);
+      if (options.peerReferences?.length) await host.recordPeerReferences?.(instruction, options.peerReferences);
 
       host.updateContextUsage(host.conversation.history());
       const loopResult = await host.runReactLoop(abortController, {
@@ -494,6 +535,10 @@ export class InstructionRunner {
         reflectionSuperseded = true;
         success = true;
         return true;
+      }
+
+      if (loopResult.status === 'incomplete') {
+        return recordIncompleteLoop(loopResult);
       }
 
       if (host.lastIntent === 'implementation' && host.filesModifiedThisSession) {
@@ -520,13 +565,13 @@ export class InstructionRunner {
         }
       }
       success = await finalizeResearchForTurn(success);
-      if (success) {
-        await host.completeTodoActivityForSuccessfulTurn?.();
-        host.clearActivityForCompletedTurn?.();
-      }
+      // The task panel describes this turn; once the turn is over, an
+      // "in progress" entry would otherwise sit above the composer forever.
+      host.clearActivityForCompletedTurn?.();
     } catch (error) {
       success = false;
       if (abortController.signal.aborted) {
+        host.clearActivityForCompletedTurn?.();
         return false;
       }
 
@@ -543,7 +588,7 @@ export class InstructionRunner {
         // After configuration, retry the instruction
         deepResearch.deferFinalization = true;
         reflectionSuperseded = true;
-        return host.runInstruction(instruction, options);
+        return 'retry-provider';
       }
 
       // Loop guard aborts are handled gracefully inside runReactLoop
@@ -551,13 +596,14 @@ export class InstructionRunner {
       // error UI so we don't double-print failure messages.
       if (error instanceof Error && error.name === 'LoopAbortedError') {
         recordReflectionFailure('loop-guard', error.message);
+        host.clearActivityForCompletedTurn?.();
         // Fall through to finally with success = false
       } else {
         // Session failure retry logic
         let err = error instanceof Error ? error : new Error(String(error));
         const encounteredProviderFailure = err instanceof ApiError || host.isRetryableSessionError(err);
         const maxRetries = host.runtime.config.agent?.sessionRetryLimit ?? 3;
-        const baseDelay = host.runtime.config.agent?.sessionRetryDelay ?? 1000;
+        const configuredDelayMs = host.runtime.config.agent?.sessionRetryDelay;
 
         while (host.isRetryableSessionError(err) && host.sessionRetryCount < maxRetries) {
           host.sessionRetryCount++;
@@ -566,15 +612,13 @@ export class InstructionRunner {
             autoReport: false,
           });
 
+          // Provider outages back off from seconds, not milliseconds: the
+          // client already retried the request itself before the turn failed.
+          const delay = resolveSessionRecoveryDelay({ attempt: host.sessionRetryCount, error: err, configuredDelayMs });
+
           // Show retry message to user
           console.log(chalk.yellow(`\n⚠ Session encountered an error: ${err.message}`));
-          console.log(chalk.cyan(`  Attempting recovery (${host.sessionRetryCount}/${maxRetries})...`));
-
-          // Wait with exponential backoff (1.5x multiplier)
-          const delay = Math.max(
-            baseDelay * Math.pow(1.5, host.sessionRetryCount - 1),
-            err instanceof ApiError ? err.retryAfterMs ?? 0 : 0
-          );
+          console.log(chalk.cyan(`  Attempting recovery (${host.sessionRetryCount}/${maxRetries}) in ${formatRecoveryWait(delay)}...`));
           await host.sleep(delay);
           if (abortController.signal.aborted) {
             return false;
@@ -603,13 +647,15 @@ export class InstructionRunner {
               host.sessionRetryCount = 0;
               return true;
             }
+            if (retryResult.status === 'incomplete') {
+              return recordIncompleteLoop(retryResult);
+            }
 
             // If we get here, retry succeeded - reset counter
             host.sessionRetryCount = 0;
             success = true;
             success = await finalizeResearchForTurn(success);
             if (success) {
-              await host.completeTodoActivityForSuccessfulTurn?.();
               host.clearActivityForCompletedTurn?.();
             }
             return success;
@@ -641,6 +687,7 @@ export class InstructionRunner {
           errorMessage,
         );
         host.recordTurnFailure?.(errorMessage);
+        host.clearActivityForCompletedTurn?.();
         host.emitOutput({ type: 'error', content: errorMessage });
         if (err instanceof Error) {
           console.error(chalk.red(errorMessage));
@@ -729,9 +776,7 @@ export class InstructionRunner {
         const turnTokens = isActualTurnUsage(completedTurnUsage) && !host.currentTurnHadUnavailableUsage
           ? completedTurnUsage.totalTokens
           : 0;
-        await new GoalManager(host.runtime.workspaceRoot, {
-          sessionId: host.sessionManager?.getCurrentSession()?.metadata?.sessionId,
-        }).recordTurnUsage({ tokensUsed: turnTokens });
+        await turnGoalManager.recordTurnUsage({ tokensUsed: turnTokens, goalId: turnGoalId });
       } catch {
         // Goal accounting is best-effort and must never mask the turn result.
       }
@@ -742,6 +787,12 @@ export class InstructionRunner {
               promptTokens: completedTurnUsage.promptTokens,
               completionTokens: completedTurnUsage.completionTokens,
               totalTokens: completedTurnUsage.totalTokens,
+              ...(completedTurnUsage.cacheReadTokens === undefined
+                ? {}
+                : { cacheReadTokens: completedTurnUsage.cacheReadTokens }),
+              ...(completedTurnUsage.cacheWriteTokens === undefined
+                ? {}
+                : { cacheWriteTokens: completedTurnUsage.cacheWriteTokens }),
               tokenUsageStatus: 'actual',
               durationMs: host.taskStartedAt ? turnCompletedAt - host.taskStartedAt : undefined,
               occurredAt: new Date(turnCompletedAt).toISOString(),

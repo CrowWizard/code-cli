@@ -11,14 +11,23 @@ import { BaseUIManager, type UIManager } from './UIManager.js';
 import { InkRenderer, type InkRendererOptions } from './ink/InkRenderer.js';
 import type { SlashCommand } from '../core/slashCommandTypes.js';
 import type { SkillMentionInfo } from './mentionFilter.js';
+import type { MessageTarget } from './messageTargets.js';
 import type { ExtensionKeybinding } from '../extensions/ExtensionRuntimeHost.js';
-import type { AgentUILineExtensions } from './ink/AgentUI.js';
+import type { ResolvedKeybindings } from '../keybindings/profiles.js';
+import type { AgentUILineExtensions, TipLineState } from './ink/AgentUI.js';
 import type { GoalEditRequest } from './ink/GoalPanel.js';
 import type { InteractionMode } from '../core/agent/InteractionModeController.js';
 import type { TaskListPosition } from '../types.js';
 
 export interface InkUIManagerOptions {
-  onInstruction: (text: string) => void;
+  onSteer?: (text: string) => void;
+  onWorkingSpinnerFrame?: (frame: number) => void;
+  enterWhileWorking?: 'steer' | 'queue';
+  onInstruction: InkRendererOptions['onInstruction'];
+  peerScopes?: InkRendererOptions['peerScopes'];
+  peersProvider?: InkRendererOptions['peersProvider'];
+  onPeersRefresh?: InkRendererOptions['onPeersRefresh'];
+  onPeerMessage?: InkRendererOptions['onPeerMessage'];
   onEscape: () => void;
   onCtrlC: () => void;
   onDismissAnnouncement?: (id: string) => void;
@@ -27,6 +36,7 @@ export interface InkUIManagerOptions {
   filesProvider?: () => string[];
   slashCommands?: SlashCommand[];
   skillsProvider?: () => SkillMentionInfo[];
+  messageTargetsProvider?: () => MessageTarget[];
   workspaceRoot?: string;
   suggestionProvider?: () => string | undefined;
   resolveShellSuggestion?: (input: string) => Promise<string | null>;
@@ -35,10 +45,12 @@ export interface InkUIManagerOptions {
   getInteractionMode?: () => InteractionMode;
   onCycleInteractionMode?: () => InteractionMode;
   mouseComposerCursor?: boolean;
+  keybindings?: ResolvedKeybindings;
   taskListPositionProvider?: () => TaskListPosition;
   onEditGoalObjective?: (request: GoalEditRequest) => void | Promise<void>;
   onCancelAgentRun?: (id: string) => void | Promise<unknown>;
   onMessageAgentRun?: (id: string, text: string) => Promise<boolean>;
+  tipProvider?: (accept: (tip: string) => boolean) => string | undefined;
   rendererFactory?: (options: InkRendererOptions) => InkRenderer;
 }
 
@@ -62,14 +74,14 @@ export class InkUIManager extends BaseUIManager implements UIManager {
     const { rendererFactory, onInstruction, ...rendererOptionBase } = this.options;
     const rendererOptions: InkRendererOptions = {
       ...rendererOptionBase,
-      onInstruction: (text: string) => {
+      onInstruction: (text, metadata) => {
         if (this.inputWaiter) {
           const waiter = this.inputWaiter;
           this.inputWaiter = null;
           waiter(text);
           return;
         }
-        onInstruction(text);
+        onInstruction(text, metadata);
       },
     };
 
@@ -114,6 +126,10 @@ export class InkUIManager extends BaseUIManager implements UIManager {
   setPlanLabel(planLabel: string | undefined): void {
     this.planLabel = planLabel;
     this.inkRenderer?.setPlanLabel(planLabel);
+  }
+
+  setTip(tip: TipLineState | undefined): void {
+    this.inkRenderer?.setTip(tip);
   }
 
   setFinalResponse(response: string): void {

@@ -46,7 +46,7 @@ import { VERTEX_AI_CODING_MODELS } from "../../providers/VertexAIProvider.js";
 import { sanitizeModelId } from "../../providers/errors.js";
 import { getOpenRouterModelContextWindow } from "../../providers/modelCapabilities.js";
 import { saveConfig, getProviderConfig } from "../../config.js";
-import { getContextWindow } from "../../utils/context.js";
+import { getContextWindow } from "../context/tokenizer.js";
 import {
   getProviderDefaultModel,
   getProviderModelIds,
@@ -262,7 +262,7 @@ export class ProviderConfigManager {
       const currentSettings = getProviderConfig(this.runtime.config, selectedProvider);
       await this.changeCloudProviderSettings(
         selectedProvider,
-        this.runtime.options.model ?? currentSettings?.model ?? "",
+        this.resolveCurrentModel(selectedProvider, currentSettings?.model),
         currentSettings,
         "model",
       );
@@ -293,12 +293,18 @@ export class ProviderConfigManager {
     return `${indicator} ${displayName}${current}${siliconNote}${hostedNote}`;
   }
 
+  private resolveCurrentModel(provider: ProviderName, configuredModel?: string): string {
+    return (provider === this.getActiveProvider() ? this.runtime.options.model : undefined)
+      ?? configuredModel
+      ?? "";
+  }
+
   private async promptConfiguredProviderSettings(
     provider: ProviderName,
   ): Promise<void> {
     const currentSettings = getProviderConfig(this.runtime.config, provider);
     const currentModel =
-      this.runtime.options.model ?? currentSettings?.model ?? "";
+      this.resolveCurrentModel(provider, currentSettings?.model);
 
     this.printProviderSettingsSummary(provider, currentModel, currentSettings);
 
@@ -1741,7 +1747,7 @@ export class ProviderConfigManager {
 
       const currentSettings = getProviderConfig(this.runtime.config, provider);
       const currentModel =
-        this.runtime.options.model ?? currentSettings?.model ?? "";
+        this.resolveCurrentModel(provider, currentSettings?.model);
 
       // For cloud providers, offer to change API key as well.
       if (
@@ -3673,6 +3679,7 @@ export class ProviderConfigManager {
         };
       }
     }
+    this.runtime.config.provider = provider;
     this.runtime.options.model = newModel;
     await saveConfig(this.runtime.config);
     this.resetLlmClient(provider, newModel);

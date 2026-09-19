@@ -20,6 +20,7 @@ import {
   classifyApiError,
   type ApiErrorCode,
 } from "./errors.js";
+import { normalizeProviderFinishReason } from "./finishReason.js";
 import { normalizeLLMUsage } from "./usage.js";
 import { toTextOnlyContent } from './messagePayload.js';
 import type {
@@ -80,6 +81,8 @@ interface ConverseResponse {
     inputTokens?: number;
     outputTokens?: number;
     totalTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheWriteInputTokens?: number;
   };
 }
 
@@ -125,6 +128,7 @@ interface OpenAIResponsesResponse {
   output_text?: string;
   output?: Array<OpenAIResponsesFunctionCall | { type?: string; [key: string]: unknown }>;
   usage?: unknown;
+  incomplete_details?: { reason?: string };
 }
 
 export function resolveBedrockRegion(region?: string): string {
@@ -304,6 +308,32 @@ function toResponsesTools(tools: FunctionDefinition[]): Array<Record<string, unk
   }));
 }
 
+/**
+ * Restate Converse usage in the shape the shared normalizer expects.
+ *
+ * Converse reports the cached share beside `inputTokens` rather than inside
+ * it, so passing the payload through untouched both loses the cache figures —
+ * the normalizer does not know these AWS spellings — and, once it did know
+ * them, would trip its own guard that a cache breakdown cannot exceed the
+ * prompt it came from. Folding the cached tokens into the prompt count matches
+ * what AnthropicProvider already does for the identical upstream API, and
+ * keeps `promptTokens` meaning one thing across every provider here.
+ */
+function converseUsage(usage: ConverseResponse["usage"]): Record<string, number> | undefined {
+  if (!usage) return undefined;
+  const cacheRead = usage.cacheReadInputTokens;
+  const cacheWrite = usage.cacheWriteInputTokens;
+  return {
+    ...(usage.inputTokens === undefined
+      ? {}
+      : { prompt_tokens: usage.inputTokens + (cacheRead ?? 0) + (cacheWrite ?? 0) }),
+    ...(usage.outputTokens === undefined ? {} : { completion_tokens: usage.outputTokens }),
+    ...(usage.totalTokens === undefined ? {} : { total_tokens: usage.totalTokens }),
+    ...(cacheRead === undefined ? {} : { cache_read_input_tokens: cacheRead }),
+    ...(cacheWrite === undefined ? {} : { cache_creation_input_tokens: cacheWrite }),
+  };
+}
+
 function toConverseTools(tools: FunctionDefinition[]): Array<Record<string, unknown>> {
   return tools.map((tool) => ({
     toolSpec: {
@@ -317,16 +347,7 @@ function toConverseTools(tools: FunctionDefinition[]): Array<Record<string, unkn
 }
 
 function normalizeStopReason(stopReason?: string): LLMResponse["finishReason"] {
-  if (stopReason === "tool_use" || stopReason === "tool_calls") {
-    return "tool_calls";
-  }
-  if (stopReason === "max_tokens" || stopReason === "length") {
-    return "length";
-  }
-  if (stopReason === "content_filter") {
-    return "content_filter";
-  }
-  return "stop";
+  return normalizeProviderFinishReason(stopReason, "length");
 }
 
 function toolCallsFromConverseBlocks(blocks: ConverseContentBlock[]): LLMToolCall[] {
@@ -611,7 +632,7 @@ export class BedrockProvider implements LLMProvider {
         content: textFromConverseBlocks(blocks),
         ...(toolCalls.length > 0 && { toolCalls }),
         finishReason: normalizeStopReason(data.stopReason),
-        usage: normalizeLLMUsage(data.usage),
+        usage: normalizeLLMUsage(converseUsage(data.usage)),
         raw: data,
       };
     } catch (error) {
@@ -725,7 +746,9 @@ export class BedrockProvider implements LLMProvider {
       created: data.created_at ?? Math.floor(Date.now() / 1000),
       content: data.output_text ?? "",
       ...(functionCalls.length > 0 && { toolCalls: functionCalls }),
-      finishReason: functionCalls.length > 0 ? "tool_calls" : "stop",
+      finishReason: functionCalls.length > 0
+        ? "tool_calls"
+        : normalizeProviderFinishReason(data.incomplete_details?.reason, "stop"),
       usage: normalizeLLMUsage(data.usage),
       raw: data,
     };

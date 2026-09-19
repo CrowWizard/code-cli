@@ -6,11 +6,15 @@
  * Advanced Git Worktree Manager
  * Provides intelligent worktree automation for parallel development workflows
  */
-import { spawnSync, spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'fs-extra';
 import os from 'node:os';
 import { CommandAbortedError, runCommand } from './command.js';
+import { getCommandCoordination } from '../session/peers/CommandCoordinationGate.js';
+
+/** Setup and sync commands (installs, rebases) may legitimately take minutes, but never forever. */
+const WORKTREE_COMMAND_TIMEOUT_MS = 10 * 60_000;
 
 // ============ Types ============
 
@@ -208,10 +212,7 @@ export class WorktreeManager {
       args.splice(2, 0, '--force');
     }
 
-    const result = spawnSync('git', args, {
-      cwd: this.repoRoot,
-      encoding: 'utf8'
-    });
+    const result = await this.runGitMutation(args);
 
     if (result.status !== 0) {
       throw new Error(result.stderr || 'Failed to create worktree');
@@ -246,10 +247,7 @@ export class WorktreeManager {
     }
     args.push(absolutePath);
 
-    const result = spawnSync('git', args, {
-      cwd: this.repoRoot,
-      encoding: 'utf8'
-    });
+    const result = await this.runGitMutation(args);
 
     if (result.status !== 0) {
       throw new Error(result.stderr || 'Failed to remove worktree');
@@ -257,10 +255,7 @@ export class WorktreeManager {
 
     // Optionally delete the branch
     if (options.deleteBranch && branchToDelete) {
-      const deleteResult = spawnSync('git', ['branch', '-d', branchToDelete], {
-        cwd: this.repoRoot,
-        encoding: 'utf8'
-      });
+      const deleteResult = await this.runGitMutation(['branch', '-d', branchToDelete]);
 
       if (deleteResult.status === 0) {
         return `Removed worktree and deleted branch ${branchToDelete}`;
@@ -317,7 +312,7 @@ export class WorktreeManager {
     }
 
     // Prune worktree metadata
-    spawnSync('git', ['worktree', 'prune'], { cwd: this.repoRoot });
+    await this.runGitMutation(['worktree', 'prune']);
 
     return { removed, wouldRemove: [] };
   }
@@ -416,7 +411,7 @@ export class WorktreeManager {
     const worktrees = this.list().filter(wt => !wt.bare && wt.branch && wt.branch !== mainBranch);
 
     // First, fetch latest
-    spawnSync('git', ['fetch', '--all'], { cwd: this.repoRoot });
+    if (!options.dryRun) await this.runGitMutation(['fetch', '--all']);
 
     const synced: string[] = [];
     const failed: string[] = [];
@@ -463,10 +458,7 @@ export class WorktreeManager {
     const branch = `pr-${prNumber}`;
 
     // Fetch the PR
-    const fetchResult = spawnSync('git', ['fetch', remote, `pull/${prNumber}/head:${branch}`], {
-      cwd: this.repoRoot,
-      encoding: 'utf8'
-    });
+    const fetchResult = await this.runGitMutation(['fetch', remote, `pull/${prNumber}/head:${branch}`]);
 
     if (fetchResult.status !== 0) {
       throw new Error(`Failed to fetch PR #${prNumber}: ${fetchResult.stderr}`);
@@ -673,96 +665,22 @@ export class WorktreeManager {
     );
   }
 
-  private async runInWorktree(worktreePath: string, command: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const child = spawn('sh', ['-c', command], {
-        cwd: worktreePath,
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
+  private async runGitMutation(args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+    if (!getCommandCoordination()) return spawnSync('git', args, { cwd: this.repoRoot, encoding: 'utf8' });
+    const result = await runCommand('git', args, this.repoRoot);
+    return { status: result.code, stdout: result.stdout, stderr: result.stderr };
+  }
 
-      let stdout = '';
-      let stderr = '';
-
-      child.stdout.on('data', data => { stdout += data; });
-      child.stderr.on('data', data => { stderr += data; });
-
-      child.on('close', code => {
-        if (code === 0) {
-          resolve(stdout);
-        } else {
-          const error = new Error(stderr || `Command failed with code ${code}`);
-          (error as any).exitCode = code;
-          reject(error);
-        }
-      });
-    });
+  private async runInWorktree(worktreePath: string, command: string, timeout = WORKTREE_COMMAND_TIMEOUT_MS): Promise<string> {
+    const result = await runCommand('sh', ['-c', command], worktreePath, { timeout });
+    // runCommand reports its own watchdog as a signal exit; name the deadline so callers can tell it from a crash.
+    if (timeout > 0 && result.code === null && result.signal) throw Object.assign(new Error(`Command timed out after ${timeout}ms`), { exitCode: result.code });
+    if (result.code !== 0) throw Object.assign(new Error(result.stderr || `Command failed with code ${result.code}`), { exitCode: result.code });
+    return result.stdout;
   }
 
   private async runInWorktreeWithTimeout(worktreePath: string, command: string, timeout: number): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const child = spawn('sh', ['-c', command], {
-        cwd: worktreePath,
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      let stdout = '';
-      let stderr = '';
-      let killed = false;
-
-      const timer = setTimeout(() => {
-        killed = true;
-        child.kill('SIGTERM');
-        reject(new Error(`Command timed out after ${timeout}ms`));
-      }, timeout);
-
-      child.stdout.on('data', data => { stdout += data; });
-      child.stderr.on('data', data => { stderr += data; });
-
-      child.on('close', code => {
-        clearTimeout(timer);
-        if (killed) return;
-
-        if (code === 0) {
-          resolve(stdout);
-        } else {
-          const error = new Error(stderr || `Command failed with code ${code}`);
-          (error as any).exitCode = code;
-          reject(error);
-        }
-      });
-    });
+    return this.runInWorktree(worktreePath, command, timeout);
   }
-}
 
-// ============ Convenience Functions ============
-
-export function createWorktreeManager(cwd: string): WorktreeManager {
-  return new WorktreeManager(cwd);
-}
-
-export function listWorktreesAdvanced(cwd: string): WorktreeInfo[] {
-  return new WorktreeManager(cwd).list();
-}
-
-export async function getWorktreeStatusAll(cwd: string): Promise<WorktreeStatus[]> {
-  return new WorktreeManager(cwd).statusAll();
-}
-
-export async function cleanupWorktrees(cwd: string, options?: Parameters<WorktreeManager['cleanup']>[0]): Promise<ReturnType<WorktreeManager['cleanup']>> {
-  return new WorktreeManager(cwd).cleanup(options);
-}
-
-export async function runAcrossWorktrees(
-  cwd: string,
-  command: string,
-  options?: Parameters<WorktreeManager['runParallel']>[1]
-): Promise<ParallelResult[]> {
-  return new WorktreeManager(cwd).runParallel(command, options);
-}
-
-export async function syncWorktrees(
-  cwd: string,
-  options?: Parameters<WorktreeManager['syncAll']>[0]
-): Promise<ReturnType<WorktreeManager['syncAll']>> {
-  return new WorktreeManager(cwd).syncAll(options);
 }

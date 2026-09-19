@@ -51,6 +51,7 @@ export interface PermissionDecision {
     | 'mode_unrestricted' | 'mode_restricted' | 'default'
     | 'external_approved' | 'external_denied' | 'external_error'
     | 'pattern_denied' | 'pattern_allowed' | 'not_in_available' | 'excluded'
+    | 'run_scope_denied' | 'run_scope_not_allowed'
     | 'all_paths_allowed' | 'all_urls_allowed'
     | 'session_allow_list' | 'session_deny_list'
     | 'project_allow_list' | 'project_deny_list'
@@ -125,6 +126,8 @@ export function getPermissionPolicyDisposition(decision: unknown): PermissionPol
 
 export interface PermissionContext {
   tool: string;
+  /** The tool the model named when `tool` is a capability it maps to (delete_path → write_file). */
+  requestedTool?: string;
   command?: string;
   args?: string[];
   path?: string;
@@ -163,13 +166,6 @@ export interface ExternalPromptResponse {
   reason?: 'external_approved' | 'external_denied';
 }
 
-/**
- * Callback function type for external prompts
- */
-export type ExternalPromptCallback = (
-  request: ExternalPromptRequest
-) => Promise<ExternalPromptResponse>;
-
 export type PermissionPromptDecision =
   | 'allow_once'
   | 'deny_once'
@@ -177,6 +173,8 @@ export type PermissionPromptDecision =
   | 'deny_session'
   | 'allow_always_project'
   | 'allow_always_user'
+  | 'allow_prefix_project'
+  | 'allow_prefix_user'
   | 'deny_always_project'
   | 'deny_always_user'
   | 'alternative';
@@ -195,6 +193,8 @@ const PERMISSION_PROMPT_DECISIONS = new Set<PermissionPromptDecision>([
   'deny_session',
   'allow_always_project',
   'allow_always_user',
+  'allow_prefix_project',
+  'allow_prefix_user',
   'deny_always_project',
   'deny_always_user',
   'alternative',
@@ -251,5 +251,15 @@ export function isAllowedPermissionPrompt(result: PermissionPromptResult): boole
     || result.decision === 'allow_session'
     || result.decision === 'allow_always_project'
     || result.decision === 'allow_always_user'
+    || result.decision === 'allow_prefix_project'
+    || result.decision === 'allow_prefix_user'
     || result.decision === 'alternative';
+}
+
+/**
+ * The executable a command line starts with, used for "always allow this
+ * command regardless of its arguments" approvals.
+ */
+export function getCommandPrefix(command: string | undefined): string | undefined {
+  return command?.trim().split(/\s+/, 1)[0] || undefined;
 }

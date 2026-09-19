@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { setBounded } from '../utils/bounded.js';
 import path from 'node:path';
 import fse from 'fs-extra';
 import { showModal, showInput, type ModalOption } from '../ui/ink/components/Modal.js';
@@ -106,8 +107,12 @@ import { PlanFileStorage } from '../modes/planMode/PlanFileStorage.js';
 import type { Plan, PlanStep } from '../modes/planMode/types.js';
 import { getPlanModeManager } from '../commands/plan.js';
 import { randomUUID } from 'node:crypto';
+import { withCommandCoordination, type CommandCoordinationContext } from '../session/peers/CommandCoordinationGate.js';
+import type { ResourceCoordinatorClient } from '../session/peers/ResourceCoordinator.js';
+import type { PeerClient } from '../session/peers/PeerMessaging.js';
+import { executePeerTool, PEER_TOOL_NAMES, validatePeerToolAction } from './peerTools.js';
 import { GoalManager } from '../goals/GoalManager.js';
-import type { GoalStatus } from '../goals/types.js';
+import { parseGoalStatus, type GoalMutationResult, type GoalState } from '../goals/types.js';
 import { GOAL_FEATURE_DISABLED_MESSAGE, isGoalFeatureEnabled } from '../goals/feature.js';
 import { initExperiment, runExperiment, logExperiment } from '../autoresearch/tools.js';
 import { replayExperiment } from '../autoresearch/replay.js';
@@ -152,6 +157,10 @@ export interface PermissionHookResponse {
 }
 
 export interface ActionExecutorOptions {
+  peerMessaging?: () => PeerClient | undefined;
+  resourceCoordinator?: () => ResourceCoordinatorClient | undefined;
+  resourceWaitTimeoutMs?: number;
+  onResourceWaiting?: CommandCoordinationContext['onWaiting'];
   runtime: AgentRuntime;
   files: FileActionManager;
   resolveWorkspacePath: (relativePath: string) => string;
@@ -199,6 +208,7 @@ export interface ActionExecutorOptions {
     attemptId?: string;
     decision?: string;
   }) => Promise<void>;
+  onGoalActivated?: (goal: GoalState) => void | Promise<void>;
   /** Callback to fire after a goal objective has been created. */
   onGoalWrittenCompleted?: (context: {
     goalId?: string;
@@ -297,6 +307,9 @@ const PEER_DIRECT_WRITE_ACTIONS = new Set<string>([
   'git_checkout',
 ]);
 
+/** Search results are full text blobs keyed by query; keep a recent window, not the session's history. */
+export const MAX_SEARCH_CACHE_ENTRIES = 100;
+
 export class ActionExecutor {
   private readonly runtime: AgentExecutorDeps['runtime'];
   private readonly files: AgentExecutorDeps['files'];
@@ -318,6 +331,7 @@ export class ActionExecutor {
   private readonly onReviewHook?: AgentExecutorDeps['onReviewHook'];
   private readonly onAutoresearchHook?: AgentExecutorDeps['onAutoresearchHook'];
   private readonly onGoalWrittenCompleted?: AgentExecutorDeps['onGoalWrittenCompleted'];
+  private readonly onGoalActivated?: AgentExecutorDeps['onGoalActivated'];
   private readonly onModalPause?: AgentExecutorDeps['onModalPause'];
   private readonly onRequestDirectoryAccess?: AgentExecutorDeps['onRequestDirectoryAccess'];
   private readonly onLiveCommandStart?: AgentExecutorDeps['onLiveCommandStart'];
@@ -333,6 +347,10 @@ export class ActionExecutor {
   private readonly readSessionLedger: ReadSessionLedger;
   private readonly securityScanner: SecurityScanner;
   private readonly searchCache: Map<string, string> = new Map();
+
+  private cacheSearchResult(cacheKey: string, result: string): void {
+    setBounded(this.searchCache, cacheKey, result, MAX_SEARCH_CACHE_ENTRIES);
+  }
   private todoActivityForCurrentTurn: ActivityTodo[] | null = null;
   private fffSearchProviderPromise: Promise<FFFSearchProvider> | null = null;
   private fffSearchWorkspaceRoot: string | null = null;
@@ -360,6 +378,7 @@ export class ActionExecutor {
     this.onReviewHook = deps.onReviewHook;
     this.onAutoresearchHook = deps.onAutoresearchHook;
     this.onGoalWrittenCompleted = deps.onGoalWrittenCompleted;
+    this.onGoalActivated = deps.onGoalActivated;
     this.onModalPause = deps.onModalPause;
     this.onRequestDirectoryAccess = deps.onRequestDirectoryAccess;
     this.onLiveCommandStart = deps.onLiveCommandStart;
@@ -383,29 +402,10 @@ export class ActionExecutor {
     this.todoActivityForCurrentTurn = null;
   }
 
-  async completeTodoActivityForSuccessfulTurn(): Promise<boolean> {
-    const todos = this.todoActivityForCurrentTurn;
-    if (!todos) {
-      return false;
-    }
-
-    let changed = false;
-    const completedTodos = todos.map((todo) => {
-      if (todo.status !== 'pending' && todo.status !== 'in_progress') {
-        return todo;
-      }
-      changed = true;
-      return { ...todo, status: 'completed' };
-    });
-
-    if (!changed) {
-      return false;
-    }
-
-    await this.files.writeFile(TODO_ACTIVITY_STATE_PATH, JSON.stringify(completedTodos, null, 2));
-    this.todoActivityForCurrentTurn = completedTodos;
-    this.onActivityTodosUpdated?.(completedTodos);
-    return true;
+  hasIncompleteTodoActivity(): boolean {
+    return this.todoActivityForCurrentTurn?.some(
+      (todo) => todo.status === 'pending' || todo.status === 'in_progress',
+    ) ?? false;
   }
 
   private createGoalManager(): GoalManager {
@@ -614,6 +614,8 @@ export class ActionExecutor {
     }
 
     const values = action as unknown as Record<string, unknown>;
+    const peerFailure = validatePeerToolAction(action);
+    if (peerFailure) return { success: false, kind: 'validation', error: peerFailure, output: peerFailure };
     if (action.type === 'read_file') {
       for (const field of ['offset', 'limit'] as const) {
         const value = values[field];
@@ -1037,6 +1039,10 @@ export class ActionExecutor {
     const command = this.commandForPeerGuard(action);
     const executionState: ActionExecutionState = { started: false };
     try {
+      const coordinator = context?.resourceCoordinator ?? this.deps.resourceCoordinator?.();
+      if (PEER_TOOL_NAMES.has(action.type)) return await executePeerTool(action, context?.peerMessaging ?? this.deps.peerMessaging?.(), coordinator, context);
+      if (coordinator) return await withCommandCoordination({ coordinator, signal: context?.signal, waitTimeoutMs: this.deps.resourceWaitTimeoutMs,
+        onWaiting: this.deps.onResourceWaiting }, () => this.executeAction(action, context, capture, executionState));
       return await this.executeAction(action, context, capture, executionState);
     } finally {
       if (executionState.started && command && isGitMutationCommand(command)) {
@@ -1067,7 +1073,7 @@ export class ActionExecutor {
       );
     }
 
-    if (this.runtime.options.dryRun && !['fff_grep', 'fff_find', 'find', 'search', 'search_with_context', 'semantic_search', 'glob', 'plan'].includes(action.type)) {
+    if (this.runtime.options.dryRun && !['find_grep', 'fff_find', 'find', 'search', 'search_with_context', 'semantic_search', 'glob', 'plan'].includes(action.type)) {
       return this.recordToolFailure(
         capture,
         'authorization',
@@ -1592,12 +1598,14 @@ export class ActionExecutor {
         const created = await manager.createOrQueueGoal({
           objective: action.objective,
           source: 'tool',
+          acceptanceCriteria: action.acceptance_criteria,
           tokenBudget: action.token_budget,
           timeBudgetSeconds: action.time_budget_seconds,
           minTokensBeforeWrapUp: action.min_tokens_before_wrap_up,
           minTimeSecondsBeforeWrapUp: action.min_time_seconds_before_wrap_up,
         });
         if (!created.queued?.length) {
+          await this.activateGoal(created);
           await this.emitGoalWrittenCompleted(created, 'tool');
         }
         return formatGoalToolResult(created);
@@ -1619,12 +1627,14 @@ export class ActionExecutor {
         const created = await manager.createOrQueueGoal({
           objective: resolution.template.objective,
           source: 'tool',
+          acceptanceCriteria: action.acceptance_criteria,
           tokenBudget: action.token_budget,
           timeBudgetSeconds: action.time_budget_seconds,
           minTokensBeforeWrapUp: action.min_tokens_before_wrap_up,
           minTimeSecondsBeforeWrapUp: action.min_time_seconds_before_wrap_up,
         });
         if (!created.queued?.length) {
+          await this.activateGoal(created);
           await this.emitGoalWrittenCompleted(created, 'tool-template');
         }
         return formatGoalToolResult(created);
@@ -1634,11 +1644,16 @@ export class ActionExecutor {
         const updated = await manager.updateGoal({
           objective: action.objective,
           status: parseGoalStatus(action.status),
+          completionEvidence: action.completion_evidence,
+          stopReason: action.stop_reason,
+          resumeWhen: action.resume_when,
+          checkpoint: action.checkpoint,
           tokenBudget: action.token_budget,
           timeBudgetSeconds: action.time_budget_seconds,
           minTokensBeforeWrapUp: action.min_tokens_before_wrap_up,
           minTimeSecondsBeforeWrapUp: action.min_time_seconds_before_wrap_up,
         });
+        if (action.status === 'active' || updated.started) await this.activateGoal(updated);
         return formatGoalToolResult(updated);
       }
       case 'clear_goal': {
@@ -1650,6 +1665,7 @@ export class ActionExecutor {
         return formatGoalToolResult(await manager.enqueueGoal({
           objective: action.objective,
           source: 'tool',
+          acceptanceCriteria: action.acceptance_criteria,
           tokenBudget: action.token_budget,
           timeBudgetSeconds: action.time_budget_seconds,
           minTokensBeforeWrapUp: action.min_tokens_before_wrap_up,
@@ -1662,7 +1678,9 @@ export class ActionExecutor {
       }
       case 'start_queued_goal': {
         const manager = this.createGoalManager();
-        return formatGoalToolResult(await manager.startQueuedGoal());
+        const started = await manager.startQueuedGoal();
+        await this.activateGoal(started);
+        return formatGoalToolResult(started);
       }
       case 'dequeue_goal': {
         const manager = this.createGoalManager();
@@ -1713,7 +1731,7 @@ export class ActionExecutor {
 
       case 'glob':
         return this.executeGlob(action);
-      case 'fff_grep':
+      case 'find_grep':
         return this.executeFFFGrep(action);
       case 'fff_find':
         return this.executeFFFFind(action);
@@ -2237,7 +2255,7 @@ export class ActionExecutor {
         }
         this.resolveWorkspacePath(action.path);
         const oldCheckoutContent = await this.files.readFile(action.path).catch(() => '');
-        checkoutFile(this.runtime.workspaceRoot, action.path);
+        await checkoutFile(this.runtime.workspaceRoot, action.path);
         const newCheckoutContent = await this.files.readFile(action.path).catch(() => '');
         if (oldCheckoutContent !== newCheckoutContent) {
           console.log(chalk.cyan(`\n↩️ ${action.path}:`));
@@ -2265,7 +2283,7 @@ export class ActionExecutor {
         if (!patch) {
           throw new Error('git_apply_patch requires patch or diff content.');
         }
-        applyGitPatch(this.runtime.workspaceRoot, patch);
+        await applyGitPatch(this.runtime.workspaceRoot, patch);
         return 'Applied git patch.';
       }
       case 'git_worktree_list':
@@ -2563,7 +2581,7 @@ export class ActionExecutor {
 
         if (autoApproveCommit) {
           console.log(chalk.gray('Auto-commit approval enabled; committing without prompt.'));
-          const result = executeAutoCommit(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false);
+          const result = await executeAutoCommit(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false);
           if (result.success) {
             console.log(chalk.green(`\n✓ ${result.message}`));
             return result.message;
@@ -2620,7 +2638,7 @@ export class ActionExecutor {
         }
 
         // Execute the commit
-        const result = executeAutoCommit(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false);
+        const result = await executeAutoCommit(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false);
 
         if (result.success) {
           console.log(chalk.green(`\n✓ ${result.message}`));
@@ -3838,7 +3856,7 @@ export class ActionExecutor {
     const label = clampedLineNumbers.length === 1
       ? `Line ${clampedLineNumbers[0]} exceeded ${READ_FILE_MAX_LINE_CHARACTERS} characters and was clamped.`
       : `Lines ${clampedLineNumbers.join(', ')} exceeded ${READ_FILE_MAX_LINE_CHARACTERS} characters and were clamped.`;
-    return `Note: ${label} Use fff_grep or shell for targeted inspection.`;
+    return `Note: ${label} Use find_grep or shell for targeted inspection.`;
   }
 
   private withReadPathRepairNote(
@@ -3867,7 +3885,7 @@ export class ActionExecutor {
   }
 
   private executeFind(action: Extract<AgentAction, { type: 'find' }>): string {
-    console.warn(chalk.yellow('[DEPRECATED] The `find` tool is deprecated. Use `fff_grep` instead. Will be removed in v0.9.0.'));
+    console.warn(chalk.yellow('[DEPRECATED] The `find` tool is deprecated. Use `find_grep` instead. Will be removed in v0.9.0.'));
     const mode = action.mode ?? (action.context && action.context > 0 ? 'context' : 'exact');
     const cacheKey = `find:${mode}:${action.query}:${action.path || ''}:${action.limit || ''}:${action.context || ''}:${action.window || ''}`;
     if (this.searchCache.has(cacheKey)) {
@@ -3883,13 +3901,13 @@ export class ActionExecutor {
         relativePath: action.path
       });
       if (!results.length) {
-        this.searchCache.set(cacheKey, 'No matches found.');
+        this.cacheSearchResult(cacheKey, 'No matches found.');
         return 'No matches found.';
       }
       const result = results
         .map((hit) => `${chalk.cyan(hit.file)}\n${hit.snippet}`)
         .join('\n\n');
-      this.searchCache.set(cacheKey, result);
+      this.cacheSearchResult(cacheKey, result);
       return result;
     }
 
@@ -3899,7 +3917,7 @@ export class ActionExecutor {
         context: action.context,
         relativePath: action.path
       });
-      this.searchCache.set(cacheKey, result);
+      this.cacheSearchResult(cacheKey, result);
       return result;
     }
 
@@ -3908,7 +3926,7 @@ export class ActionExecutor {
       .slice(0, action.limit ?? 10)
       .map((hit) => `${hit.file}:${hit.line}: ${hit.text}`)
       .join('\n');
-    this.searchCache.set(cacheKey, result);
+    this.cacheSearchResult(cacheKey, result);
     return result;
   }
 
@@ -3983,7 +4001,7 @@ export class ActionExecutor {
   }
 
   private async executeFFFGrep(
-    action: Extract<AgentAction, { type: 'fff_grep' }>
+    action: Extract<AgentAction, { type: 'find_grep' }>
   ): Promise<string> {
     const provider = await this.getFFFSearchProvider();
     try {
@@ -4656,6 +4674,12 @@ export class ActionExecutor {
     return outputLines.join('\n');
   }
 
+  private async activateGoal(result: GoalMutationResult): Promise<void> {
+    if (result.ok && result.goal?.status === 'active' && !result.queued?.length) {
+      await this.onGoalActivated?.(result.goal);
+    }
+  }
+
   private async emitGoalWrittenCompleted(result: {
     ok: boolean;
     goal?: { goalId?: string; objective?: string } | null;
@@ -4673,20 +4697,14 @@ export class ActionExecutor {
   }
 }
 
-function parseGoalStatus(value: string | undefined): GoalStatus | undefined {
-  if (!value) return undefined;
-  if (value === 'active' || value === 'paused' || value === 'complete' || value === 'budgetLimited') {
-    return value;
-  }
-  return undefined;
-}
-
 function formatGoalToolResult(result: {
   ok: boolean;
+  storageWarning?: string;
   message?: string;
   goal: unknown;
   queue: unknown[];
   queued?: unknown[];
+  queueError?: string;
   started?: unknown;
   completed?: unknown;
   completedRun?: unknown[];
@@ -4697,10 +4715,12 @@ function formatGoalToolResult(result: {
 }): string {
   return JSON.stringify({
     ok: result.ok,
+    storageWarning: result.storageWarning,
     message: result.message,
     goal: result.goal,
     queue: result.queue,
     queued: result.queued,
+    queueError: result.queueError,
     started: result.started,
     completed: result.completed,
     completedRun: result.completedRun,

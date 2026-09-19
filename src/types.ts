@@ -5,7 +5,9 @@
  */
 import type { Ora } from 'ora';
 import type { ThemeDefinition } from './ui/theme/types.js';
+import type { KeybindingProfileId } from './keybindings/profiles.js';
 import type { TeamActivitySnapshot } from './core/teams/types.js';
+import type { GoalCheckpointInput, GoalCompletionEvidence } from './goals/types.js';
 
 // InkRenderer type defined inline to avoid tsx dev mode issues with .tsx imports
 interface InkRendererInterface {
@@ -308,8 +310,10 @@ export interface UISettings {
   showCompletionNotification?: boolean;
   /** Ask the model to include a concise completion report after action turns (default: true) */
   completionReportEnabled?: boolean;
-  /** Show LLM thinking/reasoning process (default: true) */
+  /** Show LLM thinking/reasoning process (default: false) */
   showThinking?: boolean;
+  /** Render assistant markdown (headings, lists, code, tables) in the terminal instead of showing it as written (default: true) */
+  renderMarkdown?: boolean;
   /** Deprecated: Ink 7 + React 19 is now the default interactive UI and this setting is ignored. */
   useInkRenderer?: boolean;
   /** Ring terminal bell when task completes - shows badge on terminal tab (default: true) */
@@ -330,8 +334,18 @@ export interface UISettings {
   notifications?: boolean | NotificationConfig;
   /** Show LLM-generated next-step suggestions in prompt placeholder (default: true) */
   promptSuggestions?: boolean;
+  /** Rotate tips about slash commands, composer triggers and shortcuts beside the idle composer (default: true) */
+  showTips?: boolean;
+  /**
+   * What Enter does while a turn is running: `steer` sends the text into the
+   * running turn on its next model request (Shift+Enter queues it for after
+   * the turn); `queue` keeps Enter queueing (Shift+Enter steers). Default: steer.
+   */
+  enterWhileWorking?: 'steer' | 'queue';
   /** Enable mouse click-to-position editing in the Ink composer (default: true). */
   mouseComposerCursor?: boolean;
+  /** Shortcut profile for the Ink composer: Autohand defaults or another agent's conventions (default: autohand). */
+  keybindingProfile?: KeybindingProfileId;
   /** Fixed composer status-line display preferences. */
   statusLine?: StatusLineSettings;
 }
@@ -339,6 +353,15 @@ export interface UISettings {
 export interface AgentSettings {
   /** Maximum iterations per user request (default: 100) */
   maxIterations?: number;
+  /** Limits for one run, shared with in-process sub-agents; CLI flags --max-requests, --max-tokens, --max-duration win. */
+  budget?: {
+    /** Model requests before the run stops. */
+    maxRequests?: number;
+    /** Reported tokens before the run stops. */
+    maxTokens?: number;
+    /** Seconds of wall time before the run stops. */
+    maxDurationSeconds?: number;
+  };
   /** Enable request queue - allow typing while agent works (default: true) */
   enableRequestQueue?: boolean;
   /** Switch the session into auto mode while a goal is active (default: true) */
@@ -364,6 +387,7 @@ export interface AgentSettings {
 export interface SessionsSettings {
   /** How this session reacts to other sessions in the same workspace (default: warn). */
   awareness?: 'passive' | 'warn' | 'coordinate';
+  communication?: import('./session/peers/PeerSettings.js').PeerCommunicationSettings;
 }
 
 export interface TelemetrySettings {
@@ -446,6 +470,32 @@ export interface PermissionSettings {
   rules?: PermissionRule[];
   /** Remember user decisions for this session (default: true) */
   rememberSession?: boolean;
+}
+
+/** A partial config a profile layers on top of the file for one run. */
+export type ConfigProfile = Partial<Omit<AutohandConfig, 'profiles' | 'auth'>>;
+
+export interface RunConfigOverlayEntry {
+  path: string[];
+  applied: unknown;
+  hadBase: boolean;
+  base?: unknown;
+}
+
+/** Runtime-only record of the profile and `--set` values layered at load time. */
+export interface RunConfigOverlaySnapshot {
+  profile?: string;
+  entries: RunConfigOverlayEntry[];
+}
+
+export interface ShellSettings {
+  /** Environment inherited by commands Autohand runs; see docs/config-reference.md. */
+  env?: {
+    inherit?: 'all' | 'essential' | 'none';
+    include?: string[];
+    exclude?: string[];
+    set?: Record<string, string>;
+  };
 }
 
 export interface NetworkSettings {
@@ -721,6 +771,7 @@ export type HookEvent =
   | 'session-end'       // Session ends (quit, exit)
   | 'pre-clear'          // Fires before memory extraction on /clear or /new
   | 'permission-request' // Permission dialog shown
+  | 'permission-denied'  // User or policy refused a permission request
   | 'notification'      // Notification sent to user
   // Auto-mode events
   | 'automode:start'    // Auto-mode loop started
@@ -791,10 +842,25 @@ export interface ImportedHookOrigin {
 }
 
 /** Hook definition for config-based hooks */
+/** Event names from the original hooks documentation; each maps onto real lifecycle events. */
+export type LegacyHookEvent =
+  | 'on_session_start' | 'on_session_end' | 'on_session_resume'
+  | 'before_tool_call' | 'after_tool_call' | 'on_tool_error'
+  | 'on_file_change' | 'on_file_create' | 'on_file_delete' | 'on_file_read'
+  | 'before_command' | 'after_command'
+  | 'on_user_message' | 'on_agent_response'
+  | 'on_error' | 'on_permission_denied'
+  | 'on_automode_start' | 'on_automode_stop' | 'on_automode_iteration'
+  | 'on_subagent_start' | 'on_subagent_stop'
+  | 'on_permission_request' | 'on_notification';
+
+/** Any name a hook may be configured under: a lifecycle event or a legacy alias. */
+export type HookEventName = HookEvent | LegacyHookEvent;
+
 export interface HookDefinition {
   importedFrom?: ImportedHookOrigin;
-  /** Event to hook into */
-  event: HookEvent;
+  /** Event to hook into (lifecycle event or legacy alias) */
+  event: HookEventName;
   /** Shell command to execute (receives context via env vars and JSON via stdin) */
   command: string;
   /** Description for /hooks display */
@@ -914,6 +980,10 @@ export interface AutohandConfig {
   telemetry?: TelemetrySettings;
   permissions?: PermissionSettings;
   network?: NetworkSettings;
+  /** Child-process controls for shell tools and `!` commands. */
+  shell?: ShellSettings;
+  /** Named run profiles selected with `--profile <name>`; each is a partial config layered for that run only. */
+  profiles?: Record<string, ConfigProfile>;
   externalAgents?: ExternalAgentsConfig;
   api?: {
     baseUrl?: string;
@@ -970,6 +1040,78 @@ export interface LoadedConfig extends AutohandConfig {
   configPath: string;
   /** True if config was just created (first run) */
   isNewConfig?: boolean;
+  /**
+   * Runtime-only: the workspace whose `.autohand/` project files were layered
+   * into this config. Reloads use it to keep the same project overlays.
+   * Never persisted.
+   */
+  overlayWorkspaceRoot?: string;
+  /**
+   * Runtime-only record of what workspace overlays contributed at load time.
+   * `saveConfig` uses it to keep project data out of the file it writes.
+   * Never persisted.
+   */
+  workspaceOverlay?: WorkspaceOverlaySnapshot;
+  /**
+   * Runtime-only trust state for project hooks and MCP servers declared in
+   * `<workspace>/.autohand/`. Present only when the workspace declares any.
+   * Never persisted.
+   */
+  workspaceTrust?: WorkspaceTrustState;
+  /**
+   * Runtime-only record of the `--profile` and `--set` values layered at load
+   * time. `saveConfig` restores the file's own values under those paths unless
+   * the user changed them during the run. Never persisted.
+   */
+  runOverlay?: RunConfigOverlaySnapshot;
+}
+
+/** Whether a workspace's project hooks and MCP servers may run. */
+export interface WorkspaceTrustState {
+  /** Workspace whose project files declare the entries */
+  workspaceRoot: string;
+  /** Hash of the declared hooks and MCP servers; any change asks again */
+  fingerprint: string;
+  /** True when the user trusted this workspace for exactly these entries */
+  trusted: boolean;
+  /** Project hooks after layering, in the order they apply */
+  hooks: HookDefinition[];
+  /** Project MCP servers after layering */
+  mcpServers: McpServerConfigEntry[];
+}
+
+/** Keys of plain settings objects that workspace overlays merge field by field. */
+export type WorkspaceOverlayObjectKey = 'agent' | 'network' | 'telemetry' | 'permissions';
+
+/**
+ * What `.autohand/config.*` and `.autohand/settings.local.json` changed when a
+ * config was loaded for a workspace. A plain JSON value so it survives spreads
+ * and `structuredClone`.
+ */
+export interface WorkspaceOverlaySnapshot {
+  hooks?: {
+    /** The hooks section of the file being loaded, before any overlay */
+    base?: HooksSettings;
+    /** The hooks section after overlays were merged */
+    applied?: HooksSettings;
+    /** Identities of hooks contributed by overlays */
+    overlayIds: string[];
+    /** Whether an overlay set `hooks.enabled` */
+    enabledOverridden: boolean;
+  };
+  mcp?: {
+    base?: McpSettings;
+    applied?: McpSettings;
+    /** Names of MCP servers contributed by overlays */
+    overlayNames: string[];
+    enabledOverridden: boolean;
+  };
+  fields?: Partial<Record<WorkspaceOverlayObjectKey, {
+    /** True when the file being loaded had no such section */
+    baseMissing: boolean;
+    /** Per overlaid field: value before overlays and value after */
+    values: Record<string, { base?: unknown; applied?: unknown }>;
+  }>>;
 }
 
 /** Client context determines which tools are available */
@@ -993,9 +1135,15 @@ export interface InlineAgentDefinition {
   systemPrompt: string;
   tools: string[];
   model?: string;
+  /** Reasoning depth requested by the inline definition. */
+  reasoning?: 'none' | 'low' | 'medium' | 'high' | 'xhigh';
+  /** Skills active for the agent from its first request. */
+  skills?: string[];
 }
 
 export interface CLIOptions {
+  /** Select a provider for this process without updating saved configuration. */
+  provider?: ProviderName;
   prompt?: string;
   /** Structured output mode for a one-shot command. */
   commandOutputFormat?: CommandOutputFormat;
@@ -1016,8 +1164,28 @@ export interface CLIOptions {
   config?: string;
   temperature?: number;
   resumeSessionId?: string;
+  /** Keep this run out of session history: nothing saved, no auto-memory, no session sync. */
+  ephemeral?: boolean;
+  /** --output-schema <file>: the command-mode final answer must be JSON validating against this schema. */
+  outputSchema?: string;
+  /** --max-requests: model requests this run may make, sub-agents included. */
+  maxRequests?: number;
+  /** --max-tokens: reported tokens this run may spend, sub-agents included. */
+  maxTokens?: number;
+  /** --max-duration: seconds of wall time this run may take. */
+  maxDuration?: number;
+  /** --profile: layer `profiles.<name>` from the config for this run only. */
+  profile?: string;
+  /** --set key=value overrides for this run only. */
+  set?: string[];
+  /** Name the workspace's most recent session and exit. */
+  rename?: string;
   /** Run in unrestricted mode - no approval prompts */
   unrestricted?: boolean;
+  /** --allowed-tools: only these tool patterns are advertised and authorized this run. */
+  allowedTools?: string[];
+  /** --disallowed-tools: these tool patterns are never advertised or authorized this run. */
+  disallowedTools?: string[];
   /** Run in restricted mode - deny all dangerous operations */
   restricted?: boolean;
   /** Run the classified, tool-free Blueprint answer RPC profile. */
@@ -1131,13 +1299,6 @@ export interface CLIOptions {
 
 /** Output contract for one-shot command mode. */
 export type CommandOutputFormat = 'text' | 'stream-json' | 'json';
-
-export interface PromptContext {
-  workspaceRoot: string;
-  gitStatus?: string;
-  recentFiles: string[];
-  extraNotes?: string;
-}
 
 /** Message priority for context management - higher priority messages are retained longer */
 export type MessagePriority = 'critical' | 'high' | 'medium' | 'low';
@@ -1271,6 +1432,8 @@ export interface LLMRequest {
   stream?: boolean;
   /** Receives provider text increments before the final response is available. */
   onTextDelta?: (delta: string) => void;
+  /** Live provider deltas; completion still returns the assembled answer and tool calls. */
+  onDelta?: (delta: { type: 'content' | 'reasoning'; text: string }) => void;
   /** Tool/function definitions for function calling */
   tools?: FunctionDefinition[];
   /** How the model should choose which tool to use */
@@ -1328,6 +1491,13 @@ export type TurnUsage =
       promptTokens: number;
       completionTokens: number;
       totalTokens: number;
+      /**
+       * Summed over only the requests in the turn that reported a figure, so a
+       * turn against a provider that never reports cache usage is not recorded
+       * as a turn that missed cache.
+       */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
     }
   | {
       kind: 'unavailable';
@@ -1403,7 +1573,19 @@ export type BrowserFormAssignment =
 
 export type AgentAction =
   | { type: 'list_hooks' }
-  | { type: 'create_hook'; prompt: string; event?: HookEvent }
+  | { type: 'create_hook'; prompt: string; event?: HookEvent; level?: string }
+  | {
+      type: 'set_lifecycle_hook';
+      event: HookEvent;
+      command: string;
+      description: string;
+      level?: string;
+      filter?: HookFilter;
+      matcher?: string;
+      timeout?: number;
+      async?: boolean;
+      enabled?: boolean;
+    }
   | { type: 'set_hook_enabled'; event: HookEvent; index: number; enabled: boolean }
   | { type: 'read_file'; path: string; offset?: number; limit?: number }
   | { type: 'write_file'; path: string; contents?: string; content?: string }
@@ -1424,6 +1606,7 @@ export type AgentAction =
   | {
       type: 'create_goal';
       objective: string;
+      acceptance_criteria?: string[];
       token_budget?: number;
       time_budget_seconds?: number;
       min_tokens_before_wrap_up?: number;
@@ -1432,6 +1615,7 @@ export type AgentAction =
   | {
       type: 'create_goal_from_template';
       template: string;
+      acceptance_criteria?: string[];
       flags?: Record<string, string>;
       args?: string;
       token_budget?: number;
@@ -1442,6 +1626,10 @@ export type AgentAction =
   | {
       type: 'update_goal';
       objective?: string;
+      completion_evidence?: GoalCompletionEvidence;
+      stop_reason?: string;
+      resume_when?: string;
+      checkpoint?: GoalCheckpointInput;
       status?: string;
       token_budget?: number | null;
       time_budget_seconds?: number | null;
@@ -1453,6 +1641,7 @@ export type AgentAction =
   | {
       type: 'enqueue_goal';
       objective: string;
+      acceptance_criteria?: string[];
       token_budget?: number;
       time_budget_seconds?: number;
       min_tokens_before_wrap_up?: number;
@@ -1502,7 +1691,7 @@ export type AgentAction =
   | { type: 'format_file'; path: string; formatter: string }
   | { type: 'glob'; pattern?: string; patterns?: string[]; path?: string; limit?: number }
   | {
-      type: 'fff_grep';
+      type: 'find_grep';
       query: string;
       path?: string;
       exclude?: string;
@@ -1606,6 +1795,10 @@ export type AgentAction =
   | { type: 'task_output'; task_id: string; output: string }
   | { type: 'team_status' }
   | { type: 'send_team_message'; to: string; content: string }
+  | ({ type: 'list_peers' } & import('./session/peers/PeerDirectory.js').PeerListQuery)
+  | { type: 'send_peer_message'; to: string; content: string; topic?: string; replyTo?: string }
+  | { type: 'peer_messages'; after?: string; from?: string; replyTo?: string; messageId?: string; waitMs?: number }
+  | ({ type: 'coordinate_resource' } & import('./session/peers/ResourceCoordinator.js').ResourceOperation)
   | { type: 'skill'; command: 'list' | 'info' | 'activate' | 'deactivate'; name?: string }
   | { type: 'sleep'; seconds: number; reason?: string }
   | { type: 'enter_worktree'; name?: string }
@@ -1801,6 +1994,9 @@ export type ToolExecutionResult = {
 } & ToolActionOutcome;
 
 export interface ToolExecutionContext {
+  peerMessaging?: import('./session/peers/PeerMessaging.js').PeerClient;
+  resourceCoordinator?: import('./session/peers/ResourceCoordinator.js').ResourceCoordinatorClient;
+  peerAutomatic?: boolean;
   toolCallId?: string;
   tool?: AgentAction['type'];
   /** Whether approval was already handled by the caller */
@@ -1843,7 +2039,9 @@ export interface AgentStatusSnapshot {
 }
 
 export interface AgentOutputEvent {
-  type: 'message' | 'thinking' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update';
+  type: 'message' | 'thinking' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update';
+  peerEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
+  resourceEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   content?: string;
   thought?: string;
   toolName?: string;
@@ -1976,20 +2174,4 @@ export interface LearnGeneratedSkill {
   description: string;
   allowedTools: string[];
   body: string;
-}
-
-/** Browser tab type */
-export type SkillsBrowserTab = 'featured' | 'categories' | 'search';
-
-/** Browser state for Ink component */
-export interface SkillsBrowserState {
-  activeTab: SkillsBrowserTab;
-  selectedCategory: string | null;
-  searchQuery: string;
-  selectedIndex: number;
-  skills: GitHubCommunitySkill[];
-  filteredSkills: GitHubCommunitySkill[];
-  isLoading: boolean;
-  error: string | null;
-  previewSkill: GitHubCommunitySkill | null;
 }

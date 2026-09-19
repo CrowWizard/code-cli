@@ -1,5 +1,6 @@
-import type { HookEvent, HookDefinition } from '../types.js';
+import type { HookEvent, HookDefinition, HookEventName } from '../types.js';
 import type { HookManager } from './HookManager.js';
+import { resolveHookEvents } from './legacyHookEvents.js';
 
 export const HOOK_EVENTS: HookEvent[] = [
   'session-start',
@@ -17,6 +18,7 @@ export const HOOK_EVENTS: HookEvent[] = [
   'subagent-cancel-requested',
   'subagent-stop',
   'permission-request',
+  'permission-denied',
   'notification',
   'session-error',
   'rate-limit',
@@ -87,6 +89,7 @@ export const EVENT_DESCRIPTIONS: Record<HookEvent, string> = {
   'subagent-cancel-requested': 'When cancellation is requested for a subagent',
   'subagent-stop': 'When a subagent finishes',
   'permission-request': 'When permission is requested',
+  'permission-denied': 'When a permission request is refused',
   'notification': 'When notifications are shown',
   'session-error': 'When an error occurs',
   'rate-limit': 'When a provider rate limit ends the turn (no retry)',
@@ -154,14 +157,31 @@ export interface LifecycleHookRow {
   hooks: LifecycleHookEntry[];
 }
 
-export function canonicalHookEvent(event: HookEvent): HookEvent {
-  return event === 'post-response' ? 'stop' : event;
+/**
+ * Stable identity for a hook definition, used to deduplicate hooks across
+ * config layers (global config, project config, project local settings) and
+ * against the built-in defaults. Script-based hooks are keyed by script file
+ * name; inline commands by event plus description, or event plus command.
+ */
+export function hookIdentifier(hook: HookDefinition): string {
+  const scriptMatch = hook.command.match(/([^/]+\.sh)$/);
+  if (scriptMatch) {
+    return `script:${scriptMatch[1]}`;
+  }
+  if (hook.description) {
+    return `${hook.event}:${hook.description}`;
+  }
+  return `${hook.event}:${hook.command}`;
+}
+
+export function canonicalHookEvent(event: HookEventName): HookEvent {
+  return resolveHookEvents(event)[0];
 }
 
 export function getLifecycleHookInventory(manager: HookManager): LifecycleHookRow[] {
   return HOOK_EVENTS.filter(event => event !== 'post-response').map(event => {
     const hooks: LifecycleHookEntry[] = [
-      ...manager.getHooks().filter(hook => canonicalHookEvent(hook.event) === event)
+      ...manager.getHooks().filter(hook => resolveHookEvents(hook.event).includes(event))
         .map(definition => ({ source: 'config', definition, enabled: definition.enabled !== false })),
       ...manager.getExtensionHooks().filter(hook => canonicalHookEvent(hook.event) === event)
         .map(hook => ({ source: hook.extensionId, enabled: true })),

@@ -38,13 +38,14 @@ export interface CompletionConfig {
 }
 
 const DEFAULT_CONFIG: CompletionConfig = {
-  commands: ['autohand', 'autohand-code', 'agent'],
+  commands: ['autohand', 'autohand-code', 'agent', 'ah'],
   slashCommands: [
     '/quit',
     '/exit',
     '/model',
     '/session',
     '/sessions',
+    '/rename',
     '/resume',
     '/new',
     '/undo',
@@ -677,11 +678,4 @@ ${chalk.gray('Fish will automatically load the completion on next shell start.')
     default:
       return `Unknown shell: ${shell}`;
   }
-}
-
-/**
- * Print completion script to stdout (for shell sourcing)
- */
-export function printCompletion(shell: ShellType, config?: CompletionConfig): void {
-  console.log(generateCompletion(shell, config));
 }

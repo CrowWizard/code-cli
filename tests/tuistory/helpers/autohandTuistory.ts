@@ -100,6 +100,9 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
 
   const baseConfig: JsonRecord = {
     provider: 'openrouter',
+    autoReport: {
+      enabled: false,
+    },
     openrouter: {
       apiKey: 'tuistory-test-api-key',
       model: 'openai/gpt-4o-mini',
@@ -118,6 +121,8 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
     },
     ui: {
       checkForUpdates: false,
+      // Rotating tips put random command text on idle screens; the tip scenario turns them on.
+      showTips: false,
     },
   };
   const overrideConfig = options.config ?? {};
@@ -336,6 +341,19 @@ export async function createMockAutohandAINativeSequenceServer(
 
     const turn = turns[Math.min(requests.length - 1, turns.length - 1)]
       ?? { content: '' };
+    if (body.stream === true) {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(`data: ${JSON.stringify({
+        id: `chatcmpl-autohand-native-${requests.length}`,
+        choices: [{ delta: {
+          content: turn.content,
+          ...(turn.toolCall ? { tool_calls: [{ index: 0, id: turn.toolCall.id, type: 'function',
+            function: { name: turn.toolCall.name, arguments: JSON.stringify(turn.toolCall.args ?? {}) } }] } : {}),
+        }, finish_reason: turn.toolCall ? 'tool_calls' : 'stop' }],
+        usage: { prompt_tokens: 42, completion_tokens: 12, total_tokens: 54 },
+      })}\n\ndata: [DONE]\n\n`);
+      return;
+    }
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({
       id: `chatcmpl-autohand-native-${requests.length}`,
@@ -397,11 +415,20 @@ export async function createMockAutohandAINativeSequenceServer(
 export async function createMockOpenRouterSequenceServer(
   responseContents: string[],
   delayMs = 0
-): Promise<MockOpenRouterServer> {
+): Promise<MockOpenRouterServer & { requests: Array<Record<string, unknown>> }> {
   let completionCalls = 0;
+  const requests: Array<Record<string, unknown>> = [];
   const server = createServer((request, response) => {
     if (request.url === '/chat/completions' && request.method === 'POST') {
-      request.resume();
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      request.on('end', () => {
+        try {
+          requests.push(recordOrEmpty(JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown));
+        } catch {
+          requests.push({});
+        }
+      });
       setTimeout(() => {
         const index = Math.min(completionCalls, responseContents.length - 1);
         completionCalls += 1;
@@ -444,6 +471,7 @@ export async function createMockOpenRouterSequenceServer(
 
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
+    requests,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error?: Error) => {
@@ -1150,8 +1178,10 @@ export async function launchBuiltAutohand(
     FORCE_COLOR: '0',
     AUTOHAND_NO_BANNER: '1',
     AUTOHAND_SKIP_PING: '1',
+    AUTOHAND_DISABLE_AUTO_REPORT: '1',
     AUTOHAND_SKIP_UPDATE_CHECK: '1',
     AUTOHAND_OFFLINE: '1',
+    AUTOHAND_NO_BROWSER: '1',
     // Hermetic version resolution: an ambient AUTOHAND_VERSION_SOURCE (e.g.
     // when the suite runs inside an Autohand session) would otherwise make
     // the built CLI report a git-derived version instead of the manifest one.
@@ -1195,13 +1225,34 @@ const SESSION_TEARDOWN_MARKER = 'Ending Autohand session';
 
 export async function exitInteractive(session: Session): Promise<void> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    await session.press(['ctrl', 'c']);
-    try {
-      await waitForExit(session, 1_000);
+    if (session.exitInfo) {
       expectCleanExit(session);
       return;
+    }
+
+    const screen = await session.text({ immediate: true });
+    if (screen.includes(SESSION_TEARDOWN_MARKER) || screen.includes('Ending Autohand session') || screen.includes('Session saved')) {
+      await waitForExit(session);
+      expectCleanExit(session);
+      return;
+    }
+
+    const confirmingExit = screen.includes('Press Ctrl+C again to exit');
+    await session.press(['ctrl', 'c']);
+    if (confirmingExit) {
+      await waitForExit(session);
+      expectCleanExit(session);
+      return;
+    }
+    try {
+      await waitForExit(session, 1_000);
     } catch {
       // The first Ctrl+C may clear composer text or show the exit warning.
+      continue;
+    }
+    if (session.exitInfo) {
+      expectCleanExit(session);
+      return;
     }
     // Once teardown has started Ink has released raw mode, so another Ctrl+C
     // would reach the process as a real SIGINT and turn a clean exit into 130.

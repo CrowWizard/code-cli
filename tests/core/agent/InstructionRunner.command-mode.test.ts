@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
+import { GoalManager } from '../../../src/goals/GoalManager.js';
 import { InstructionRunner, type AgentInstructionHost } from '../../../src/core/agent/InstructionRunner.js';
 import { startDeepResearchRun } from '../../../src/deepResearch/session.js';
 import {
@@ -125,6 +126,22 @@ describe('InstructionRunner command mode UI', () => {
     }
   });
 
+  it('completes provider setup cleanup before retrying within the same admitted turn', async () => {
+    const host = createHost();
+    host.runtime.isCommandMode = false;
+    host.runtime.options.prompt = undefined;
+    vi.mocked(host.providerConfigManager.promptModelSelection).mockResolvedValue(true);
+    vi.mocked(host.runReactLoop).mockRejectedValueOnce(new ProviderNotConfiguredError('openai')).mockImplementationOnce(async () => {
+      expect(host.cleanupUI).toHaveBeenCalled();
+      expect(host.isInstructionActive).toBe(true);
+      return { status: 'completed' };
+    });
+    expect(await new InstructionRunner(host).run('retry provider setup')).toBe(true);
+    expect(host.runInstruction).not.toHaveBeenCalled();
+    expect(host.runReactLoop).toHaveBeenCalledTimes(2);
+    expect(host.isInstructionActive).toBe(false);
+  });
+
   it('exposes the prompt hook to cancellation and clears active state afterwards', async () => {
     const host = createHost();
     host.hookManager = new HookManager({ workspaceRoot: '/tmp' });
@@ -181,6 +198,31 @@ describe('InstructionRunner command mode UI', () => {
     }] } });
     expect(await new InstructionRunner(host).run('prompt')).toBe(true);
     expect(host.conversation.addSystemNote).toHaveBeenCalledWith('IMPORTED_CONTEXT', '[Pre-prompt Hook Context]');
+  });
+
+  it('charges the finishing turn to its original goal after the next goal starts', async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'goal-turn-accounting-'));
+    const manager = new GoalManager(workspaceRoot);
+    await manager.createGoal({ objective: 'first goal' });
+    await manager.enqueueGoal({ objective: 'second goal', source: 'tool' });
+    const host = createHost();
+    host.runtime.workspaceRoot = workspaceRoot;
+    host.runReactLoop = async () => {
+      host.currentTurnActualUsage = {
+        kind: 'actual', promptTokens: 100, completionTokens: 23, totalTokens: 123,
+      };
+      await manager.updateGoal({ status: 'complete' });
+      return { status: 'completed' };
+    };
+
+    try {
+      expect(await new InstructionRunner(host).run('finish the first goal')).toBe(true);
+      const snapshot = await manager.getSessionSnapshot();
+      expect(snapshot.completed[0]?.tokensUsed).toBe(123);
+      expect(snapshot.goal).toMatchObject({ objective: 'second goal', tokensUsed: 0 });
+    } finally {
+      await fs.remove(workspaceRoot);
+    }
   });
 
   it('returns before starting work when the external signal is already aborted', async () => {
@@ -346,20 +388,123 @@ describe('InstructionRunner command mode UI', () => {
     expect(host.scheduleTurnMemoryReflection).toHaveBeenCalledWith({ status: 'succeeded' });
   });
 
-  it('clears sticky activity after a successful turn reaches final completion', async () => {
+  it('records an incomplete loop as failed reflection evidence instead of successful work', async () => {
     const host = createHost();
-    const completeTodoActivityForSuccessfulTurn = vi.fn(async () => true);
+    host.runtime = {
+      ...host.runtime,
+      options: {},
+      isCommandMode: false,
+    };
+    host.runReactLoop = vi.fn(async () => ({
+      status: 'incomplete',
+      reason: 'iteration_limit',
+    } as never));
+
+    await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(false);
+
+    expect(host.scheduleTurnMemoryReflection).toHaveBeenCalledWith({
+      status: 'failed',
+      category: 'incomplete',
+      reason: 'The agent loop reached its iteration limit before completion',
+    });
+  });
+
+  it('records unfinished todos as failed reflection evidence when the loop ends with pending items', async () => {
+    const host = createHost();
+    host.runtime = {
+      ...host.runtime,
+      options: {},
+      isCommandMode: false,
+    };
+    host.runReactLoop = vi.fn(async () => ({
+      status: 'incomplete',
+      reason: 'pending_todos',
+    } as never));
+
+    await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(false);
+
+    expect(host.scheduleTurnMemoryReflection).toHaveBeenCalledWith({
+      status: 'failed',
+      category: 'incomplete',
+      reason: 'The turn ended with unfinished todo items',
+    });
+  });
+
+  it('records an incomplete loop reached through session retry as failed reflection evidence', async () => {
+    const host = createHost();
+    host.runtime = {
+      ...host.runtime,
+      options: {},
+      isCommandMode: false,
+      config: {
+        ...host.runtime.config,
+        agent: { enableRequestQueue: true, sessionRetryLimit: 3, sessionRetryDelay: 0 },
+      },
+    };
+    host.isRetryableSessionError = vi.fn(() => true);
+    host.shouldUsePassiveSessionRetry = vi.fn(() => true);
+    const clearActivityForCompletedTurn = vi.fn();
+    (host as AgentInstructionHost & { clearActivityForCompletedTurn: () => void })
+      .clearActivityForCompletedTurn = clearActivityForCompletedTurn;
+    host.runReactLoop = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('provider timeout'))
+      .mockResolvedValueOnce({ status: 'incomplete', reason: 'iteration_limit' });
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(false);
+
+      expect(host.runReactLoop).toHaveBeenCalledTimes(2);
+      expect(host.scheduleTurnMemoryReflection).toHaveBeenCalledWith({
+        status: 'failed',
+        category: 'incomplete',
+        reason: 'The agent loop reached its iteration limit before completion',
+      });
+      expect(clearActivityForCompletedTurn).toHaveBeenCalledOnce();
+    } finally {
+      consoleLogSpy.mockRestore();
+    }
+  });
+
+  function createActivityHost() {
+    const host = createHost();
     const clearActivityForCompletedTurn = vi.fn();
     const activityHost = host as AgentInstructionHost & {
-      completeTodoActivityForSuccessfulTurn: () => Promise<boolean>;
       clearActivityForCompletedTurn: () => void;
     };
-    activityHost.completeTodoActivityForSuccessfulTurn = completeTodoActivityForSuccessfulTurn;
     activityHost.clearActivityForCompletedTurn = clearActivityForCompletedTurn;
+    return { host: activityHost, clearActivityForCompletedTurn };
+  }
 
-    await expect(new InstructionRunner(activityHost).run('finish the active task')).resolves.toBe(true);
+  it('clears sticky activity after a successful turn reaches final completion', async () => {
+    const { host, clearActivityForCompletedTurn } = createActivityHost();
 
-    expect(completeTodoActivityForSuccessfulTurn).toHaveBeenCalledOnce();
+    await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(true);
+
+    expect(clearActivityForCompletedTurn).toHaveBeenCalledOnce();
+  });
+
+  it('clears sticky activity after a turn fails so in-progress tasks do not linger', async () => {
+    const { host, clearActivityForCompletedTurn } = createActivityHost();
+    host.runReactLoop = vi.fn(async () => {
+      throw new Error('provider returned 500');
+    });
+
+    await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(false);
+
+    expect(clearActivityForCompletedTurn).toHaveBeenCalledOnce();
+  });
+
+  it('clears sticky activity when the user cancels the turn', async () => {
+    const { host, clearActivityForCompletedTurn } = createActivityHost();
+    host.runReactLoop = vi.fn(async (controller: AbortController) => {
+      controller.abort();
+      throw new Error('aborted');
+    });
+
+    await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(false);
+
     expect(clearActivityForCompletedTurn).toHaveBeenCalledOnce();
   });
 
@@ -414,7 +559,8 @@ describe('InstructionRunner command mode UI', () => {
 
     expect(result).toBe(false);
     expect(host.stopUI).toHaveBeenCalledWith(true, 'Quality checks failed');
-    expect(clearActivityForCompletedTurn).not.toHaveBeenCalled();
+    // The turn is over either way: the task panel must not keep showing work in progress.
+    expect(clearActivityForCompletedTurn).toHaveBeenCalledOnce();
     expect(host.printCompletionSummary).toHaveBeenCalledWith(false, false);
     expect(host.scheduleTurnMemoryReflection).toHaveBeenCalledWith({
       status: 'failed',
@@ -839,5 +985,37 @@ describe('InstructionRunner command mode UI', () => {
     } finally {
       consoleErrorSpy.mockRestore();
     }
+  });
+});
+
+describe('InstructionRunner interrupt listener cleanup', () => {
+  it('removes the ESC listener when the turn is aborted during specialist preparation', async () => {
+    const host = createHost();
+    const cleanupEsc = vi.fn();
+    host.setupEscListener = vi.fn(() => cleanupEsc);
+    host.prepareSpecialists = vi.fn(async () => {
+      host.activeAbortController?.abort();
+      return null;
+    });
+
+    await expect(new InstructionRunner(host).run('abort while preparing')).resolves.toBe(false);
+
+    expect(host.setupEscListener).toHaveBeenCalledOnce();
+    expect(cleanupEsc).toHaveBeenCalledOnce();
+    expect(host.runReactLoop).not.toHaveBeenCalled();
+  });
+
+  it('removes the ESC listener when specialist preparation throws', async () => {
+    const host = createHost();
+    const cleanupEsc = vi.fn();
+    host.setupEscListener = vi.fn(() => cleanupEsc);
+    host.prepareSpecialists = vi.fn(async () => {
+      throw new Error('specialist registry unavailable');
+    });
+
+    await expect(new InstructionRunner(host).run('throw while preparing')).resolves.toBe(false);
+
+    expect(cleanupEsc).toHaveBeenCalledOnce();
+    expect(host.runReactLoop).not.toHaveBeenCalled();
   });
 });

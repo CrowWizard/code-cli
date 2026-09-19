@@ -5,6 +5,8 @@
  */
 
 import chalk from 'chalk';
+import type { SubAgentSkillsRegistry } from './subAgentSkills.js';
+import type { RunBudgetGate } from '../agent/RunBudget.js';
 import { randomUUID } from 'node:crypto';
 import { AgentRegistry, type AgentDefinition } from './AgentRegistry.js';
 import { SubAgent, type SubAgentOptions, type SubAgentProgress } from './SubAgent.js';
@@ -14,6 +16,7 @@ import type { ClientContext, LLMUsage, LoadedConfig, ToolActionOutcome } from '.
 import type { ToolAuthorizationOptions, ToolDefinition, ToolManagerOptions } from '../toolManager.js';
 import type { TeamModelAssignment } from '../teams/TeamModelPolicy.js';
 import { getSessionThreadBudget, SessionThreadLimitError, type ThreadBudget, type ThreadLease } from './SessionThreadBudget.js';
+import type { PeerRunRuntime, PeerRunRuntimeFactory } from '../agent/PeerCommunicationRuntime.js';
 
 /** Default maximum delegation depth to prevent infinite loops */
 const DEFAULT_MAX_DEPTH = 3;
@@ -56,6 +59,7 @@ export interface SubagentStartContext {
     model?: string;
     /** Why the provider/model pair was selected. */
     modelSource?: TeamModelAssignment['source'];
+    reasoningEffort?: TeamModelAssignment['reasoningEffort'];
 }
 
 /** Context passed to the subagent-stop hook callback */
@@ -74,6 +78,7 @@ export interface SubagentStopContext extends SubagentStartContext {
 export interface SubagentProgressContext extends SubagentStartContext, SubAgentProgress {}
 
 export interface DelegatorOptions {
+    bindPeerRun?: PeerRunRuntimeFactory;
     workspaceRoot?: string;
     projectMemoryEnabled?: boolean;
     getWorkspaceRoot?: () => string;
@@ -100,6 +105,10 @@ export interface DelegatorOptions {
     confirmApproval?: ToolManagerOptions['confirmApproval'];
     /** Resolve the current runtime tool set for extension-aware agent allowlists. */
     getToolDefinitions?: () => ToolDefinition[];
+    /** Skills sub-agents may read and activate for themselves; resolved when a sub-agent starts. */
+    getSkillsRegistry?: () => SubAgentSkillsRegistry | undefined;
+    /** The lead's run budget, shared by every in-process sub-agent. */
+    runBudget?: RunBudgetGate;
     /** Resolve the provider/model pair for one in-process sub-agent. */
     resolveSubagentAssignment?: SubagentAssignmentResolver;
     /** Create an isolated LLM client for a resolved sub-agent assignment. */
@@ -187,6 +196,8 @@ export class AgentDelegator {
             authorization: this.authorization,
             confirmApproval: this.confirmApproval,
             getToolDefinitions: this.getToolDefinitions,
+            skillsRegistry: this.options.getSkillsRegistry?.(),
+            runBudget: this.options.runBudget,
             resolveSubagentAssignment: this.resolveSubagentAssignment,
             createSubagentProvider: this.createSubagentProvider,
             threadBudget: this.threadBudget,
@@ -204,6 +215,7 @@ export class AgentDelegator {
         let lease: ThreadLease | undefined;
         let started = false;
         let agent: SubAgent | undefined;
+        let peerRun: PeerRunRuntime | undefined;
         let startContext: SubagentStartContext = {
             subagentId,
             subagentName: agentName,
@@ -225,9 +237,14 @@ export class AgentDelegator {
             signal.throwIfAborted();
             lease = await this.threadBudget.tryAcquire(subagentId);
             signal.throwIfAborted();
+            peerRun = await this.options.bindPeerRun?.(subagentId, agentName);
+            signal.throwIfAborted();
             const assignment = this.resolveSubagentAssignment?.(agentConfig);
             if (assignment) {
-                startContext = { ...startContext, provider: assignment.provider, model: assignment.model, modelSource: assignment.source };
+                startContext = {
+                    ...startContext, provider: assignment.provider, model: assignment.model,
+                    modelSource: assignment.source, reasoningEffort: assignment.reasoningEffort,
+                };
             }
             started = true;
             await this.notifyObserver(this.onSubagentStart, startContext);
@@ -237,6 +254,11 @@ export class AgentDelegator {
                 this.actionExecutor,
                 {
                     ...subAgentOptions, parentId: subagentId,
+                    ...(peerRun ? {
+                        peerMessaging: peerRun.messaging, resourceCoordinator: peerRun.coordinator,
+                        bindPeerRun: peerRun.bindRun, onPeerEvent: peerRun.notify, peerAutomatic: peerRun.automatic,
+                        recordPeerContext: messages => peerRun!.messaging.recordContext(messages),
+                    } : {}),
                     getPendingInstructions: () => pendingInstructions.splice(0),
                     ...(assignment ? { model: assignment.model } : {}),
                     onProgress: progress => this.notifyObserver(this.options.onSubagentProgress, { ...startContext, ...progress }),
@@ -285,7 +307,7 @@ export class AgentDelegator {
         } finally {
             acceptingMessages = false;
             pendingInstructions.length = 0;
-            await lease?.release();
+            try { await peerRun?.close(); } finally { await lease?.release(); }
         }
     }
 

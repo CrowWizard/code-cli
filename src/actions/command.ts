@@ -8,6 +8,8 @@ import type { SpawnOptions } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { buildAutohandChildProcessEnv } from '../utils/childProcessEnv.js';
+import { prepareCommandCoordination } from '../session/peers/CommandCoordinationGate.js';
+import { CommandOutputCapture } from '../utils/commandOutputCapture.js';
 
 const DEFAULT_KILL_GRACE_PERIOD_MS = 1_000;
 
@@ -123,7 +125,7 @@ function invokeBackgroundOutput(
  * @param options - Extended options for directory, background, shell mode
  * @returns Command result with stdout, stderr, code, and optional backgroundPid
  */
-export function runCommand(
+export async function runCommand(
   cmd: string,
   args: string[],
   cwd: string,
@@ -136,18 +138,26 @@ export function runCommand(
     return Promise.reject(new CommandAbortedError());
   }
 
+  const workDir = options.directory
+    ? (isAbsolute(options.directory) ? options.directory : join(cwd, options.directory))
+    : cwd;
+  const coordinated = await prepareCommandCoordination({ file: cmd, args, cwd: workDir }, options.signal);
+  if (options.signal?.aborted) {
+    const error = new CommandAbortedError();
+    await coordinated?.failed(error);
+    throw error;
+  }
+
   return new Promise((resolve, reject) => {
-    const workDir = options.directory
-      ? (isAbsolute(options.directory) ? options.directory : join(cwd, options.directory))
-      : cwd;
     const hasTimeout = options.timeout !== undefined && options.timeout > 0;
-    const isolateProcessGroup = hasTimeout && process.platform !== 'win32' && !options.background && !options.interactive;
+    const isolateProcessGroup = (hasTimeout || Boolean(coordinated)) && process.platform !== 'win32' && !options.background && !options.interactive;
 
     // Build spawn options
     const spawnOptions: SpawnOptions = {
       cwd: workDir,
       shell: options.shell ?? false,
       env: buildAutohandChildProcessEnv(options.env),
+      ...(coordinated ? { detached: true } : {}),
     };
 
     // Handle background process
@@ -167,6 +177,7 @@ export function runCommand(
     let child;
     try {
       child = spawn(cmd, args, spawnOptions);
+      coordinated?.observe(child);
     } catch (error) {
       const spawnError = toCommandSpawnError(error, cmd, workDir);
       if (options.background) {
@@ -176,7 +187,8 @@ export function runCommand(
           error: spawnError,
         });
       }
-      reject(spawnError);
+      if (coordinated) void coordinated.failed(error).then(() => reject(spawnError), reject);
+      else reject(spawnError);
       return;
     }
 
@@ -252,19 +264,21 @@ export function runCommand(
         unrefBackgroundHandle(child);
         unrefBackgroundHandle(child.stdout);
         unrefBackgroundHandle(child.stderr);
-        resolve({
+        const result: CommandResult = {
           stdout: '',
           stderr: '',
           code: null,
           backgroundPid,
           signal: null,
-        });
+        };
+        if (coordinated) void coordinated.started.then(() => resolve(result), reject);
+        else resolve(result);
       });
       return;
     }
 
-    let stdout = '';
-    let stderr = '';
+    const stdout = new CommandOutputCapture();
+    const stderr = new CommandOutputCapture();
     let timeoutId: NodeJS.Timeout | undefined;
     let forceKillId: NodeJS.Timeout | undefined;
     let settled = false;
@@ -287,14 +301,16 @@ export function runCommand(
       if (settled) return;
       settled = true;
       cleanup();
-      reject(error);
+      if (coordinated) void coordinated.started.then(() => reject(error), () => reject(error));
+      else reject(error);
     };
 
     const finishWithResult = (result: CommandResult): void => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(result);
+      if (coordinated) void coordinated.started.then(() => resolve(result), reject);
+      else resolve(result);
     };
 
     const signalChild = (signal: NodeJS.Signals): void => {
@@ -344,19 +360,19 @@ export function runCommand(
       child.stdout?.setEncoding('utf8');
       child.stderr?.setEncoding('utf8');
       child.stdout?.on('data', (chunk: string) => {
-        stdout += chunk;
+        stdout.append(chunk);
         options.onStdout?.(chunk);
       });
 
       child.stderr?.on('data', (chunk: string) => {
-        stderr += chunk;
+        stderr.append(chunk);
         options.onStderr?.(chunk);
       });
     }
 
     child.once('error', (error: NodeJS.ErrnoException) => {
       if (terminationReason === 'abort') {
-        finishWithError(new CommandAbortedError(stdout, stderr));
+        finishWithError(new CommandAbortedError(stdout.toString(), stderr.toString()));
         return;
       }
       finishWithError(toCommandSpawnError(error, cmd, workDir));
@@ -364,10 +380,10 @@ export function runCommand(
 
     child.once('close', (code, signal) => {
       if (terminationReason === 'abort') {
-        finishWithError(new CommandAbortedError(stdout, stderr));
+        finishWithError(new CommandAbortedError(stdout.toString(), stderr.toString()));
         return;
       }
-      finishWithResult({ stdout, stderr, code, signal });
+      finishWithResult({ stdout: stdout.toString(), stderr: stderr.toString(), code, signal });
     });
   });
 }
@@ -377,7 +393,7 @@ export function runCommand(
  * kill on Windows or if the group no longer exists. Returns whether the
  * signal was delivered to something — false means the pid is already gone.
  */
-function attemptKill(pid: number, signal: NodeJS.Signals): boolean {
+export function attemptKill(pid: number, signal: NodeJS.Signals): boolean {
   if (process.platform !== 'win32') {
     try {
       process.kill(-pid, signal);

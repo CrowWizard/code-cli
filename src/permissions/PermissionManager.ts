@@ -2,6 +2,7 @@
  * Permission Manager - Handles tool/command approval with allow/deny lists
  * @license Apache-2.0
  */
+import { getCommandPrefix } from './types.js';
 import type {
   PermissionSettings,
   PermissionDecision,
@@ -19,6 +20,8 @@ import {
   mergePermissions
 } from './localProjectPermissions.js';
 import { matchesToolPattern } from './toolPatterns.js';
+import { filterAdvertisedTools } from './toolAdvertising.js';
+import { checkRunToolScope, isToolAdvertisedByScope, type RunToolScope } from './runToolScope.js';
 import {
   addToSessionAllowList,
   addToSessionDenyList,
@@ -249,6 +252,23 @@ export class PermissionManager {
   /**
    * Get merged settings (global + local)
    */
+  private runToolScope: RunToolScope | undefined;
+
+  /** Installs the per-run tool scope from the CLI; it is never merged or persisted. */
+  setRunToolScope(scope: RunToolScope | undefined): void {
+    this.runToolScope = scope;
+  }
+
+  getRunToolScope(): RunToolScope | undefined {
+    return this.runToolScope;
+  }
+
+  /** Tool schemas worth offering the model under the run scope and effective settings. */
+  filterAdvertisedTools<T extends { name: string }>(definitions: readonly T[]): T[] {
+    const inScope = definitions.filter((definition) => isToolAdvertisedByScope(this.runToolScope, definition.name));
+    return filterAdvertisedTools(inScope, this.getMergedSettings());
+  }
+
   private getMergedSettings(): PermissionSettings {
     return this.extensionPolicies.reduce(
       (settings, policy) => mergePermissions(settings, policy.settings),
@@ -500,22 +520,14 @@ export class PermissionManager {
         };
         return;
       }
-      case 'allow_always_project': {
-        if (!this.workspaceRoot) {
-          this.addToAllowList(pattern);
-          if (dirPattern) this.addToAllowList(dirPattern);
-          if (this.onPersist) {
-            await this.onPersist(this.settings);
-          }
-          return;
-        }
-        for (const entry of allowPatterns) {
-          await addToLocalAllowList(this.workspaceRoot, entry);
-        }
-        if (!this.localSettings) {
-          this.localSettings = this.normalizeSettings({});
-        }
-        this.localSettings.allowList = Array.from(new Set([...(this.localSettings.allowList ?? []), ...allowPatterns]));
+      case 'allow_always_project':
+        await this.persistAllowPatterns('project', allowPatterns);
+        return;
+      case 'allow_prefix_project':
+      case 'allow_prefix_user': {
+        const prefixPattern = this.commandPrefixPattern(context);
+        if (!prefixPattern) return;
+        await this.persistAllowPatterns(result.decision === 'allow_prefix_user' ? 'user' : 'project', [prefixPattern]);
         return;
       }
       case 'deny_always_project': {
@@ -534,11 +546,7 @@ export class PermissionManager {
         return;
       }
       case 'allow_always_user':
-        this.addToAllowList(pattern);
-        if (dirPattern) this.addToAllowList(dirPattern);
-        if (this.onPersist) {
-          await this.onPersist(this.settings);
-        }
+        await this.persistAllowPatterns('user', allowPatterns);
         return;
       case 'deny_always_user':
         this.addToDenyList(pattern);
@@ -547,6 +555,34 @@ export class PermissionManager {
         }
         return;
     }
+  }
+
+  private async persistAllowPatterns(scope: 'project' | 'user', patterns: string[]): Promise<void> {
+    if (scope === 'user' || !this.workspaceRoot) {
+      for (const entry of patterns) {
+        this.addToAllowList(entry);
+      }
+      if (this.onPersist) {
+        await this.onPersist(this.settings);
+      }
+      return;
+    }
+    for (const entry of patterns) {
+      await addToLocalAllowList(this.workspaceRoot, entry);
+    }
+    if (!this.localSettings) {
+      this.localSettings = this.normalizeSettings({});
+    }
+    this.localSettings.allowList = Array.from(new Set([...(this.localSettings.allowList ?? []), ...patterns]));
+  }
+
+  /**
+   * Pattern that approves every invocation of the context's executable
+   * (e.g. run_command:git:*), regardless of its arguments.
+   */
+  private commandPrefixPattern(context: PermissionContext): string | null {
+    const prefix = getCommandPrefix(context.command);
+    return prefix ? PermissionManager.createPrefixPattern(context.tool, prefix) : null;
   }
 
   /**
@@ -599,6 +635,14 @@ export class PermissionManager {
   private checkPatterns(context: PermissionContext): PermissionDecision | null {
     const settings = this.getMergedSettings();
     const call = this.contextToCall(context);
+
+    // 0. The run scope from the CLI is checked before any merged policy so a
+    //    local or extension allowlist cannot widen it. It names the tool the
+    //    model called, not the capability the call maps to.
+    const scoped = checkRunToolScope(this.runToolScope, { kind: context.requestedTool ?? context.tool, target: call.target });
+    if (!scoped.allowed) {
+      return { allowed: false, reason: scoped.reason };
+    }
 
     // 1. denyPatterns – always denied
     if (settings.denyPatterns?.length) {

@@ -11,11 +11,13 @@ import type {
   NvidiaAISettings,
   NetworkSettings,
   FunctionDefinition,
-  NvidiaChatTemplateKwargs,
 } from "../types.js";
 import { ApiError, FRIENDLY_MESSAGES, classifyApiError } from "./errors.js";
 import { normalizeLLMUsage } from "./usage.js";
+import { joinReasoning, splitInlineThinking } from "./inlineThinking.js";
 import { toTextOnlyContent } from "./messagePayload.js";
+import { buildChatTemplateKwargs, coerceErrorDetail } from "./openAICompatibleShared.js";
+import { normalizeProviderFinishReason } from "./finishReason.js";
 
 /**
  * Sanitize messages for API consumption.
@@ -72,16 +74,6 @@ const FRIENDLY_ERRORS: Record<number, string> = {
   503: "The NVIDIA service is currently overloaded. Please try again later.",
   504: "The request timed out. The service may be experiencing high load.",
 };
-
-function coerceErrorDetail(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value && typeof value === "object") {
-    return JSON.stringify(value);
-  }
-  return "";
-}
 
 function coerceNvidiaErrorDetail(body: unknown): string {
   if (!body || typeof body !== "object") return "";
@@ -151,7 +143,7 @@ export class NVIDIAClient {
     // Add chat_template_kwargs for NVIDIA reasoning models
     if (request.chatTemplateKwargs) {
       payload.extra_body = {
-        chat_template_kwargs: this.buildChatTemplateKwargs(request.chatTemplateKwargs),
+        chat_template_kwargs: buildChatTemplateKwargs(request.chatTemplateKwargs),
       };
     }
 
@@ -223,15 +215,6 @@ export class NVIDIAClient {
     return payload;
   }
 
-  private buildChatTemplateKwargs(kwargs: NvidiaChatTemplateKwargs): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-    if (kwargs.thinking !== undefined) result.thinking = kwargs.thinking;
-    if (kwargs.enable_thinking !== undefined) result.enable_thinking = kwargs.enable_thinking;
-    if (kwargs.reasoning_effort !== undefined) result.reasoning_effort = kwargs.reasoning_effort;
-    if (kwargs.clear_thinking !== undefined) result.clear_thinking = kwargs.clear_thinking;
-    return result;
-  }
-
   private async makeRequest(
     payload: object,
     headers: Record<string, string>,
@@ -279,7 +262,8 @@ export class NVIDIAClient {
 
     const json = (await response.json()) as any;
     const message = json?.choices?.[0]?.message;
-    const text = message?.content ?? "";
+    const inline = splitInlineThinking(message?.content ?? "");
+    const reasoning = joinReasoning(message?.reasoning ?? message?.reasoning_content, inline.reasoning);
     const finishReason = json?.choices?.[0]?.finish_reason;
 
     let toolCalls: LLMToolCall[] | undefined;
@@ -299,10 +283,11 @@ export class NVIDIAClient {
     return {
       id: json.id ?? "nvidia-response",
       created: json.created ?? Date.now(),
-      content: text,
+      content: inline.content,
       toolCalls,
-      finishReason: finishReason as LLMResponse["finishReason"],
+      finishReason: normalizeProviderFinishReason(finishReason),
       usage,
+      reasoning,
       raw: json,
     };
   }
@@ -317,7 +302,7 @@ export class NVIDIAClient {
     let fullContent = "";
     let fullReasoning = "";
     let lastChunk: any = null;
-    let finishReason: string = "stop";
+    let finishReason: LLMResponse['finishReason'];
 
     try {
       while (true) {
@@ -350,7 +335,7 @@ export class NVIDIAClient {
               }
 
               if (data.choices?.[0]?.finish_reason) {
-                finishReason = data.choices[0].finish_reason;
+                finishReason = normalizeProviderFinishReason(data.choices[0].finish_reason, 'length');
               }
             } catch {
               // Skip invalid JSON lines
@@ -362,16 +347,16 @@ export class NVIDIAClient {
       reader.releaseLock();
     }
 
-    // Combine reasoning and content if reasoning exists
-    const finalContent = fullReasoning
-      ? `<thinking>${fullReasoning}</thinking>\n\n${fullContent}`
-      : fullContent;
+    // Reasoning stays out of `content` so the show-thinking setting, not the
+    // transcript, decides whether the user sees it.
+    const inline = splitInlineThinking(fullContent);
 
     return {
       id: lastChunk?.id ?? `nvidia-stream-${Date.now()}`,
       created: lastChunk?.created ?? Math.floor(Date.now() / 1000),
-      content: finalContent,
-      finishReason: finishReason as LLMResponse["finishReason"],
+      content: inline.content,
+      reasoning: joinReasoning(fullReasoning, inline.reasoning),
+      finishReason: finishReason ?? 'length',
       raw: { content: fullContent, reasoning: fullReasoning, chunks: lastChunk },
     };
   }
@@ -394,7 +379,7 @@ export class NVIDIAClient {
     const friendlyMessage = FRIENDLY_ERRORS[status];
     const classified = classifyApiError(status === 422 ? 400 : status, errorDetail, response.headers);
     const classifiedStatus = status === 422 ? status : classified.httpStatus;
-    if (status === 400 || status === 422) {
+    if (status === 400 || status === 422 || classified.code === 'model_not_found') {
       const base = FRIENDLY_MESSAGES[classified.code];
       return new ApiError(
         errorDetail ? `${base}\n${errorDetail}` : `${base} (HTTP ${status})`,
