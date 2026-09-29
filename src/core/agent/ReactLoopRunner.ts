@@ -7,7 +7,7 @@ import chalk from 'chalk';
 import type { PermissionManager } from '../../permissions/PermissionManager.js';
 import { getProviderConfig } from '../../config.js';
 import { isSearchConfigured } from '../../actions/web.js';
-import { formatToolOutputForDisplay } from '../../ui/toolOutput.js';
+import { formatToolOutputForDisplay, type ToolOutputDisplay } from '../../ui/toolOutput.js';
 import { getPlanModeManager } from '../../commands/plan.js';
 import type {
   AgentAction,
@@ -23,6 +23,8 @@ import type {
   TurnUsage,
   ToolCallRequest,
   ToolExecutionResult,
+  ToolImageInput,
+  ToolImageRegistrationResult,
   LLMRetryEvent,
 } from '../../types.js';
 import type { LLMProvider } from '../../providers/LLMProvider.js';
@@ -69,7 +71,11 @@ import {
   type WorkspaceChangeSet,
 } from './WorkspaceChangeCapture.js';
 import { stripAnsiCodes } from '../../ui/displayUtils.js';
-import { getSessionPromptCacheDirective as deriveSessionPromptCacheDirective } from './PromptCache.js';
+import {
+  getSessionPromptCacheDirective as deriveSessionPromptCacheDirective,
+  PromptCacheToolSet,
+} from './PromptCache.js';
+import { usesAutohandAICloud } from '../../providers/AutohandAIProvider.js';
 import { StreamingResponsePreview } from './StreamingResponsePreview.js';
 import type { RunBudgetGate } from './RunBudget.js';
 
@@ -164,6 +170,7 @@ export interface ReactLoopInkRenderer {
     success: boolean,
     output: string,
     thought?: string,
+    expandedOutput?: string,
   ): void;
   addWorkspaceChanges?(changeSet: WorkspaceChangeSet): void;
   setThinking(thought: string | null): void;
@@ -230,12 +237,16 @@ export interface AgentReactLoopHost {
   ensureSpinnerRunning(): void;
   forceRenderSpinner(): void;
   getMessagesWithImages(): Promise<MultimodalMessage[]>;
+  registerToolImages?(images: readonly ToolImageInput[], signal?: AbortSignal): Promise<ToolImageRegistrationResult>;
   attachToolImages?(message: LLMMessage, imagePaths: readonly string[], signal: AbortSignal): Promise<{ attached: number; error?: string }>;
+  attachRegisteredToolImages?(message: LLMMessage, imageRefs: readonly string[], signal: AbortSignal): Promise<{ attached: number; error?: string }>;
   getReactionParser(): { parseAssistantResponse(completion: LLMResponse): AssistantReactPayload };
   handleSmartContextCrop(call: ToolCallRequest): Promise<string>;
   hasIncompleteTodoActivity?(): boolean;
   isContextOverflowError(errorOrMessage: Error | string): boolean;
   isPromptCachingEnabled?(): boolean;
+  /** Keeps Autohand AI cloud tool lists stable for the session; see PromptCacheToolSet. */
+  promptCacheToolSet?: PromptCacheToolSet;
   saveAssistantMessage(content: string, toolCalls?: ToolCallRequest[]): Promise<void>;
   saveToolMessage(name: AgentAction['type'], content: string, toolCallId?: string): Promise<void>;
   setComposerFinalResponse(response: string): void;
@@ -268,6 +279,23 @@ function getSessionPromptCacheDirective(host: AgentReactLoopHost) {
   if (host.isPromptCachingEnabled?.() !== true) return undefined;
   const sessionId = host.sessionManager.getCurrentSession()?.metadata.sessionId;
   return deriveSessionPromptCacheDirective(sessionId);
+}
+
+/**
+ * Relevance filtering still decides which tools join the list; on Autohand AI
+ * cloud the list then only grows, so the cached prefix survives the next iteration.
+ */
+function selectCacheStableTools(
+  host: AgentReactLoopHost,
+  allTools: FunctionDefinition[],
+  relevant: FunctionDefinition[],
+  toolSet: PromptCacheToolSet,
+): FunctionDefinition[] {
+  if (!usesAutohandAICloud(host.runtime.config, host.activeProvider) || host.isPromptCachingEnabled?.() !== true) {
+    return relevant;
+  }
+  const sessionId = host.sessionManager.getCurrentSession()?.metadata.sessionId;
+  return toolSet.select(sessionId, allTools, relevant);
 }
 
 /**
@@ -536,6 +564,7 @@ export async function runAgentReactLoop(
     };
 
     const supportsNativeToolCalling = host.llm.getCapabilities?.().nativeToolCalling === true;
+    const promptCacheToolSet = host.promptCacheToolSet ?? new PromptCacheToolSet();
 
     // Get all function definitions for tool awareness and native tool calling.
     // Providers without native support keep using Autohand's text protocol and
@@ -659,12 +688,12 @@ export async function runAgentReactLoop(
       await host.peerCommunicationRuntime?.safeBoundary();
       if (abortController.signal.aborted) break;
       const messages = host.conversation.history();
-      let tools = filterToolsByRelevance(allTools, messages, {
+      let tools = selectCacheStableTools(host, allTools, filterToolsByRelevance(allTools, messages, {
         cache: host.runtime.config.agent?.toolSelectionCache !== false,
         // The browser side panel is browser-first by definition, so browser_*
         // tools stay available even before the user mentions a page.
         baselineCategories: host.runtime.options.clientContext === 'browser' ? ['browser'] : [],
-      });
+      }), promptCacheToolSet);
 
       // Filter tools for plan mode (read-only tools only during planning phase)
       const planModeManager = getPlanModeManager();
@@ -1194,13 +1223,22 @@ export async function runAgentReactLoop(
           const formatResultForDisplay = (
             result: ToolExecutionResult,
             call: ToolCallRequest | undefined,
-          ): string => {
+          ): ToolOutputDisplay => {
             const filePath = call?.args?.path as string | undefined;
             const command = call?.args?.command as string | undefined;
             const commandArgs = call?.args?.args as string[] | undefined;
-            return result.success
-              ? formatToolOutputForDisplay({ tool: result.tool, content: result.output ?? '', charLimit, filePath, command, commandArgs }).output
-              : result.error ?? result.output ?? 'Tool failed';
+            if (result.success) {
+              return formatToolOutputForDisplay({
+                tool: result.tool,
+                content: result.output ?? '',
+                charLimit,
+                filePath,
+                command,
+                commandArgs,
+              });
+            }
+            const output = result.error ?? result.output ?? 'Tool failed';
+            return { output, truncated: false, totalChars: output.length };
           };
 
           // Execute all tools with progress callback
@@ -1220,12 +1258,23 @@ export async function runAgentReactLoop(
               deferredDiffResults.push({ result, call, thought: resultThought });
               return;
             }
-            host.inkRenderer.addToolOutput(
-              result.tool,
-              result.success,
-              formatResultForDisplay(result, call),
-              resultThought,
-            );
+            const display = formatResultForDisplay(result, call);
+            if (display.expandedOutput !== undefined) {
+              host.inkRenderer.addToolOutput(
+                result.tool,
+                result.success,
+                display.output,
+                resultThought,
+                display.expandedOutput,
+              );
+            } else {
+              host.inkRenderer.addToolOutput(
+                result.tool,
+                result.success,
+                display.output,
+                resultThought,
+              );
+            }
           };
 
           // Parallel calls to the same tool are collected and flushed as one
@@ -1234,6 +1283,7 @@ export async function runAgentReactLoop(
             item: { tool: AgentAction['type']; label: string; detail?: string; success: boolean };
             output: string;
             thought?: string;
+            expandedOutput?: string;
           }
           interface PendingToolGroup {
             expected: number;
@@ -1267,7 +1317,22 @@ export async function runAgentReactLoop(
             }
             if (group.items.length === 1) {
               const single = group.items[0]!;
-              host.inkRenderer.addToolOutput(single.item.tool, single.item.success, single.output, single.thought);
+              if (single.expandedOutput !== undefined) {
+                host.inkRenderer.addToolOutput(
+                  single.item.tool,
+                  single.item.success,
+                  single.output,
+                  single.thought,
+                  single.expandedOutput,
+                );
+              } else {
+                host.inkRenderer.addToolOutput(
+                  single.item.tool,
+                  single.item.success,
+                  single.output,
+                  single.thought,
+                );
+              }
             } else {
               host.inkRenderer.addToolOutputBatch(
                 group.items.map(({ item }) => item),
@@ -1304,12 +1369,21 @@ export async function runAgentReactLoop(
                 deferredDiffResults.push({ result, call, thought: resultThought });
                 return;
               }
-              const displayOutput = formatResultForDisplay(result, call);
-              group.items.push({ item: toBatchItem(result, displayOutput), output: displayOutput, thought: resultThought });
+              const display = formatResultForDisplay(result, call);
+              group.items.push({
+                item: toBatchItem(result, display.output),
+                output: display.output,
+                thought: resultThought,
+                expandedOutput: display.expandedOutput,
+              });
               if (group.items.length >= group.expected) {
                 flushToolGroup(group);
               }
-            }, { signal: abortController.signal, ...(host.peerRuntime?.automatic ? { peerAutomatic: true } : {}) });
+            }, {
+              signal: abortController.signal,
+              registerToolImages: host.registerToolImages,
+              ...(host.peerRuntime?.automatic ? { peerAutomatic: true } : {}),
+            });
           } finally {
             if (workspaceChangeCapture && checkpoint) {
               workspaceChanges = await workspaceChangeCapture.finish(checkpoint).catch((error: unknown) => {
@@ -1367,11 +1441,19 @@ export async function runAgentReactLoop(
               content,
               tool_call_id: otherCalls[i]?.id
             };
+            const imageErrors: string[] = [];
             if (result.imagePaths?.length) {
               const attachment = await host.attachToolImages?.(toolMessage, result.imagePaths, abortController.signal);
-              if (!attachment || attachment.error) {
-                toolMessage.content += `\n[Visual inspection unavailable] ${attachment?.error ?? 'Screenshot attachment is unavailable in this runtime.'}`;
-              }
+              if (!attachment) imageErrors.push('Screenshot attachment is unavailable in this runtime.');
+              else if (attachment.error) imageErrors.push(attachment.error);
+            }
+            if (result.imageRefs?.length) {
+              const attachment = await host.attachRegisteredToolImages?.(toolMessage, result.imageRefs, abortController.signal);
+              if (!attachment) imageErrors.push('Tool image attachment is unavailable in this runtime.');
+              else if (attachment.error) imageErrors.push(attachment.error);
+            }
+            if (imageErrors.length > 0) {
+              toolMessage.content += `\n[Visual inspection unavailable] ${imageErrors.join(' ').slice(0, 1_000)}`;
             }
             host.conversation.addMessage(toolMessage);
             await host.saveToolMessage(result.tool, toolMessage.content, otherCalls[i]?.id);

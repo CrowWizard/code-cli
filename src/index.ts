@@ -62,6 +62,7 @@ import { AUTOHAND_PATHS, PROJECT_DIR_NAME } from './constants.js';
 import { isSessionWorktreeEnabled, prepareSessionWorktree } from './utils/sessionWorktree.js';
 import { buildTmuxLaunchCommand, createTmuxSessionName, isTmuxEnabled } from './utils/tmux.js';
 import { registerBrowserCommand, registerBrowserOptions } from './browser/cliCommand.js';
+import { registerComputerCommand } from './computer/cliCommand.js';
 import { registerReviewCommand } from './review/reviewCliCommand.js';
 import { registerTransferCommand } from './startup/transferCommand.js';
 import { registerResumeCommand } from './startup/resumeCommand.js';
@@ -125,6 +126,24 @@ if (process.argv.includes('--answer-only') || process.argv.includes('--setup-onl
  * banner, the status line and the first request all agree on the served model.
  */
 async function applyServedAutohandModel(config: LoadedConfig, opts: { model?: string }): Promise<void> {
+  const {
+    getAutohandAICloudModelCliUnsupportedReason,
+    getAutohandAICloudModelContextWindow,
+  } = await import('./providers/AutohandAIProvider.js');
+  const configuredModel =
+    config.provider === 'autohandai' && config.autohandai?.plan === 'cloud'
+      ? config.autohandai.model
+      : undefined;
+  const unsupportedReason = getAutohandAICloudModelCliUnsupportedReason(configuredModel);
+  if (unsupportedReason && config.autohandai) {
+    console.error(chalk.yellow(unsupportedReason));
+    config.autohandai.model = 'fantail';
+    config.autohandai.contextWindow = getAutohandAICloudModelContextWindow('fantail');
+    delete config.autohandai.reasoningEffort;
+    if (opts.model) opts.model = 'fantail';
+    return;
+  }
+
   const { normalizeAutohandAIStartupModel } = await import('./core/agent/AutohandAIModelTierPolicy.js');
   const served = normalizeAutohandAIStartupModel(config);
   if (served && opts.model) {
@@ -221,8 +240,9 @@ function getCommitFromAlphaVersion(version: string): string | null {
 
 function getGitCommit(): string {
   // Use build-time embedded commit if available
-  if (process.env.BUILD_GIT_COMMIT && process.env.BUILD_GIT_COMMIT !== 'undefined') {
-    return process.env.BUILD_GIT_COMMIT;
+  const buildCommit = process.env.AUTOHAND_BUILD_GIT_COMMIT ?? process.env.BUILD_GIT_COMMIT;
+  if (buildCommit && buildCommit !== 'undefined') {
+    return buildCommit;
   }
   // For alpha builds, version suffix encodes the source commit
   const alphaCommit = getCommitFromAlphaVersion(runtimeVersion);
@@ -328,7 +348,8 @@ program.hook('preAction', async (thisCommand, actionCommand) => {
   }>();
   configureRunConfigOverlay({ profile, sets: set });
 
-  const traceControlCommand = actionCommand.name() === 'traces';
+  const commandPath = commandPathOf(actionCommand);
+  const traceControlCommand = commandPath[0] === 'traces' || commandPath[0] === 'computer';
   const traceSupervision = !tracesOn
     && !tracesOff
     && !traceControlCommand
@@ -372,6 +393,7 @@ function commandPathOf(command: Command): string[] {
 }
 registerBrowserCommand(program);
 registerBrowserOptions(program);
+registerComputerCommand(program);
 registerExtensionsCommand(program);
 registerDiscoveryCommand(program);
 

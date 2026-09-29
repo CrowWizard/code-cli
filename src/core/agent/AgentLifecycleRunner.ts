@@ -58,6 +58,8 @@ import { validateMobileCommandInvocationForWorkspace } from '../../mobile/Mobile
 import { executeReviewWithLifecycle } from '../../review/reviewLifecycle.js';
 import type { ReviewExecutionSurface } from '../../review/reviewLifecycle.js';
 import type { ReviewRequest } from '../../review/reviewRequest.js';
+import { matchesComputerControlIntent } from '../../skills/computerControlIntent.js';
+import { CUA_DRIVER_MCP_SERVER_NAME } from '../../computer/cuaDriver.js';
 
 const execFileAsync = promisify(execFile);
 const RUNTIME_RESOURCE_SHUTDOWN_TIMEOUT_MS = 2_500;
@@ -76,6 +78,7 @@ const COMMAND_HOOK_KILL_GRACE_PERIOD_MS = 100;
  * reach the next model request; a dead server must never hold the first turn.
  */
 const MCP_FIRST_TURN_DEADLINE_MS = 2_000;
+const COMPUTER_CONTROL_FIRST_TURN_DEADLINE_MS = 8_000;
 const STARTUP_WAIT_STATUS = 'Finishing startup...';
 
 export interface AgentLifecycleHost {
@@ -841,7 +844,7 @@ export async function performAgentBackgroundInit(
       if (host.runtime.config.mcp?.enabled !== false) {
         host.mcpStartupCoordinator.markConnectStarted();
         host.mcpReady = host.mcpManager
-          .connectAll(host.runtime.config.mcp?.servers ?? [])
+          .connectAll(host.runtimeMcpServers ?? host.runtime.config.mcp?.servers ?? [])
           .then(() => {
             if (!isRuntimeResourceShutdownStarted(host)) host.syncMcpTools();
           })
@@ -999,6 +1002,25 @@ interface CommandFinalizationDeadline {
   dispose(): void;
 }
 
+async function waitForComputerControlTools(
+  host: AgentLifecycleHost,
+  instruction: string,
+): Promise<void> {
+  if (!matchesComputerControlIntent(instruction)) return;
+  if (!host.mcpManager?.waitForServerSettlement) return;
+
+  const status = await host.mcpManager.waitForServerSettlement(
+    CUA_DRIVER_MCP_SERVER_NAME,
+    {
+      timeoutMs: COMPUTER_CONTROL_FIRST_TURN_DEADLINE_MS,
+      signal: host.runtimeResourceShutdownController?.signal,
+    },
+  );
+  if (status === 'connected' && !isRuntimeResourceShutdownStarted(host)) {
+    host.syncMcpTools();
+  }
+}
+
 function createCommandFinalizationDeadline(
   lifecycleSignal?: AbortSignal,
 ): CommandFinalizationDeadline {
@@ -1061,7 +1083,7 @@ export async function initializeAgentForRPC(
     // Start MCP connections concurrently with the remaining initialization.
     if (host.runtime.config.mcp?.enabled !== false) {
       host.mcpReady = host.mcpManager
-        .connectAll(host.runtime.config.mcp?.servers ?? [])
+        .connectAll(host.runtimeMcpServers ?? host.runtime.config.mcp?.servers ?? [])
         .then(() => { host.syncMcpTools(); })
         .catch(() => {})
         .finally(() => {
@@ -1726,6 +1748,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         // Slash commands depend on initialized managers too; for example,
         // /skills reads the registry populated during startup.
         await host.ensureInitComplete();
+        await waitForComputerControlTools(host, instruction);
         host.flushMcpStartupSummaryIfPending();
 
         // Handle slash commands locally (never send to LLM).

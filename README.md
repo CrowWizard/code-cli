@@ -59,18 +59,32 @@ Autohand's own install directory — so `agent` reliably resolves to Autohand.
 This happens automatically with no prompt; if another tool's `agent` command
 stops working after installing Autohand, this is why.
 
-The release archives, Unix/Windows installers, and Homebrew formula also install
-`ahtraces`, the managed local trace-monitor companion. Its private source is
-built independently from a pinned revision during the Autohand release. It remains
-idle until the user answers the trace-consent step. New users see that step in
-onboarding; existing users see it once after upgrading to the consent-aware
-release. Cloud trace ingestion does not count against Autohand API usage.
+The npm package, release archives, Unix/Windows installers, and Homebrew formula
+also install `ahtraces`, the managed local trace-monitor companion. npm downloads
+the matching release binary during postinstall and verifies its SHA-256 checksum;
+`--ignore-scripts` or `AUTOHAND_SKIP_AHTRACES_INSTALL=1` intentionally omits it.
+Its private source is built independently from a pinned revision during the
+Autohand release. It remains idle until the user answers the trace-consent step.
+New users see that step in onboarding; existing users see it once after upgrading
+to the consent-aware release. Cloud trace ingestion does not count against
+Autohand API usage.
 
 Use `autohand --traces-on`, `autohand traces on`, or `ahtraces on` to enable
 local monitoring with metadata sync. Use the matching `--traces-off`,
 `autohand traces off`, or `ahtraces off` control to stop it. Uploaded traces are
 visible at `https://console.autohand.ai/traces` and can be deleted from the
-Console Account page.
+Console Account page. See the [agent traces setup guide](docs/traces.md) for consent modes, supported agents, Team use, and deletion controls.
+
+The Unix and Windows installers and npm postinstall also install **Autohand
+Computer Use**, built independently in the public
+[Autohand computer-use](https://github.com/autohandai/computer-use) repository
+from the MIT-licensed Cua engine. Autohand
+reuses an existing compatible engine and connects it as a runtime-only MCP
+server. On macOS, Privacy & Security lists `Autohand Computer Use`, and the
+installer opens its Accessibility and Screen Recording requests. Ask “open my browser” or “go to Spotify and play X” to
+activate the built-in `computer-control` skill. Run `autohand computer status`,
+`autohand computer install`, or `autohand computer doctor` to inspect, repair,
+or verify desktop permissions. See the [native computer control guide](docs/computer-control.md).
 
 ### Manual Installation
 
@@ -271,6 +285,14 @@ events and writes exactly one final `result` or `error` object to stdout.
 | `--feedback`                    |       | Submit feedback                                                                  |
 | `--browser`                     |       | Enable browser integration (same as /browser)                                    |
 | `--no-browser`                  |       | Disable browser integration                                                      |
+
+Native computer control commands:
+
+| Command | Description |
+| --- | --- |
+| `autohand computer status [--json]` | Show Autohand Computer Use and MCP readiness |
+| `autohand computer install [--force]` | Install or repair the pinned, verified native driver |
+| `autohand computer doctor` | Check platform support and desktop permissions |
 
 ## Agent Skills
 
@@ -549,7 +571,7 @@ Create `~/.autohand/config.json` or use `config.toml`, `config.yaml`, or `config
 
 | Provider    | Config Key    | Notes                                                |
 | ----------- | ------------- | ---------------------------------------------------- |
-| Autohand AI | `autohandai`  | Cloud Fantail/Moa or guided local Apple Silicon MLX  |
+| Autohand AI | `autohandai`  | Cloud Fantail/Moa or guided local Apple Silicon MLX. Weka is API/Console only. |
 | OpenRouter  | `openrouter`  | Access to Claude, GPT-4, Grok, etc.                  |
 | LLMGateway  | `llmgateway`  | Direct Claude API access                             |
 | OpenAI      | `openai`      | GPT-4 and other models                               |
@@ -715,6 +737,7 @@ docker run -it autohand
 - [Playbook](AUTOHAND_PLAYBOOK.md) - 20 use cases for the software development lifecycle
 - [Features](docs/features.md) - Complete feature and experiment list
 - [Agent Skills](docs/agent-skills.md) - Skills system guide
+- [Autohand Computer Use](docs/computer-control.md) - Install native computer control and operate local apps conversationally
 - [ACP integration guide](docs/guides/ACP.md) - Use the native ACP agent in compatible editors, IDEs, and ADEs
 - [Extending Autohand Code CLI](docs/extending.md) - Build tools, skills, hooks, MCP servers, and integrations
 - [Autohand Code extensions](docs/extensions.md) - Validate, install, inspect, and manage declarative extension packages

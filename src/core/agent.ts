@@ -98,6 +98,7 @@ import { SkillsRegistry } from '../skills/SkillsRegistry.js';
 import { CommunitySkillsClient } from '../skills/CommunitySkillsClient.js';
 import { McpClientManager } from '../mcp/McpClientManager.js';
 import type { McpServerConfig } from '../mcp/types.js';
+import { resolveRuntimeMcpServers } from '../computer/cuaDriver.js';
 import { PersistentInput } from '../ui/persistentInput.js';
 // InkRenderer type - using 'any' to avoid bun bundling ink at compile time
 // The actual type comes from dynamic import at runtime
@@ -132,6 +133,7 @@ import { ShellSuggestionProvider } from './agent/ShellSuggestionProvider.js';
 import { SimpleChatHandler, type SimpleChatAgent } from './agent/SimpleChatHandler.js';
 import {
   isPromptCachingEnabled as resolvePromptCachingEnabled,
+  PromptCacheToolSet,
 } from './agent/PromptCache.js';
 import { McpStartupCoordinator } from './agent/McpStartupCoordinator.js';
 import { MentionResolver } from './agent/MentionResolver.js';
@@ -406,6 +408,7 @@ export class AutohandAgent {
   private skillsRegistry!: SkillsRegistry;
   private communityClient!: CommunitySkillsClient;
   private mcpManager!: McpClientManager;
+  private runtimeMcpServers: McpServerConfig[] = [];
   private mcpStartupCoordinator!: McpStartupCoordinator;
   /** Background MCP connection promise - resolves when all servers finish connecting */
   private mcpReady: Promise<void> | null = null;
@@ -416,6 +419,7 @@ export class AutohandAgent {
   private providerConfigManager!: ProviderConfigManager;
   private reactionParser!: ReactionParser;
   private simpleChatHandler!: SimpleChatHandler;
+  private readonly promptCacheToolSet = new PromptCacheToolSet();
   private isInstructionActive = false;
   private hasPrintedExplorationHeader = false;
   private activeProvider!: ProviderName;
@@ -1036,7 +1040,7 @@ export class AutohandAgent {
   }
 
   private isPromptCachingEnabled(): boolean {
-    return resolvePromptCachingEnabled(this.runtime.config, this.featureFlagManager);
+    return resolvePromptCachingEnabled(this.runtime.config, this.featureFlagManager, this.activeProvider);
   }
 
   /**
@@ -1369,12 +1373,15 @@ export class AutohandAgent {
       ensureSpinnerRunning: () => agent.ensureSpinnerRunning(),
       forceRenderSpinner: () => agent.forceRenderSpinner(),
       getMessagesWithImages: () => agent.getMessagesWithImages(),
+      registerToolImages: (images, signal) => agent.getToolImageStore().register(images, signal),
       attachToolImages: (message, imagePaths, signal) => agent.getToolImageStore().attach(message, imagePaths, signal),
+      attachRegisteredToolImages: (message, imageRefs, signal) => agent.getToolImageStore().attachRegistered(message, imageRefs, signal),
       getReactionParser: () => agent.getReactionParser(),
       handleSmartContextCrop: (call) => agent.handleSmartContextCrop(call),
       hasIncompleteTodoActivity: () => agent.hasIncompleteTodoActivity(),
       isContextOverflowError: (errorOrMessage) => agent.isContextOverflowError(errorOrMessage),
       isPromptCachingEnabled: () => agent.isPromptCachingEnabled(),
+      promptCacheToolSet: agent.promptCacheToolSet,
       saveAssistantMessage: (content, toolCalls) => agent.saveAssistantMessage(content, toolCalls),
       saveToolMessage: (name, content, toolCallId) => agent.saveToolMessage(name, content, toolCallId),
       setComposerFinalResponse: (response) => agent.setComposerFinalResponse(response),
@@ -2362,9 +2369,12 @@ export class AutohandAgent {
    */
   async applyManagedMcpSettings(mcp: McpSettings | undefined): Promise<void> {
     this.runtime.config.mcp = mcp;
+    this.runtimeMcpServers = resolveRuntimeMcpServers(this.runtime.config, {
+      bare: this.runtime.options.bare,
+    });
     await this.mcpManager.disconnectAll();
     if (mcp?.enabled !== false) {
-      await this.mcpManager.connectAll(mcp?.servers ?? []);
+      await this.mcpManager.connectAll(this.runtimeMcpServers);
     }
     this.syncMcpTools();
   }

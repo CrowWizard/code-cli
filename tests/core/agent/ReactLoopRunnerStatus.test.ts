@@ -33,8 +33,14 @@ import {
   runAgentReactLoop,
   shouldDisplayToolOutput,
 } from '../../../src/core/agent/ReactLoopRunner.js';
-import type { LLMRetryEvent, ToolCallRequest } from '../../../src/types.js';
+import type {
+  AgentAction,
+  LLMRetryEvent,
+  ToolCallRequest,
+  ToolExecutionContext,
+} from '../../../src/types.js';
 import { ReactionParser } from '../../../src/core/agent/ReactionParser.js';
+import { PromptCacheToolSet } from '../../../src/core/agent/PromptCache.js';
 
 describe('ReactLoopRunner composer status', () => {
   it('emits streamed final response text without duplicating the terminal response', async () => {
@@ -132,6 +138,60 @@ describe('ReactLoopRunner composer status', () => {
       expect(toolMessage?.content).not.toContain('base64');
       if (attachment.error) expect(toolMessage?.content).toContain(attachment.error);
       expect(host.saveToolMessage).toHaveBeenCalledWith('capture_test_evidence', toolMessage?.content, toolMessage?.tool_call_id);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('keeps registered MCP images private while attaching them before saving the tool observation', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const llmComplete = vi.fn()
+      .mockResolvedValueOnce({
+        id: 'capture', created: 1, raw: {},
+        content: JSON.stringify({ toolCalls: [{ tool: 'mcp__cua-driver__get_state', args: {} }] }),
+      })
+      .mockResolvedValueOnce({ id: 'answer', created: 2, raw: {}, content: '{"finalResponse":"Screen inspected."}' });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    const imageRef = 'tool-image:11111111-1111-4111-8111-111111111111';
+    const registerToolImages = vi.fn(async () => ({ refs: [imageRef] }));
+    const attachRegisteredToolImages = vi.fn(async () => ({ attached: 1 }));
+    Object.assign(host, { registerToolImages, attachRegisteredToolImages });
+    host.toolManager.execute = vi.fn(async (
+      _calls,
+      _onProgress,
+      context?: ToolExecutionContext,
+    ) => {
+      expect(context?.registerToolImages).toBe(registerToolImages);
+      return [{
+        tool: 'mcp__cua-driver__get_state' as AgentAction['type'],
+        success: true,
+        output: 'desktop screenshot 1x1 px\n[1 image available for visual inspection.]',
+        imageRefs: [imageRef],
+      }];
+    });
+    const controller = new AbortController();
+
+    try {
+      await runAgentReactLoop(host, controller);
+
+      const toolMessage = vi.mocked(host.conversation.addMessage).mock.calls
+        .map(([message]) => message).find((message) => message.role === 'tool');
+      expect(toolMessage).toBeDefined();
+      expect(attachRegisteredToolImages).toHaveBeenCalledExactlyOnceWith(
+        toolMessage,
+        [imageRef],
+        controller.signal,
+      );
+      expect(attachRegisteredToolImages.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(host.saveToolMessage).mock.invocationCallOrder[0],
+      );
+      expect(toolMessage?.content).toBe('desktop screenshot 1x1 px\n[1 image available for visual inspection.]');
+      expect(JSON.stringify(toolMessage)).not.toContain('base64');
+      expect(host.saveToolMessage).toHaveBeenCalledWith(
+        'mcp__cua-driver__get_state',
+        toolMessage?.content,
+        toolMessage?.tool_call_id,
+      );
     } finally {
       logSpy.mockRestore();
     }
@@ -1315,6 +1375,98 @@ describe('ReactLoopRunner composer status', () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+});
+
+describe('ReactLoopRunner prompt-cache tool stability', () => {
+  const definitions = [
+    { name: 'read_file', description: 'Read a file', parameters: { type: 'object' as const, properties: {} } },
+    { name: 'write_file', description: 'Write a file', parameters: { type: 'object' as const, properties: {} } },
+  ];
+
+  // The first request follows a request to fix something, so the editing tools
+  // are relevant; by the second request the recent messages no longer mention
+  // editing, which is exactly when relevance filtering would shrink the list.
+  async function advertisedToolsPerIteration(configure: (host: AgentReactLoopHost) => void): Promise<string[][]> {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const llmComplete = vi.fn()
+        .mockResolvedValueOnce({ id: 'tool', created: 1, raw: {},
+          content: JSON.stringify({ toolCalls: [{ tool: 'read_file', args: { path: 'a.ts' } }] }) })
+        .mockResolvedValueOnce({ id: 'answer', created: 2, raw: {}, content: '{"finalResponse":"Done."}' });
+      const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+      host.toolManager.toFunctionDefinitions = vi.fn(() => definitions);
+      host.toolManager.execute = vi.fn().mockResolvedValue([{ tool: 'read_file', success: true, output: 'code' }]);
+      host.sessionManager.getCurrentSession = vi.fn(() => ({ metadata: { sessionId: 'session-123' } }));
+      host.conversation.history = vi.fn()
+        .mockReturnValueOnce([{ role: 'user', content: 'fix the parser' }])
+        .mockReturnValue([{ role: 'user', content: 'thanks' }]);
+      configure(host);
+
+      await runAgentReactLoop(host, new AbortController());
+
+      const prepareRequest = host.contextOrchestrator.prepareRequest as ReturnType<typeof vi.fn>;
+      return prepareRequest.mock.calls.map(([tools]) => (tools as Array<{ name: string }>).map((tool) => tool.name));
+    } finally {
+      logSpy.mockRestore();
+    }
+  }
+
+  it('keeps the advertised tool list identical across iterations for Autohand AI cloud', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud' };
+      host.isPromptCachingEnabled = () => true;
+    });
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('keeps the tool list stable for a session across turns', async () => {
+    const promptCacheToolSet = new PromptCacheToolSet();
+    const configure = (host: AgentReactLoopHost) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud' };
+      host.isPromptCachingEnabled = () => true;
+      host.promptCacheToolSet = promptCacheToolSet;
+    };
+    await advertisedToolsPerIteration(configure);
+
+    const nextTurn = await advertisedToolsPerIteration((host) => {
+      configure(host);
+      host.conversation.history = vi.fn(() => [{ role: 'user' as const, content: 'thanks' }]);
+    });
+
+    expect(nextTurn[0]).toEqual(['read_file', 'write_file']);
+  });
+
+  it('still filters tools by relevance for other providers', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'openai';
+      host.isPromptCachingEnabled = () => true;
+    });
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file']]);
+  });
+
+  it('still filters tools by relevance when prompt caching is switched off for Autohand AI cloud', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud' };
+      host.isPromptCachingEnabled = () => false;
+    });
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file']]);
+  });
+
+  it('still filters tools by relevance for the Autohand AI local plan', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'local' };
+      host.isPromptCachingEnabled = () => true;
+    });
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file']]);
   });
 });
 

@@ -6,8 +6,9 @@
 
 import { getProviderConfig } from '../../config.js';
 import { ProviderFactory } from '../../providers/ProviderFactory.js';
-import { getProviderModelIds } from '../../providers/modelCatalog.js';
+import { getProviderRunnableModelIds } from '../../providers/modelCatalog.js';
 import { isCustomProviderName } from '../../providers/customProviders.js';
+import { usesAutohandAICloud } from '../../providers/AutohandAIProvider.js';
 import type { AutohandConfig, BuiltInProviderName, ProviderName, ReasoningEffort } from '../../types.js';
 import type { LLMProvider } from '../../providers/LLMProvider.js';
 
@@ -96,16 +97,12 @@ function resolveCandidate(
 function isKnownModelForProvider(config: AutohandConfig, provider: ProviderName, model: string): boolean {
   if (isCustomProviderName(provider)) return true;
   if (provider === 'autohandai' && config.autohandai?.plan === 'local') return true;
-  const known = getProviderModelIds(provider as BuiltInProviderName);
+  const known = getProviderRunnableModelIds(provider as BuiltInProviderName);
   return known.length === 0 || known.includes(model);
 }
 
 function isSuggestedSource(source: TeamModelAssignmentSource): boolean {
   return source === 'agent-definition' || source === 'member-override';
-}
-
-function usesAutohandAICloud(config: AutohandConfig, provider: ProviderName): boolean {
-  return provider === 'autohandai' && config.autohandai?.plan !== 'local';
 }
 
 /**

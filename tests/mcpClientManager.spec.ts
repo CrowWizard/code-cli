@@ -251,6 +251,95 @@ describe('McpClientManager', () => {
     });
   });
 
+  describe('waitForServerSettlement', () => {
+    afterEach(() => {
+      const internals = manager as unknown as {
+        connectionAttempts: Map<string, Promise<void>>;
+      };
+      internals.connectionAttempts.delete('cua-driver');
+      vi.useRealTimers();
+    });
+
+    it('waits for one in-flight server and releases its deadline timer', async () => {
+      vi.useFakeTimers();
+      let settle!: () => void;
+      const attempt = new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+      const internals = manager as unknown as {
+        connectionAttempts: Map<string, Promise<void>>;
+        servers: Map<string, {
+          config: McpServerConfig;
+          status: 'connected';
+          tools: [];
+        }>;
+      };
+      internals.connectionAttempts.set('cua-driver', attempt);
+      const baselineTimers = vi.getTimerCount();
+
+      const waiting = manager.waitForServerSettlement('cua-driver', { timeoutMs: 8_000 });
+      internals.servers.set('cua-driver', {
+        config: { name: 'cua-driver', transport: 'stdio', command: '/tmp/cua-driver' },
+        status: 'connected',
+        tools: [],
+      });
+      settle();
+
+      await expect(waiting).resolves.toBe('connected');
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+      internals.connectionAttempts.delete('cua-driver');
+    });
+
+    it('returns missing immediately when that server has no connection attempt', async () => {
+      vi.useFakeTimers();
+      const baselineTimers = vi.getTimerCount();
+
+      const result = await manager.waitForServerSettlement('cua-driver', { timeoutMs: 8_000 });
+
+      expect(result).toBe('missing');
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+    });
+
+    it('bounds an in-flight wait and releases its deadline timer on timeout', async () => {
+      vi.useFakeTimers();
+      const neverSettles = new Promise<void>(() => {});
+      const internals = manager as unknown as {
+        connectionAttempts: Map<string, Promise<void>>;
+      };
+      internals.connectionAttempts.set('cua-driver', neverSettles);
+      const baselineTimers = vi.getTimerCount();
+
+      const waiting = manager.waitForServerSettlement('cua-driver', { timeoutMs: 8_000 });
+      expect(vi.getTimerCount()).toBe(baselineTimers + 1);
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      await expect(waiting).resolves.toBe('timeout');
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+      internals.connectionAttempts.delete('cua-driver');
+    });
+
+    it('releases its deadline timer when startup is aborted', async () => {
+      vi.useFakeTimers();
+      const neverSettles = new Promise<void>(() => {});
+      const internals = manager as unknown as {
+        connectionAttempts: Map<string, Promise<void>>;
+      };
+      internals.connectionAttempts.set('cua-driver', neverSettles);
+      const controller = new AbortController();
+      const baselineTimers = vi.getTimerCount();
+
+      const waiting = manager.waitForServerSettlement('cua-driver', {
+        timeoutMs: 8_000,
+        signal: controller.signal,
+      });
+      controller.abort();
+
+      await expect(waiting).resolves.toBe('aborted');
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+      internals.connectionAttempts.delete('cua-driver');
+    });
+  });
+
   // ========================================================================
   // startup timeouts (first-turn latency)
   // ========================================================================
@@ -284,6 +373,30 @@ describe('McpClientManager', () => {
       expect(failure?.message).toBe('MCP request "tools/list" timed out after 30000ms');
     });
 
+    it('rejects an in-flight request when the server explicitly rejects its wire framing', async () => {
+      vi.useFakeTimers();
+      const { connection } = createFakeStdioConnection();
+      const baselineTimers = vi.getTimerCount();
+
+      const initializing = connection.request('initialize', {});
+      expect(vi.getTimerCount()).toBe(baselineTimers + 1);
+
+      (connection as unknown as {
+        handleMessage: (message: {
+          jsonrpc: '2.0';
+          id: null;
+          error: { code: number; message: string };
+        }) => void;
+      }).handleMessage({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32700, message: 'Parse error' },
+      });
+
+      await expect(initializing).rejects.toThrow('MCP protocol error (-32700): Parse error');
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+    });
+
     it('does not retry with newline framing after the handshake timed out', async () => {
       const connectWithFraming = vi
         .spyOn(manager as unknown as { connectStdioWithFraming: () => Promise<unknown> }, 'connectStdioWithFraming')
@@ -311,6 +424,38 @@ describe('McpClientManager', () => {
 
       expect(connectWithFraming).toHaveBeenCalledTimes(2);
       expect(connectWithFraming).toHaveBeenLastCalledWith(stdioConfig, 'newline', 0);
+    });
+
+    it('retries with newline framing when the server rejects Content-Length framing', async () => {
+      const connectWithFraming = vi
+        .spyOn(manager as unknown as { connectStdioWithFraming: () => Promise<unknown> }, 'connectStdioWithFraming')
+        .mockRejectedValueOnce(new Error('MCP protocol error (-32700): Parse error'))
+        .mockResolvedValueOnce({ connection: {}, tools: [] });
+
+      await (manager as unknown as {
+        connectStdioWithFallbackFraming: (config: McpServerConfig, generation: number) => Promise<unknown>;
+      }).connectStdioWithFallbackFraming(stdioConfig, 0);
+
+      expect(connectWithFraming).toHaveBeenCalledTimes(2);
+      expect(connectWithFraming).toHaveBeenNthCalledWith(1, stdioConfig, 'content-length', 0);
+      expect(connectWithFraming).toHaveBeenNthCalledWith(2, stdioConfig, 'newline', 0);
+    });
+
+    it('uses an explicitly configured newline framing without a failed first launch', async () => {
+      const newlineConfig: McpServerConfig = {
+        ...stdioConfig,
+        stdioFraming: 'newline',
+      };
+      const connectWithFraming = vi
+        .spyOn(manager as unknown as { connectStdioWithFraming: () => Promise<unknown> }, 'connectStdioWithFraming')
+        .mockResolvedValueOnce({ connection: {}, tools: [] });
+
+      await (manager as unknown as {
+        connectStdioWithFallbackFraming: (config: McpServerConfig, generation: number) => Promise<unknown>;
+      }).connectStdioWithFallbackFraming(newlineConfig, 0);
+
+      expect(connectWithFraming).toHaveBeenCalledOnce();
+      expect(connectWithFraming).toHaveBeenCalledWith(newlineConfig, 'newline', 0);
     });
   });
 

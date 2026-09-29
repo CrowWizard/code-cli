@@ -31,6 +31,8 @@ import {
   buildNpxIsolatedCacheEnv,
 } from './commandNormalization.js';
 
+export type McpServerSettlementResult = McpServerStatus | 'missing' | 'timeout' | 'aborted';
+
 // ============================================================================
 // JSON-RPC 2.0 Types (MCP protocol wire format)
 // ============================================================================
@@ -50,7 +52,7 @@ interface JsonRpcNotification {
 
 interface JsonRpcResponse {
   jsonrpc: '2.0';
-  id: number;
+  id?: number | null;
   result?: unknown;
   error?: {
     code: number;
@@ -358,7 +360,11 @@ export class McpStdioConnection extends EventEmitter {
    * Routes incoming JSON-RPC responses to their pending request handlers.
    */
   private handleMessage(message: JsonRpcResponse): void {
-    if (message.id !== undefined && this.pendingRequests.has(message.id)) {
+    if (message.id === null && message.error) {
+      this.rejectPendingRequests(new Error(
+        `MCP protocol error (${message.error.code}): ${message.error.message}`
+      ));
+    } else if (typeof message.id === 'number' && this.pendingRequests.has(message.id)) {
       const pending = this.pendingRequests.get(message.id)!;
       this.pendingRequests.delete(message.id);
       clearTimeout(pending.timer);
@@ -377,16 +383,20 @@ export class McpStdioConnection extends EventEmitter {
     }
   }
 
+  private rejectPendingRequests(error: Error): void {
+    for (const [id, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.removeAbortListener?.();
+      pending.reject(error);
+      this.pendingRequests.delete(id);
+    }
+  }
+
   /**
    * Cleans up all pending requests and resets state.
    */
   private cleanup(): void {
-    for (const [id, pending] of this.pendingRequests) {
-      clearTimeout(pending.timer);
-      pending.removeAbortListener?.();
-      pending.reject(new Error('MCP connection closed'));
-      this.pendingRequests.delete(id);
-    }
+    this.rejectPendingRequests(new Error('MCP connection closed'));
     this.process = null;
     this.lineBuffer = '';
     this.frameBuffer = Buffer.alloc(0);
@@ -876,6 +886,52 @@ export class McpClientManager {
     return tracked;
   }
 
+  /**
+   * Wait for one server's current connection attempt without coupling the
+   * caller to every MCP server that may be starting in parallel.
+   */
+  async waitForServerSettlement(
+    serverName: string,
+    options: { timeoutMs: number; signal?: AbortSignal },
+  ): Promise<McpServerSettlementResult> {
+    const currentState = this.servers.get(serverName);
+    const attempt = this.connectionAttempts.get(serverName);
+    if (!attempt) {
+      return currentState?.status ?? 'missing';
+    }
+    if (options.signal?.aborted) {
+      return 'aborted';
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const deadline = new Promise<'timeout' | 'aborted'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), Math.max(0, options.timeoutMs));
+      timer.unref?.();
+      if (options.signal) {
+        onAbort = () => resolve('aborted');
+        options.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+    const settled = attempt.then(
+      () => 'settled' as const,
+      () => 'settled' as const,
+    );
+
+    try {
+      const outcome = await Promise.race([settled, deadline]);
+      if (outcome !== 'settled') {
+        return outcome;
+      }
+      return this.servers.get(serverName)?.status ?? 'missing';
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort && options.signal) {
+        options.signal.removeEventListener('abort', onAbort);
+      }
+    }
+  }
+
   private async performConnect(config: McpServerConfig, generation: number): Promise<void> {
     // Disconnect existing connection if any
     if (this.servers.has(config.name)) {
@@ -1098,6 +1154,8 @@ export class McpClientManager {
     return (
       message.includes('MCP connection closed before initialization completed')
       || message.includes('MCP connection closed (server exited with code')
+      || message.includes('MCP protocol error (-32700):')
+      || message.includes('MCP protocol error (-32600):')
     );
   }
 
@@ -1105,7 +1163,11 @@ export class McpClientManager {
     config: McpServerConfig,
     generation: number,
   ): Promise<{ connection: McpStdioConnection; tools: McpToolDefinition[] }> {
-    if (isOAuthBridge(config)) return this.connectStdioWithFraming(config, 'newline', generation);
+    const configuredFraming = config.stdioFraming
+      ?? (isOAuthBridge(config) ? 'newline' : undefined);
+    if (configuredFraming) {
+      return this.connectStdioWithFraming(config, configuredFraming, generation);
+    }
     try {
       return await this.connectStdioWithFraming(config, 'content-length', generation);
     } catch (contentLengthError) {

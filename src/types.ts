@@ -137,6 +137,11 @@ export interface LLMGatewaySettings extends ProviderSettings {
    * text. This is a transport capability, not a user-configurable setting.
    */
   supportsImageInput?: boolean;
+  /**
+   * Forward `LLMRequest.promptCache` as `prompt_cache_key`. Only set for gateways
+   * verified to accept it; this is a transport capability, not a user setting.
+   */
+  supportsPromptCacheKey?: boolean;
 }
 
 export interface OpenAIChatGPTAuth {
@@ -582,6 +587,8 @@ export interface McpServerConfigEntry {
   headers?: Record<string, string>;
   /** Whether to auto-connect on startup (default: true) */
   autoConnect?: boolean;
+  /** JSON-RPC framing for stdio servers (default: Content-Length with compatibility fallback) */
+  stdioFraming?: 'content-length' | 'newline';
   /** Account-scoped connector ID assigned by the Autohand Console control plane. */
   managedConnectorId?: string;
   /** Last connector revision applied from the Autohand Console control plane. */
@@ -1996,12 +2003,27 @@ export type ToolFailureKind =
   | 'aborted'
   | 'operational';
 
+export type ToolImageMimeType = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+
+export interface ToolImageInput {
+  data: string;
+  mimeType: ToolImageMimeType;
+  label?: string;
+}
+
+export interface ToolImageRegistrationResult {
+  refs: string[];
+  error?: string;
+}
+
 export type ToolActionOutcome =
   | {
       success: true;
       output?: string;
       /** Local artifact paths for runtime-only multimodal handoff; never image bytes or URLs. */
       imagePaths?: string[];
+      /** Opaque runtime-only image handles; never image bytes or URLs. */
+      imageRefs?: string[];
     }
   | {
       success: false;
@@ -2010,6 +2032,7 @@ export type ToolActionOutcome =
       output?: string;
       exitCode?: number | null;
       imagePaths?: string[];
+      imageRefs?: string[];
     };
 
 export type ToolExecutionResult = {
@@ -2026,6 +2049,11 @@ export interface ToolExecutionContext {
   approvalHandled?: boolean;
   /** Active instruction cancellation signal for foreground work. */
   signal?: AbortSignal;
+  /** Privately retain tool-returned images without placing image bytes in tool output or history. */
+  registerToolImages?: (
+    images: readonly ToolImageInput[],
+    signal?: AbortSignal,
+  ) => Promise<ToolImageRegistrationResult>;
 }
 
 export interface ToolOutputChunk {

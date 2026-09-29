@@ -8,19 +8,38 @@ import { LLMGatewayClient } from "./LLMGatewayClient.js";
 import { MLXProvider } from "./MLXProvider.js";
 import type {
   AutohandAISettings,
+  AutohandConfig,
   LLMGatewaySettings,
   LLMRequest,
   LLMResponse,
   NetworkSettings,
+  ProviderName,
 } from "../types.js";
 import type { LLMProvider, LLMProviderCapabilities } from "./LLMProvider.js";
 import { AUTOHAND_AI_LOCAL_CODING_MODEL_FALLBACKS } from "./autohandAILocalSetup.js";
-import { getProviderModelOptions } from "./modelCatalog.js";
+import { getProviderModelOptions, getProviderRunnableModelOptions } from "./modelCatalog.js";
 
 export const AUTOHAND_AI_DEFAULT_BASE_URL = "https://inference.autohand.ai/v1";
 // Requested output when the caller does not specify one; mirrors the shared
 // LLMGatewayClient default and is itself clamped to the model ceiling below.
 export const AUTOHAND_AI_DEFAULT_MAX_OUTPUT_TOKENS = 16_000;
+
+function normalizeAutohandAICloudModelId(model: string | undefined): string | undefined {
+  return model?.trim().replace(/^autohand(?:ai)?\//i, "").toLowerCase();
+}
+
+export function getAutohandAICloudModelCliUnsupportedReason(
+  model: string | undefined,
+): string | undefined {
+  const normalized = normalizeAutohandAICloudModelId(model);
+  const entry = getProviderModelOptions("autohandai").find(
+    (candidate) => candidate.id === normalized,
+  );
+  if (entry?.cliSupported !== false) return undefined;
+
+  const name = entry.id === "weka" ? "Weka" : (entry.displayName ?? entry.id);
+  return `${name} is available through the Autohand API and Console Playground. CLI execution is not supported yet.`;
+}
 
 export interface AutohandAICloudModelDefinition {
   id: string;
@@ -41,7 +60,7 @@ function requireCatalogNumber(model: string, field: "contextWindow" | "maxTokens
 }
 
 export const AUTOHAND_AI_CLOUD_MODEL_DEFINITIONS: readonly AutohandAICloudModelDefinition[] =
-  getProviderModelOptions("autohandai").map((model) => ({
+  getProviderRunnableModelOptions("autohandai").map((model) => ({
     id: model.id,
     label: model.displayName ?? model.id,
     description: model.description ?? model.displayName ?? model.id,
@@ -68,10 +87,18 @@ export const AUTOHAND_AI_LOCAL_MODELS = [
   ...AUTOHAND_AI_LOCAL_CODING_MODEL_FALLBACKS.map((model) => model.id),
 ];
 
-/** The cloud model the gateway will actually serve for a selection; unknown ids fall back to Fantail. */
+/** The cloud chat model the gateway will serve; known non-chat models fail with a useful explanation. */
 export function resolveAutohandAICloudModel(model: string | undefined): string {
-  const normalized = model?.replace(/^autohand\//, "");
+  const unsupportedReason = getAutohandAICloudModelCliUnsupportedReason(model);
+  if (unsupportedReason) throw new Error(unsupportedReason);
+
+  const normalized = normalizeAutohandAICloudModelId(model);
   return normalized && AUTOHAND_AI_CLOUD_MODELS.includes(normalized) ? normalized : "fantail";
+}
+
+/** True when requests for `provider` go to the hosted Autohand AI gateway rather than a local model. */
+export function usesAutohandAICloud(config: AutohandConfig, provider: ProviderName | undefined): boolean {
+  return provider === "autohandai" && config.autohandai?.plan !== "local";
 }
 
 /** Migrate only the old first-party endpoint; private gateways are left alone. */
@@ -141,6 +168,7 @@ export class AutohandAIProvider implements LLMProvider {
       model: this.model,
       contextWindow: config.contextWindow ?? getAutohandAICloudModelContextWindow(this.model),
       supportsImageInput: true,
+      supportsPromptCacheKey: true,
     };
     // Streamed completions only need the budget to cover time to headers, but
     // reasoning and gateway inspection can hold headers back; keep the old
