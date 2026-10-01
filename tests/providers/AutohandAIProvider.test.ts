@@ -26,6 +26,20 @@ describe("AutohandAIProvider", () => {
     vi.restoreAllMocks();
   });
 
+  it("applies an ACP effort change to the next Moa completion without mutating the source settings", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      id:"response",choices:[{message:{content:"Done"},finish_reason:"stop"}],
+    }));
+    globalThis.fetch=fetchMock as typeof globalThis.fetch;
+    const settings={plan:"cloud" as const,authMode:"api-key" as const,apiKey:"test-key",model:"moa",reasoningEffort:"high" as const};
+    const provider=new AutohandAIProvider(settings);
+    provider.setReasoningEffort("xhigh");
+    await provider.complete({messages:[{role:"user",content:"Test"}]});
+    const body=JSON.parse(String(fetchMock.mock.calls[0]?.[1].body));
+    expect(body.extra_body.chat_template_kwargs.reasoning_effort).toBe("xhigh");
+    expect(settings.reasoningEffort).toBe("high");
+  });
+
   it("exposes Auto, Fantail, and Moa cloud models with the provider context contract", async () => {
     const provider = new AutohandAIProvider({
       plan: "cloud",
