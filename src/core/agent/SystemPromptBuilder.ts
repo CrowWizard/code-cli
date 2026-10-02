@@ -43,6 +43,8 @@ export interface SystemPromptBuilderOptions {
   getContextMemories: () => Promise<string>;
   loadInstructionFiles: () => Promise<string[]>;
   listSkills: () => PromptSkillSummary[];
+  /** Names-only skill index; defaults to on for ACP clients (see isAcpClient). */
+  compactSkillIndex?: boolean;
   getActiveSkills: () => PromptSkillSummary[];
   getTeam: () => PromptTeam | null;
 }
@@ -65,6 +67,19 @@ function hasCodexSkillInstallerMarkers(skill: PromptSkillSummary): boolean {
 function shouldAddAutohandSkillCompatibilityOverride(skill: PromptSkillSummary): boolean {
   return Boolean(skill.source && VENDOR_SKILL_SOURCES.includes(skill.source))
     || hasCodexSkillInstallerMarkers(skill);
+}
+
+/** True inside `autohand --mode acp` (runAcpMode sets AUTOHAND_CLIENT_NAME). */
+function isAcpClient(): boolean {
+  return process.env.AUTOHAND_CLIENT_NAME === 'acp';
+}
+
+/** Compact, stable skill index for the system prompt: sorted names, active ones marked. */
+export function formatSkillNameIndex(skills: readonly PromptSkillSummary[]): string {
+  return skills
+    .map((skill) => (skill.isActive ? `${skill.name} [ACTIVE]` : skill.name))
+    .sort((a, b) => a.localeCompare(b))
+    .join(', ');
 }
 
 function formatActiveSkillBody(skill: PromptSkillSummary): string {
@@ -433,10 +448,21 @@ export class SystemPromptBuilder {
     const allSkills = this.options.listSkills();
     if (allSkills.length > 0) {
       parts.push('', '## Available Skills');
-      parts.push('Skills are specialized instruction packages. Use the `skill` tool with command `activate` to activate a relevant learned or available skill.');
-      for (const skill of allSkills) {
-        const activeMarker = skill.isActive ? ' [ACTIVE]' : '';
-        parts.push(`- **${skill.name}**${activeMarker}: ${skill.description}`);
+      if (this.options.compactSkillIndex ?? isAcpClient()) {
+        // Protocol hosts (the desktop app over ACP) get names only: the full
+        // catalog is ~60 KB (~15k tokens) per request and dominated time-to-first-
+        // token for simple prompts. The model pulls details on demand. Terminal
+        // users keep the full catalog below.
+        parts.push(
+          'Skills are specialized instruction packages. When one of these names looks relevant, use the `skill` tool with command `info` to read its description, then `activate` to load it (`list` shows every skill with its description).'
+        );
+        parts.push(formatSkillNameIndex(allSkills));
+      } else {
+        parts.push('Skills are specialized instruction packages. Use the `skill` tool with command `activate` to activate a relevant learned or available skill.');
+        for (const skill of allSkills) {
+          const activeMarker = skill.isActive ? ' [ACTIVE]' : '';
+          parts.push(`- **${skill.name}**${activeMarker}: ${skill.description}`);
+        }
       }
     }
 

@@ -65,6 +65,8 @@ import { CommunitySkillsCache } from '../../skills/CommunitySkillsCache.js';
 import { GitHubRegistryFetcher } from '../../skills/GitHubRegistryFetcher.js';
 import { fetchRegistryWithFallback, installSkillWithSecurity } from '../../skills/communityInstaller.js';
 import { McpClientManager } from '../../mcp/McpClientManager.js';
+import { compactComputerUseResult, COMPUTER_USE_TOOL_PREFIX } from '../../computer/computerUseOutput.js';
+import { ComputerUseLifecycle } from '../../computer/ComputerUseLifecycle.js';
 import { resolveRuntimeMcpServers } from '../../computer/cuaDriver.js';
 import {
   findCommunityMcpServers,
@@ -360,6 +362,9 @@ function stringifyMcpValue(value: unknown): string | undefined {
       if (entry !== null && typeof entry === 'object') {
         if (seen.has(entry)) return '[circular reference omitted]';
         seen.add(entry);
+        if (isPlainRecord(entry) && (entry.type === 'image' || entry.type === 'audio') && typeof entry.data === 'string') {
+          return { ...entry, data: `[binary content omitted: ${entry.data.length} characters]` };
+        }
       }
       return entry;
     });
@@ -429,8 +434,8 @@ async function normalizeMcpToolOutcome(
   if (unsupportedImages > 0) {
     notes.push(`[Visual inspection unavailable] ${unsupportedImages} unsupported image${unsupportedImages === 1 ? ' was' : 's were'} omitted.`);
   }
-  const structured = text.length === 0 ? stringifyMcpValue(result.structuredContent) : undefined;
-  const outputParts = [...text, ...(structured ? [structured] : []), ...notes];
+  const structured = stringifyMcpValue(result.structuredContent);
+  const outputParts = [...text, ...(structured && !text.some(part => part.trim() === structured) ? [structured] : []), ...notes];
   const output = outputParts.length > 0 ? outputParts.join('\n') : undefined;
 
   if (result.isError === true) {
@@ -665,6 +670,7 @@ export function initializeAgentDependencies(
         }
       }
     });
+    host.computerUseLifecycle = new ComputerUseLifecycle(host.hookManager);
     host.permissionManager.setModeChangeListener?.(async (mode: PermissionMode, previousMode: PermissionMode) => {
       await host.hookManager.executeHooks('mode-change', { mode, previousMode });
     });
@@ -1337,9 +1343,11 @@ export function initializeAgentDependencies(
         let toolSuccess = false;
         let toolOutput: string | undefined;
         let toolError: string | undefined;
+        let toolAborted = false;
 
         try {
           // Emit tool_start only after ToolManager's canonical authorization.
+          await host.computerUseLifecycle.startAction({ tool: action.type, toolCallId: toolId, args: action });
           host.emitOutput({
             type: 'tool_start',
             toolId,
@@ -1769,8 +1777,6 @@ export function initializeAgentDependencies(
               }
             }
           } else if (McpClientManager.isMcpTool(action.type)) {
-            // Ensure MCP servers have finished connecting before dispatching
-            if (host.mcpReady) await host.mcpReady;
             // Route MCP tool calls to the MCP client manager
             const parsed = McpClientManager.parseMcpToolName(action.type);
             if (parsed) {
@@ -1781,7 +1787,10 @@ export function initializeAgentDependencies(
                 mcpArgs,
                 { signal: context?.signal },
               );
-              outcome = await normalizeMcpToolOutcome(mcpResult, context);
+              outcome = await normalizeMcpToolOutcome(
+                action.type.startsWith(COMPUTER_USE_TOOL_PREFIX) ? compactComputerUseResult(mcpResult) : mcpResult,
+                context,
+              );
             } else {
               const error = `Invalid MCP tool name: ${action.type}`;
               outcome = { success: false, kind: 'validation', error, output: error };
@@ -1826,6 +1835,7 @@ export function initializeAgentDependencies(
           toolSuccess = finalOutcome.success;
           toolOutput = readableOutput;
           toolError = finalOutcome.success ? undefined : finalOutcome.error;
+          toolAborted = !finalOutcome.success && finalOutcome.kind === 'aborted';
 
           return finalOutcome;
         } catch (error) {
@@ -1833,6 +1843,7 @@ export function initializeAgentDependencies(
           const errorMessage = rawMessage.trim() || 'Tool execution failed.';
           toolOutput = errorMessage;
           toolError = errorMessage;
+          toolAborted = context?.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError');
 
           // Track failed tool use
           await host.telemetryManager.trackToolUse({
@@ -1859,10 +1870,7 @@ export function initializeAgentDependencies(
 
           return {
             success: false,
-            kind: context?.signal?.aborted === true
-              || (error instanceof Error && error.name === 'AbortError')
-              ? 'aborted'
-              : 'operational',
+            kind: toolAborted ? 'aborted' : 'operational',
             error: errorMessage,
           } satisfies ToolActionOutcome;
         } finally {
@@ -1875,6 +1883,9 @@ export function initializeAgentDependencies(
             toolOutput,
             toolError,
           });
+          await host.computerUseLifecycle.finishAction({ tool: action.type, toolCallId: toolId, args: action,
+            success: toolSuccess, output: toolOutput, error: toolError, duration: Date.now() - startTime,
+          }, toolAborted || context?.signal?.aborted === true);
         }
       },
       confirmApproval: (message, context) => host.confirmDangerousAction(message, context),

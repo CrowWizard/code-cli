@@ -10,13 +10,16 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { LoadedConfig, McpServerConfigEntry } from '../types.js';
+import { resolveAutohandHome } from '../constants.js';
 import {
   AUTOHAND_COMPUTER_USE_BUNDLE_ID,
   resolveAutohandComputerUseHostPath,
 } from './autohandComputerUse.js';
 
 export const CUA_DRIVER_VERSION = '0.28.2';
+export const AUTOHAND_COMPUTER_USE_MCP_SERVER_NAME = 'autohand-computer-use';
 export const CUA_DRIVER_MCP_SERVER_NAME = 'cua-driver';
+const CUA_MCP_SERVER_NAME = 'cua';
 
 const executeFile = promisify(execFile);
 
@@ -168,11 +171,25 @@ function isDisabledValue(value: string | undefined): boolean {
   return value !== undefined && /^(?:1|true|yes|on)$/iu.test(value.trim());
 }
 
-function isCuaServer(server: McpServerConfigEntry): boolean {
+export function isComputerUseMcpServerName(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  return normalized === AUTOHAND_COMPUTER_USE_MCP_SERVER_NAME
+    || normalized === CUA_DRIVER_MCP_SERVER_NAME
+    || normalized === CUA_MCP_SERVER_NAME;
+}
+
+export function isComputerUseMcpServer(server: McpServerConfigEntry): boolean {
   const name = server.name.trim().toLowerCase();
-  if (name === 'cua' || name === CUA_DRIVER_MCP_SERVER_NAME) return true;
+  if (isComputerUseMcpServerName(name)) return true;
   if (!server.command) return false;
   return path.basename(server.command).toLowerCase().replace(/\.exe$/u, '') === 'cua-driver';
+}
+
+export function resolveComputerUseMcpServerName(
+  servers: readonly McpServerConfigEntry[] | undefined,
+): string {
+  return servers?.find(isComputerUseMcpServer)?.name
+    ?? AUTOHAND_COMPUTER_USE_MCP_SERVER_NAME;
 }
 
 /**
@@ -198,7 +215,7 @@ export function ensureCuaMcpServer(
     return { status: 'disabled' };
   }
 
-  const existing = config.mcp?.servers?.find(isCuaServer);
+  const existing = config.mcp?.servers?.find(isComputerUseMcpServer);
   if (existing) {
     return { status: 'existing', ...(existing.command ? { path: existing.command } : {}) };
   }
@@ -225,13 +242,14 @@ export function ensureCuaMcpServer(
     servers: [
       ...(config.mcp?.servers ?? []),
       {
-        name: CUA_DRIVER_MCP_SERVER_NAME,
+        name: AUTOHAND_COMPUTER_USE_MCP_SERVER_NAME,
         transport: 'stdio',
         stdioFraming: 'newline',
         command,
         args,
         autoConnect: true,
         env: {
+          CUA_DRIVER_CURSOR_THEME_DIR: path.resolve(resolveAutohandHome({ environment: env }), 'computer-use', 'cursor-themes'),
           CUA_DRIVER_PERMISSION_MODE: 'standard',
           CUA_DRIVER_RS_TELEMETRY_ENABLED: '0',
           ...(computerUseHostPath

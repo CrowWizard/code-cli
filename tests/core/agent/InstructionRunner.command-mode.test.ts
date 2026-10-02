@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
+import * as computerUse from '../../../src/computer/autohandComputerUse.js';
 import { GoalManager } from '../../../src/goals/GoalManager.js';
 import { InstructionRunner, type AgentInstructionHost } from '../../../src/core/agent/InstructionRunner.js';
 import { startDeepResearchRun } from '../../../src/deepResearch/session.js';
@@ -15,6 +16,7 @@ import {
   shouldUsePassiveAgentSessionRetry,
 } from '../../../src/core/agent/InputTurnCoordinator.js';
 import { HookManager } from '../../../src/core/HookManager.js';
+import { ComputerUseLifecycle } from '../../../src/computer/ComputerUseLifecycle.js';
 import { ApiError, classifyApiError } from '../../../src/providers/errors.js';
 import { ProviderNotConfiguredError } from '../../../src/providers/ProviderFactory.js';
 
@@ -97,7 +99,7 @@ function createHost(): AgentInstructionHost {
     setupPersistentInputInterruptHandlers: vi.fn(() => vi.fn()),
     setupEscListener: vi.fn(() => vi.fn()),
     startPreparationStatus: vi.fn(() => vi.fn()),
-    buildUserMessage: vi.fn(async instruction => instruction),
+    buildTurnContext: vi.fn(async instruction => instruction),
     setUIStatus: vi.fn(),
     saveUserMessage: vi.fn(async () => {}),
     updateContextUsage: vi.fn(),
@@ -118,6 +120,80 @@ function createHost(): AgentInstructionHost {
 }
 
 describe('InstructionRunner command mode UI', () => {
+  it.each(['finished', 'failed', 'cancelled'] as const)('settles the Computer Use lifecycle once when the turn is %s', async status => {
+    const host = createHost();
+    const manager = new HookManager({ workspaceRoot: '/tmp', settings: { enabled: false } });
+    const observer = vi.fn();
+    const unsubscribe = manager.subscribeLifecycle(observer);
+    host.computerUseLifecycle = new ComputerUseLifecycle(manager);
+    host.runReactLoop = vi.fn(async controller => {
+      await host.computerUseLifecycle!.startAction({ tool: 'mcp__autohand-computer-use__list_apps', toolCallId: 'discover' });
+      if (status === 'failed') throw new Error('fixture provider failure');
+      if (status === 'cancelled') controller.abort();
+      return { status: status === 'cancelled' ? 'aborted' : 'completed' };
+    });
+    try {
+      expect(await new InstructionRunner(host).run('inspect the fixture')).toBe(status === 'finished');
+      await host.computerUseLifecycle.finish('cancelled');
+      const stops = observer.mock.calls.map(([event]) => event).filter(event => event.event === 'computer-use-stop');
+      expect(stops).toHaveLength(1);
+      expect(stops[0]).toMatchObject({ computerUseStatus: status, toolCallsCount: 1 });
+      expect(host.cleanupUI).toHaveBeenCalled();
+    } finally { unsubscribe(); }
+  });
+  it.each(['open my browser', 'open the Calculator app', 'type hello in the TextEdit window'])(
+    'stops %s before inference when the shared native permission check fails', async instruction => {
+      const host = createHost();
+      const issue = 'Autohand Computer Use needs Accessibility permission.';
+      const check = vi.spyOn(computerUse, 'getManagedComputerUsePermissionIssue').mockResolvedValue(issue);
+      try {
+        expect(await new InstructionRunner(host).run(instruction)).toBe(false);
+        expect(host.emitOutput).toHaveBeenCalledWith({ type: 'error', content: issue });
+        expect(host.buildTurnContext).not.toHaveBeenCalled();
+        expect(host.runReactLoop).not.toHaveBeenCalled();
+        expect(host.isInstructionActive).toBe(false);
+      } finally { check.mockRestore(); }
+    },
+  );
+
+  it('does not inspect desktop permissions for an ordinary coding request', async () => {
+    const check = vi.spyOn(computerUse, 'getManagedComputerUsePermissionIssue');
+    try {
+      expect(await new InstructionRunner(createHost()).run('explain this TypeScript function')).toBe(true);
+      expect(check).not.toHaveBeenCalled();
+    } finally { check.mockRestore(); }
+  });
+
+  it('keeps native permission inspection cancellable and releases turn state', async () => {
+    const host = createHost();
+    const check = vi.spyOn(computerUse, 'getManagedComputerUsePermissionIssue').mockImplementation(async () => {
+      expect(host.isInstructionActive).toBe(true);
+      expect(host.activeAbortController).not.toBeNull();
+      host.activeAbortController?.abort();
+      return undefined;
+    });
+    try {
+      expect(await new InstructionRunner(host).run('open the Calculator app')).toBe(false);
+      expect(host.runReactLoop).not.toHaveBeenCalled();
+      expect(host.activeAbortController).toBeNull();
+      expect(host.isInstructionActive).toBe(false);
+    } finally { check.mockRestore(); }
+  });
+
+  it('keeps the human instruction separate from generated native-control context', async () => {
+    const host = createHost();
+    const instruction = 'open my computer and use spotify find felix rosch and play a song from him';
+    const context = 'Workspace: /private/project\nComputer control mode: observe before acting.';
+    host.buildTurnContext = vi.fn(async () => context);
+
+    expect(await new InstructionRunner(host).run(instruction)).toBe(true);
+    expect(host.conversation.addMessage).toHaveBeenCalledWith({ role: 'user', content: instruction });
+    expect(host.conversation.addSystemNote).toHaveBeenCalledWith(context);
+    expect(vi.mocked(host.conversation.addMessage).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(host.conversation.addSystemNote).mock.invocationCallOrder.at(-1)!);
+    expect(host.saveUserMessage).toHaveBeenCalledWith(instruction);
+  });
+
   const restoreFns: Array<() => void> = [];
 
   afterEach(() => {
@@ -185,7 +261,7 @@ describe('InstructionRunner command mode UI', () => {
       event: 'pre-prompt', command: `printf '%s' '{"decision":"block","reason":"PROMPT_BLOCKED"}'`,
     }] } });
     expect(await new InstructionRunner(host).run('blocked prompt')).toBe(false);
-    expect(host.buildUserMessage).not.toHaveBeenCalled();
+    expect(host.buildTurnContext).not.toHaveBeenCalled();
     expect(host.runReactLoop).not.toHaveBeenCalled();
     expect(host.runEnvironmentBootstrap).not.toHaveBeenCalled();
     expect(host.isInstructionActive).toBe(false);
@@ -248,7 +324,7 @@ describe('InstructionRunner command mode UI', () => {
     })).resolves.toBe(true);
 
     expect(host.printUserInstructionToChatLog).not.toHaveBeenCalled();
-    expect(host.buildUserMessage).toHaveBeenCalledWith(instruction);
+    expect(host.buildTurnContext).toHaveBeenCalledWith(instruction);
     expect(host.saveUserMessage).toHaveBeenCalledWith(instruction);
     expect(host.conversation.addMessage).toHaveBeenCalledWith({
       role: 'user',

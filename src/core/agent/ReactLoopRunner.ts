@@ -8,6 +8,7 @@ import type { PermissionManager } from '../../permissions/PermissionManager.js';
 import { getProviderConfig } from '../../config.js';
 import { isSearchConfigured } from '../../actions/web.js';
 import { formatToolOutputForDisplay, type ToolOutputDisplay } from '../../ui/toolOutput.js';
+import { COMPUTER_USE_TOOL_PREFIX } from '../../computer/computerUseOutput.js';
 import { getPlanModeManager } from '../../commands/plan.js';
 import type {
   AgentAction,
@@ -76,7 +77,7 @@ import {
   PromptCacheToolSet,
 } from './PromptCache.js';
 import { usesAutohandAICloud } from '../../providers/AutohandAIProvider.js';
-import { StreamingResponsePreview } from './StreamingResponsePreview.js';
+import { combineDeltaHandlers, StreamedOutputRelay, StreamingResponsePreview } from './StreamingResponsePreview.js';
 import type { RunBudgetGate } from './RunBudget.js';
 
 const COMPLETION_REMINDER_TOOL_BATCH_THRESHOLD = 3;
@@ -148,6 +149,8 @@ class LoopAbortedError extends Error {
 }
 
 export interface ReactLoopInkRenderer {
+  startComputerUseStep?(id: string, tool: string, args: Record<string, unknown>): void;
+  finishComputerUseStep?(id: string, success: boolean, output: string): void;
   setStatus(status: string): void;
   addToolCall(tool: AgentAction['type'], detail: string): void;
   addToolOutputBatch(
@@ -593,6 +596,9 @@ export async function runAgentReactLoop(
     let toolFreeRecoveryCount = 0;
     let invalidLoopGuardFinalCount = 0;
     let pendingTodoReminderSent = false;
+    // The relay of the most recent model request; the final events it already
+    // streamed to output listeners are flagged so protocol hosts do not repeat them.
+    let streamedOutput: StreamedOutputRelay | undefined;
 
     const renderFinalResponse = (
       response: string,
@@ -603,9 +609,17 @@ export async function runAgentReactLoop(
       host.lastAssistantResponseForNotification = response;
 
       if (options.thought) {
-        host.emitOutput({ type: 'thinking', thought: options.thought });
+        host.emitOutput({
+          type: 'thinking',
+          thought: options.thought,
+          ...(streamedOutput?.hasStreamedThought(options.thought) ? { streamed: true } : {}),
+        });
       }
-      host.emitOutput({ type: 'message', content: response });
+      host.emitOutput({
+        type: 'message',
+        content: response,
+        ...(streamedOutput?.hasStreamedContent(response) ? { streamed: true } : {}),
+      });
 
       if (host.inkRenderer) {
         if (showThinking && options.thought) {
@@ -803,6 +817,13 @@ export async function runAgentReactLoop(
         const preview = supportsStreaming && host.inkRenderer?.setStreamingResponse
           ? new StreamingResponsePreview((text) => host.inkRenderer?.setStreamingResponse?.(text))
           : undefined;
+        // Output listeners (ACP, RPC, command output) receive the same deltas
+        // as the terminal preview, so protocol hosts show the reply as it arrives.
+        streamedOutput = supportsStreaming ? new StreamedOutputRelay((event) => host.emitOutput(event)) : undefined;
+        const relay = streamedOutput;
+        const onRetry = relay
+          ? (event: LLMRetryEvent) => { retryWait.handle(event); relay.onRetry(event); }
+          : retryWait.handle;
         try {
           completion = await host.llm.complete({
             messages: messagesWithImages,
@@ -814,8 +835,8 @@ export async function runAgentReactLoop(
             maxTokens: 16000,  // Allow large outputs for file generation
             thinkingLevel,
             promptCache: getSessionPromptCacheDirective(host),
-            onRetry: retryWait.handle,
-            ...(supportsStreaming ? { stream: true, onDelta: preview?.onDelta } : {}),
+            onRetry,
+            ...(supportsStreaming ? { stream: true, onDelta: combineDeltaHandlers(preview?.onDelta, relay?.onDelta) } : {}),
           });
         } finally {
           retryWait.dispose();
@@ -1153,7 +1174,15 @@ export async function runAgentReactLoop(
           : undefined;
 
         if (host.inkRenderer && displayToolOutput) {
-          for (const line of collapseToolCallLogLines(payload.toolCalls)) {
+          const nativeLane = Boolean(host.inkRenderer.startComputerUseStep && host.inkRenderer.finishComputerUseStep);
+          if (nativeLane) {
+            otherCalls.forEach((call, index) => {
+              if (call.tool.startsWith(COMPUTER_USE_TOOL_PREFIX)) {
+                host.inkRenderer?.startComputerUseStep?.(call.id ?? `computer-${iteration}-${index}`, call.tool, call.args ?? {});
+              }
+            });
+          }
+          for (const line of collapseToolCallLogLines(payload.toolCalls.filter(call => !nativeLane || !call.tool.startsWith(COMPUTER_USE_TOOL_PREFIX)))) {
             host.inkRenderer.addToolCall(line.tool, line.detail);
           }
         }
@@ -1332,6 +1361,12 @@ export async function runAgentReactLoop(
               }
               const resultThought = completedCount === 1 ? thought : undefined;
               const call = otherCalls[index];
+              if (displayToolOutput && result.tool.startsWith(COMPUTER_USE_TOOL_PREFIX)
+                && host.inkRenderer?.startComputerUseStep && host.inkRenderer.finishComputerUseStep) {
+                host.inkRenderer.finishComputerUseStep(call?.id ?? `computer-${iteration}-${index}`, result.success,
+                  result.success ? result.output ?? '' : result.error ?? result.output ?? '');
+                return;
+              }
               const group = host.inkRenderer && displayToolOutput ? pendingGroups.get(result.tool) : undefined;
               if (!group) {
                 renderToolResult(result, call, resultThought);

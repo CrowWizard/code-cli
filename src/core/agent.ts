@@ -155,6 +155,7 @@ import {
 } from './agent/ReactLoopRunner.js';
 import { DEFAULT_RESPONSE_COMPLETION_HOOKS } from './agent/ResponseCompletionClassifier.js';
 import { initializeAgentDependencies, type AgentDependencyHost } from './agent/AgentDependencyComposer.js';
+import type { ComputerUseLifecycle } from '../computer/ComputerUseLifecycle.js';
 import {
   InstructionRunner,
   type AgentInstructionHost,
@@ -263,7 +264,7 @@ import {
   steerAgentActiveInstruction,
 } from './agent/AgentUIRuntime.js';
 import {
-  buildAgentUserMessage,
+  buildAgentTurnContext,
   collectAgentContextSummary,
   formatAgentStatusLine,
   generateAgentSessionBootstrap,
@@ -400,6 +401,7 @@ export class AutohandAgent {
   private turnMemoryReflectionAbortController: AbortController | null = null;
   private permissionManager!: PermissionManager;
   private hookManager!: HookManager;
+  private computerUseLifecycle?: ComputerUseLifecycle;
   private delegator!: AgentDelegator;
   private specialistOrchestrator!: SpecialistOrchestrator;
   private feedbackManager!: FeedbackManager;
@@ -1070,7 +1072,10 @@ export class AutohandAgent {
   }
 
   private async executeAdmittedInstruction(instruction: string, options?: RunInstructionOptions): Promise<boolean> {
-    await this.refreshAccountPlan();
+    // The turn runs on the last known plan; the refresh completes in the
+    // background so a slow or failing /auth/me never delays the prompt.
+    await this.alignCloudModelWithTier(this.accountPlan?.tier);
+    void this.refreshAccountPlan();
     if (options?.signal?.aborted || this.shouldExit) return false;
     this.currentInstructionText = instruction;
     try {
@@ -1291,6 +1296,7 @@ export class AutohandAgent {
 
   async shutdown(options: AgentShutdownOptions = {}): Promise<void> {
     this.shutdownPromise ??= (async () => {
+      await this.computerUseLifecycle?.finish('cancelled');
       await this.flushTurnMemoryReflection();
       await closeAgentSession(this as unknown as AgentSessionAccountingHost, options);
     })();
@@ -1437,8 +1443,8 @@ export class AutohandAgent {
     return `Cropped ${removed.length} message(s) from the ${direction}.`;
   }
 
-  private async buildUserMessage(instruction: string): Promise<string> {
-    return buildAgentUserMessage(this as unknown as AgentContextRuntimeHost, instruction);
+  private async buildTurnContext(instruction: string): Promise<string> {
+    return buildAgentTurnContext(this as unknown as AgentContextRuntimeHost, instruction);
   }
 
   private async prepareSpecialists(instruction: string): Promise<string | undefined> {
@@ -1591,6 +1597,8 @@ export class AutohandAgent {
    * Refresh the plan and payment notice without requiring a restart. At an idle
    * instruction boundary, align the Cloud model with current access. Failed
    * refreshes retain the last known display; the API enforces each request.
+   * Prompt admission does not wait for this: the turn starts on the last known
+   * plan and picks up the fresh one afterwards.
    */
   private refreshAccountPlan(): Promise<void> {
     if (this.accountPlanRefresh) return this.accountPlanRefresh;
@@ -1623,13 +1631,7 @@ export class AutohandAgent {
         if (!this.runtime.isRpcMode) this.notifyUser(content);
       }
       this.lastPaymentNotice = noticeId;
-      const settings = this.runtime.config.autohandai;
-      const model = this.runtime.options.model ?? settings?.model;
-      const resolvedModel = resolveAutohandAIModelForTier({ provider: this.activeProvider, plan: settings?.plan, model, tier: entitlement.tier });
-      if (!this.isInstructionActive && model && resolvedModel !== model && this.providerConfigManager) {
-        if (settings) delete settings.reasoningEffort;
-        await this.providerConfigManager.applyModelChangeRemote('autohandai', resolvedModel);
-      }
+      await this.alignCloudModelWithTier(entitlement.tier);
       const changed =
         next?.tier !== this.accountPlan?.tier ||
         next?.interval !== this.accountPlan?.interval ||
@@ -1641,6 +1643,22 @@ export class AutohandAgent {
     } catch {
       // Leave the last known plan in place rather than blanking the status line.
     }
+  }
+
+  /**
+   * Downgrade a Cloud model the tier cannot run (Moa on Free) before a request
+   * is made. Only idle boundaries switch models, so a refresh landing mid-turn
+   * defers to the next prompt admission, which re-applies the last known tier.
+   */
+  private async alignCloudModelWithTier(tier: string | undefined): Promise<void> {
+    if (this.isInstructionActive || !this.providerConfigManager) return;
+    const settings = this.runtime.config.autohandai;
+    const model = this.runtime.options.model ?? settings?.model;
+    if (!model) return;
+    const resolvedModel = resolveAutohandAIModelForTier({ provider: this.activeProvider, plan: settings?.plan, model, tier });
+    if (resolvedModel === model) return;
+    if (settings) delete settings.reasoningEffort;
+    await this.providerConfigManager.applyModelChangeRemote('autohandai', resolvedModel);
   }
 
   private startAccountPlanRefresh(): void {
