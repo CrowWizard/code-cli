@@ -733,6 +733,7 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       host.persistentConsoleBridgeCleanup = null;
       callResourceCleanupSync(host.announcementUnsubscribe ?? undefined);
       host.announcementUnsubscribe = null;
+      callResourceCleanupSync(() => host.feedbackSurvey?.dispose());
       callResourceCleanupSync(host.teamActivityUnsubscribe ?? undefined);
       host.teamActivityUnsubscribe = null;
       callResourceCleanupSync(host.goalActivityUnsubscribe ?? undefined);
@@ -1740,6 +1741,9 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
           continue;
         }
 
+        // The user moved on: an unanswered session survey must not linger.
+        host.feedbackSurvey?.clear();
+
         // Handle ! shell commands locally (never send to LLM)
         if (!mobileTurn && isShellCommand(instruction)) {
           const shellCmd = parseShellCommand(instruction);
@@ -1879,11 +1883,6 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         if (!mobileTurn && (instruction.trim() === '/exit' || instruction.trim() === '/quit')) {
           // Fire-and-forget: don't block quit on telemetry
           host.telemetryManager.trackCommand({ command: instruction }).catch(() => {});
-          const trigger = host.feedbackManager.shouldPrompt({ sessionEnding: true });
-          if (trigger) {
-            const session = host.sessionManager.getCurrentSession();
-            await host.showFeedbackWithPause(trigger, session?.metadata.sessionId);
-          }
           await host.closeSession();
           return;
         }
@@ -1992,7 +1991,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
 
         if (feedbackTrigger) {
           const session = host.sessionManager.getCurrentSession();
-          await host.showFeedbackWithPause(feedbackTrigger, session?.metadata.sessionId);
+          host.feedbackSurvey?.show(feedbackTrigger, session?.metadata.sessionId);
         }
 
         console.log();

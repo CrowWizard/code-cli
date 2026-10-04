@@ -77,6 +77,7 @@ import {
   type InteractionMode,
 } from '../../core/agent/InteractionModeController.js';
 import { AnnouncementLine } from './AnnouncementLine.js';
+import { FeedbackSurveyLine, type FeedbackSurveyState } from './FeedbackSurveyLine.js';
 import { IdleTipRow, TipLine } from './TipLine.js';
 import {
   REQUEST_CURSOR_POSITION,
@@ -122,6 +123,7 @@ function colorizeGlyphText(hex: string, text: string): string {
 }
 
 export type { ActivityItem } from './TaskActivityPanel.js';
+export type { FeedbackSurveyState } from './FeedbackSurveyLine.js';
 
 export interface ContextTokenDisplay {
   used: number;
@@ -239,6 +241,8 @@ export interface AgentUIState {
   goalPanelVisible: boolean;
   /** Highest-priority active CLI announcement rendered above status. */
   announcement?: AnnouncementLineState;
+  /** Optional session survey rendered above status; never takes focus from the composer. */
+  feedbackSurvey?: FeedbackSurveyState;
   /** Rotating tip while working, or a pinned upgrade hint, rendered under the status line. */
   tip?: TipLineState;
   /** Compact command result placed below the status line instead of transcript history. */
@@ -270,6 +274,8 @@ export interface AgentUIProps {
   onCtrlC: () => void;
   /** Dismiss the currently rendered announcement without changing composer input. */
   onDismissAnnouncement?: (id: string) => void;
+  /** An option key pressed on an empty composer while the survey is showing. */
+  onFeedbackSurveyAnswer?: (id: string, key: string) => void;
   onToggleLiveCommandExpanded?: (id?: string) => void;
   onToggleToolOutputExpanded?: () => void;
   /** Toggle the expanded live team view. */
@@ -839,6 +845,7 @@ export function AgentUI({
   onEscape,
   onCtrlC,
   onDismissAnnouncement,
+  onFeedbackSurveyAnswer,
   onToggleLiveCommandExpanded,
   onToggleToolOutputExpanded,
   onToggleTeamPanel,
@@ -1004,6 +1011,10 @@ export function AgentUI({
   onDismissAnnouncementRef.current = onDismissAnnouncement;
   const announcementRef = useRef(state.announcement);
   announcementRef.current = state.announcement;
+  const onFeedbackSurveyAnswerRef = useRef(onFeedbackSurveyAnswer);
+  onFeedbackSurveyAnswerRef.current = onFeedbackSurveyAnswer;
+  const feedbackSurveyRef = useRef(state.feedbackSurvey);
+  feedbackSurveyRef.current = state.feedbackSurvey;
   const onToggleLiveCommandExpandedRef = useRef(onToggleLiveCommandExpanded);
   onToggleLiveCommandExpandedRef.current = onToggleLiveCommandExpanded;
   const onToggleToolOutputExpandedRef = useRef(onToggleToolOutputExpanded);
@@ -1906,6 +1917,21 @@ export function AgentUI({
       return;
     }
 
+    // The survey only claims its option keys while there is no draft, so a
+    // prompt can always be typed and submitted without answering it.
+    const survey = feedbackSurveyRef.current;
+    if (
+      survey &&
+      !survey.acknowledgement &&
+      !key.ctrl &&
+      !key.meta &&
+      textBufferRef.current.getText().length === 0 &&
+      survey.options.some((option) => option.key === char)
+    ) {
+      onFeedbackSurveyAnswerRef.current?.(survey.id, char);
+      return;
+    }
+
     if (activeKeybindings.matches('toggleLiveOutput', keyEvent)) {
       if (liveCommandsRef.current.length > 0) {
         onToggleLiveCommandExpandedRef.current?.();
@@ -2750,6 +2776,7 @@ export function AgentUI({
       ) : <FixedBottom
         onWorkingSpinnerFrame={onWorkingSpinnerFrame}
         announcement={state.announcement}
+        feedbackSurvey={state.feedbackSurvey}
         tip={state.tip}
         terminalColumns={windowSize.columns ?? process.stdout.columns ?? 80}
         terminalRows={windowSize.rows}
@@ -3572,6 +3599,7 @@ const MessageTargetWrapper = memo(function MessageTargetWrapper({
 interface FixedBottomProps {
   onWorkingSpinnerFrame?: (frame: number) => void;
   announcement?: AnnouncementLineState;
+  feedbackSurvey?: FeedbackSurveyState;
   terminalColumns: number;
   terminalRows?: number;
   isWorking: boolean;
@@ -3688,6 +3716,7 @@ function useUserDrivenComposerCursor(
 const FixedBottom = memo(function FixedBottom({
   onWorkingSpinnerFrame,
   announcement,
+  feedbackSurvey,
   terminalColumns,
   terminalRows,
   isWorking,
@@ -3751,6 +3780,9 @@ const FixedBottom = memo(function FixedBottom({
           visible={announcement.visible}
           columns={terminalColumns}
         />
+      ) : null}
+      {feedbackSurvey ? (
+        <FeedbackSurveyLine survey={feedbackSurvey} columns={terminalColumns} />
       ) : null}
       <StatusSection
         terminalRows={terminalRows}
