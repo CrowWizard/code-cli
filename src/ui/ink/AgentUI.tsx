@@ -71,11 +71,7 @@ import { ComputerUseProgress } from './ComputerUseProgress.js';
 import { TypedMessageHistory, type TypedMessageEntry } from '../../session/TypedMessageHistory.js';
 import type { TaskListPosition } from '../../types.js';
 import { formatCompactTokens } from '../../core/agent/AgentFormatter.js';
-import {
-  getInteractionModeDescription,
-  getInteractionModeIndicator,
-  type InteractionMode,
-} from '../../core/agent/InteractionModeController.js';
+import type { InteractionMode } from '../../core/agent/InteractionModeController.js';
 import { AnnouncementLine } from './AnnouncementLine.js';
 import { FeedbackSurveyLine, type FeedbackSurveyState } from './FeedbackSurveyLine.js';
 import { IdleTipRow, TipLine } from './TipLine.js';
@@ -195,8 +191,6 @@ export interface AgentUIState {
   streamingResponse?: string | null;
   /** Completion stats shown after work finishes */
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
-  /** Plan mode indicator (e.g., '[PLAN]' or '[EXEC]') */
-  planModeIndicator?: string;
   /** Context percentage remaining (0-100) */
   contextPercent?: number;
   /** Current context occupancy and active model context window. */
@@ -900,8 +894,6 @@ export function AgentUI({
   const [isReadingHistory, setIsReadingHistory] = useState(false);
   const readingHistoryRef = useRef(false);
   const [ctrlCCount, setCtrlCCount] = useState(0);
-  const [planModeIndicator, setPlanModeIndicator] = useState('');
-  const [planModeStatusKey, setPlanModeStatusKey] = useState('');
   const [interactionMode, setInteractionMode] = useState<InteractionMode>(
     getInteractionMode?.() ?? state.interactionMode ?? 'default'
   );
@@ -1300,8 +1292,6 @@ export function AgentUI({
   useEffect(() => {
     const planModeManager = getPlanModeManager();
     const updateIndicator = () => {
-      setPlanModeIndicator(planModeManager.getPromptIndicator());
-      setPlanModeStatusKey(planModeManager.getStatusDescriptionKey());
       setInteractionMode(
         getInteractionModeRef.current?.()
           ?? (planModeManager.isEnabled() ? 'plan' : 'default')
@@ -2714,12 +2704,6 @@ export function AgentUI({
   const effectiveLineExtensions = state.lineExtensions ?? lineExtensions;
   const effectiveConfiguredLineExtensions = state.configuredLineExtensions;
   const effectiveRuntimeLineExtensions = state.extensionLineExtensions;
-  const interactionModeIndicator = interactionMode === 'plan'
-    ? planModeIndicator || getInteractionModeIndicator('plan')
-    : getInteractionModeIndicator(interactionMode);
-  const interactionModeDescription = interactionMode === 'plan' && planModeStatusKey
-    ? t(planModeStatusKey)
-    : getInteractionModeDescription(interactionMode);
 
   return (
     <Box flexDirection="column">
@@ -2855,8 +2839,6 @@ export function AgentUI({
         showShortcuts={showShortcuts}
         interactionMode={interactionMode}
         showModeLabel={state.showModeLabel ?? true}
-        modeIndicator={interactionModeIndicator}
-        modeDescription={interactionModeDescription}
         taskListPosition={taskListPosition}
       />}
     </Box>
@@ -3143,10 +3125,6 @@ interface StatusSectionProps {
   contextTokens?: ContextTokenDisplay;
   provider?: string;
   model?: string;
-  /** Bracketed mode indicator (e.g. "[AUTO]"); empty in default mode. */
-  modeIndicator?: string;
-  /** Human-readable description paired with the bracketed indicator. */
-  modeDescription?: string;
   taskListPosition: TaskListPosition;
   lineExtension?: LineExtension;
   tip?: TipLineState;
@@ -3244,8 +3222,6 @@ const StatusSection = memo(function StatusSection({
   contextTokens,
   provider,
   model,
-  modeIndicator,
-  modeDescription,
   taskListPosition,
   lineExtension,
   tip,
@@ -3297,16 +3273,6 @@ const StatusSection = memo(function StatusSection({
         />
       ) : null}
 
-      {/* Below the status line: rendering it above the dynamic output region
-          flushes it into scrollback on every repaint once tool output exceeds
-          the viewport. */}
-      {modeIndicator ? (
-        <Box>
-          <Text color={colors.accent} bold>{modeIndicator}</Text>
-          <Text color={colors.muted}> {modeDescription}</Text>
-        </Box>
-      ) : null}
-
       {/* Info section - either queue or completion stats, stable position */}
       {showQueue && (
         <QueuedInstructionsPanel
@@ -3347,8 +3313,6 @@ const StatusSection = memo(function StatusSection({
          prev.commandResult?.output === next.commandResult?.output &&
          prev.provider === next.provider &&
          prev.model === next.model &&
-         prev.modeIndicator === next.modeIndicator &&
-         prev.modeDescription === next.modeDescription &&
          prev.tip === next.tip &&
          prev.columns === next.columns &&
          prev.taskListPosition === next.taskListPosition &&
@@ -3654,10 +3618,6 @@ interface FixedBottomProps {
   interactionMode?: InteractionMode;
   /** Whether to show the mode word (PLAN/YOLO/AUTO) next to the glyph. */
   showModeLabel?: boolean;
-  /** Bracketed mode indicator (e.g. "[AUTO]"); empty in default mode. */
-  modeIndicator?: string;
-  /** Human-readable description paired with the bracketed indicator. */
-  modeDescription?: string;
   taskListPosition: TaskListPosition;
 }
 
@@ -3765,8 +3725,6 @@ const FixedBottom = memo(function FixedBottom({
   keybindings,
   interactionMode,
   showModeLabel,
-  modeIndicator,
-  modeDescription,
   taskListPosition,
 }: FixedBottomProps) {
   const composerCursorIntent = useUserDrivenComposerCursor(isWorking, input, cursorOffset);
@@ -3808,8 +3766,6 @@ const FixedBottom = memo(function FixedBottom({
         contextTokens={contextTokens}
         provider={provider}
         model={model}
-        modeIndicator={modeIndicator}
-        modeDescription={modeDescription}
         taskListPosition={taskListPosition}
         lineExtension={mergeLineExtensions(
           configuredLineExtensions?.status,
