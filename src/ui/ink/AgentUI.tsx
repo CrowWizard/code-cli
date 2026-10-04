@@ -989,6 +989,9 @@ export function AgentUI({
   isWorkingRef.current = state.isWorking;
   const liveCommandsRef = useRef(state.liveCommands);
   liveCommandsRef.current = state.liveCommands;
+  const hasExpandableToolOutput = state.toolOutputs.some((item) => item.type !== 'batch' && Boolean(item.expandedOutput));
+  const hasExpandableToolOutputRef = useRef(hasExpandableToolOutput);
+  hasExpandableToolOutputRef.current = hasExpandableToolOutput;
   const enableQueueInputRef = useRef(enableQueueInput);
   enableQueueInputRef.current = enableQueueInput;
   const enterWhileWorkingRef = useRef(enterWhileWorking);
@@ -1748,6 +1751,12 @@ export function AgentUI({
         // running subprocess rather than dropping that interaction.
         if (!clickedCell && liveCommandsRef.current.length > 0) {
           onToggleLiveCommandExpandedRef.current?.();
+          return;
+        }
+        // Finished output lives in scrollback and cannot be measured, so any
+        // click outside the composer opens the latest result that has more to show.
+        if (!clickedCell && hasExpandableToolOutputRef.current) {
+          onToggleToolOutputExpandedRef.current?.();
           return;
         }
         if (!clickedCell) {
@@ -2833,6 +2842,7 @@ export function AgentUI({
         isReadingHistory={isReadingHistory}
         enableMouseTargetControls={mouseComposerCursor && (
           liveCommandItems.length > 0
+          || hasExpandableToolOutput
           || (state.goalPanelVisible && goalItemsRef.current.length > 0)
         )}
         onComposerLayoutChange={handleComposerLayoutChange}
