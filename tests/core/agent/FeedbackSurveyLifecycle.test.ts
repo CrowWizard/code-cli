@@ -96,6 +96,24 @@ describe('feedback survey in the interactive loop', () => {
     expect(host.closeSession).toHaveBeenCalledOnce();
   });
 
+  it('preserves a draft typed after the feedback survey becomes visible', async () => {
+    let draft = '';
+    const { host } = createHost(['/feedback'], {
+      ui: {},
+      setComposerIdle: vi.fn(),
+      clearComposerInput: vi.fn(() => { draft = ''; }),
+      runSlashCommandWithInput: vi.fn(async () => {
+        draft = 'still typing';
+        host.shouldExit = true;
+        return null;
+      }),
+    });
+
+    await runAgentInteractiveLoop(host);
+
+    expect(draft).toBe('still typing');
+  });
+
   it('clears the previous survey as soon as the next prompt is submitted', async () => {
     const { host, events } = createHost(['first prompt', 'second prompt']);
 

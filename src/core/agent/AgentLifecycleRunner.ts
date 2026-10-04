@@ -1837,7 +1837,9 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
               );
               if (host.ui || host.inkRenderer) {
                 host.setComposerIdle();
-                if (command !== '/whatityped' && command !== '/peers') host.clearComposerInput();
+                if (command !== '/whatityped' && command !== '/peers' && command !== '/feedback') {
+                  host.clearComposerInput();
+                }
                 // Return to the top of the loop so the idle-wait path can await
                 // the next Composer submission without falling through to
                 // instruction.startsWith('/') which would throw on null.
