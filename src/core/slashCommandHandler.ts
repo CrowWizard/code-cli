@@ -43,8 +43,7 @@ export class SlashCommandHandler {
   async handle(command: string, args: string[] = []): Promise<string | null> {
     if (command === LEGACY_BROWSER_SLASH_COMMAND) {
       if (!this.commandMap.has(BROWSER_SLASH_COMMAND)) {
-        this.printUnsupported(command);
-        return null;
+        return this.formatUnsupported(command);
       }
       const result = await this.handle(BROWSER_SLASH_COMMAND, args);
       return result
@@ -59,12 +58,10 @@ export class SlashCommandHandler {
       implemented: true,
     } : undefined);
     if (!meta) {
-      this.printUnsupported(command);
-      return null;
+      return this.formatUnsupported(command);
     }
     if (meta && !meta.implemented) {
-      this.printUnimplemented(meta);
-      return null;
+      return this.formatUnimplemented(meta);
     }
 
     let usageOutcome: 'succeeded' | 'failed' = 'succeeded';
@@ -149,12 +146,7 @@ export class SlashCommandHandler {
         case '/help':
         case '/?': {
           const { help } = await import('../commands/help.js');
-          await this.ctx.onBeforeModal?.();
-          try {
-            return help();
-          } finally {
-            await this.ctx.onAfterModal?.();
-          }
+          return help();
         }
         case '/about': {
           const { about } = await import('../commands/about.js');
@@ -812,8 +804,7 @@ export class SlashCommandHandler {
         }
         default:
           usageOutcome = 'failed';
-          this.printUnsupported(command);
-          return null;
+          return this.formatUnsupported(command);
       }
     } catch (error) {
       usageOutcome = 'failed';
@@ -835,17 +826,15 @@ export class SlashCommandHandler {
     }
   }
 
-  private printUnsupported(command: string): void {
+  private formatUnsupported(command: string): string {
     const docLink = terminalLink('docs.autohand.ai', 'https://docs.autohand.ai');
-    console.log(
-      chalk.yellow(`Command ${command} is not supported. Please visit ${docLink} for supported actions or type -help.`)
-    );
+    return chalk.yellow(`Command ${command} is not supported. Please visit ${docLink} for supported actions or type -help.`);
   }
 
-  private printUnimplemented(command: SlashCommand): void {
-    console.log(chalk.yellow(`Command ${command.command} is not implemented yet.`));
-    if (command.prd) {
-      console.log(chalk.gray(`PRD: ${command.prd}`));
-    }
+  private formatUnimplemented(command: SlashCommand): string {
+    return [
+      chalk.yellow(`Command ${command.command} is not implemented yet.`),
+      ...(command.prd ? [chalk.gray(`PRD: ${command.prd}`)] : []),
+    ].join("\n");
   }
 }

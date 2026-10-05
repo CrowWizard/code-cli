@@ -101,6 +101,8 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
 
 /** Operational command results that belong with the fixed composer controls. */
 const FIXED_COMPOSER_RESULT_COMMANDS = new Set(['/tasks', '/team', '/teams', '/squad']);
+const TERMINAL_REPORT_COMMANDS = new Set(['/about', '/go', '/ps', '/deep-research', '/deep-search', '/help', '/?']);
+const TERMINAL_USAGE_COMMANDS = new Set(['/pr-review', '/deslop', '/tester']);
 
 export function shouldRenderSlashCommandResultInComposer(command: string): boolean {
   return FIXED_COMPOSER_RESULT_COMMANDS.has(command);
@@ -120,7 +122,7 @@ export function renderAgentSlashCommandResult(
   }
   if (shouldRenderSlashCommandResultInComposer(command)) {
     host.inkRenderer.setCommandResult?.(command, result);
-  } else if (command === '/about' || command === '/go' || command === '/ps') {
+  } else if (TERMINAL_REPORT_COMMANDS.has(command) || (TERMINAL_USAGE_COMMANDS.has(command) && result.startsWith('Usage:'))) {
     host.inkRenderer.addAssistantMessage?.(result, 'terminal');
   } else {
     host.inkRenderer.addAssistantMessage?.(result);

@@ -46,7 +46,7 @@ export const ShortcutsHelpPanel = memo(function ShortcutsHelpPanel({
     { title: fullScreen ? 'Transcript' : 'History', rows: [
       ['/whatityped', 'Typed history'], ...bindingRows('openHistory', 'Typed history'),
       ...bindingRows('toggleLiveOutput', 'Expand output'),
-      ...(fullScreen ? [['pgup / pgdn', 'Scroll'], ['ctrl+f', 'Find text'], ['ctrl+end', 'Latest']] as [string, string][] : []),
+      ...(fullScreen ? [['pgup / pgdn', 'Scroll'], ['ctrl+f', 'Find text'], ['ctrl+home', 'First message'], ['ctrl+end / esc', 'Back to bottom']] as [string, string][] : []),
       ['↑ / ↓', 'Recall prompt'],
     ] },
   ];

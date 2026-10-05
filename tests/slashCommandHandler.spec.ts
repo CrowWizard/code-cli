@@ -223,7 +223,7 @@ describe('SlashCommandHandler', () => {
 
     const result = await handler.handle(dummy);
 
-    expect(result).toBeNull();
+    expect(result).toContain('Command /does-not-exist is not supported.');
     expect(ctx.promptModelSelection).not.toHaveBeenCalled();
   });
 
@@ -237,9 +237,8 @@ describe('SlashCommandHandler', () => {
 
     const result = await handler.handle('/help');
 
-    expect(result).toBeNull();
-    expect(spy).toHaveBeenCalledWith(expect.stringContaining('not implemented'));
-    expect(spy).toHaveBeenCalledWith(expect.stringContaining('docs/prd/slash-help.md'));
+    expect(result).toContain('not implemented');
+    expect(result).toContain('docs/prd/slash-help.md');
     spy.mockRestore();
   });
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, cleanup } from 'ink-testing-library';
 import stripAnsi from 'strip-ansi';
 import { AgentUI, createInitialUIState } from '../../../src/ui/ink/AgentUI.js';
@@ -10,6 +10,25 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 afterEach(cleanup);
 
 describe('full-screen composer integration', () => {
+  it('dismisses shortcuts before leaving history and leaves interruption available at the tail', async () => {
+    const model = new FullScreenTranscript();
+    const state = { ...createInitialUIState(), chatMessages: Array.from({ length: 100 }, (_, i) => ({ role: 'assistant' as const, content: `Message ${i}` })) };
+    const onEscape = vi.fn();
+    const view = render(<I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={model} state={state} onInstruction={() => {}} onEscape={onEscape} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>);
+    await flush();
+    view.stdin.write('\x1b[5~'); await flush();
+    view.stdin.write('?'); await flush();
+    expect(stripAnsi(view.lastFrame() ?? '')).toContain('Keyboard shortcuts');
+    view.stdin.write('\x1b'); await flush();
+    expect(stripAnsi(view.lastFrame() ?? '')).not.toContain('Keyboard shortcuts');
+    expect(model.view(8).following).toBe(false);
+    view.stdin.write('\x1b'); await flush();
+    expect(model.view(8).following).toBe(true);
+    expect(onEscape).not.toHaveBeenCalled();
+    view.stdin.write('\x1b'); await flush();
+    expect(onEscape).toHaveBeenCalledOnce();
+  });
+
   it('keeps drafts editable while paging and searching long history', async () => {
     const state = { ...createInitialUIState(), currentInput: 'preserved draft', chatMessages: Array.from({ length: 200 }, (_, index) => ({ role: 'assistant' as const, content: `History entry ${index}` })) };
     const model = new FullScreenTranscript();

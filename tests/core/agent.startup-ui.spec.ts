@@ -2470,6 +2470,7 @@ describe('agent startup and active input UI', () => {
     expect(agent.inkRenderer.addUserMessage).toHaveBeenCalledWith('/deep-search status');
     expect(agent.inkRenderer.addAssistantMessage).toHaveBeenCalledWith(
       'State: Running\nProgress: 2/6 completed',
+      'terminal',
     );
     expect(agent.inkRenderer.addQueuedInstruction).not.toHaveBeenCalled();
   });

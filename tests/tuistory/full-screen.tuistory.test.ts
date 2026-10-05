@@ -104,6 +104,24 @@ describe('experimental full-screen terminal', () => {
     await exitInteractive(session);
   });
 
+  it('returns from status when Ghostty sends protocol-encoded Escape', async () => {
+    state = await createTempAutohandHome({ config: { features: { fullScreenMode: true }, ui: { promptSuggestions: false } } });
+    session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot, waitForDataTimeout: 15_000,
+      cols: 120, rows: 40, env: { TERM_PROGRAM: 'ghostty' },
+    });
+    await session.waitForText('❯');
+    await session.type('/status'); await session.press('enter');
+    await session.waitForText('(tab to cycle)');
+    session.writeRaw('\x1b[27u');
+    await session.waitForText('Full screen', { timeout: 2_000 });
+    await session.waitIdle();
+    await session.type('after enhanced escape');
+    await session.waitForText('❯ after enhanced escape');
+    await expect.poll(() => composerCaretLine(session)).toBe('❯ after enhanced escape|');
+    await exitInteractive(session);
+  });
+
   it('preserves the about logo and returns from status to an editable composer', async () => {
     state = await createTempAutohandHome({ config: { features: { fullScreenMode: true }, ui: { promptSuggestions: false } } });
     session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], {
@@ -130,6 +148,10 @@ describe('experimental full-screen terminal', () => {
     const snapshot = await readFile(new URL('../../src/testing/snapshots/full-screen.txt', import.meta.url), 'utf8');
     for (const line of snapshot.trimEnd().split('\n')) expect(outputViewport(session)).toContain(line);
     await session.type('preserved draft'); await session.waitForText('❯ preserved draft');
+    await session.write('\x1b[1;5H'); await session.waitForText('History item 0');
+    await session.waitForText('Back to bottom');
+    await session.press('esc'); await session.waitForText('History item 79');
+    expect(outputViewport(session)).toContain('preserved draft');
     await session.press('pageup'); await session.waitForText('Ctrl+End latest');
     expect(outputViewport(session)).not.toContain('History item 79');
     await session.press(['ctrl', 'f']); await session.type('History item 20'); await session.press('enter');
@@ -178,6 +200,45 @@ describe('experimental full-screen terminal', () => {
     expect(JSON.stringify(server.requests)).toContain('row-40');
     await exitInteractive(session);
   }, 90_000);
+
+  it('retains formatted help in scrollable history after redraw', async () => {
+    state = await createTempAutohandHome({ config: { features: { fullScreenMode: true }, ui: { promptSuggestions: false } } });
+    session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot, waitForDataTimeout: 15_000, cols: 120, rows: 40,
+    });
+    await session.waitForText('❯');
+    await session.type('/help'); await session.press('enter');
+    await session.waitIdle();
+    await session.type('help stays visible');
+    await session.waitForText('❯ help stays visible');
+    await session.waitForText('docs.autohand.ai');
+    await session.write('\x1b[1;5H');
+    await session.waitForText('/about');
+    expect(outputViewport(session)).toContain('help stays visible');
+    await exitInteractive(session);
+  });
+
+  it('marks command activity while reading history and returns to it without moving the draft', async () => {
+    state = await createTempAutohandHome({ config: { features: { fullScreenMode: true }, ui: { promptSuggestions: false } } });
+    await seedFullScreenHistory(state.autohandHome, state.workspaceRoot);
+    session = await launchBuiltAutohand(['resume', 'full-screen-history', '--config', state.configPath, '--offline'], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot, waitForDataTimeout: 15_000, cols: 120, rows: 40,
+    });
+    await session.waitForText('History item 79');
+    await session.write('\x1b[1;5H'); await session.waitForText('History item 0');
+    await session.type('/missing-full-screen-command'); await session.press('enter');
+    await session.waitForText('New activity · ↓ Back to bottom');
+    expect(outputViewport(session)).toContain('History item 0');
+    await session.type('preserved draft');
+    await session.waitForText('❯ preserved draft');
+    const beforeRow = outputViewport(session).split('\n').findIndex(line => line.includes('❯ preserved draft'));
+    await session.press('esc');
+    await session.waitForText('Command /missing-full-screen-command is not supported.');
+    expect(outputViewport(session)).not.toContain('New activity');
+    expect(outputViewport(session).split('\n').findIndex(line => line.includes('❯ preserved draft'))).toBe(beforeRow);
+    await expect.poll(() => composerCaretLine(session)).toBe('❯ preserved draft|');
+    await exitInteractive(session);
+  });
 
   it('persists explicit opt-in through experiments and leaves the current inline session unchanged', async () => {
     state = await createTempAutohandHome({ config: { ui: { promptSuggestions: false } } });

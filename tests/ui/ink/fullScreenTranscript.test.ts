@@ -5,6 +5,39 @@ import type { ChatLogMessage } from '../../../src/session/chatLog.js';
 const messages: ChatLogMessage[] = Array.from({ length: 100 }, (_, i) => ({ role: 'assistant', content: `Message ${i} with enough words to wrap on narrow terminals.` }));
 
 describe('full-screen transcript viewport', () => {
+  it('marks new output while reading and returns to the tail without consuming interruption at the tail', () => {
+    const model = new FullScreenTranscript();
+    const key = (flags: object) => flags as Parameters<typeof model.handleKey>[1];
+    model.update(messages, 60);
+    model.view(8);
+    expect(model.handleKey('', key({ ctrl: true, home: true }))).toBe(true);
+    expect(model.view(8).lines.join('\n')).toContain('Message 0');
+    expect(model.view(8).newActivity).toBe(false);
+    model.update([...messages, { role: 'assistant', content: 'New activity arrived' }], 60);
+    expect(model.view(8).newActivity).toBe(true);
+    expect(model.view(8).lines.join('\n')).not.toContain('New activity arrived');
+    expect(model.handleKey('', key({ escape: true }))).toBe(true);
+    expect(model.view(8).newActivity).toBe(false);
+    expect(model.view(8).lines.join('\n')).toContain('New activity arrived');
+    expect(model.handleKey('', key({ escape: true }))).toBe(false);
+  });
+
+  it('searches backwards and wraps while preserving the composer key boundary', () => {
+    const model = new FullScreenTranscript();
+    const key = (flags: object) => flags as Parameters<typeof model.handleKey>[1];
+    model.update(messages, 60);
+    model.view(8);
+    model.handleKey('f', key({ ctrl: true }));
+    model.handleKey('Message', key({}));
+    model.handleKey('', key({ return: true }));
+    expect(model.view(8).lines.join('\n')).toContain('Message 0');
+    model.handleKey('', key({ return: true, shift: true }));
+    expect(model.view(8).lines.join('\n')).toContain('Message 99');
+    model.handleKey('', key({ escape: true }));
+    expect(model.searchQuery).toBeNull();
+    expect(model.handleKey('draft', key({}))).toBe(false);
+  });
+
   it('renders a bounded tail and preserves the reading anchor when output arrives', () => {
     const model = new FullScreenTranscript();
     model.update(messages, 60);

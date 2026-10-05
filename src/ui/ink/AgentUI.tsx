@@ -1685,7 +1685,7 @@ export function AgentUI({
   // Empty dependency array means useInput never re-registers, eliminating
   // a major source of flicker during rapid keystrokes.
   const handleInput = useCallback((char: string, key: InkKey) => {
-    if (fullScreenKeys.current && fullScreenTranscript?.handleKey(char, key)) { redrawFullScreen(value => value + 1); return; }
+    if (fullScreenKeys.current && (!key.escape || fullScreenTranscript?.searchQuery != null) && fullScreenTranscript?.handleKey(char, key)) { redrawFullScreen(value => value + 1); return; }
     syncBufferViewport();
     const keyEvent = toInkKeyEvent(char, key);
     const activeKeybindings = keybindingsRef.current;
@@ -1890,6 +1890,10 @@ export function AgentUI({
       }
       if (showShortcutsRef.current) {
         setShowShortcuts(false);
+        return;
+      }
+      if (fullScreenKeys.current && fullScreenTranscript?.handleKey(char, key)) {
+        redrawFullScreen(value => value + 1);
         return;
       }
       onEscapeRef.current();

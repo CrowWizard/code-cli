@@ -17,6 +17,7 @@ import {
   type TuistoryTempState,
 } from './helpers/autohandTuistory.js';
 import {
+  DEMO_EXTENSION_FILES,
   DEMO_EXTENSION_ID,
   DEMO_EXTENSION_RELATIVE_ROOT,
   createExtensionBuilderDemoResponses,
@@ -93,9 +94,57 @@ async function writeToolExtension(
 }
 
 describe('built extensions CLI Tuistory E2E', () => {
-  it('uses $extension-builder to author, validate, install, and inspect a real extension', async () => {
+  it.each(['legacy', 'enhanced'])('answers an extension-builder question and restores input with %s keys', async (keyboard) => {
+    const server = await createMockOpenRouterSequenceServer([
+      JSON.stringify({ toolCalls: [{ tool: 'ask_followup_question', args: {
+        question: 'Which extension should I build?', suggested_answers: ['Workspace briefing', 'Release helper'],
+      } }] }),
+      ...createExtensionBuilderDemoResponses(),
+    ]);
+    const state = await createTempAutohandHome({ config: {
+      features: { fullScreenMode: true },
+      openrouter: { baseUrl: server.baseUrl },
+      ui: { promptSuggestions: false },
+      agent: { maxIterations: 4 },
+    } });
+    tempStates.push(state);
+    const session = await launchBuiltAutohand(['--config', state.configPath], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot,
+      cols: 120, rows: 40, waitForDataTimeout: 15_000, env: { TERM_PROGRAM: 'ghostty' },
+    });
+    sessions.push(session);
+    const enter = async () => {
+      if (keyboard === 'enhanced') await session.write('\x1b[13u');
+      else await session.press('enter');
+    };
+    try {
+      await session.waitForText('❯');
+      await session.type('$extension-builder help me build an extension');
+      await enter();
+      await session.waitForText('Which extension should I build?', { timeout: 20_000 });
+      await session.waitIdle();
+      await session.press('down');
+      await session.waitForText('▸ 2. Release helper');
+      await enter();
+      for (const file of Object.keys(DEMO_EXTENSION_FILES)) {
+        await session.waitForText(`${DEMO_EXTENSION_ID}/${file}`, { timeout: 15_000 });
+        await session.waitIdle();
+        await enter();
+      }
+      await session.waitForText(`Created ${DEMO_EXTENSION_ID}`, { timeout: 30_000 });
+      await session.waitIdle();
+      await session.type('continue building');
+      await session.waitForText('❯ continue building');
+      await exitInteractive(session);
+    } finally {
+      await server.close();
+    }
+  }, 70_000);
+
+  it.each([false, true])('uses $extension-builder to author, validate, install, and inspect a real extension (full screen: %s)', async (fullScreenMode) => {
     const state = await createTempAutohandHome({
       config: {
+        features: { fullScreenMode },
         openrouter: { baseUrl: '' },
         ui: { promptSuggestions: false },
         agent: { maxIterations: 3 },
@@ -123,6 +172,10 @@ describe('built extensions CLI Tuistory E2E', () => {
 
     try {
       await driveExtensionBuilderAuthoring(session);
+      await session.waitIdle();
+      await session.type('continue building');
+      await session.waitForText('❯ continue building');
+      await session.press(['ctrl', 'c']);
     } finally {
       await server.close();
     }
@@ -215,8 +268,8 @@ describe('built extensions CLI Tuistory E2E', () => {
     await exitInteractive(session);
   }, 90_000);
 
-  it('runs trusted slash commands, Ink views, line segments, flags, and keybindings', async () => {
-    const state = await createTempAutohandHome();
+  it.each([false, true])('runs trusted slash commands, Ink views, line segments, flags, and keybindings (full screen: %s)', async (fullScreenMode) => {
+    const state = await createTempAutohandHome({ config: { features: { fullScreenMode } } });
     tempStates.push(state);
     const source = path.join(
       repoRoot(),
