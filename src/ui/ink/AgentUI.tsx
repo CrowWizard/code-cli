@@ -1694,6 +1694,11 @@ export function AgentUI({
       const mouseInput = parseSgrMouseInput(char);
       if (mouseInput) {
         if (mouseInput.action === 'wheel') {
+          if (fullScreenTranscript) {
+            fullScreenTranscript.scroll(mouseInput.button === 'wheel-up' ? -3 : 3);
+            redrawFullScreen(value => value + 1);
+            return;
+          }
           // Mouse reporting redirects the wheel away from native scrollback.
           // Yield it until keyboard input resumes; background goal updates must
           // not recapture the wheel or move the composer cursor while reading.
@@ -1774,7 +1779,7 @@ export function AgentUI({
         const cursor = resolveComposerCursorPosition(
           inputRef.current,
           layout.width,
-          clickedCell.visualRow,
+          clickedCell.visualRow + (layout.firstVisibleRow ?? 0),
           clickedCell.visualColumn,
         );
         if (!cursor) {
@@ -3033,7 +3038,7 @@ const ChatHistoryMessage = memo(function ChatHistoryMessage({
 
   return (
     <Box marginTop={1}>
-      <MarkdownDiffContent content={message.content} markdown />
+      {message.format === 'terminal' ? <Text>{message.content}</Text> : <MarkdownDiffContent content={message.content} markdown />}
     </Box>
   );
 });
@@ -3487,7 +3492,7 @@ const HelpLineSection = memo(function HelpLineSection({
     ? getInteractionModeLabel(interactionMode)
     : '';
   return (
-    <Box width={width}>
+    <Box width={width} flexShrink={0}>
       {glyphColor ? (
         <Box flexShrink={0}>
           <Text>{colorizeGlyphText(glyphColor, modeLabel ? `● ${modeLabel} ` : '● ')}</Text>
@@ -3779,6 +3784,13 @@ const FixedBottom = memo(function FixedBottom({
   taskListPosition,
 }: FixedBottomProps) {
   const composerCursorIntent = useUserDrivenComposerCursor(isWorking, input, cursorOffset);
+  const menus = <>
+    <FileMentionWrapper fileMentionDropdown={fileMentionDropdown} />
+    {peerMentionDropdown}
+    <SlashCommandWrapper slashCommandDropdown={slashCommandDropdown} />
+    <SkillMentionWrapper skillMentionDropdown={skillMentionDropdown} />
+    <MessageTargetWrapper messageTargetDropdown={messageTargetDropdown} />
+  </>;
 
   return (
     <>
@@ -3824,6 +3836,8 @@ const FixedBottom = memo(function FixedBottom({
           runtimeLineExtensions?.status,
         )}
       />
+      {fullScreen && menus}
+      <ShortcutsHelpPanel visible={showShortcuts && !isWorking} keybindings={keybindings} columns={terminalColumns} fullScreen={fullScreen} />
       <InputLineWrapper
         maxRows={fullScreen ? Math.max(1, Math.min(4, Math.floor((terminalRows ?? 24) / 4))) : undefined}
         enableQueueInput={enableQueueInput}
@@ -3855,12 +3869,7 @@ const FixedBottom = memo(function FixedBottom({
           runtimeLineExtensions?.help,
         )}
       />
-      <FileMentionWrapper fileMentionDropdown={fileMentionDropdown} />
-      {peerMentionDropdown}
-      <SlashCommandWrapper slashCommandDropdown={slashCommandDropdown} />
-      <SkillMentionWrapper skillMentionDropdown={skillMentionDropdown} />
-      <MessageTargetWrapper messageTargetDropdown={messageTargetDropdown} />
-      <ShortcutsHelpPanel visible={showShortcuts && !isWorking} keybindings={keybindings} />
+      {!fullScreen && menus}
       <CtrlCWarning ctrlCCount={ctrlCCount} />
       {!fullScreen && <FooterClearance />}
     </>

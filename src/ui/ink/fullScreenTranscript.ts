@@ -27,7 +27,7 @@ function formatMessage(message: ChatLogMessage, width: number): string[] {
       if (Array.isArray(steps) && steps.every(isComputerUseStep)) text = steps.map(step => `${step.status === 'done' ? '✓' : step.status === 'failed' ? '×' : '?'} ${step.label}${step.detail ? ` · ${step.detail}` : ''}`).join('\n');
     } catch { /* Keep the original tool error if it is not structured progress. */ }
   }
-  if (message.role === 'assistant') text = formatAssistantMarkdown(text, { width });
+  if (message.role === 'assistant' && message.format !== 'terminal') text = formatAssistantMarkdown(text, { width });
   else if (message.role === 'user') text = `❯ ${text}`;
   else if (message.role === 'tool') text = `${message.success === false ? '×' : '✓'} ${message.tool ?? 'Tool'}\n${text}`;
   else if (message.role === 'tool_call') text = `… ${message.tool ?? 'Tool'} ${text}`;

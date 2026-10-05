@@ -35,7 +35,7 @@ describe('handleAgentInkSubmittedInstruction while an instruction is active', ()
 
     expect(handleSlashCommand).toHaveBeenCalledWith('/ps', []);
     expect(host.inkRenderer.addQueuedInstruction).not.toHaveBeenCalled();
-    expect(host.inkRenderer.addAssistantMessage).toHaveBeenCalledWith('No background processes running.');
+    expect(host.inkRenderer.addAssistantMessage).toHaveBeenCalledWith('No background processes running.', 'terminal');
   });
 
   it('dispatches /stop with its argument immediately instead of queueing it', async () => {

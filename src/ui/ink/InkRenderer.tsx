@@ -599,7 +599,7 @@ export class InkRenderer {
             onRemoveQueuedInstruction={(index) => this.removeQueuedInstruction(index)}
             getInteractionMode={this.options.getInteractionMode}
             onCycleInteractionMode={this.options.onCycleInteractionMode}
-            mouseComposerCursor={this.fullScreenTranscript ? false : this.options.mouseComposerCursor}
+            mouseComposerCursor={this.options.mouseComposerCursor}
             fullScreenTranscript={this.fullScreenTranscript}
             keybindings={this.options.keybindings}
             taskListPositionProvider={this.options.taskListPositionProvider}
@@ -849,14 +849,14 @@ export class InkRenderer {
     });
   }
 
-  addAssistantMessage(message: string): void {
+  addAssistantMessage(message: string, format?: 'terminal'): void {
     const content = message.trim();
     if (!content) {
       return;
     }
 
     this.updateState({
-      chatMessages: [...this.state.chatMessages, { role: 'assistant', content }],
+      chatMessages: [...this.state.chatMessages, { role: 'assistant', content, ...(format ? { format } : {}) }],
     });
   }
 

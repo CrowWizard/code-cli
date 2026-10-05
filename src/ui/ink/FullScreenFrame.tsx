@@ -1,9 +1,11 @@
 /** @license Apache-2.0 */
-import React, { useMemo, useRef } from 'react';
+import React, { createContext, useMemo, useRef } from 'react';
 import { Box, Text, useBoxMetrics, type DOMElement } from 'ink';
 import type { ChatLogMessage } from '../../session/chatLog.js';
 import { useTheme } from '../theme/ThemeContext.js';
 import type { FullScreenTranscript } from './fullScreenTranscript.js';
+
+export const ComposerOriginContext = createContext({ left: 0, top: 0 });
 
 interface FullScreenFrameProps {
   model: FullScreenTranscript;
@@ -36,6 +38,10 @@ export function FullScreenFrame({ model, messages, footer, rows, columns, detail
     <Box flexDirection="column" height={bodyHeight} flexShrink={0} overflow="hidden">
       {lines.map((line, index) => <Text key={index} wrap="truncate">{line || ' '}</Text>)}
     </Box>
-    <Box ref={footerRef} flexDirection="column" flexShrink={0} maxHeight={footerLimit} overflow="hidden" justifyContent="flex-end">{footer}</Box>
+    <Box ref={footerRef} flexDirection="column" flexShrink={0} maxHeight={footerLimit} overflow="hidden" justifyContent="flex-end">
+      <ComposerOriginContext.Provider value={{ left: metrics.left, top: metrics.top }}>
+        {footer}
+      </ComposerOriginContext.Provider>
+    </Box>
   </Box>;
 }

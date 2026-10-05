@@ -19,3 +19,15 @@
 - All nine failed files passed unchanged in a focused rerun (254 tests): `command.spec.ts`, `extensionsCliCommand.spec.ts`, `mcpClientManager.spec.ts`, `actions/command.coordination.test.ts`, `ui/discoveryProgressPty.test.ts`, `ui/inputPrompt.test.ts`, `core/agent/WorkspaceFileCollector.mobile-query.test.ts`, `modes/rpc/blueprintProcess.integration.test.ts`, and `ui/ink/peerComposer.pty.test.ts`. These reruns support intermittent execution failures; they do not replace a passing aggregate proof.
 
 The experiment remains disabled by default. No release or remote push is part of this implementation.
+
+## Interaction repair — 2026-10-06
+
+- Shortcut help now opens above the composer in responsive Compose, Session and Transcript/History columns. It uses the active keybinding profile. Full-screen suggestion menus also open above the input, and the status bar retains its height.
+- Hardware cursor coordinates include the measured full-screen footer origin, including after resize and popup layout changes.
+- Mouse input respects the existing setting and terminal defaults. The wheel scrolls the transcript; click-to-edit includes the first visible row of a clipped multiline draft.
+- `/about`, `/go`, and `/ps` outputs are explicitly marked as preformatted terminal content so Markdown cannot flatten logos, QR quiet zones, or numbered process rows.
+- A new rendered shortcut snapshot and built-CLI scenarios cover wide/narrow help placement, cursor position, slash menus, mouse editing, multiline drafts, and `/status` modal return. The isolated `/status` test passes; the user-reported live-provider lockout has not been reproduced and is not claimed fixed.
+
+Validation: 226 related unit/Ink tests passed, followed by 24 command-format/profile tests. Fourteen full-screen/caret Tuistory scenarios passed; the inline profile scenario and four targeted startup/slash/QR/process scenarios passed. The initial broader terminal run had 38 passed and 7 failed: four PTY startup timeouts, QR/process formatting failures corrected above, and a deep-research assertion that did not tolerate terminal word wrapping. The assertion now checks the same message and report path across wrapped whitespace, and the scenario passes. Lint, type checking and build passed. Native Ghostty GUI testing was unavailable; terminal claims are based on real PTYs.
+
+Full proof completed in 13m33s with **11,734 passed, 9 failed, and 49 skipped** (826 files). It stopped in the unit stage, so the automatic whole Tuistory stage did not run. One failure used the old shortcut-history labels; the updated eight-test file passed. The eight failed files then ran in isolation: 185 passed and one command-coordination timing test failed. That final test passed individually both on unchanged main and in this worktree. These reruns do not turn the aggregate proof green. The final shortcut placement/caret check also passed at all three tested widths, and lint/type checking passed after the test expectation updates.

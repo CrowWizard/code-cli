@@ -20,7 +20,7 @@ Long conversations and tool output currently share the terminal's scrollback wit
 5. Ctrl+F searches rendered transcript text without overwriting the composer draft. Enter advances through matches; Escape leaves search.
 6. Support Markdown, links and clickable image labels through the existing terminal formatter. Preserve compact tool previews and explicit expansion.
 7. Keep slash-command menus, usage reports, permission prompts, feedback, queues and Ctrl+C behavior working. Restore the original terminal screen on shutdown, failed startup and process exit.
-8. Do not enable mouse capture as a side effect of the experiment. Keyboard scrolling is guaranteed; selection/copy uses terminal facilities. Custom selection and mouse scrolling are outside the first experiment.
+8. Honor the existing mouse setting and terminal defaults. When enabled, support click-to-position in the composer and wheel scrolling in the transcript. Keep keyboard navigation available when mouse capture is disabled. Show grouped shortcut help and suggestion menus above the anchored composer.
 9. Do not change provider requests, token accounting, permissions, session storage or noninteractive output.
 
 ## Acceptance evidence

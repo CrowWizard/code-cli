@@ -3,7 +3,7 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useContext, useEffect, useMemo, useRef } from 'react';
 import {
   Box,
   Text,
@@ -13,6 +13,7 @@ import {
   useStdout,
   type DOMElement,
 } from 'ink';
+import { ComposerOriginContext } from './FullScreenFrame.js';
 import { useTheme } from '../theme/ThemeContext.js';
 import { buildMultiLineRenderState } from '../inputPrompt.js';
 import { stripAnsiCodes } from '../displayUtils.js';
@@ -83,6 +84,7 @@ function InputLineComponent({
   const { theme } = useTheme();
   const rootRef = useRef<DOMElement | null>(null);
   const metrics = useBoxMetrics(rootRef);
+  const origin = useContext(ComposerOriginContext);
   const { setCursorPosition } = useCursor();
   const { stdout } = useStdout();
 
@@ -117,6 +119,7 @@ function InputLineComponent({
     return {
       plainLines: lines.slice(start, start + limit).map((line) => stripAnsiCodes(line)),
       cursorRow: cursorRow - start,
+      firstVisibleRow: start,
       cursorColumn,
     };
   }, [value, cursorOffset, width, borderStyle, placeholderText, nextPromptSuggestion, inlineGhostSuffix, maxRows]);
@@ -124,7 +127,7 @@ function InputLineComponent({
   setCursorPosition(
     resolveInputLineCursorPosition(
       isActive && enableHardwareCursor && metrics.hasMeasured,
-      metrics,
+      { left: metrics.left + origin.left, top: metrics.top + origin.top },
       displayData
     )
   );
@@ -144,6 +147,7 @@ function InputLineComponent({
     const position = measureElement(rootRef.current);
     onLayoutChange?.({
       ...position,
+      firstVisibleRow: displayData.firstVisibleRow,
       cursorX: position.x + displayData.cursorColumn,
       cursorY: position.y + displayData.cursorRow + 1,
     });
@@ -154,6 +158,7 @@ function InputLineComponent({
   }, [
     displayData.cursorColumn,
     displayData.cursorRow,
+    displayData.firstVisibleRow,
     enableHardwareCursor,
     enableMouseCursor,
     isActive,
@@ -163,6 +168,8 @@ function InputLineComponent({
     metrics.top,
     metrics.width,
     onLayoutChange,
+    origin.left,
+    origin.top,
   ]);
 
   useEffect(() => {

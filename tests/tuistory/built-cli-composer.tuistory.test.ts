@@ -110,11 +110,11 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
     await session.type('?');
     const helpScreen = await session.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes('? shortcuts'),
+      waitFor: (text) => text.includes('Keyboard shortcuts'),
       trimEnd: true,
     });
-    expect(helpScreen).toContain('ctrl + j inserts newline');
-    expect(helpScreen).toContain('ctrl + d exits');
+    expect(helpScreen).toMatch(/ctrl \+ j\s+New line/);
+    expect(helpScreen).toMatch(/ctrl \+ d\s+Exit/);
     await session.press('escape');
 
     await session.press(['ctrl', 'd']);

@@ -14,9 +14,9 @@ The model stores a tail-follow state or a message/row anchor. Appending output c
 
 ## Layout and interaction
 
-The frame uses the existing theme, Markdown formatter and composer controls. A short header identifies full-screen mode and displays paging/search hints. The composer area is height-bounded; excess ancillary content cannot grow the root beyond the terminal. Transcript rows fill remaining space. The first experiment is validated down to 60 columns by 20 rows; smaller terminals may clip auxiliary controls.
+The frame uses the existing theme, Markdown formatter and composer controls. A short header identifies full-screen mode and displays paging/search hints. The composer area is height-bounded; excess ancillary content cannot grow the root beyond the terminal. Transcript rows fill remaining space. The measured footer origin is shared with the input so hardware cursor coordinates include its vertical offset. Shortcuts and suggestions grow above the composer; the status bar does not shrink when auxiliary content fills the viewport. The first experiment is validated down to 60 columns by 20 rows; smaller terminals may clip auxiliary controls.
 
-Page keys and search are handled before composer editing only while the full-screen viewport is active. Existing agent inspector panels retain their input ownership. Native copy and OSC 8 links remain terminal-dependent; the experiment adds no mouse capture. Standalone modal screens clear their own frame and restore the parent frame on release without losing transcript or draft state.
+Page keys and search are handled before composer editing only while the full-screen viewport is active. Existing agent inspector panels retain their input ownership. Native copy and OSC 8 links remain terminal-dependent; mouse capture follows the existing setting and terminal defaults. Wheel reports scroll the transcript, and measured absolute composer coordinates map clicks to the draft. Standalone modal screens clear their own frame and restore the parent frame on release without losing transcript or draft state.
 
 ## Compatibility and rollout
 

@@ -120,6 +120,8 @@ export function renderAgentSlashCommandResult(
   }
   if (shouldRenderSlashCommandResultInComposer(command)) {
     host.inkRenderer.setCommandResult?.(command, result);
+  } else if (command === '/about' || command === '/go' || command === '/ps') {
+    host.inkRenderer.addAssistantMessage?.(result, 'terminal');
   } else {
     host.inkRenderer.addAssistantMessage?.(result);
   }
