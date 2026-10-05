@@ -1,0 +1,23 @@
+# Full-screen terminal design
+
+## Ownership
+
+`InkRenderer` owns one alternate-screen lease for the interactive session. Modal renderers acquire nested leases instead of entering or leaving the terminal buffer independently. The last release restores the primary screen. Synchronous process-exit cleanup is a final safety net; listeners are removed during normal cleanup.
+
+`AgentUI` retains the existing composer and input routing. A full-screen frame allocates the terminal height between a transcript viewport and the measured composer area. The inline render branch stays intact. The experimental state is captured at renderer startup, so `/experiments` never switches terminal ownership halfway through a turn.
+
+## Transcript model
+
+A focused presentation model formats canonical chat messages into width-aware terminal rows. Stable message objects reuse their formatted rows; updated streaming content replaces its own rows. Ink mounts only a viewport-sized slice. The row cache belongs to the transcript model and is released with the renderer. Resizing rebuilds width-dependent rows while preserving a message-relative reading anchor.
+
+The model stores a tail-follow state or a message/row anchor. Appending output cannot move an anchored reader. Search operates on individual rendered lines (queries spanning a wrapped line are not matched) and exposes match positions; search input is separate from the composer draft. Ctrl+End explicitly resumes tail following. Temporary expanded output is a presentation entry, never a new model message.
+
+## Layout and interaction
+
+The frame uses the existing theme, Markdown formatter and composer controls. A short header identifies full-screen mode and displays paging/search hints. The composer area is height-bounded; excess ancillary content cannot grow the root beyond the terminal. Transcript rows fill remaining space. The first experiment is validated down to 60 columns by 20 rows; smaller terminals may clip auxiliary controls.
+
+Page keys and search are handled before composer editing only while the full-screen viewport is active. Existing agent inspector panels retain their input ownership. Native copy and OSC 8 links remain terminal-dependent; the experiment adds no mouse capture. Standalone modal screens clear their own frame and restore the parent frame on release without losing transcript or draft state.
+
+## Compatibility and rollout
+
+The local `full_screen_mode` registry flag is experimental, false by default and restart-required. The setting is checked alongside TTY capability. There are no new dependencies or framework version changes. The experiment can be disabled through the same registry and documented JSON/TOML/YAML config paths. Keep inline tests running alongside the full-screen scenarios.

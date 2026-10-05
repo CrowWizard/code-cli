@@ -29,6 +29,7 @@ function drawInkRule(width: number, edge: 'top' | 'bottom'): string {
 }
 
 export interface InputLineProps {
+  maxRows?: number;
   value: string;
   cursorOffset: number;
   isActive: boolean;
@@ -66,6 +67,7 @@ export function resolveInputLineCursorPosition(
 }
 
 function InputLineComponent({
+  maxRows,
   value,
   cursorOffset,
   isActive,
@@ -110,12 +112,14 @@ function InputLineComponent({
         inlineGhostSuffix,
       }
     );
+    const limit = maxRows === undefined ? lines.length : Math.max(1, maxRows);
+    const start = Math.max(0, Math.min(lines.length - limit, cursorRow - limit + 1));
     return {
-      plainLines: lines.map((line) => stripAnsiCodes(line)),
-      cursorRow,
+      plainLines: lines.slice(start, start + limit).map((line) => stripAnsiCodes(line)),
+      cursorRow: cursorRow - start,
       cursorColumn,
     };
-  }, [value, cursorOffset, width, borderStyle, placeholderText, nextPromptSuggestion, inlineGhostSuffix]);
+  }, [value, cursorOffset, width, borderStyle, placeholderText, nextPromptSuggestion, inlineGhostSuffix, maxRows]);
 
   setCursorPosition(
     resolveInputLineCursorPosition(
@@ -191,7 +195,7 @@ function InputLineComponent({
 
   // Active state mirrors the open prompt style from readline mode.
   return (
-    <Box ref={rootRef} flexDirection="column">
+    <Box ref={rootRef} flexDirection="column" flexShrink={0}>
       <Text>{theme.fgBg(borderToken, 'userMessageBg', rules.top)}</Text>
       {displayData.plainLines.map(renderContentLine)}
       <Text>{theme.fgBg(borderToken, 'userMessageBg', rules.bottom)}</Text>

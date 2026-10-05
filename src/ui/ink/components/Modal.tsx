@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { acquireAlternateScreen, ownsAlternateScreen } from '../../terminal/alternateScreen.js';
 import React, { useState, useMemo, useCallback } from 'react';
 import { Box, Text, useInput, render, type Instance, type Key as InkKey } from 'ink';
 import { I18nProvider, useTranslation } from '../../i18n/index.js';
@@ -137,6 +138,7 @@ export type ModalProps = SelectModalProps | ConfirmModalProps | InputModalProps 
 const OTHER_VALUE = '__other__';
 const ENTER_ALTERNATE_SCREEN = '\x1b[?1049h\x1b[2J\x1b[H';
 const EXIT_ALTERNATE_SCREEN = '\x1b[?1049l';
+const nestedScreenReleases = new WeakMap<NodeJS.WriteStream, Array<() => void>>();
 
 interface ModalRenderOptions {
   skipAltScreen?: boolean;
@@ -273,7 +275,11 @@ export function prepareModalRender(
   disableBracketedPaste(output);
   resetScrollRegion();
   if (!options.skipAltScreen) {
-    output.write(ENTER_ALTERNATE_SCREEN);
+    if (ownsAlternateScreen(output)) {
+      const stack = nestedScreenReleases.get(output) ?? [];
+      stack.push(acquireAlternateScreen(output));
+      nestedScreenReleases.set(output, stack);
+    } else output.write(ENTER_ALTERNATE_SCREEN);
   }
 }
 
@@ -284,7 +290,9 @@ export function cleanupModalRender(
   // Ink 7 does not own an alternate-screen lifecycle; restore the primary
   // composer screen explicitly, then re-enable bracketed paste.
   if (!options.skipAltScreen) {
-    output.write(EXIT_ALTERNATE_SCREEN);
+    const release = nestedScreenReleases.get(output)?.pop();
+    if (release) release();
+    else output.write(EXIT_ALTERNATE_SCREEN);
   }
   enableBracketedPaste(output);
 }

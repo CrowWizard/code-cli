@@ -44,6 +44,15 @@ export const AWS_BEDROCK_PROVIDER_FLAG = 'aws_bedrock_provider';
 
 export const FEATURE_REGISTRY: readonly FeatureDefinition[] = [
   {
+    id: 'full_screen_mode',
+    label: 'Full-screen terminal',
+    description: 'Keep the composer visible with a scrollable and searchable full-screen transcript.',
+    stage: 'experimental',
+    configPath: 'features.fullScreenMode',
+    defaultEnabled: false,
+    requiresRestart: true,
+  },
+  {
     id: 'mcp',
     label: 'MCP tools',
     description: 'Connect configured Model Context Protocol servers and expose their tools.',

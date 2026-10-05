@@ -11,6 +11,8 @@
  * flickering by letting React handle efficient DOM updates.
  */
 import { disableKittyProtocol, enableKittyProtocol, KITTY_DISAMBIGUATE_FLAG } from '../kittyProtocol.js';
+import { acquireAlternateScreen, shouldUseFullScreen } from '../terminal/alternateScreen.js';
+import { FullScreenTranscript } from './fullScreenTranscript.js';
 import React, { useState, useImperativeHandle, forwardRef, useCallback, useRef } from 'react';
 import { render, type Instance } from 'ink';
 import { COMPUTER_USE_TOOL_PREFIX, computerUseStepLabel, computerUseStepResult } from '../../computer/computerUseOutput.js';
@@ -64,6 +66,7 @@ import {
 } from '../../utils/queuedWorkSequence.js';
 
 export interface InkRendererOptions {
+  fullScreenMode?: boolean;
   onSteer?: (text: string) => void;
   onSteerQueuedMessage?: (text: string) => boolean;
   onWorkingSpinnerFrame?: (frame: number) => void;
@@ -209,6 +212,7 @@ export interface AgentUIWrapperHandle {
 }
 
 interface AgentUIWrapperProps {
+  fullScreenTranscript?: FullScreenTranscript;
   initialState: AgentUIState;
   onSteer?: (text: string) => void;
   onSteerQueuedInstruction: (index: number, sequence: number | undefined, originalText: string, text: string) => boolean;
@@ -296,6 +300,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
       getInteractionMode,
       onCycleInteractionMode,
       mouseComposerCursor,
+      fullScreenTranscript,
       keybindings,
       taskListPositionProvider,
     } = props;
@@ -361,6 +366,7 @@ const AgentUIWrapper = forwardRef<AgentUIWrapperHandle, AgentUIWrapperProps>(
         getInteractionMode={getInteractionMode}
         onCycleInteractionMode={onCycleInteractionMode}
         mouseComposerCursor={mouseComposerCursor}
+        fullScreenTranscript={fullScreenTranscript}
         keybindings={keybindings}
         taskListPosition={taskListPositionProvider?.() ?? 'above-composer'}
       />
@@ -432,6 +438,8 @@ function patchStdoutForSyncOutput(): () => void {
  */
 export class InkRenderer {
   private instance: Instance | null = null;
+  private fullScreenTranscript: FullScreenTranscript | undefined;
+  private releaseScreen: (() => void) | undefined;
   private state: AgentUIState;
   private options: InkRendererOptions;
   private toolIdCounter = 0;
@@ -508,28 +516,40 @@ export class InkRenderer {
       return;
     }
 
-    // Enable synchronized output wrapping to eliminate flicker from partial
-    // frame updates. Must happen before Ink starts writing to stdout.
-    this.unpatchedStdout = patchStdoutForSyncOutput();
-
-    // Shift+Enter, Alt+Enter and Esc are only distinguishable when the
-    // terminal encodes modified keys. Ink parses the kitty CSI u form; iTerm2,
-    // Ghostty, kitty and WezTerm honour the request, others ignore it.
-    if (process.stdout.isTTY) {
-      enableKittyProtocol(process.stdout, KITTY_DISAMBIGUATE_FLAG);
+    if (shouldUseFullScreen(this.options.fullScreenMode, process.stdin.isTTY, process.stdout.isTTY, process.env.TERM)) {
+      this.fullScreenTranscript = new FullScreenTranscript();
+      this.releaseScreen = acquireAlternateScreen(process.stdout);
     }
 
-    // Install our resize guard BEFORE Ink registers its own handler.
-    // Node.js event listeners fire in registration order.
-    this.resizeHandler = this.onResize;
-    if (typeof process.stdout.on === 'function') {
-      process.stdout.on('resize', this.resizeHandler);
+    try {
+      // Enable synchronized output wrapping to eliminate flicker from partial
+      // frame updates. Must happen before Ink starts writing to stdout.
+      this.unpatchedStdout = patchStdoutForSyncOutput();
+
+      // Shift+Enter, Alt+Enter and Esc are only distinguishable when the
+      // terminal encodes modified keys. Ink parses the kitty CSI u form; iTerm2,
+      // Ghostty, kitty and WezTerm honour the request, others ignore it.
+      if (process.stdout.isTTY) {
+        enableKittyProtocol(process.stdout, KITTY_DISAMBIGUATE_FLAG);
+      }
+
+      // Install our resize guard BEFORE Ink registers its own handler.
+      // Node.js event listeners fire in registration order.
+      this.resizeHandler = this.onResize;
+      if (typeof process.stdout.on === 'function') {
+        process.stdout.on('resize', this.resizeHandler);
+      }
+
+      // Seed the idle tip before the first frame so it does not pop in a render later.
+      this.syncIdleTips();
+
+      this.instance = this.mountAgentUI();
+    } catch (error) {
+      void this.stop().catch(() => undefined);
+      this.releaseScreen?.();
+      this.releaseScreen = undefined;
+      throw error;
     }
-
-    // Seed the idle tip before the first frame so it does not pop in a render later.
-    this.syncIdleTips();
-
-    this.instance = this.mountAgentUI();
   }
 
   /**
@@ -579,7 +599,8 @@ export class InkRenderer {
             onRemoveQueuedInstruction={(index) => this.removeQueuedInstruction(index)}
             getInteractionMode={this.options.getInteractionMode}
             onCycleInteractionMode={this.options.onCycleInteractionMode}
-            mouseComposerCursor={this.options.mouseComposerCursor}
+            mouseComposerCursor={this.fullScreenTranscript ? false : this.options.mouseComposerCursor}
+            fullScreenTranscript={this.fullScreenTranscript}
             keybindings={this.options.keybindings}
             taskListPositionProvider={this.options.taskListPositionProvider}
           />
@@ -601,53 +622,59 @@ export class InkRenderer {
    */
   async stop(): Promise<void> {
     let waitForExit: Promise<void> | undefined;
-    if (this.instance && process.stdout.isTTY) {
-      disableKittyProtocol(process.stdout);
-    }
-    if (this.instance) {
-      const instance = this.instance;
-      try {
-        instance.clear();
-      } finally {
-        instance.unmount();
+    try {
+      if (this.instance && process.stdout.isTTY) disableKittyProtocol(process.stdout);
+      if (this.instance) {
+        const instance = this.instance;
+        this.instance = null;
+        try {
+          instance.clear();
+        } finally {
+          try {
+            instance.unmount();
+          } finally {
+            try {
+              waitForExit = Promise.resolve(instance.waitUntilExit()).then(() => undefined);
+            } catch {
+              waitForExit = Promise.resolve();
+            }
+          }
+        }
       }
-      this.instance = null;
-      try {
-        waitForExit = Promise.resolve(instance.waitUntilExit()).then(() => undefined);
-      } catch {
-        waitForExit = Promise.resolve();
+    } finally {
+      if (
+        this.resizeHandler &&
+        typeof process.stdout.off === 'function'
+      ) {
+        process.stdout.off('resize', this.resizeHandler);
+        this.resizeHandler = null;
       }
+
+      if (this.resizeDebounceTimer) {
+        clearTimeout(this.resizeDebounceTimer);
+        this.resizeDebounceTimer = null;
+      }
+
+      this.stopIdleTips();
+      if (this.liveOutputFlushTimer) {
+        clearTimeout(this.liveOutputFlushTimer);
+        this.liveOutputFlushTimer = null;
+      }
+      this.pendingLiveOutput.clear();
+
+      if (this.unpatchedStdout) {
+        this.unpatchedStdout();
+        this.unpatchedStdout = null;
+      }
+
+      // Clear any pending instruction waiter to prevent dangling promises
+      this._instructionWaiter = null;
+
+      await waitForExit?.catch(() => undefined);
+      this.releaseScreen?.();
+      this.releaseScreen = undefined;
+      this.fullScreenTranscript = undefined;
     }
-
-    if (
-      this.resizeHandler &&
-      typeof process.stdout.off === 'function'
-    ) {
-      process.stdout.off('resize', this.resizeHandler);
-      this.resizeHandler = null;
-    }
-
-    if (this.resizeDebounceTimer) {
-      clearTimeout(this.resizeDebounceTimer);
-      this.resizeDebounceTimer = null;
-    }
-
-    this.stopIdleTips();
-    if (this.liveOutputFlushTimer) {
-      clearTimeout(this.liveOutputFlushTimer);
-      this.liveOutputFlushTimer = null;
-    }
-    this.pendingLiveOutput.clear();
-
-    if (this.unpatchedStdout) {
-      this.unpatchedStdout();
-      this.unpatchedStdout = null;
-    }
-
-    // Clear any pending instruction waiter to prevent dangling promises
-    this._instructionWaiter = null;
-
-    await waitForExit?.catch(() => undefined);
   }
 
   /**
@@ -1578,7 +1605,8 @@ export class InkRenderer {
       process.stdout.write('\x1b[J');
 
       // Clear line and move to new line for clean restart
-      process.stdout.write('\n');
+      if (!this.fullScreenTranscript) process.stdout.write('\n');
+      this.fullScreenTranscript?.invalidate();
 
       // Create fresh ref for new instance
       this.wrapperRef = React.createRef<AgentUIWrapperHandle>();

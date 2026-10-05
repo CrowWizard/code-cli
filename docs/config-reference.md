@@ -2953,6 +2953,22 @@ To register the native stdio agent in Zed, JetBrains IDEs, JetBrains Air, or ano
 
 Remote feature flags are fetched from `/v1/feature-flags/evaluate`, cached at `~/.autohand/feature-flags.json`, and refreshed after the API-provided TTL expires. Use `features.environment` to select a remote flag environment and `features.remoteOverrides` for local opt-outs of user-overridable remote flags.
 
+`full_screen_mode` is an **opt-in**, restart-required experiment (config path `features.fullScreenMode`, default `false`). Enable it with `/experiments enable full_screen_mode` inside the CLI, or `autohand experiments enable full_screen_mode` from your shell, then restart Autohand. Disable it with the corresponding `disable` command and restart to return to inline mode.
+
+```json
+{
+  "features": {
+    "fullScreenMode": true
+  }
+}
+```
+
+The experimental screen keeps a scrollable transcript above the composer. Page Up/Page Down browse the transcript; Ctrl+End returns to the latest output and resumes automatic following. Ctrl+F opens transcript search, Enter finds the next match, and Escape closes search without changing your draft. Ctrl+O retains the existing tool-detail toggle. Opening `/usage` or another modal preserves the parent screen, transcript position, and draft when you return. Long multiline drafts display a bounded window around the cursor.
+
+Full-screen mode requires interactive TTY input and output and is skipped for `TERM=dumb`. Noninteractive, piped, RPC and ACP output retains its existing format. This first experiment uses keyboard navigation and does not capture the mouse, including when `ui.mouseComposerCursor` is enabled; copying/selecting text and following terminal hyperlinks depend on your terminal. Shell scrollback returns when Autohand exits; conversation history remains in saved Autohand sessions. There is no change to model context, token accounting, permissions, or session storage.
+
+See the [specification](full-screen-mode/spec.md), [design](full-screen-mode/design.md), and [implementation checklist](full-screen-mode/implementation.md).
+
 `cli_usage_v2` is an experimental feature switch for the project token activity dashboard shown by `/usage`, `/usage weekly`, and `/usage monthly` (config path `features.cliUsageV2`, default on). Disable it with `autohand experiments disable cli_usage_v2`.
 
 In an interactive terminal, `/usage` opens a dedicated keyboard-driven screen with Overview, Usage, Messages, Extensions, Skills, Sessions, and Traces reports. Tab/Shift+Tab or 1–7 selects a report, left/right selects a chart day, up/down and Page Up/Page Down browse content, and Enter opens session details. Press `r` for 7/30 days, `p` for this project/all local projects, `s` to sort sessions, `R` to refresh, and `?` for help. Escape goes back; Escape at the report level or Ctrl+C closes the screen and restores the composer.

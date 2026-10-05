@@ -437,6 +437,8 @@ export interface AutoReportSettings {
 }
 
 export interface FeatureFlagSettings {
+  /** Opt in to the full-screen interactive terminal; restart required. */
+  fullScreenMode?: boolean;
   multi_agent_v2?: {
     /** Total session threads including the main agent. Integer 1–64; default 9. */
     max_concurrent_threads_per_session?: number;
