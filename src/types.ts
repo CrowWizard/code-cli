@@ -833,6 +833,7 @@ export interface AutomodeSettings {
 
 /** Hook events that can be subscribed to */
 export type HookEvent =
+  | 'program-status'
   | 'pre-tool'
   | 'post-tool'
   | 'file-modified'
@@ -2168,7 +2169,8 @@ export interface AgentOutputEvent {
    * model's reply in `content` / `thought` while the completion is still in
    * flight; the whole reply still follows as `message` / `thinking`.
    */
-  type: 'message' | 'message_delta' | 'thinking' | 'thought_delta' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update';
+  type: 'message' | 'message_delta' | 'thinking' | 'thought_delta' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update' | 'program_status';
+  programStatus?: import('./core/agent/AgentProgramStatus.js').ProgramStatusReport;
   peerEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   resourceEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   content?: string;

@@ -12,6 +12,7 @@ import { resetScrollRegion } from '../../resetScrollRegion.js';
 import { inkRenderOptions } from '../../inkRenderOptions.js';
 import { ThemeProvider, useTheme } from '../../theme/ThemeContext.js';
 import type { ColorToken } from '../../theme/types.js';
+import { withProgramStatusPrompt } from '../../../core/agent/AgentProgramStatus.js';
 
 /**
  * Represents an option in the modal.
@@ -940,7 +941,7 @@ export async function showModal(
   // renders but keyboard is frozen (stdin in cooked/line-buffered mode).
   await new Promise<void>((resolve) => setImmediate(resolve));
 
-  return new Promise((resolve) => {
+  return withProgramStatusPrompt(title ?? 'Choose an option', () => new Promise<ModalOption | null>((resolve) => {
     let completed = false;
     let fallbackInput: ((data: Buffer | string) => void) | null = null;
     let fallbackReadable: (() => void) | null = null;
@@ -1025,7 +1026,7 @@ export async function showModal(
     if (hasPendingCompletion) {
       resolveWithInstance(instance, pendingCompletion);
     }
-  });
+  }));
 }
 
 /**
@@ -1084,7 +1085,7 @@ async function showSingleValueModal<T>(
 
   await new Promise<void>((resolve) => setImmediate(resolve));
 
-  return new Promise((resolve) => {
+  return withProgramStatusPrompt('Waiting for input', () => new Promise<T>((resolve) => {
     let completed = false;
     let instance: Instance;
     const finish = (value: T): void => {
@@ -1106,7 +1107,7 @@ async function showSingleValueModal<T>(
         exitOnCtrlC: false
       })
     );
-  });
+  }));
 }
 
 /**

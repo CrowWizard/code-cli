@@ -25,6 +25,7 @@ import type { MobileClaimedTurnContext } from '../../mobile/MobileRelay.js';
 import type { TurnMemoryReflectionOutcome } from '../../memory/extractSessionMemories.js';
 import type { QueuedInstructionPolicy } from './PostTurnActionCoordinator.js';
 import type { PeerCommunicationRuntime } from './PeerCommunicationRuntime.js';
+import type { AgentProgramStatus } from './AgentProgramStatus.js';
 import type { PeerReference } from '../../ui/peerMention.js';
 import type {
   AgentLoopStep,
@@ -93,6 +94,7 @@ function readCompletedTurnUsage(host: AgentInstructionHost): TurnUsage {
 }
 
 export interface AgentInstructionHost {
+  programStatus?: AgentProgramStatus;
   computerUseLifecycle?: ComputerUseLifecycle;
   peerCommunicationRuntime?: PeerCommunicationRuntime;
   recordPeerReferences?: (instruction: string, references: PeerReference[]) => Promise<void>;
@@ -261,7 +263,10 @@ export class InstructionRunner {
     }
 
     host.peerCommunicationRuntime?.beginTurn();
-    const pausePeers = () => host.peerCommunicationRuntime?.setPaused('cancelled', true);
+    const pausePeers = () => {
+      host.programStatus?.cancel();
+      host.peerCommunicationRuntime?.setPaused('cancelled', true);
+    };
     abortController.signal.addEventListener('abort', pausePeers, { once: true });
 
     try {

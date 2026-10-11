@@ -16,6 +16,7 @@ import packageJson from '../../package.json' with { type: 'json' };
 import type { LoadedConfig } from '../types.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { platform } from 'node:os';
+import { withProgramStatusAuthentication } from '../core/agent/AgentProgramStatus.js';
 
 /**
  * Get git commit hash (short)
@@ -141,7 +142,7 @@ export async function ensureAuthenticated(
   if (config.auth?.token) {
     if (isTokenExpiredLocally(config)) {
       // Expired locally — skip server check, go straight to login
-      return await promptLogin(config);
+      return await withProgramStatusAuthentication(() => promptLogin(config));
     }
 
     // Trust locally unexpired tokens on the startup path. runCLI starts a
@@ -151,7 +152,7 @@ export async function ensureAuthenticated(
   }
 
   // No token at all — need to login
-  return await promptLogin(config);
+  return await withProgramStatusAuthentication(() => promptLogin(config));
 }
 
 function resolveBareModeApiKey(config: LoadedConfig): string | null {

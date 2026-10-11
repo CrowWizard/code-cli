@@ -331,9 +331,15 @@ export async function createMockAutohandAINativeToolServer(): Promise<MockNative
 
 export async function createMockAutohandAINativeSequenceServer(
   turns: MockNativeAssistantTurn[],
+  options: { models?: readonly string[] } = {},
 ): Promise<MockNativeToolServer> {
   const requests: JsonRecord[] = [];
   const server = createServer(async (request, response) => {
+    if (request.url === '/models' && request.method === 'GET' && options.models) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ data: options.models.map(id => ({ id })) }));
+      return;
+    }
     if (request.url !== '/chat/completions' || request.method !== 'POST') {
       response.writeHead(404, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: 'not found' }));
