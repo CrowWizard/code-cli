@@ -280,20 +280,26 @@ function getSessionPromptCacheDirective(host: AgentReactLoopHost) {
 }
 
 /**
- * Relevance filtering still decides which tools join the list; on Autohand AI
- * cloud the list then only grows, so the cached prefix survives the next iteration.
+ * Seed cloud sessions with available tools so moving from reading to editing does
+ * not invalidate the entire conversation cache. Bound the seed for large MCP
+ * registries; current relevant tools still take precedence at the provider limit.
  */
 function selectCacheStableTools(
   host: AgentReactLoopHost,
   allTools: FunctionDefinition[],
   relevant: FunctionDefinition[],
   toolSet: PromptCacheToolSet,
+  messages: LLMMessage[],
 ): FunctionDefinition[] {
   if (!usesAutohandAICloud(host.runtime.config, host.activeProvider) || host.isPromptCachingEnabled?.() !== true) {
     return relevant;
   }
   const sessionId = host.sessionManager.getCurrentSession()?.metadata.sessionId;
-  return toolSet.select(sessionId, allTools, relevant);
+  if (!sessionId) return relevant;
+  const initialTools = limitToolSelection(
+    allTools, relevant, messages, host.llm.getCapabilities?.().maxTools ?? 128,
+  );
+  return toolSet.select(sessionId, allTools, relevant, initialTools);
 }
 
 /**
@@ -757,7 +763,7 @@ export async function runAgentReactLoop(
         baselineCategories: host.runtime.options.clientContext === 'browser' ? ['browser'] : [],
       });
       let tools = limitToolSelection(
-        selectCacheStableTools(host, allTools, relevantTools, promptCacheToolSet),
+        selectCacheStableTools(host, allTools, relevantTools, promptCacheToolSet, messages),
         relevantTools, messages, host.llm.getCapabilities?.().maxTools,
       );
 

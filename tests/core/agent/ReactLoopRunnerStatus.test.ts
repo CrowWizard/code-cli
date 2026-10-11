@@ -1525,7 +1525,10 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
   // The first request follows a request to fix something, so the editing tools
   // are relevant; by the second request the recent messages no longer mention
   // editing, which is exactly when relevance filtering would shrink the list.
-  async function advertisedToolsPerIteration(configure: (host: AgentReactLoopHost) => void): Promise<string[][]> {
+  async function advertisedToolsPerIteration(
+    configure: (host: AgentReactLoopHost) => void,
+    instructions = ['fix the parser', 'thanks'],
+  ): Promise<string[][]> {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       const llmComplete = vi.fn()
@@ -1538,7 +1541,7 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
       host.sessionManager.getCurrentSession = vi.fn(() => ({ metadata: { sessionId: 'session-123' } }));
       host.conversation.history = vi.fn(() => [{
         role: 'user' as const,
-        content: llmComplete.mock.calls.length === 0 ? 'fix the parser' : 'thanks',
+        content: instructions[Math.min(llmComplete.mock.calls.length, instructions.length - 1)],
       }]);
       configure(host);
 
@@ -1559,6 +1562,27 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
     });
 
     expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('preserves the cached cloud tool prefix when a read becomes an edit', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud', model: 'grok-4.7' };
+      host.isPromptCachingEnabled = () => true;
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('keeps relevance filtering when there is no session cache key', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud' };
+      host.isPromptCachingEnabled = () => true;
+      host.sessionManager.getCurrentSession = vi.fn(() => null);
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file'], ['read_file', 'write_file']]);
   });
 
   it('keeps the tool list stable for a session across turns', async () => {

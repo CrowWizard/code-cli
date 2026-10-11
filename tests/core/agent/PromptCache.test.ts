@@ -119,6 +119,18 @@ describe('PromptCacheToolSet', () => {
     expect(third).toEqual(first);
   });
 
+  it('seeds the session once so changing relevance does not rewrite the prefix', () => {
+    const set = new PromptCacheToolSet();
+    const all = [tool('read_file'), tool('write_file'), tool('run_command')];
+
+    const first = set.select('session-a', all, [all[0]], all);
+    const second = set.select('session-a', all, [all[1]], [...all].reverse());
+
+    expect(first).toEqual(all);
+    expect(second).toEqual(first);
+    expect(set.select('session-b', all, [all[1]], [all[1]])).toEqual([all[1]]);
+  });
+
   it('only appends newly relevant tools, so earlier tool definitions keep their position', () => {
     const set = new PromptCacheToolSet();
     const all = [tool('read_file'), tool('write_file'), tool('run_command'), tool('web_search')];
