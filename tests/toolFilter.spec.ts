@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   createToolFilter,
+  limitToolSelection,
   filterToolsByRelevance,
   formatToolCapabilityCatalog,
   getToolCategory,
@@ -340,5 +341,33 @@ describe('ToolFilter', () => {
       expect(catalog).not.toContain('query: string');
       expect(catalog).not.toContain('contents: string');
     });
+  });
+});
+
+
+describe('provider tool limits', () => {
+  const tool = (name: string) => ({ name, description: name });
+  it('bounds cached growth while preserving computer use and discovery', () => {
+    const unrelated = Array.from({ length: 134 }, (_, i) => tool(`fixture_${i}`));
+    const computer = ['list_apps', 'list_windows', 'get_window_state', 'click'].map(name => tool(`mcp__autohand-computer-use__${name}`));
+    const available = [...unrelated, ...computer, tool('tool_search'), tool('tools_registry')];
+    const selected = limitToolSelection(available, available, [{ role: 'user', content: 'Use my computer to open Slack' }], 128);
+    expect(selected).toHaveLength(128);
+    for (const needed of [...computer, tool('tool_search'), tool('tools_registry')]) expect(selected.map(t => t.name)).toContain(needed.name);
+    expect(available).toHaveLength(140);
+  });
+  it('makes a tool discovered after saturation available on the next request', () => {
+    const available = [...Array.from({ length: 140 }, (_, i) => tool(`fixture_${i}`)), tool('tool_search')];
+    const selected = limitToolSelection(available, available, [
+      { role: 'user', content: 'Find the needed capability' },
+      { role: 'tool', name: 'tool_search', tool_call_id: 'search', content: 'fixture_139: requested capability' },
+    ], 128);
+    expect(selected.map(t => t.name)).toContain('fixture_139');
+    expect(selected.map(t => t.name)).toContain('tool_search');
+  });
+  it('preserves definition order below the limit and leaves uncapped providers unchanged', () => {
+    const available = [tool('b'), tool('a')];
+    expect(limitToolSelection(available, available, [], 128)).toBe(available);
+    expect(limitToolSelection(available, available, [], undefined)).toBe(available);
   });
 });

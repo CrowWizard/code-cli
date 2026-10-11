@@ -14,6 +14,8 @@ export interface LLMProviderCapabilities {
     nativeToolCalling: boolean;
     /** Supports incremental content callbacks while assembling the final response. */
     streaming?: boolean;
+    /** Maximum function definitions accepted per request by the active model. */
+    maxTools?: number;
 }
 
 /**

@@ -39,7 +39,7 @@ import type { ContextOrchestrator } from '../context/orchestrator.js';
 import type { ToolManager } from '../toolManager.js';
 import type { ToolsRegistry } from '../toolsRegistry.js';
 import { calculateContextUsage } from '../context/tokenizer.js';
-import { filterToolsByRelevance } from '../toolFilter.js';
+import { filterToolsByRelevance, limitToolSelection } from '../toolFilter.js';
 import type { PeerCommunicationRuntime } from './PeerCommunicationRuntime.js';
 import type { AgentPeerRuntime } from './AgentPeerRuntime.js';
 import { pushBounded } from '../../utils/bounded.js';
@@ -750,12 +750,16 @@ export async function runAgentReactLoop(
       await host.peerCommunicationRuntime?.safeBoundary();
       if (abortController.signal.aborted) break;
       const messages = host.conversation.history();
-      let tools = selectCacheStableTools(host, allTools, filterToolsByRelevance(allTools, messages, {
+      const relevantTools = filterToolsByRelevance(allTools, messages, {
         cache: host.runtime.config.agent?.toolSelectionCache !== false,
         // The browser side panel is browser-first by definition, so browser_*
         // tools stay available even before the user mentions a page.
         baselineCategories: host.runtime.options.clientContext === 'browser' ? ['browser'] : [],
-      }), promptCacheToolSet);
+      });
+      let tools = limitToolSelection(
+        selectCacheStableTools(host, allTools, relevantTools, promptCacheToolSet),
+        relevantTools, messages, host.llm.getCapabilities?.().maxTools,
+      );
 
       // Filter tools for plan mode (read-only tools only during planning phase)
       const planModeManager = getPlanModeManager();

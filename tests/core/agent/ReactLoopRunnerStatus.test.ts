@@ -1405,6 +1405,28 @@ describe('ReactLoopRunner composer status', () => {
     }
   });
 
+  it('bounds the actual native request after cached tool selection reaches the Grok limit', async () => {
+    const complete = vi.fn().mockResolvedValue({ id: 'bounded', created: 1, content: 'Done.', raw: {} });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.activeProvider = 'autohandai';
+    host.runtime.config.autohandai = { plan: 'cloud' };
+    host.isPromptCachingEnabled = () => true;
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, maxTools: 128 });
+    host.conversation.history = () => [{ role: 'user', content: 'Use my computer to inspect the window' }];
+    host.toolManager.toFunctionDefinitions = () => [
+      ...Array.from({ length: 134 }, (_, i) => ({ name: `fixture_${i}`, description: 'computer window' })),
+      { name: 'tool_search', description: 'Search available capabilities' },
+      { name: 'mcp__autohand-computer-use__get_window_state', description: 'Inspect the window' },
+    ];
+    await runAgentReactLoop(host, new AbortController());
+    const sent = complete.mock.calls[0]?.[0].tools;
+    expect(sent).toHaveLength(128);
+    expect(sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'tool_search' }),
+      expect.objectContaining({ name: 'mcp__autohand-computer-use__get_window_state' }),
+    ]));
+  });
+
   it('does not send native tool schemas to providers without native tool-call capability', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const parser = new ReactionParser();
