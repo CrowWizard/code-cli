@@ -55,9 +55,9 @@ export function getSessionPromptCacheDirective(
 /**
  * The tool block precedes the conversation in every request, so a tool list that
  * changes between iterations invalidates the provider's whole cached prefix.
- * Relevance filtering picks tools from the last few messages and would do exactly
- * that; this keeps the first selection for the session and only appends tools as
- * they become relevant, in first-seen order, so each growth costs one cache miss.
+ * Seed the session once with a bounded selection of available tools, then append
+ * newly relevant tools in first-seen order. Ordinary relevance changes reuse the
+ * seed; newly discovered capabilities can still join at the cost of a cache miss.
  */
 export class PromptCacheToolSet {
   private sessionId: string | undefined;
@@ -67,13 +67,15 @@ export class PromptCacheToolSet {
     sessionId: string | undefined,
     available: readonly FunctionDefinition[],
     relevant: readonly FunctionDefinition[],
+    initialTools: readonly FunctionDefinition[] = relevant,
   ): FunctionDefinition[] {
     if (sessionId !== this.sessionId) {
       this.sessionId = sessionId;
       this.names = [];
     }
     const selected = new Set(this.names);
-    for (const tool of relevant) {
+    const candidates = this.names.length === 0 ? [...initialTools, ...relevant] : relevant;
+    for (const tool of candidates) {
       if (!selected.has(tool.name)) {
         selected.add(tool.name);
         this.names.push(tool.name);

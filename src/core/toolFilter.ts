@@ -828,3 +828,37 @@ export function formatToolCapabilityCatalog(tools: ToolDefinition[]): string {
     .map(([label, names]) => `- ${label}: ${[...new Set(names)].sort().join(', ')}`)
     .join('\n');
 }
+
+
+/** Preserve discovery and current actions when a provider cannot accept the full cached tool set. */
+export function limitToolSelection(
+  selected: FunctionDefinition[],
+  relevant: readonly FunctionDefinition[],
+  messages: LLMMessage[],
+  maxTools: number | undefined,
+): FunctionDefinition[] {
+  if (maxTools === undefined || selected.length <= maxTools) return selected;
+  if (!Number.isSafeInteger(maxTools) || maxTools < 1) throw new Error('Invalid provider tool limit');
+  const recent = messages.filter(message => message.role !== 'system').slice(-8);
+  const userText = [...recent].reverse().find(message => message.role === 'user')?.content?.toLowerCase() ?? '';
+  const discoveryText = recent.filter(message => message.role === 'tool' && message.name === 'tool_search')
+    .map(message => message.content ?? '').join(' ').toLowerCase();
+  const used = new Set(recent.flatMap(message => [
+    ...(message.name ? [message.name] : []),
+    ...(message.tool_calls ?? []).map(call => call.function.name),
+  ]));
+  const current = new Set(relevant.map(tool => tool.name));
+  const computer = matchesComputerControlIntent(getRecentSelectionText(messages));
+  const ranked = selected.map((tool, index) => {
+    let score = current.has(tool.name) ? 20 : 0;
+    if (RELEVANCE_CATEGORIES[tool.name] === 'always') score = 40;
+    if (computer && /^(?:mcp__autohand-computer-use__|mcp__cua-driver__|mcp__cua__)/i.test(tool.name)) score = 50;
+    if (matchesCategoryTrigger(discoveryText, tool.name.toLowerCase())) score = 60;
+    if (used.has(tool.name)) score = 70;
+    if (matchesCategoryTrigger(userText, tool.name.toLowerCase())) score = 80;
+    if (tool.name === 'tool_search' || tool.name === 'tools_registry') score = 100;
+    return { index, score };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+  const retained = new Set(ranked.slice(0, maxTools).map(entry => entry.index));
+  return selected.filter((_, index) => retained.has(index));
+}

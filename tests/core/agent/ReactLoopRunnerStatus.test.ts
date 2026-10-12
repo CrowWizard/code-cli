@@ -1405,6 +1405,28 @@ describe('ReactLoopRunner composer status', () => {
     }
   });
 
+  it('bounds the actual native request after cached tool selection reaches the Grok limit', async () => {
+    const complete = vi.fn().mockResolvedValue({ id: 'bounded', created: 1, content: 'Done.', raw: {} });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.activeProvider = 'autohandai';
+    host.runtime.config.autohandai = { plan: 'cloud' };
+    host.isPromptCachingEnabled = () => true;
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, maxTools: 128 });
+    host.conversation.history = () => [{ role: 'user', content: 'Use my computer to inspect the window' }];
+    host.toolManager.toFunctionDefinitions = () => [
+      ...Array.from({ length: 134 }, (_, i) => ({ name: `fixture_${i}`, description: 'computer window' })),
+      { name: 'tool_search', description: 'Search available capabilities' },
+      { name: 'mcp__autohand-computer-use__get_window_state', description: 'Inspect the window' },
+    ];
+    await runAgentReactLoop(host, new AbortController());
+    const sent = complete.mock.calls[0]?.[0].tools;
+    expect(sent).toHaveLength(128);
+    expect(sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'tool_search' }),
+      expect.objectContaining({ name: 'mcp__autohand-computer-use__get_window_state' }),
+    ]));
+  });
+
   it('does not send native tool schemas to providers without native tool-call capability', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const parser = new ReactionParser();
@@ -1503,7 +1525,10 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
   // The first request follows a request to fix something, so the editing tools
   // are relevant; by the second request the recent messages no longer mention
   // editing, which is exactly when relevance filtering would shrink the list.
-  async function advertisedToolsPerIteration(configure: (host: AgentReactLoopHost) => void): Promise<string[][]> {
+  async function advertisedToolsPerIteration(
+    configure: (host: AgentReactLoopHost) => void,
+    instructions = ['fix the parser', 'thanks'],
+  ): Promise<string[][]> {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       const llmComplete = vi.fn()
@@ -1516,7 +1541,7 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
       host.sessionManager.getCurrentSession = vi.fn(() => ({ metadata: { sessionId: 'session-123' } }));
       host.conversation.history = vi.fn(() => [{
         role: 'user' as const,
-        content: llmComplete.mock.calls.length === 0 ? 'fix the parser' : 'thanks',
+        content: instructions[Math.min(llmComplete.mock.calls.length, instructions.length - 1)],
       }]);
       configure(host);
 
@@ -1537,6 +1562,27 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
     });
 
     expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('preserves the cached cloud tool prefix when a read becomes an edit', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud', model: 'grok-4.7' };
+      host.isPromptCachingEnabled = () => true;
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('keeps relevance filtering when there is no session cache key', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud' };
+      host.isPromptCachingEnabled = () => true;
+      host.sessionManager.getCurrentSession = vi.fn(() => null);
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file'], ['read_file', 'write_file']]);
   });
 
   it('keeps the tool list stable for a session across turns', async () => {

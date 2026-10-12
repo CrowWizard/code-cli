@@ -217,7 +217,9 @@ export class AutohandAIProvider implements LLMProvider {
     const model = AUTOHAND_AI_CLOUD_MODEL_DEFINITIONS.find(
       (definition) => definition.id === this.model,
     );
-    return { nativeToolCalling: model?.toolCalls === true, streaming: true };
+    return { nativeToolCalling: model?.toolCalls === true, streaming: true,
+      ...(this.model === "grok-4.7" ? { maxTools: 128 } : {}),
+    };
   }
 
   setModel(model: string): void {

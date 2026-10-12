@@ -1227,6 +1227,13 @@ export interface InlineAgentDefinition {
 }
 
 export interface CLIOptions {
+  cloud?: boolean;
+  resume?: string | boolean;
+  cloudAccount?: string;
+  cloudRepository?: string;
+  cloudConnector?: string;
+  cloudBranch?: string;
+  cloudProvider?: string;
   /** Select a provider for this process without updating saved configuration. */
   provider?: ProviderName;
   prompt?: string;

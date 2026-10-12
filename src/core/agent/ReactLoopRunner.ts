@@ -39,7 +39,7 @@ import type { ContextOrchestrator } from '../context/orchestrator.js';
 import type { ToolManager } from '../toolManager.js';
 import type { ToolsRegistry } from '../toolsRegistry.js';
 import { calculateContextUsage } from '../context/tokenizer.js';
-import { filterToolsByRelevance } from '../toolFilter.js';
+import { filterToolsByRelevance, limitToolSelection } from '../toolFilter.js';
 import type { PeerCommunicationRuntime } from './PeerCommunicationRuntime.js';
 import type { AgentPeerRuntime } from './AgentPeerRuntime.js';
 import { pushBounded } from '../../utils/bounded.js';
@@ -280,20 +280,26 @@ function getSessionPromptCacheDirective(host: AgentReactLoopHost) {
 }
 
 /**
- * Relevance filtering still decides which tools join the list; on Autohand AI
- * cloud the list then only grows, so the cached prefix survives the next iteration.
+ * Seed cloud sessions with available tools so moving from reading to editing does
+ * not invalidate the entire conversation cache. Bound the seed for large MCP
+ * registries; current relevant tools still take precedence at the provider limit.
  */
 function selectCacheStableTools(
   host: AgentReactLoopHost,
   allTools: FunctionDefinition[],
   relevant: FunctionDefinition[],
   toolSet: PromptCacheToolSet,
+  messages: LLMMessage[],
 ): FunctionDefinition[] {
   if (!usesAutohandAICloud(host.runtime.config, host.activeProvider) || host.isPromptCachingEnabled?.() !== true) {
     return relevant;
   }
   const sessionId = host.sessionManager.getCurrentSession()?.metadata.sessionId;
-  return toolSet.select(sessionId, allTools, relevant);
+  if (!sessionId) return relevant;
+  const initialTools = limitToolSelection(
+    allTools, relevant, messages, host.llm.getCapabilities?.().maxTools ?? 128,
+  );
+  return toolSet.select(sessionId, allTools, relevant, initialTools);
 }
 
 /**
@@ -750,12 +756,16 @@ export async function runAgentReactLoop(
       await host.peerCommunicationRuntime?.safeBoundary();
       if (abortController.signal.aborted) break;
       const messages = host.conversation.history();
-      let tools = selectCacheStableTools(host, allTools, filterToolsByRelevance(allTools, messages, {
+      const relevantTools = filterToolsByRelevance(allTools, messages, {
         cache: host.runtime.config.agent?.toolSelectionCache !== false,
         // The browser side panel is browser-first by definition, so browser_*
         // tools stay available even before the user mentions a page.
         baselineCategories: host.runtime.options.clientContext === 'browser' ? ['browser'] : [],
-      }), promptCacheToolSet);
+      });
+      let tools = limitToolSelection(
+        selectCacheStableTools(host, allTools, relevantTools, promptCacheToolSet, messages),
+        relevantTools, messages, host.llm.getCapabilities?.().maxTools,
+      );
 
       // Filter tools for plan mode (read-only tools only during planning phase)
       const planModeManager = getPlanModeManager();

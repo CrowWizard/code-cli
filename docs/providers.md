@@ -726,11 +726,17 @@ Update `~/.autohand/config.json`:
 
 **Symptom:** "Rate limit exceeded" errors
 
-Autohand AI distinguishes short request-per-minute throttles from account quota
-exhaustion. The CLI automatically retries only a server-identified RPM throttle,
-honors its bounded `Retry-After` delay, and remains cancellable while waiting.
-An input/output token-throughput limit or a 5-hour, 24-hour, weekly, or monthly quota limit ends the turn
-immediately instead of keeping the terminal or auto mode asleep until the reset.
+Autohand AI retries server-identified request-per-minute and input/output
+token-throughput throttles within the configured retry budget. It honors the
+bounded `Retry-After` delay and remains cancellable while waiting. A 5-hour,
+24-hour, weekly, or monthly quota limit ends the turn immediately.
+
+Prompt caching is enabled by default for Autohand AI cloud sessions. The CLI
+seeds a bounded tool selection at session start so normal relevance changes
+reuse the tool prefix instead of repeatedly processing the full conversation
+as uncached input. Provider limits, permission changes, and newly discovered
+tools can still require a different selection. Set `features.promptCaching`
+to `false` to opt out; the remote cache kill switch also remains effective.
 
 **Solutions:**
 

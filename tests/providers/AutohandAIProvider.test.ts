@@ -132,6 +132,15 @@ describe("AutohandAIProvider", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(`${expected}/chat/completions`);
   });
 
+  it('updates the tool limit when switching between Grok and other hosted models', () => {
+    const provider = new AutohandAIProvider({ plan: 'cloud', authMode: 'api-key', apiKey: 'fixture', model: 'grok-4.7' });
+    expect(provider.getCapabilities().maxTools).toBe(128);
+    provider.setModel('moa');
+    expect(provider.getCapabilities().maxTools).toBeUndefined();
+    provider.setModel('grok-4.7');
+    expect(provider.getCapabilities().maxTools).toBe(128);
+  });
+
   it("advertises native tool calling for Moa", () => {
     const provider = new AutohandAIProvider({
       plan: "cloud",

@@ -10,15 +10,26 @@ import { importTransferSession } from '../session/transfer/transfer-session-stor
 import { createTransferCheckout, applyTransferPatch, transferRepositoryUrl } from '../session/transfer/transfer-workspace.js';
 import { isRecord } from '../session/transfer/record.js';
 import type { SessionTransfer } from '../session/transfer/session-transfer.js';
+import type { LoadedConfig } from '../types.js';
+import { applyRunConfigOverlay } from '../runConfigOverlay.js';
 
-interface TransferOptions { account: string; path?: string; config?: string; offline: boolean; accept?: boolean; importOnly?: boolean }
-export interface TransferRunOptions { path: string; resumeSessionId: string; model: string; provider: 'autohandai'; offline: boolean; config?: string }
+interface TransferOptions { account: string; path?: string; config?: string; offline: boolean; accept?: boolean; importOnly?: boolean; plan?: boolean }
+export interface TransferRunOptions { path: string; resumeSessionId: string; model: string; provider: 'autohandai'; offline: boolean; config?: string; account: string; plan?: boolean }
 interface TransferDependencies {
   run(options: TransferRunOptions): Promise<void>;
   receive?(id: string, options: TransferOptions): Promise<ReceivedTransfer>;
   prepare?(received: ReceivedTransfer, directory: string): Promise<{ sessionId: string; workspace: string }>;
   confirm?(snapshot: SessionTransfer): Promise<boolean>;
   report?(message: string): void;
+}
+
+export function createTransferRunConfig(config: LoadedConfig, options: Pick<TransferRunOptions, 'model' | 'account'>): LoadedConfig {
+  const overlay = applyRunConfigOverlay(config, { sets: [
+    'provider="autohandai"',
+    `autohandai=${JSON.stringify({ plan: 'cloud', authMode: 'account', accountToken: config.auth?.token, model: options.model })}`,
+    `api.accountId=${JSON.stringify(options.account)}`,
+  ] });
+  return { ...config, ...overlay.config, runOverlay: { ...config.runOverlay, entries: [...(config.runOverlay?.entries ?? []), ...(overlay.snapshot?.entries ?? [])] } };
 }
 
 async function receive(id: string, options: TransferOptions): Promise<ReceivedTransfer> {
@@ -46,7 +57,7 @@ export async function prepareCliTransfer({ snapshot, transfer }: ReceivedTransfe
   return { sessionId, workspace };
 }
 
-async function confirm(snapshot: SessionTransfer): Promise<boolean> {
+export async function confirmCliTransfer(snapshot: SessionTransfer): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Use --accept to import noninteractively after reviewing this transfer on the Web.');
   const clean = (value: string) => [...value].filter(character => character === '\n' || character === '\t' || character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127).join('');
   while (true) {
@@ -76,10 +87,10 @@ export function registerTransferCommand(program: Command, dependencies: Transfer
         if (!/^[A-Za-z0-9_-]{1,200}$/.test(options.account)) throw new Error('Invalid transfer account.');
         const received = await (dependencies.receive ?? receive)(id, options);
         if (received.snapshot.provider !== 'autohandai') throw new Error('Open this transfer in Autohand Code Web and select its model before continuing in the CLI.');
-        if (!options.accept && !await (dependencies.confirm ?? confirm)(received.snapshot)) return;
+        if (!options.accept && !await (dependencies.confirm ?? confirmCliTransfer)(received.snapshot)) return;
         const imported = await (dependencies.prepare ?? prepareCliTransfer)(received, path.resolve(options.path ?? process.cwd()));
         if (options.importOnly) { (dependencies.report ?? (message => process.stdout.write(message + '\n')))(`Imported session ${imported.sessionId} in ${imported.workspace}`); return; }
-        await dependencies.run({ path: imported.workspace, resumeSessionId: imported.sessionId, model: received.snapshot.model, provider: 'autohandai', offline: options.offline, config: options.config });
+        await dependencies.run({ path: imported.workspace, resumeSessionId: imported.sessionId, model: received.snapshot.model, provider: 'autohandai', offline: options.offline, config: options.config, account: received.transfer.accountId, ...(options.plan ? { plan: true } : {}) });
       } catch (error) { command.error(error instanceof Error ? error.message : 'This transfer could not be imported.'); }
     });
 }
