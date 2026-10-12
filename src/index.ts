@@ -75,8 +75,9 @@ import { buildTmuxLaunchCommand, createTmuxSessionName, isTmuxEnabled } from './
 import { registerBrowserCommand, registerBrowserOptions } from './browser/cliCommand.js';
 import { registerComputerCommand } from './computer/cliCommand.js';
 import { registerReviewCommand } from './review/reviewCliCommand.js';
-import { registerTransferCommand } from './startup/transferCommand.js';
+import { createTransferRunConfig, registerTransferCommand } from './startup/transferCommand.js';
 import { registerResumeCommand } from './startup/resumeCommand.js';
+import { registerCloudOptions, validateCloudOptions } from './startup/cloudOptions.js';
 import { attachHerdrIntegration, type HerdrIntegration } from './integrations/herdr/index.js';
 import { probeMcpServersWithManager, registerDoctorCommand } from './startup/doctorCommand.js';
 import type { ReviewCliExecution } from './review/reviewCliRuntime.js';
@@ -409,6 +410,7 @@ function commandPathOf(command: Command): string[] {
 }
 registerBrowserCommand(program);
 registerBrowserOptions(program);
+registerCloudOptions(program);
 registerComputerCommand(program);
 registerExtensionsCommand(program);
 registerDiscoveryCommand(program);
@@ -544,6 +546,8 @@ program
     }
     opts.commandOutputFormat = commandOutputResolution.format;
     normalizePromptAndProtocolOptions(positionalPrompt, opts);
+    try { validateCloudOptions(opts); }
+    catch (error) { program.error(error instanceof Error ? error.message : 'Invalid cloud options.'); }
 
     const restrictedProtocolMode = resolveProtocolLaunchMode(opts);
     if (opts.answerOnly || opts.setupOnly || (
@@ -790,7 +794,23 @@ program
       authConfig = await ensureAuthenticated(authConfig, { bare: opts.bare === true });
       // Propagate refreshed auth into the options so downstream code sees
       // the updated token (e.g. runCLI, runRpcMode, runAutoMode).
-      (opts as any)._authConfig = authConfig;
+      opts._authConfig = authConfig;
+    }
+
+    if (opts.cloud) {
+      const { launchCloud } = await import('./cloud/launchCloud.js');
+      const result = await launchCloud({ config: opts._authConfig!, workspaceRoot: resolveWorkspaceRoot(opts._authConfig!, opts.path) }, opts);
+      if (result.kind === 'local') {
+        const { SessionTransferClient } = await import('./session/transfer/transfer-client.js');
+        const { prepareCliTransfer, confirmCliTransfer } = await import('./startup/transferCommand.js');
+        const config = opts._authConfig!;
+        const received = await new SessionTransferClient().download(result.transferId, { token: config.auth!.token!, userId: config.auth?.user?.id ?? 'authenticated', accountId: result.accountId });
+        if (!await confirmCliTransfer(received.snapshot)) return;
+        const imported = await prepareCliTransfer(received, resolveWorkspaceRoot(config, opts.path));
+        const localConfig = await loadConfig(opts.config, imported.workspace);
+        await runCLI({ path: imported.workspace, resumeSessionId: imported.sessionId, model: received.snapshot.model, provider: 'autohandai', plan: result.plan, config: opts.config, _authConfig: createTransferRunConfig({ ...localConfig, auth: config.auth }, { account: result.accountId, model: received.snapshot.model }) });
+      }
+      return;
     }
 
     // Handle --patch flag
@@ -887,9 +907,9 @@ registerReviewCommand(program, {
 });
 
 registerTransferCommand(program, {
-  run: async ({ provider, ...opts }) => {
+  run: async ({ provider, account, ...opts }) => {
     const authConfig = await ensureAuthenticated(await loadConfig(opts.config, opts.path));
-    await runCLI({ ...opts, _authConfig: { ...authConfig, provider, autohandai: { plan: 'cloud', authMode: 'account', accountToken: authConfig.auth?.token, model: opts.model } } });
+    await runCLI({ ...opts, provider, _authConfig: createTransferRunConfig(authConfig, { account, model: opts.model }) });
   },
 });
 

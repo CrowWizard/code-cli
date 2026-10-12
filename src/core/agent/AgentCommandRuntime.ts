@@ -97,6 +97,7 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
   '/model', '/skills', '/skills install', '/skills-install',
   '/skills new', '/skills-new', '/mcp', '/mcp install', '/mcp-install',
   '/squad', '/peers', '/whatityped',
+  '/cloud', '/handoff', '/handoff cloud', '/open',
 ]);
 
 /** Operational command results that belong with the fixed composer controls. */
@@ -307,7 +308,7 @@ export function parseAgentSlashCommand(_host: AgentCommandRuntimeHost, input: st
     const parts = trimmed.split(/\s+/);
 
     // Check for two-word commands like "/skills install", "/mcp install"
-    const twoWordCommands = ['/skills install', '/skills new', '/skills use', '/agents new', '/mcp install', '/handoff session', '/handoff web'];
+    const twoWordCommands = ['/skills install', '/skills new', '/skills use', '/agents new', '/mcp install', '/handoff session', '/handoff web', '/handoff cloud'];
     const potentialTwoWord = parts.slice(0, 2).join(' ');
 
     if (twoWordCommands.includes(potentialTwoWord)) {
