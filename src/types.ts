@@ -385,6 +385,8 @@ export interface UISettings {
   notifications?: boolean | NotificationConfig;
   /** Show LLM-generated next-step suggestions in prompt placeholder (default: true) */
   promptSuggestions?: boolean;
+  /** Background, read-only repository review offered after the first completed turn (default: true). */
+  repositoryReadiness?: boolean;
   /** Rotate tips about slash commands, composer triggers and shortcuts beside the idle composer (default: true) */
   showTips?: boolean;
   /**
@@ -2145,6 +2147,8 @@ export interface ToolOutputChunk {
 export interface AgentRuntime {
   config: LoadedConfig;
   workspaceRoot: string;
+  /** Original repository when --zit runs the agent in an isolated workspace. */
+  repositorySourceRoot?: string;
   /** Additional directories with same access as workspaceRoot */
   additionalDirs?: string[];
   options: CLIOptions;

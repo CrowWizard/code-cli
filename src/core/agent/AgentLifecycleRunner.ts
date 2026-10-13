@@ -749,6 +749,7 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       callResourceCleanupSync(() => process.stdin.pause());
 
       const cleanupTasks: Promise<unknown>[] = [];
+      if (host.repositoryReadiness) cleanupTasks.push(callResourceCleanup(() => host.repositoryReadiness.stop()));
       if (host.ui) {
         const ui = host.ui;
         host.ui = null;

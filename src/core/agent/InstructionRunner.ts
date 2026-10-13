@@ -94,6 +94,7 @@ function readCompletedTurnUsage(host: AgentInstructionHost): TurnUsage {
 }
 
 export interface AgentInstructionHost {
+  repositoryReadiness?: Pick<import('./RepositoryReadiness.js').RepositoryReadiness, 'markTurnCompleted'> | null;
   programStatus?: AgentProgramStatus;
   computerUseLifecycle?: ComputerUseLifecycle;
   peerCommunicationRuntime?: PeerCommunicationRuntime;
@@ -855,6 +856,10 @@ export class InstructionRunner {
       host.isInstructionActive = false;
       host.activeAbortController = null;
       host.clearExplorationLog();
+      if (success && !canceledByUser && !abortController.signal.aborted && !reflectionSuperseded
+        && !host.runtime.isCommandMode && !host.runtime.options?.prompt && options.echoInTranscript !== false) {
+        host.repositoryReadiness?.markTurnCompleted();
+      }
     }
     return success;
   }

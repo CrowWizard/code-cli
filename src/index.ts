@@ -1874,7 +1874,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       options,
       commandOutputCaptured: captureCommandOutput,
       additionalDirs: additionalDirs.length > 0 ? additionalDirs : undefined,
-      ...(sessionZit ? { zitClaims: new ZitClaimGuard(sessionZit) } : {}),
+      ...(sessionZit ? { zitClaims: new ZitClaimGuard(sessionZit), repositorySourceRoot: sessionZit.repoRoot } : {}),
     };
 
     // Print banner FIRST for immediate visual feedback

@@ -773,6 +773,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `activityVerbsEnabled`       | boolean | `true`  | Show rotating activity verbs like `Compiling...` while the agent is working |
 | `activitySymbol`             | string | `"✳"`   | Symbol shown before the activity verb in activity indicator output |
 | `showTips`                   | boolean | `true`  | Rotate tips about slash commands, the `/ @ $ ! : ?` triggers and shortcuts beside the idle composer |
+| `repositoryReadiness`        | boolean | `true`  | Review repository readiness in the background and offer concrete findings after the first successful interactive turn |
 | `enterWhileWorking`          | string  | `select` | While a turn runs, Enter queues a draft; select a queued message with the arrow keys, press Enter to edit it, then Enter to steer or Shift+Enter to save it in the queue. `steer` and `queue` retain the earlier direct steering shortcuts for configured sessions |
 | `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"automode"` | Mode an interactive terminal session starts in. Auto mode runs without approval prompts; set `"default"` to be asked before risky actions. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
 | `statusLine.showProviderModel` | boolean | `true`  | Show the active provider and model in the composer status line |

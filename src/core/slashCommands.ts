@@ -79,6 +79,7 @@ import * as sessionBranchingCmd from '../commands/sessionBranching.js';
 import * as renameCmd from '../commands/rename.js';
 import * as whatsnewCmd from '../commands/whatsnew.js';
 import * as changelogCmd from '../commands/changelog.js';
+import * as readinessCmd from '../commands/readiness.js';
 
 import type { SlashCommand } from './slashCommandTypes.js';
 export type { SlashCommand } from './slashCommandTypes.js';
@@ -177,4 +178,5 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   renameCmd.metadata,
   whatsnewCmd.metadata,
   changelogCmd.metadata,
+  readinessCmd.metadata,
 ] as (SlashCommand | undefined)[]).filter((cmd): cmd is SlashCommand => cmd != null && typeof cmd.command === 'string');

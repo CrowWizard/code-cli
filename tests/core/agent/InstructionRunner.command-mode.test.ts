@@ -480,6 +480,19 @@ describe('InstructionRunner command mode UI', () => {
     expect(host.scheduleTurnMemoryReflection).not.toHaveBeenCalled();
   });
 
+  it('offers repository readiness only after a successful interactive turn has released active state', async () => {
+    const host = createHost();
+    host.runtime.isCommandMode = false;
+    host.runtime.options.prompt = undefined;
+    const markTurnCompleted = vi.fn(() => expect(host.isInstructionActive).toBe(false));
+    host.repositoryReadiness = { markTurnCompleted };
+    expect(await new InstructionRunner(host).run('explain this repository')).toBe(true);
+    expect(markTurnCompleted).toHaveBeenCalledOnce();
+    host.runtime.isCommandMode = true;
+    await new InstructionRunner(host).run('another instruction');
+    expect(markTurnCompleted).toHaveBeenCalledOnce();
+  });
+
   it('schedules automatic memory reflection with a successful interactive outcome', async () => {
     const host = createHost();
     host.runtime = {
