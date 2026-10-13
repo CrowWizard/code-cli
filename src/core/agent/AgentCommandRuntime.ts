@@ -100,12 +100,16 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
   '/agents-new', '/agents new', '/resume', '/theme', '/language',
   '/model', '/skills', '/skills install', '/skills-install',
   '/skills new', '/skills-new', '/mcp', '/mcp install', '/mcp-install',
-  '/squad', '/peers', '/whatityped',
+  '/squad', '/peers', '/whatityped', '/sync',
   '/cloud', '/handoff', '/handoff cloud', '/open',
 ]);
 
 /** Operational command results that belong with the fixed composer controls. */
 const FIXED_COMPOSER_RESULT_COMMANDS = new Set(['/tasks', '/team', '/teams', '/squad']);
+
+export function shouldPreserveComposerDraftAfterCommand(command: string): boolean {
+  return command === '/whatityped' || command === '/peers' || command === '/feedback' || command === '/sync';
+}
 
 export function shouldRenderSlashCommandResultInComposer(command: string): boolean {
   return FIXED_COMPOSER_RESULT_COMMANDS.has(command);
@@ -258,7 +262,7 @@ export async function runAgentSlashCommandWithInput(host: AgentCommandRuntimeHos
         host.persistentInputActiveTurn = false;
       }
       cleanupConsoleBridge();
-      if (isInteractive && command !== '/whatityped' && command !== '/peers' && command !== '/feedback' && host.inkRenderer?.isRunning()) {
+      if (isInteractive && !shouldPreserveComposerDraftAfterCommand(command) && host.inkRenderer?.isRunning()) {
         host.inkRenderer.clearInput();
       }
     }

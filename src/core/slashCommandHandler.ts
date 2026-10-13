@@ -607,7 +607,12 @@ export class SlashCommandHandler {
         }
         case '/sync': {
           const { sync } = await import('../commands/sync.js');
-          return sync(this.ctx);
+          await this.ctx.onBeforeModal?.();
+          try {
+            return await sync(this.ctx);
+          } finally {
+            await this.ctx.onAfterModal?.();
+          }
         }
         case '/add-dir': {
           const { addDir } = await import('../commands/add-dir.js');

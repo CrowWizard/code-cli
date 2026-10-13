@@ -45,7 +45,7 @@ import { shouldForceAgentIdleLogout } from './AgentSessionAccounting.js';
 import {
   consumeAgentInkSubmittedInstructionEcho,
 } from './AgentUIRuntime.js';
-import { renderAgentSlashCommandResult } from './AgentCommandRuntime.js';
+import { renderAgentSlashCommandResult, shouldPreserveComposerDraftAfterCommand } from './AgentCommandRuntime.js';
 import {
   createQueuedAgentInstruction,
   resolveActiveGoalContinuation,
@@ -1854,7 +1854,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
               );
               if (host.ui || host.inkRenderer) {
                 host.setComposerIdle();
-                if (command !== '/whatityped' && command !== '/peers' && command !== '/feedback') {
+                if (!shouldPreserveComposerDraftAfterCommand(command)) {
                   host.clearComposerInput();
                 }
                 // Return to the top of the loop so the idle-wait path can await
