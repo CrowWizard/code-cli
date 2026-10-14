@@ -42,6 +42,7 @@ const INCOMPLETE_LOOP_REASONS: Record<Extract<ReactLoopResult, { status: 'incomp
   iteration_limit: 'The agent loop reached its iteration limit before completion',
   pending_todos: 'The turn ended with unfinished todo items',
   advisor_review: 'The turn ended before its Moa checkpoint review was resolved',
+  goal_completion: 'The final answer was delivered but the goal completion could not be persisted',
 };
 
 interface InstructionConversation {

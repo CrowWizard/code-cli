@@ -592,7 +592,7 @@ describe('ReactLoopRunner composer status', () => {
       expect(host.toolManager.execute).toHaveBeenCalledWith(
         [expect.objectContaining({ tool: 'read_file' })],
         expect.any(Function),
-        { signal: controller.signal },
+        expect.objectContaining({ signal: controller.signal }),
       );
       expect(llmComplete).toHaveBeenCalledTimes(1);
       expect(host.conversation.addSystemNote).not.toHaveBeenCalledWith(
@@ -1903,6 +1903,77 @@ describe('failed tool observations', () => {
     expect(observation).toContain('DOCUMENTATION_FINDINGS');
     expect(observation).toContain('Failed to complete task within 10 iterations');
   });
+});
+
+describe('goal completion delivery', () => {
+  it.each(['unavailable', 'changes_requested', 'approved', 'disabled', 'delivery_failure', 'cancelled'] as const)(
+    'preserves the original goal until successful delivery: %s', async (mode) => {
+      const fs = (await import('fs-extra')).default;
+      const { tmpdir } = await import('node:os');
+      const path = await import('node:path');
+      const { GoalManager } = await import('../../../src/goals/GoalManager.js');
+      const { ActionExecutor } = await import('../../../src/core/actionExecutor.js');
+      const { FileActionManager } = await import('../../../src/actions/filesystem.js');
+      const { ToolManager, GOAL_TOOL_DEFINITIONS } = await import('../../../src/core/toolManager.js');
+      const root = await fs.mkdtemp(path.join(tmpdir(), 'goal-delivery-'));
+      try {
+        const manager = new GoalManager(root);
+        await manager.createGoal({ objective: 'Deliver changelog' });
+        await manager.enqueueGoal({ objective: 'Repair installer', source: 'tool' });
+        const controller = new AbortController();
+        const complete = vi.fn().mockResolvedValueOnce({ content: JSON.stringify({ toolCalls: [
+          { tool: 'update_goal', args: { status: 'complete' } },
+        ] }) }).mockResolvedValue({ content: 'DELIVERED_CHANGELOG' });
+        const host = createReactLoopTestHost(complete, new ReactionParser());
+        host.runtime.workspaceRoot = root;
+        host.runtime.config.features = { slashGoal: true };
+        host.runtime.commandOutputCaptured = true;
+        const executor = new ActionExecutor({ runtime: host.runtime, files: new FileActionManager(root),
+          resolveWorkspacePath: (relative) => path.resolve(root, relative),
+          confirmDangerousAction: async () => true });
+        host.toolManager = new ToolManager({ definitions: GOAL_TOOL_DEFINITIONS, executor: async (action, context) => {
+          const result = await executor.executeForTool(action, context);
+          expect(result).toMatchObject({ success: true, output: expect.stringContaining('"ok": true') });
+          return result;
+        },
+          confirmApproval: async () => true });
+        const assertPending = async () => {
+          const state = await manager.getSessionSnapshot();
+          expect(state.goal?.objective).toBe('Deliver changelog');
+          expect(state.completed).toHaveLength(0);
+          expect(state.queue).toHaveLength(1);
+        };
+        if (mode !== 'disabled' && mode !== 'delivery_failure') {
+          host.createCheckpointAdvisor = () => ({ observeFailure: () => false, review: async () => {
+            await assertPending();
+            if (mode === 'cancelled') controller.abort();
+            return { verdict: mode === 'cancelled' ? 'approved' : mode, feedback: 'Fixture review' };
+          } });
+          host.captureAdvisorDiff = async () => 'No changes';
+        }
+        let delivered = false;
+        host.emitOutput = vi.fn((event) => {
+          if (event.type !== 'message' || event.content !== 'DELIVERED_CHANGELOG') return;
+          if (mode === 'delivery_failure') throw new Error('Output unavailable');
+          delivered = true;
+        });
+        if (mode === 'delivery_failure') {
+          await expect(runAgentReactLoop(host, controller)).rejects.toThrow('Output unavailable');
+        } else {
+          const result = await runAgentReactLoop(host, controller);
+          expect(result.status).toBe(mode === 'approved' || mode === 'disabled' ? 'completed'
+            : mode === 'cancelled' ? 'aborted' : 'incomplete');
+        }
+        expect(host.saveToolMessage).toHaveBeenCalledWith('update_goal', expect.stringContaining('"ok": true'), expect.any(String));
+        const state = await manager.getSessionSnapshot();
+        if (mode === 'approved' || mode === 'disabled') {
+          expect(delivered).toBe(true);
+          expect(state.completed).toHaveLength(1);
+          expect(state.goal?.objective).toBe('Repair installer');
+        } else await assertPending();
+      } finally { await fs.remove(root); }
+    },
+  );
 });
 
 function createReactLoopTestHost(

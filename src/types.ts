@@ -2114,6 +2114,10 @@ export type ToolExecutionResult = {
 } & ToolActionOutcome;
 
 export interface ToolExecutionContext {
+  deferGoalCompletion?: (
+    prepared: import('./goals/types.js').GoalMutationResult,
+    commit: () => Promise<import('./goals/types.js').GoalMutationResult>,
+  ) => import('./goals/types.js').GoalMutationResult;
   peerMessaging?: import('./session/peers/PeerMessaging.js').PeerClient;
   resourceCoordinator?: import('./session/peers/ResourceCoordinator.js').ResourceCoordinatorClient;
   peerAutomatic?: boolean;

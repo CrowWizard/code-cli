@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import type { GoalMutationResult } from '../../goals/types.js';
 import { formatToolObservation } from './AgentToolOutputRuntime.js';
 import type { PermissionManager } from '../../permissions/PermissionManager.js';
 import { getProviderConfig } from '../../config.js';
@@ -270,7 +271,7 @@ export interface ReactLoopControl {
 
 export type ReactLoopResult =
   | { status: 'completed' }
-  | { status: 'incomplete'; reason: 'iteration_limit' | 'pending_todos' | 'advisor_review' }
+  | { status: 'incomplete'; reason: 'iteration_limit' | 'pending_todos' | 'advisor_review' | 'goal_completion' }
   | { status: 'stopped'; stepNumber: number }
   | { status: 'aborted' };
 
@@ -631,6 +632,7 @@ export async function runAgentReactLoop(
       if (previousOrchestrationNote?.content !== note) host.conversation.addSystemNote(note);
     }
     let hadToolWork = false;
+    let pendingGoalCompletion: { commit: () => Promise<GoalMutationResult> } | undefined;
     let advisorRejections = 0;
     const consultAdvisor = async (checkpoint: AdvisorCheckpoint, evidence: string): Promise<AdvisorReview> => {
       host.setSpinnerStatus(`Moa reviewing ${checkpoint.replaceAll('_', ' ')}... (esc to interrupt)`);
@@ -1495,6 +1497,12 @@ export async function runAgentReactLoop(
               }
             }, {
               signal: abortController.signal,
+              deferGoalCompletion: (prepared, commit) => {
+                if (pendingGoalCompletion) return { ...prepared, ok: false, completionPending: false,
+                  message: 'Goal completion is already prepared for this turn. Deliver the final response before completing another goal.' };
+                pendingGoalCompletion = { commit };
+                return prepared;
+              },
               registerToolImages: host.registerToolImages,
               ...(host.peerRuntime?.automatic ? { peerAutomatic: true } : {}),
             });
@@ -1793,7 +1801,16 @@ export async function runAgentReactLoop(
           continue;
         }
       }
+      if (abortController.signal.aborted) return { status: 'aborted' };
       renderFinalResponse(turnOutcome.response, { thought: payload.thought });
+      if (pendingGoalCompletion) {
+        const completed = await pendingGoalCompletion.commit();
+        if (!completed.ok) {
+          renderFinalResponse(`${turnOutcome.response}\n\nGoal completion remains pending: ${completed.message}`);
+          return { status: 'incomplete', reason: 'goal_completion' };
+        }
+        host.conversation.addSystemNote(`[Goal completion after delivery] ${completed.message}`);
+      }
       return { status: 'completed' };
     }
     if (abortController.signal.aborted) {
