@@ -1966,6 +1966,12 @@ describe('goal completion delivery', () => {
         }
         expect(host.saveToolMessage).toHaveBeenCalledWith('update_goal', expect.stringContaining('"ok": true'), expect.any(String));
         const state = await manager.getSessionSnapshot();
+        if (mode === 'unavailable' || mode === 'changes_requested') {
+          expect(host.emitOutput).toHaveBeenCalledWith(expect.objectContaining({ type: 'message',
+            content: expect.stringContaining(mode === 'unavailable' ? 'Unreviewed draft' : 'Unapproved draft') }));
+          expect(vi.mocked(host.emitOutput).mock.calls.some(([event]) => event.type === 'message'
+            && event.content?.includes('DELIVERED_CHANGELOG') && event.content.includes('Work remains pending Moa review'))).toBe(true);
+        }
         if (mode === 'approved' || mode === 'disabled') {
           expect(delivered).toBe(true);
           expect(state.completed).toHaveLength(1);

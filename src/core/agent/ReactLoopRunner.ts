@@ -1795,7 +1795,8 @@ export async function runAgentReactLoop(
         if (review.verdict !== 'approved') {
           advisorRejections += 1;
           if (review.verdict === 'unavailable' || advisorRejections >= 3) {
-            renderFinalResponse(`Work remains pending Moa review: ${review.feedback}`);
+            const label = review.verdict === 'unavailable' ? 'Unreviewed draft' : 'Unapproved draft';
+            renderFinalResponse(`${label}\n\n${turnOutcome.response}\n\nWork remains pending Moa review: ${review.feedback}\nResolve the review feedback and ask to continue before treating this work as complete.`);
             return { status: 'incomplete', reason: 'advisor_review' };
           }
           continue;

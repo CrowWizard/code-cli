@@ -67,7 +67,11 @@ describe('checkpoint completion footer', () => {
       });
       const screen = await runCheckpointFooterScenario(session);
       expect(screen).toContain(footer);
-      if (footer === 'Failed in') expect(screen).not.toContain('Completed in');
+      if (footer === 'Failed in') {
+        expect(screen).not.toContain('Completed in');
+        expect(screen).toContain('Unreviewed draft');
+        expect(screen).toContain('CHECKPOINT_FOOTER_ANSWER');
+      }
       await exitInteractive(session);
     } finally {
       session?.close();
