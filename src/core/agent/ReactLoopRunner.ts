@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { formatToolObservation } from './AgentToolOutputRuntime.js';
 import type { PermissionManager } from '../../permissions/PermissionManager.js';
 import { getProviderConfig } from '../../config.js';
 import { isSearchConfigured } from '../../actions/web.js';
@@ -1545,9 +1546,7 @@ export async function runAgentReactLoop(
           // Add tool messages to conversation after ALL tools complete (needs full ordered results)
           for (let i = 0; i < results.length; i++) {
             const result = results[i];
-            const content = result.success
-              ? result.output ?? '(no output)'
-              : result.error ?? result.output ?? 'Tool failed without error message';
+            const content = formatToolObservation(result);
             const toolMessage: LLMMessage = {
               role: 'tool',
               name: result.tool,

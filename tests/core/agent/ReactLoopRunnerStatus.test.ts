@@ -1883,6 +1883,28 @@ describe('ReactLoopRunner parallel tool grouping', () => {
   });
 });
 
+describe('failed tool observations', () => {
+  it('retains successful sibling findings alongside a failed delegation error', async () => {
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ toolCalls: [{ tool: 'delegate_parallel', args: { tasks: [
+        { agent_name: 'reader', task: 'Inspect code' }, { agent_name: 'writer', task: 'Inspect docs' },
+      ] } }] }) })
+      .mockResolvedValueOnce({ content: 'Repository evidence reviewed.' });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.runtime.commandOutputCaptured = true;
+    host.toolManager.execute = vi.fn(async () => [{ tool: 'delegate_parallel', success: false,
+      error: '[reader] Failed to complete task within 10 iterations.',
+      output: '[reader] Failed: iteration limit\n[writer] Result: DOCUMENTATION_FINDINGS',
+    }]);
+
+    await runAgentReactLoop(host, new AbortController());
+
+    const observation = vi.mocked(host.saveToolMessage).mock.calls[0]?.[1];
+    expect(observation).toContain('DOCUMENTATION_FINDINGS');
+    expect(observation).toContain('Failed to complete task within 10 iterations');
+  });
+});
+
 function createReactLoopTestHost(
   llmComplete: ReturnType<typeof vi.fn>,
   parser: ReactionParser,
