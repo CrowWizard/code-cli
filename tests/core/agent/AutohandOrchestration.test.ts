@@ -39,6 +39,37 @@ function harness(responses: LLMResponse[] = [{ content: '{"verdict":"approved","
 }
 
 describe('Moa checkpoint advisor', () => {
+  it('reports safe response metadata without retaining malformed review text', async () => {
+    const { advisor } = harness([{ id: 'review-request-42', content: 'PRIVATE_REVIEW_TEXT', finishReason: 'stop' }]);
+    const result = await advisor.review('completion', { history: [], context: 'diff', signal: new AbortController().signal });
+    expect(result.verdict).toBe('unavailable');
+    expect(result.feedback).toContain('stage=content-json');
+    expect(result.feedback).toContain('contentChars=19');
+    expect(result.feedback).toContain('finishReason=stop');
+    expect(result.feedback).toContain('responseId=review-request-42');
+    expect(result.feedback).not.toContain('PRIVATE_REVIEW_TEXT');
+  });
+  it('distinguishes provider JSON failures from malformed model verdicts without exposing error bodies', async () => {
+    const advisor = new CheckpointAdvisor({ provider: { complete: vi.fn(async () => { throw new SyntaxError('PRIVATE_HTTP_BODY'); }) }, recordUsage: () => {} });
+    const result = await advisor.review('completion', { history: [], context: 'diff', signal: new AbortController().signal });
+    expect(result.feedback).toContain('stage=provider');
+    expect(result.feedback).toContain('SyntaxError');
+    expect(result.feedback).not.toContain('PRIVATE_HTTP_BODY');
+  });
+  it('does not approve a response returned after the review deadline', async () => {
+    const deadline = new AbortController();
+    vi.useFakeTimers();
+    const timerBaseline = vi.getTimerCount();
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal);
+    try {
+      const advisor = new CheckpointAdvisor({ provider: { complete: async () => {
+        deadline.abort(new DOMException('Review deadline expired', 'TimeoutError'));
+        return { content: '{"verdict":"approved","feedback":"Late approval"}' };
+      } }, recordUsage: () => {} });
+      expect((await advisor.review('completion', { history: [], context: 'diff', signal: new AbortController().signal })).verdict).toBe('unavailable');
+      expect(vi.getTimerCount()).toBe(timerBaseline);
+    } finally { timeout.mockRestore(); vi.useRealTimers(); }
+  });
   it.each([
     { content: '', finishReason: 'length' as const },
     { content: '```json\n```', finishReason: 'stop' as const },
@@ -75,7 +106,7 @@ describe('Moa checkpoint advisor', () => {
       { content: '', finishReason: 'length' },
     ]);
     const review = await advisor.review('commit', { history: [], context: 'diff', signal: new AbortController().signal });
-    expect(review).toEqual({ verdict: 'unavailable', feedback: 'Moa exhausted its output budget before returning a complete checkpoint verdict.' });
+    expect(review).toMatchObject({ verdict: 'unavailable', feedback: expect.stringContaining('Moa exhausted its output budget before returning a complete checkpoint verdict.') });
     expect(complete).toHaveBeenCalledTimes(2);
   });
   it('does not exceed the request budget to recover an empty verdict', async () => {

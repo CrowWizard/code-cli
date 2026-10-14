@@ -40,6 +40,14 @@ requests share the run's request and token budgets, support cancellation, and
 report usage with the lead. Moa reviews are disabled for known Free accounts;
 when entitlements are unknown they run only if Moa or Auto is already selected.
 
+Empty or output-limited verdicts get one larger-output recovery request within
+the same 90-second review deadline. An unavailable checkpoint gets one further
+review attempt; all requests count against the run budget. Failures report the
+provider or verdict-parsing stage, content length, finish reason, and a bounded
+response ID when available, without recording raw review text or HTTP bodies.
+Invalid accepted HTTP JSON is identified separately and is not automatically
+replayed by the transport. A late or malformed answer never counts as approval.
+
 ## Controls
 
 - `/agents orchestration` shows the current setting.

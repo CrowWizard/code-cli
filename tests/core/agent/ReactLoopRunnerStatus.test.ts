@@ -1906,7 +1906,7 @@ describe('failed tool observations', () => {
 });
 
 describe('goal completion delivery', () => {
-  it.each(['unavailable', 'changes_requested', 'approved', 'disabled', 'delivery_failure', 'cancelled'] as const)(
+  it.each(['unavailable', 'changes_requested', 'approved', 'disabled', 'delivery_failure', 'cancelled', 'concurrent_goal_change', 'duplicate_completion'] as const)(
     'preserves the original goal until successful delivery: %s', async (mode) => {
       const fs = (await import('fs-extra')).default;
       const { tmpdir } = await import('node:os');
@@ -1921,9 +1921,12 @@ describe('goal completion delivery', () => {
         await manager.createGoal({ objective: 'Deliver changelog' });
         await manager.enqueueGoal({ objective: 'Repair installer', source: 'tool' });
         const controller = new AbortController();
-        const complete = vi.fn().mockResolvedValueOnce({ content: JSON.stringify({ toolCalls: [
+        const calls = [
           { tool: 'update_goal', args: { status: 'complete' } },
-        ] }) }).mockResolvedValue({ content: 'DELIVERED_CHANGELOG' });
+        ];
+        if (mode === 'duplicate_completion') calls.push({ tool: 'update_goal', args: { status: 'complete' } });
+        const complete = vi.fn().mockResolvedValueOnce({ content: JSON.stringify({ toolCalls: calls }) })
+          .mockResolvedValue({ content: 'DELIVERED_CHANGELOG' });
         const host = createReactLoopTestHost(complete, new ReactionParser());
         host.runtime.workspaceRoot = root;
         host.runtime.config.features = { slashGoal: true };
@@ -1933,7 +1936,7 @@ describe('goal completion delivery', () => {
           confirmDangerousAction: async () => true });
         host.toolManager = new ToolManager({ definitions: GOAL_TOOL_DEFINITIONS, executor: async (action, context) => {
           const result = await executor.executeForTool(action, context);
-          expect(result).toMatchObject({ success: true, output: expect.stringContaining('"ok": true') });
+          expect(result).toMatchObject({ success: true });
           return result;
         },
           confirmApproval: async () => true });
@@ -1947,7 +1950,8 @@ describe('goal completion delivery', () => {
           host.createCheckpointAdvisor = () => ({ observeFailure: () => false, review: async () => {
             await assertPending();
             if (mode === 'cancelled') controller.abort();
-            return { verdict: mode === 'cancelled' ? 'approved' : mode, feedback: 'Fixture review' };
+            if (mode === 'concurrent_goal_change') await manager.updateGoal({ status: 'complete' });
+            return { verdict: mode === 'cancelled' || mode === 'concurrent_goal_change' || mode === 'duplicate_completion' ? 'approved' : mode, feedback: 'Fixture review' };
           } });
           host.captureAdvisorDiff = async () => 'No changes';
         }
@@ -1961,7 +1965,7 @@ describe('goal completion delivery', () => {
           await expect(runAgentReactLoop(host, controller)).rejects.toThrow('Output unavailable');
         } else {
           const result = await runAgentReactLoop(host, controller);
-          expect(result.status).toBe(mode === 'approved' || mode === 'disabled' ? 'completed'
+          expect(result.status).toBe(mode === 'approved' || mode === 'disabled' || mode === 'duplicate_completion' ? 'completed'
             : mode === 'cancelled' ? 'aborted' : 'incomplete');
         }
         expect(host.saveToolMessage).toHaveBeenCalledWith('update_goal', expect.stringContaining('"ok": true'), expect.any(String));
@@ -1972,7 +1976,14 @@ describe('goal completion delivery', () => {
           expect(vi.mocked(host.emitOutput).mock.calls.some(([event]) => event.type === 'message'
             && event.content?.includes('DELIVERED_CHANGELOG') && event.content.includes('Work remains pending Moa review'))).toBe(true);
         }
-        if (mode === 'approved' || mode === 'disabled') {
+        if (mode === 'duplicate_completion') {
+          expect(host.saveToolMessage).toHaveBeenCalledWith('update_goal', expect.stringContaining('already prepared'), expect.any(String));
+        }
+        if (mode === 'concurrent_goal_change') {
+          expect(state.completed).toHaveLength(1);
+          expect(state.goal).toMatchObject({ objective: 'Repair installer', status: 'active' });
+          expect(host.emitOutput).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', content: expect.stringContaining('Goal completion remains pending') }));
+        } else if (mode === 'approved' || mode === 'disabled' || mode === 'duplicate_completion') {
           expect(delivered).toBe(true);
           expect(state.completed).toHaveLength(1);
           expect(state.goal?.objective).toBe('Repair installer');

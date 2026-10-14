@@ -43,14 +43,15 @@ describe('checkpoint completion footer', () => {
   });
 
   it.each([
-    { name: 'unavailable review', review: 'not json', footer: 'Failed in' },
-    { name: 'approved review', review: '{"verdict":"approved","feedback":"Source evidence checked."}', footer: 'Completed in' },
-  ])('shows an honest outcome after $name', async ({ review, footer }) => {
+    { name: 'unavailable review', review: 'not json', retryReview: 'not json', footer: 'Failed in' },
+    { name: 'approved review', review: '{"verdict":"approved","feedback":"Source evidence checked."}', retryReview: '', footer: 'Completed in' },
+    { name: 'recovered malformed review', review: 'not json', retryReview: '{"verdict":"approved","feedback":"Recovery evidence checked."}', footer: 'Completed in' },
+  ])('shows an honest outcome after $name', async ({ review, retryReview, footer }) => {
     const server = await createMockAutohandAINativeSequenceServer([
       { content: 'Reading package.json.', toolCall: { id: 'read-package', name: 'read_file', args: { path: 'package.json' } } },
       { content: 'CHECKPOINT_FOOTER_ANSWER: Repository facts verified.' },
       { content: review },
-      { content: review },
+      { content: retryReview },
     ]);
     const state = await createTempAutohandHome({ config: {
       provider: 'autohandai',
