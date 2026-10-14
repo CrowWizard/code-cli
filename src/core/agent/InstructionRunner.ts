@@ -446,6 +446,7 @@ export class InstructionRunner {
     const recordIncompleteLoop = (result: Extract<ReactLoopResult, { status: 'incomplete' }>): false => {
       success = false;
       recordReflectionFailure('incomplete', INCOMPLETE_LOOP_REASONS[result.reason]);
+      host.stopUI(true);
       host.clearActivityForCompletedTurn?.();
       return false;
     };

@@ -1137,3 +1137,13 @@ describe('InstructionRunner interrupt listener cleanup', () => {
     expect(host.runReactLoop).not.toHaveBeenCalled();
   });
 });
+
+
+describe('incomplete turn status', () => {
+  it.each(['iteration_limit', 'pending_todos', 'advisor_review'] as const)('marks %s as unsuccessful in the terminal UI', async reason => {
+    const host = createHost();
+    host.runReactLoop = vi.fn(async () => ({ status: 'incomplete', reason }));
+    await expect(new InstructionRunner(host).run('finish the active task')).resolves.toBe(false);
+    expect(host.stopUI).toHaveBeenCalledWith(true);
+  });
+});
