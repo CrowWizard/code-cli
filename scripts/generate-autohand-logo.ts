@@ -4,67 +4,98 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { readFile, writeFile } from 'node:fs/promises';
+import { fromSvg } from 'ascii.rest/kit';
 
-const source = await readFile(new URL('../assets/autohand-mark.svg', import.meta.url), 'utf8');
-const frameCount = 48;
-const circles = [...source.matchAll(/<circle\b([^>]+)\/>/gu)].map((match) => {
-  const attribute = (name: string) => Number(new RegExp(`${name}="([^"]+)"`, 'u').exec(match[1])?.[1]);
-  return { x: attribute('cx'), y: attribute('cy'), radius: attribute('r'), filled: /\bfill=/u.test(match[1]) };
-});
-const rings = circles.filter(circle => !circle.filled);
-const centers = circles.filter(circle => circle.filled);
-if (rings.length !== 8 || centers.length !== 8) throw new Error('The Autohand mark must contain eight rings and eight centers.');
+const source = await readFile(new URL('../assets/autohand-logo.svg', import.meta.url), 'utf8');
+const circles = [...source.matchAll(/<circle\b[^>]*\/>/gu)].map(match => match[0]);
+if (circles.length !== 16) throw new Error('The Autohand SVG must contain eight rings and eight centers.');
+const mark = `${source.match(/<svg\b[^>]*>/u)?.[0]}<g id="float"><g id="mark">${circles.join('')}</g></g></svg>`;
+const fps = 15;
+const frameCount = 120;
+const period = frameCount / fps;
 
-function generateArt(columns: number, rows: number, frame: number): string[] {
+function composeScene(front: string, columns: number, rows: number, frame: number): string {
   const phase = frame / frameCount * Math.PI * 2;
-  const marginY = rows <= 6 ? 1 : 2;
-  const scale = Math.min((columns - 6) / 236, (rows - marginY * 2) * 2 / 118);
-  const originX = (columns - 236 * scale) / 2;
-  const originY = marginY + (rows - marginY * 2 - 118 * scale / 2) / 2;
-  const bob = rows > 6 ? Math.round(Math.sin(phase) * 0.65) : 0;
-  const lines = Array.from({ length: rows }, () => ' '.repeat(columns));
-  const put = (column: number, row: number, glyph: string): void => {
+  const body = front.split('\n').map(line => [...line]);
+  const scene = Array.from({ length: rows }, () => Array<string>(columns).fill(' '));
+  const put = (column: number, row: number, glyph: string) => {
     if (row < 0 || row >= rows || column < 0 || column >= columns) return;
-    lines[row] = `${lines[row].slice(0, column)}${glyph}${lines[row].slice(column + 1)}`;
+    scene[row][column] = glyph;
   };
-  const outline = columns >= 32 ? [' ___ ', '( o )', ' --- '] : [' _ ', '(o)', ' - '];
-  for (const center of centers) {
-    const column = Math.floor(originX + center.x * scale);
-    const row = Math.floor(originY + (center.y + 2.5) * scale / 2) + bob;
-    outline.forEach((line, y) => [...line].forEach((glyph, x) => {
-      if (glyph !== ' ') put(column + x - Math.floor(line.length / 2), row + y - 1, glyph);
-    }));
+
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      if ((column * 43 + row * 71) % 167 === 3) put(column, row, '.');
+    }
   }
-  const logo = lines.slice();
-  for (const [offset, glyph] of [[-0.22, '.'], [-0.11, '.'], [0, '*']] as const) {
-    const angle = phase + offset;
-    const column = Math.round((columns - 1) / 2 + Math.cos(angle) * (columns / 2 - 1));
-    const row = Math.round((rows - 1) / 2 + Math.sin(angle) * (rows / 2 - 0.6));
-    if (logo[row][column] === ' ') put(column, row, glyph);
+
+  const moonX = (columns - 1) / 2 + Math.cos(phase + 0.7) * (columns / 2 - 2);
+  const moonY = (rows - 1) / 2 + Math.sin(phase + 0.7) * (rows / 2 - 1.2);
+  const moonInFront = Math.sin(phase + 0.7) > 0;
+  const drawMoon = () => {
+    for (let row = Math.floor(moonY - 1); row <= Math.ceil(moonY + 1); row++) {
+      for (let column = Math.floor(moonX - 1.6); column <= Math.ceil(moonX + 1.6); column++) {
+        const x = (column - moonX) / 1.6;
+        const y = (row - moonY) * 2 / 1.6;
+        const distance = x * x + y * y;
+        if (distance >= 1) continue;
+        const light = Math.max(0, -0.6 * x - 0.5 * y + 0.6 * Math.sqrt(1 - distance));
+        put(column, row, light > 0.6 ? '●' : light > 0.25 ? '•' : '·');
+      }
+    }
+  };
+  if (!moonInFront) drawMoon();
+
+  for (let row = rows - 1; row >= 0; row--) {
+    for (let column = columns - 1; column >= 0; column--) {
+      if (body[row][column] !== ' ') put(column + 1, row + 1, '·');
+    }
   }
-  return lines;
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      if (body[row][column] !== ' ') put(column, row, body[row][column]);
+    }
+  }
+  if (moonInFront) drawMoon();
+  return scene.map(line => line.join('')).join('\n');
 }
 
 const sizes = [
-  { columns: 32, rows: 10 },
-  { columns: 24, rows: 8 },
+  { columns: 48, rows: 12 },
+  { columns: 36, rows: 10 },
+  { columns: 28, rows: 8 },
   { columns: 24, rows: 6 },
 ];
 const variants = [];
 for (const { columns, rows } of sizes) {
-  const frames = [];
-  for (let frame = 0; frame < frameCount; frame++) frames.push(generateArt(columns, rows, frame));
-  variants.push({ columns, lines: frames[0], frames });
+  const logo = fromSvg(mark, {
+    cols: columns, rows, margin: [3, 1], color: false, style: 'braille', fps,
+    '#float': {
+      motion: (t) => {
+        const phase = t / period * Math.PI * 2;
+        return { y: 0.45 * Math.sin(phase), rotate: 0.035 * Math.sin(phase), scale: [0.97 + 0.03 * Math.cos(phase), 1] };
+      },
+      period,
+    },
+    '#mark': { motion: 'glint', every: 4 },
+  }).default();
+  const frames = Array.from({ length: frameCount }, (_, frame) => composeScene(logo(frame / fps), columns, rows, frame));
+  variants.push({ columns, lines: frames[0].split('\n'), frames });
 }
 const output = `/**
  * @license
  * Copyright 2026 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  *
- * Generated from assets/autohand-mark.svg with 2:1 terminal cells.
+ * Generated from assets/autohand-logo.svg with ascii.rest/kit.
  * Regenerate with: bun scripts/generate-autohand-logo.ts
  */
 export const AUTOHAND_LOGO_FRAME_COUNT = ${frameCount};
-export const AUTOHAND_LOGO_ART = ${JSON.stringify(variants, null, 2)} as const;
+export const AUTOHAND_LOGO_FPS = ${fps};
+export const AUTOHAND_LOGO_ART: readonly {
+  columns: number;
+  lines: readonly string[];
+  frames: readonly string[];
+}[] = ${JSON.stringify(variants, null, 2)};
 `;
 await writeFile(new URL('../src/utils/autohandLogoData.ts', import.meta.url), output);

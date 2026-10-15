@@ -38,8 +38,8 @@ afterEach(async () => {
 
 describe('returning authenticated startup branding', () => {
   it.each([
-    { cols: 80, rows: 24, logoRows: 6 },
-    { cols: 120, rows: 32, logoRows: 6 },
+    { cols: 80, rows: 24, logoRows: 9 },
+    { cols: 120, rows: 32, logoRows: 11 },
   ])('keeps the complete logo and editable composer visible at $cols×$rows', async ({ cols, rows, logoRows }) => {
     auth = await createMockAuthServer();
     provider = await createMockOpenRouterServer('Returning startup is ready.');

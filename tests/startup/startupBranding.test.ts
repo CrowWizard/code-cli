@@ -67,7 +67,7 @@ describe('startup branding', () => {
 
   it.each([
     { columns: 80, rows: 24, expectedLogoRows: 10 },
-    { columns: 120, rows: 32, expectedLogoRows: 10 },
+    { columns: 120, rows: 32, expectedLogoRows: 12 },
   ])('keeps the complete returning logo above the composer at $columns×$rows', ({ columns, rows, expectedLogoRows }) => {
     const availableRows = getStartupLogoRows({ columns, rows, welcomeLines: welcome, footerText: footer });
     const logo = renderAutohandLogo({ columns, rows: availableRows });

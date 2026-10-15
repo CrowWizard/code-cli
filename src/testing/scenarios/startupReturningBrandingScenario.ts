@@ -6,6 +6,10 @@
 import type { Session } from 'tuistory';
 import stripAnsi from 'strip-ansi';
 
+export function isStartupLogoRow(line: string): boolean {
+  return line.trim().length > 0 && /^[ "'(),./08:=OPY\\^_bdopq|~\u2800-\u28ff·•●-]+$/u.test(line);
+}
+
 export function returningStartupViewport(session: Session): string {
   const terminal = session.getTerminalData();
   return terminal.lines.slice(-terminal.rows)
@@ -15,5 +19,5 @@ export function returningStartupViewport(session: Session): string {
 
 export function returningStartupLogoRows(output: string): string[] {
   return stripAnsi(output).split('\n').map((line) => line.trimEnd())
-    .filter((line) => /^[ ()o_*\.\-]+$/u.test(line) && /[()o_*\.\-]/u.test(line));
+    .filter(isStartupLogoRow);
 }

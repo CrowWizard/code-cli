@@ -803,7 +803,7 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
 
     await session.waitForText('Sign in to continue.', { timeout: 10_000 });
     const firstLogoRow = (await session.text({ immediate: true })).split('\n')
-      .find((line) => /^[ ()o_*\.\-]+$/u.test(line) && /[()o_*\.\-]/u.test(line));
+      .find((line) => /^[ "'(),./08:=OPY\\^_bdopq|~\u2800-\u28ff·•●-]+$/u.test(line) && line.trim());
     expect(firstLogoRow).toBeDefined();
     const authGateOutputLength = session.getRawOutput().length;
     await session.press('enter');

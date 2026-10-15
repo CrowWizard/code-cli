@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import stringWidth from 'string-width';
+import { AUTOHAND_LOGO_FRAME_COUNT } from '../../src/utils/autohandLogoData.js';
 import {
   ASCII_FRIEND,
   LOGO_LINES,
@@ -17,51 +18,68 @@ function logoLineWidths(logo: string): number[] {
 }
 
 describe('responsive Autohand ASCII logo', () => {
+  it('preserves the SVG curves with shape-matched cells instead of symbolic ring outlines', () => {
+    const art = renderAutohandLogo({ columns: 80, rows: 16 });
+    expect(Math.max(...logoLineWidths(art))).toBe(48);
+    expect(art).toMatch(/[\u2801-\u28ff]/u);
+    expect(art).not.toContain('( o )');
+  });
+
+  it('shows continuous motion across the body as well as the orbit', () => {
+    const frames = Array.from({ length: 15 }, (_, frame) => renderAutohandLogo({ columns: 80, rows: 16, frame }));
+    expect(new Set(frames).size).toBeGreaterThanOrEqual(8);
+    const body = (art: string) => art.split('\n').slice(2, -2).map(line => line.slice(8, -8)).join('');
+    expect(body(frames[0])).not.toBe(body(frames[14]));
+  });
+
   it('animates SVG geometry within a compact, fixed canvas', () => {
     const first = renderAutohandLogo({ columns: 120, rows: 30, frame: 0 });
     const next = renderAutohandLogo({ columns: 120, rows: 30, frame: 12 });
     expect(next).not.toBe(first);
-    expect(first.split('\n')).toHaveLength(10);
-    expect(next.split('\n')).toHaveLength(10);
-    expect(Math.max(...logoLineWidths(first))).toBeLessThanOrEqual(32);
-    expect(Math.max(...logoLineWidths(next))).toBeLessThanOrEqual(32);
+    expect(first.split('\n')).toHaveLength(12);
+    expect(next.split('\n')).toHaveLength(12);
+    expect(Math.max(...logoLineWidths(first))).toBeLessThanOrEqual(48);
+    expect(Math.max(...logoLineWidths(next))).toBeLessThanOrEqual(48);
   });
 
-  it('wraps every motion phase and retains all eight centres without growing the canvas', () => {
-    for (const size of [{ columns: 32, rows: 10 }, { columns: 24, rows: 8 }, { columns: 24, rows: 6 }]) {
-      for (let frame = 0; frame < 48; frame++) {
+  it('wraps every scene phase without growing the canvas or dropping the mark', () => {
+    for (const size of [{ columns: 48, rows: 12 }, { columns: 36, rows: 10 }, { columns: 28, rows: 8 }, { columns: 24, rows: 6 }]) {
+      for (let frame = 0; frame < AUTOHAND_LOGO_FRAME_COUNT; frame++) {
         const art = renderAutohandLogo({ ...size, frame });
         expect(art.split('\n')).toHaveLength(size.rows);
         expect(logoLineWidths(art).every(width => width === size.columns)).toBe(true);
-        expect(art.match(/o/g)).toHaveLength(8);
-        expect(renderAutohandLogo({ ...size, frame: frame + 48 })).toBe(art);
+        expect(art.replace(/\s/gu, '').length).toBeGreaterThan(30);
+        expect(art).toMatch(/^[\x20-\x7e\u2800-\u28ff·•●\n]+$/u);
+        expect(renderAutohandLogo({ ...size, frame: frame + AUTOHAND_LOGO_FRAME_COUNT })).toBe(art);
       }
     }
-    expect(renderAutohandLogo({ frame: -1 })).toBe(renderAutohandLogo({ frame: 47 }));
+    expect(renderAutohandLogo({ frame: -1 })).toBe(renderAutohandLogo({ frame: AUTOHAND_LOGO_FRAME_COUNT - 1 }));
     expect(renderAutohandLogo({ frame: Number.NaN })).toBe(ASCII_FRIEND);
     expect(renderAutohandLogo({ frame: Number.POSITIVE_INFINITY })).toBe(ASCII_FRIEND);
   });
   it.each([
-    { columns: 80, expectedColumns: 32, expectedRows: 10 },
-    { columns: 56, expectedColumns: 32, expectedRows: 10 },
-    { columns: 40, expectedColumns: 32, expectedRows: 10 },
-    { columns: 32, expectedColumns: 32, expectedRows: 10 },
-    { columns: 31, expectedColumns: 24, expectedRows: 8 },
-    { columns: 24, expectedColumns: 24, expectedRows: 8 },
+    { columns: 80, expectedColumns: 48, expectedRows: 12 },
+    { columns: 56, expectedColumns: 48, expectedRows: 12 },
+    { columns: 40, expectedColumns: 36, expectedRows: 10 },
+    { columns: 32, expectedColumns: 28, expectedRows: 8 },
+    { columns: 31, expectedColumns: 28, expectedRows: 8 },
+    { columns: 24, expectedColumns: 24, expectedRows: 6 },
   ])('selects a faithful mark that fits $columns columns', ({ columns, expectedColumns, expectedRows }) => {
     const logo = renderAutohandLogo({ columns });
 
     expect(Math.max(...logoLineWidths(logo))).toBe(expectedColumns);
     expect(logo.split('\n')).toHaveLength(expectedRows);
-    expect(logo).toMatch(/^[ ()o_*\.\-\n]+$/);
+    expect(logo).toMatch(/^[\x20-\x7e\u2800-\u28ff·•●\n]+$/u);
   });
 
-  it('retains four ring outlines and separate center disks in each row of the wide mark', () => {
+  it('retains ink in all eight ring regions of the SVG layout', () => {
     const lines = renderAutohandLogo({ columns: 56 }).split('\n');
-
-    expect(lines[3].match(/\( o \)/g)).toHaveLength(4);
-    expect(lines[6].match(/\( o \)/g)).toHaveLength(4);
-    expect(lines.join('').match(/o/g)).toHaveLength(8);
+    for (const [top, bottom] of [[1, 6], [6, 11]]) {
+      for (let ring = 0; ring < 4; ring++) {
+        const ink = lines.slice(top, bottom).map(line => line.slice(6 + ring * 9, 15 + ring * 9)).join('');
+        expect(ink.match(/[\u2801-\u28ff]/gu)?.length).toBeGreaterThan(3);
+      }
+    }
   });
 
   it.each([
@@ -81,16 +99,16 @@ describe('responsive Autohand ASCII logo', () => {
   it('uses the same mark and a simple wordmark on wide terminals', () => {
     const logo = renderAutohandLogo({ columns: 140, includeWordmark: true });
 
-    expect(logo).toBe(`${ASCII_FRIEND}\n\n${' '.repeat(12)}autohand`);
+    expect(logo).toBe(`${ASCII_FRIEND}\n\n${' '.repeat(20)}autohand`);
     expect(LOGO_LINES.join('\n')).toBe(logo);
-    expect(logo.split('\n')).toHaveLength(12);
+    expect(logo.split('\n')).toHaveLength(14);
     expect(logoLineWidths(logo).every((width) => width <= 140)).toBe(true);
   });
 
   it.each([
-    { rows: 14, expectedRows: 10, expectedColumns: 32 },
-    { rows: 10, expectedRows: 10, expectedColumns: 32 },
-    { rows: 9, expectedRows: 8, expectedColumns: 24 },
+    { rows: 14, expectedRows: 12, expectedColumns: 48 },
+    { rows: 10, expectedRows: 10, expectedColumns: 36 },
+    { rows: 9, expectedRows: 8, expectedColumns: 28 },
     { rows: 7, expectedRows: 6, expectedColumns: 24 },
     { rows: 5, expectedRows: 1, expectedColumns: 8 },
     { rows: 1, expectedRows: 1, expectedColumns: 8 },
@@ -108,9 +126,9 @@ describe('responsive Autohand ASCII logo', () => {
   it('includes the wordmark in the available height budget', () => {
     const logo = renderAutohandLogo({ columns: 80, rows: 14, includeWordmark: true });
 
-    expect(logo.split('\n')).toHaveLength(12);
-    expect(Math.max(...logoLineWidths(logo))).toBe(32);
-    expect(logo.split('\n').at(-1)).toBe(`${' '.repeat(12)}autohand`);
+    expect(logo.split('\n')).toHaveLength(14);
+    expect(Math.max(...logoLineWidths(logo))).toBe(48);
+    expect(logo.split('\n').at(-1)).toBe(`${' '.repeat(20)}autohand`);
   });
 
   it('never exceeds constrained columns or rows during terminal resizing', () => {

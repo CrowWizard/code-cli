@@ -12,6 +12,7 @@ import { pathToFileURL } from 'node:url';
 import type { TerminalData } from 'ghostty-opentui';
 import { renderTerminalToImage } from 'ghostty-opentui/image';
 import type { Session } from 'tuistory';
+import sharp from 'sharp';
 import { BRAND_FRAME_INTERVAL_MS, BRAND_FRAME_COUNT, formatBrandLogo } from '../../ui/brand.js';
 import { renderAutohandLogo } from '../../utils/asciiArt.js';
 import { launchTuistorySession } from '../drivers/tuistory-driver.js';
@@ -142,6 +143,31 @@ async function writeFrames(outputRoot: string, frames: readonly CapturedFrame[])
   return images;
 }
 
+async function writeAnimation(outputRoot: string, frames: readonly TerminalData[]): Promise<void> {
+  const pages: Buffer[] = [];
+  let width = 0;
+  let height = 0;
+  for (const terminal of frames) {
+    const png = await renderTerminalToImage(terminal, {
+      fontSize: 16, lineHeight: 1.2, paddingX: 18, paddingY: 18,
+      height: terminal.rows * Math.round(16 * 1.2) + 36,
+      theme: { background: '#101216', text: '#e6e8eb' }, frameColor: '#101216',
+    });
+    const raw = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    if (pages.length) assert(raw.info.width === width && raw.info.height === height, 'Animation canvas must remain fixed');
+    width = raw.info.width;
+    height = raw.info.height;
+    pages.push(raw.data);
+  }
+  const destination = path.join(outputRoot, 'startup-motion.gif');
+  await sharp(Buffer.concat(pages), {
+    raw: { width, height: height * pages.length, channels: 4, pageHeight: height },
+  }).gif({ delay: pages.map(() => 100), loop: 0, effort: 1 }).toFile(destination);
+  const metadata = await sharp(destination, { animated: true }).metadata();
+  assert.equal(metadata.pages, pages.length, 'Preview must retain the captured animation frames');
+  assert.equal(metadata.delay?.reduce((total, delay) => total + delay, 0), pages.length * 100, 'Preview must play at its captured speed');
+}
+
 async function capture(): Promise<void> {
   const outputRoot = path.resolve('.artifacts/startup-branding');
   const session = await launchTuistorySession({
@@ -164,6 +190,7 @@ async function capture(): Promise<void> {
     },
   });
   const frames: CapturedFrame[] = [];
+  const animationFrames: TerminalData[] = [];
   let bytes = 0;
   let chunks = 0;
   let elapsedMs = 0;
@@ -176,12 +203,16 @@ async function capture(): Promise<void> {
       bytes += Buffer.byteLength(data, 'utf8');
       chunks++;
     });
-    await delay(1_500);
-    const second = await waitForScreen(session, hasCompleteMenu);
+    for (let sample = 0; sample < 80; sample++) {
+      const terminal = await waitForScreen(session, hasCompleteMenu);
+      assert.equal(identityText(terminal), identityText(first), 'Motion must not move the menu');
+      animationFrames.push(terminal);
+      await delay(100);
+    }
+    const second = animationFrames[15];
     assert.equal(identityText(second), identityText(first), 'Motion must keep the identity and menu stationary');
     assert.notEqual(screenText(second), screenText(first), 'Two phases must contain moving logo geometry');
     frames.push({ name: 'wide-phase-2', terminal: second });
-    await delay(Math.max(0, 3_000 - (performance.now() - started)));
     elapsedMs = performance.now() - started;
     unsubscribe();
     unsubscribe = undefined;
@@ -206,6 +237,7 @@ async function capture(): Promise<void> {
   }
 
   const images = await writeFrames(outputRoot, frames);
+  await writeAnimation(outputRoot, animationFrames);
   const report = {
     generatedAt: new Date().toISOString(),
     command: 'node --import tsx src/testing/scenarios/captureStartupBranding.ts',
@@ -223,6 +255,7 @@ async function capture(): Promise<void> {
     formatter: benchmarkFormatter(),
     captures: frames.map(({ name, terminal }) => ({ name, cols: terminal.cols, rows: terminal.rows })),
     images,
+    animationPreview: { file: 'startup-motion.gif', frames: animationFrames.length, framesPerSecond: 10, source: 'Captured PTY terminal cells' },
   };
   await writeFile(path.join(outputRoot, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));
@@ -251,7 +284,7 @@ async function captureReturning(): Promise<void> {
         ui: { mouseComposerCursor: false, promptSuggestions: false, showCompletionNotification: false, terminalBell: false },
       },
     });
-    for (const size of [{ cols: 80, rows: 24, logoRows: 6 }, { cols: 120, rows: 32, logoRows: 6 }]) {
+    for (const size of [{ cols: 80, rows: 24, logoRows: 9 }, { cols: 120, rows: 32, logoRows: 11 }]) {
       session = await helpers.launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
         autohandHome: state.autohandHome,
         cwd: state.workspaceRoot,
@@ -308,7 +341,7 @@ async function captureReturning(): Promise<void> {
   const report = {
     generatedAt: new Date().toISOString(),
     command: 'node --import tsx src/testing/scenarios/captureStartupBranding.ts --returning-only',
-    verification: 'Actual built CLI with authenticated temporary config and local mock auth/provider servers. All six occupied logo rows remain visible in a compact canvas while editing the composer; both sessions exit cleanly and restore the cursor.',
+    verification: 'Actual built CLI with authenticated temporary config and local mock auth/provider servers. Every occupied logo row remains visible while editing the composer; both sessions exit cleanly and restore the cursor.',
     builtCli: { path: 'dist/index.js', sha256: builtHash, bytes: builtStat.size, modifiedAt: builtStat.mtime.toISOString() },
     nativeApplications: { Ghostty: 'unverified', iTerm2: 'unverified', WindowsTerminal: 'unverified' },
     captures: frames.map(({ name, terminal }) => ({ name, cols: terminal.cols, rows: terminal.rows, visibleLogoRows: returningStartupLogoRows(screenText(terminal)).length })),

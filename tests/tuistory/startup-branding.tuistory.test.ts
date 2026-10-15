@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Session } from 'tuistory';
 import stringWidth from 'string-width';
 import { launchTuistorySession } from '../../src/testing/drivers/tuistory-driver.js';
+import { isStartupLogoRow } from '../../src/testing/scenarios/startupReturningBrandingScenario.js';
 import { expectCleanExit, waitForExit } from './helpers/autohandTuistory.js';
 
 interface TerminalProfile {
@@ -21,6 +22,7 @@ const animatedProfiles: TerminalProfile[] = [
   { name: 'Windows Terminal', env: { TERM: 'xterm-256color', COLORTERM: 'truecolor', WT_SESSION: 'branding-test-session' } },
   { name: '256-color', env: { TERM: 'xterm-256color', FORCE_COLOR: '2' } },
   { name: '16-color', env: { TERM: 'xterm', FORCE_COLOR: '1' } },
+  { name: 'NO_COLOR monochrome', env: { TERM: 'xterm-256color', NO_COLOR: '1' } },
 ];
 
 let session: Session | undefined;
@@ -38,14 +40,14 @@ function viewport(current: Session): string {
 }
 
 function artRows(screen: string): string[] {
-  return screen.split('\n').filter((line) => /^[ ()o_*\.\-]+$/u.test(line) && /[()o_*\.\-]/u.test(line));
+  return screen.split('\n').filter(isStartupLogoRow);
 }
 
 function artColors(current: Session): string {
   const terminal = current.getTerminalData();
   return JSON.stringify([...new Set(terminal.lines.slice(-terminal.rows)
     .filter((line) => artRows(line.spans.map((span) => span.text).join('')).length > 0)
-    .flatMap((line) => line.spans.filter((span) => /[()o_*\.\-]/u.test(span.text)).map((span) => span.fg)))]);
+    .flatMap((line) => line.spans.filter((span) => span.text.trim()).map((span) => span.fg)))]);
 }
 
 async function waitForScreen(current: Session, predicate: (screen: string) => boolean): Promise<string> {
@@ -113,11 +115,11 @@ describe('startup branding in real terminals', () => {
     const laterFrame = await waitForScreen(current, (screen) => screen.includes('ESC Cancel'));
     expect(laterFrame.slice(laterFrame.indexOf('autohand'))).toBe(initialScreen.slice(initialScreen.indexOf('autohand')));
     expect(laterFrame.split('\n').length).toBe(initialScreen.split('\n').length);
-    expect(Math.max(...artRows(laterFrame).map(line => line.trimEnd().length))).toBeLessThanOrEqual(33);
+    expect(Math.max(...artRows(laterFrame).map(line => line.trimEnd().length))).toBeLessThanOrEqual(49);
     const frameOutput = current.getRawOutput().slice(outputStart);
     expect(frameOutput.length).toBeGreaterThan(0);
     expect(frameOutput).not.toContain('\x1b[3J');
-    expect(frameOutput.length).toBeLessThan(100_000);
+    expect(frameOutput.length).toBeLessThan(200_000);
     expect(current.getTerminalData().totalLines).toBeLessThanOrEqual(current.currentRows);
 
     current.sendKey('down');
@@ -133,7 +135,6 @@ describe('startup branding in real terminals', () => {
   });
 
   it.each([
-    { name: 'NO_COLOR', env: { NO_COLOR: '1' }, hasColor: false },
     { name: 'dumb terminal', env: { TERM: 'dumb' }, hasColor: false },
     { name: 'reduced motion', env: { AUTOHAND_REDUCED_MOTION: '1', COLORTERM: 'truecolor' }, hasColor: true },
   ])('keeps readable, static branding for $name', async ({ env, hasColor }) => {
@@ -251,18 +252,20 @@ describe('startup branding in real terminals', () => {
   });
 
   it('renders the complete monochrome sign-in screen as a stable terminal snapshot', async () => {
-    const current = await launchBranding({ NO_COLOR: '1' });
+    const current = await launchBranding({ NO_COLOR: '1', AUTOHAND_REDUCED_MOTION: '1' });
     expect(viewport(current)).toMatchInlineSnapshot(`
       "
-
-            ___    ___   ___   ___
-           ( o )  ( o ) ( o ) ( o )
-            ---    ---   ---   ---   .
-            ___    ___   ___   ___    *
-           ( o )  ( o ) ( o ) ( o )
-            ---    ---   ---   ---
-
-
+                ⣀⣀⡀      ⢀⣀⣀      ⣀⣀⡀      ⢀⣀⣀
+             ⢀⡴⠋⠉⠉⠉⠳⣄  ⣰⠞⠉⠉⠉⠙⢦⡀⢀⡴⠋⠉⠉⠉⠳⣆  ⣠⠞⠉⠉⠉⠙⢦⡀
+             ⣼⠁·⣴⣶⡄·⢸⡆⢰⡇·⢠⣶⣦·⠈⡇⢸⠁·⣰⣶⡆·⢸⡆⢰⡇·⢠⣶⣦·⠈⣧·
+             ⠸⣄·⠈⠛⠁·⡼⠁⠈⣧·⠈⠛⠋·⣰⠇⠸⣆·⠈⠛⠁·⣼⠁⠈⢧·⠈⠛⠋·⣠⠇·
+              ⠈⠳⠦⠤⠶⠛⠁··⠈⠓⠶⠤⠴⠞⠁··⠈⠳⠦⠤⠶⠚⠁··⠈⠛⠶⠤⠴⠞⠁··
+              ⢀⡴⠖⠒⠶⣤⡀· ⢀⡤⠶⠒⠲⢦⡀· ⢀⡴⠖⠒⠶⢤⡀· ⢀⣤⠶⠒⠲⢦⡀·
+             ⢰⠋·⢀⣀⡀·⢳⡀⢀⡟·⢀⣠⡀·⠹⡆⢰⠏·⢀⣀⡀·⢻⡀⢀⡞··⣠⣀·⠙⡆
+             ⢻⡀·⠻⡿⠇·⢸⠇⠸⡇·⠸⢿⠟·⢀⡇⢸⡀·⠻⡿⠇·⢸⠇⠸⡇·⠘⢿⠿·●•·
+             ⠈⠳⣄⣀⣀⣀⡴⠋··⠹⢦⣀⣀⣀⣠⠞⠁⠈⠳⣄⣀⣀⣀⡴⠏··⠙⢦⣀⣀⣀••··
+              ··⠉⠉⠁···  ·⠈⠉⠉······⠉⠉⠁···  ·⠈⠉⠉····
+                 ···      ···      ···      ···
 
        autohand
        v0.8.2

@@ -85,8 +85,8 @@ describe('Autohand branding inside Ink', () => {
     screen = renderInkScreen(<AutohandBrand version="v0.8.2" />);
     await settle();
     const lines = stripAnsi(screen.lastFrame() ?? '').split('\n');
-    expect(lines.length).toBeLessThanOrEqual(13);
-    expect(Math.max(...lines.map(line => line.length))).toBeLessThanOrEqual(32);
+    expect(lines.length).toBeLessThanOrEqual(15);
+    expect(Math.max(...lines.map(line => line.length))).toBeLessThanOrEqual(48);
   });
 
   it('shrinks the mark on terminal resize with room for the login menu', async () => {
@@ -102,10 +102,25 @@ describe('Autohand branding inside Ink', () => {
     expect(lines.join('\n')).toContain('autohand');
   });
 
-  it.each(['NO_COLOR', 'AUTOHAND_REDUCED_MOTION'] as const)('does not allocate animation timers with %s', async (setting) => {
+  it.each(['AUTOHAND_REDUCED_MOTION'] as const)('does not allocate animation timers with %s', async (setting) => {
     vi.stubEnv(setting, '1');
     const baseline = vi.getTimerCount();
     screen = renderInkScreen(<AutohandBrand />);
+    await settle();
+    expect(vi.getTimerCount()).toBe(baseline);
+  });
+
+  it('keeps visible frame motion with NO_COLOR and still releases its timer', async () => {
+    vi.stubEnv('NO_COLOR', '1');
+    const baseline = vi.getTimerCount();
+    screen = renderInkScreen(<AutohandBrand />);
+    await settle();
+    const first = screen.lastFrame();
+    vi.advanceTimersByTime(1_000);
+    await settle();
+    expect(screen.lastFrame()).not.toBe(first);
+    expect(screen.lastFrame()).not.toMatch(/\x1b\[[\d;]+m/u);
+    screen.unmount();
     await settle();
     expect(vi.getTimerCount()).toBe(baseline);
   });

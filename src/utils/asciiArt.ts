@@ -61,7 +61,7 @@ export function renderAutohandLogo(options: RenderAutohandLogoOptions = {}): str
   if (match) {
     const frame = typeof options.frame === 'number' && Number.isFinite(options.frame) ? Math.floor(options.frame) : 0;
     const phase = (frame % AUTOHAND_LOGO_FRAME_COUNT + AUTOHAND_LOGO_FRAME_COUNT) % AUTOHAND_LOGO_FRAME_COUNT;
-    const art = match.frames[phase].join('\n');
+    const art = match.frames[phase];
     return options.includeWordmark
       ? `${art}\n\n${centeredWordmark(match.columns)}`
       : art;
