@@ -58,3 +58,5 @@ autoresearch-results/
 .baseline-orchestration-terminal-extra.log
 .baseline-orchestration-terminal.log
 .orchestration-local-build.log
+vendor/zit/
+!scripts/install-zit.mjs
