@@ -17,6 +17,7 @@ interface TransferOptions { account: string; path?: string; config?: string; off
 export interface TransferRunOptions { path: string; resumeSessionId: string; model: string; provider: 'autohandai'; offline: boolean; config?: string; account: string; plan?: boolean }
 interface TransferDependencies {
   run(options: TransferRunOptions): Promise<void>;
+  authenticate?(config: LoadedConfig): Promise<LoadedConfig>;
   receive?(id: string, options: TransferOptions): Promise<ReceivedTransfer>;
   prepare?(received: ReceivedTransfer, directory: string): Promise<{ sessionId: string; workspace: string }>;
   confirm?(snapshot: SessionTransfer): Promise<boolean>;
@@ -32,8 +33,8 @@ export function createTransferRunConfig(config: LoadedConfig, options: Pick<Tran
   return { ...config, ...overlay.config, runOverlay: { ...config.runOverlay, entries: [...(config.runOverlay?.entries ?? []), ...(overlay.snapshot?.entries ?? [])] } };
 }
 
-async function receive(id: string, options: TransferOptions): Promise<ReceivedTransfer> {
-  const config = await ensureAuthenticated(await loadConfig(options.config));
+async function receive(id: string, options: TransferOptions, authenticate = ensureAuthenticated): Promise<ReceivedTransfer> {
+  const config = await authenticate(await loadConfig(options.config));
   if (!config.auth?.token) throw new Error('Run autohand login before importing this transfer.');
   return new SessionTransferClient().download(id, { token: config.auth.token, userId: config.auth.user?.id ?? 'authenticated', accountId: options.account });
 }
@@ -85,7 +86,7 @@ export function registerTransferCommand(program: Command, dependencies: Transfer
         const options = command.optsWithGlobals<TransferOptions>();
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) throw new Error('Invalid transfer ID.');
         if (!/^[A-Za-z0-9_-]{1,200}$/.test(options.account)) throw new Error('Invalid transfer account.');
-        const received = await (dependencies.receive ?? receive)(id, options);
+        const received = await (dependencies.receive ?? ((id, options) => receive(id, options, dependencies.authenticate)))(id, options);
         if (received.snapshot.provider !== 'autohandai') throw new Error('Open this transfer in Autohand Code Web and select its model before continuing in the CLI.');
         if (!options.accept && !await (dependencies.confirm ?? confirmCliTransfer)(received.snapshot)) return;
         const imported = await (dependencies.prepare ?? prepareCliTransfer)(received, path.resolve(options.path ?? process.cwd()));

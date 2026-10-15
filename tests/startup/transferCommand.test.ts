@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import type { LoadedConfig } from '../../src/types.js';
+import { SessionTransferClient } from '../../src/session/transfer/transfer-client.js';
 
 const directories: string[] = [];
 afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
@@ -23,6 +24,34 @@ function fixture(confirmed = true) {
   return { receive, prepare, confirm, run, report, parse: (args: string[]) => program.parseAsync(['transfer', id, '--account', 'personal_ada', ...args], { from: 'user' }) };
 }
 describe('standalone Web transfer command', () => {
+  it('uses the launch-owned authentication flow when receiving a transfer', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'autohand-transfer-auth-'));
+    directories.push(directory);
+    const configPath = path.join(directory, 'config.json');
+    await writeFile(configPath, JSON.stringify({ auth: { token: 'saved-device-token' } }));
+    const authenticate = vi.fn(async (config: LoadedConfig) => ({
+      ...config,
+      auth: { token: 'launch-owner-token' },
+    }));
+    const download = vi.spyOn(SessionTransferClient.prototype, 'download').mockResolvedValue(received);
+    const program = new Command().exitOverride();
+    const run = vi.fn();
+    registerTransferCommand(program, {
+      authenticate,
+      prepare: async () => ({ sessionId: `web-${id}`, workspace: directory }),
+      run,
+    });
+
+    try {
+      await program.parseAsync(['transfer', id, '--account', 'personal_ada', '--config', configPath, '--accept'], { from: 'user' });
+
+      expect(authenticate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ configPath }));
+      expect(download).toHaveBeenCalledWith(id, expect.objectContaining({ token: 'launch-owner-token' }));
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      download.mockRestore();
+    }
+  });
   it.each([false, true])('keeps transfer credentials, account and model out of configuration saves with existing Autohand settings: %s', async existing => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'autohand-transfer-config-')); directories.push(directory);
     const config: LoadedConfig = { configPath: path.join(directory, 'config.json'), provider: 'openrouter', auth: { token: 'fixture-native-token' }, api: { accountId: 'personal_local' }, ui: { showTips: false }, runOverlay: { entries: [{ path: ['ui', 'showTips'], hadBase: true, base: true, applied: false }] }, ...(existing ? { autohandai: { plan: 'local', model: 'saved-local-model' } } : {}) };
