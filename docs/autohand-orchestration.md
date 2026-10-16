@@ -40,11 +40,14 @@ requests share the run's request and token budgets, support cancellation, and
 report usage with the lead. Moa reviews are disabled for known Free accounts;
 when entitlements are unknown they run only if Moa or Auto is already selected.
 
-Empty or output-limited verdicts get one larger-output recovery request within
-the same 90-second review deadline. An unavailable checkpoint gets one further
-review attempt; all requests count against the run budget. Failures report the
-provider or verdict-parsing stage, content length, finish reason, and a bounded
-response ID when available, without recording raw review text or HTTP bodies.
+Each review request has a five-minute generation deadline, including a fresh
+deadline for the larger-output recovery request after an empty or output-limited
+verdict. An unavailable checkpoint gets one further review attempt; all requests
+count against the run budget. Escape can interrupt the review at any time.
+Deadline expiry is identified as a timeout, separately from user cancellation.
+Failures report the deadline, provider, or verdict-parsing stage, content length,
+finish reason, and a bounded response ID when available, without recording raw
+review text or HTTP bodies.
 Invalid accepted HTTP JSON is identified separately and is not automatically
 replayed by the transport. A late or malformed answer never counts as approval.
 

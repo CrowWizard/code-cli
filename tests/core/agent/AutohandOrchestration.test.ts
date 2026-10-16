@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isAutohandOrchestrationEnabled, orchestrationThreadLimit, canUseMoaAdvisor, RESEARCH_WORKER_TOOLS } from '../../../src/core/agent/AutohandOrchestration.js';
 import { CheckpointAdvisor } from '../../../src/core/agent/CheckpointAdvisor.js';
 import { RunBudget } from '../../../src/core/agent/RunBudget.js';
+import { LLMGatewayClient } from '../../../src/providers/LLMGatewayClient.js';
 import type { LoadedConfig, LLMRequest, LLMResponse } from '../../../src/types.js';
 
 const config: LoadedConfig = { provider: 'autohandai', autohandai: { plan: 'cloud', model: 'moa' } };
@@ -27,6 +28,83 @@ describe('Autohand orchestration defaults', () => {
     for (const tool of ['run_command', 'custom_command', 'write_file', 'code_mode', 'delegate_task', 'mcp__anything', 'git_add']) {
       expect(RESEARCH_WORKER_TOOLS.has(tool)).toBe(false);
     }
+  });
+});
+
+describe('Moa review deadlines through the gateway', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  async function reviewAfter(delays: number[], cancelAt?: number) {
+    vi.useFakeTimers();
+    const timerBaseline = vi.getTimerCount();
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation(milliseconds => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException('Deadline expired', 'TimeoutError')), milliseconds);
+      return controller.signal;
+    });
+    const parent = new AbortController();
+    if (cancelAt !== undefined) setTimeout(() => parent.abort(), cancelAt);
+    const fetchMock = vi.fn<typeof fetch>(async (_url, options) => {
+      const signal = options?.signal;
+      if (!signal) throw new Error('Expected the review request signal');
+      const index = fetchMock.mock.calls.length - 1;
+      return new Promise<Response>((resolve, reject) => {
+        const abort = () => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', abort);
+          reject(signal.reason);
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener('abort', abort);
+          const recovering = index < delays.length - 1;
+          resolve(Response.json({ id: 'checkpoint-fixture', choices: [{ message: {
+            content: recovering ? '' : '{"verdict":"approved","feedback":"Evidence verified."}',
+          }, finish_reason: recovering ? 'length' : 'stop' }] }));
+        }, delays[index]);
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = new LLMGatewayClient({ apiKey: 'fixture', model: 'moa' }, { maxRetries: 0 });
+    const advisor = new CheckpointAdvisor({ provider, recordUsage: () => {} });
+    const pending = advisor.review('completion', { history: [], context: 'diff', signal: parent.signal })
+      .then(value => ({ kind: 'review' as const, value }), (error: unknown) => ({ kind: 'error' as const, error }));
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    expect(vi.getTimerCount()).toBe(timerBaseline);
+    return { result, requests: fetchMock.mock.calls.length, parentAborted: parent.signal.aborted };
+  }
+
+  it('allows a valid thinking review to finish after ninety seconds', async () => {
+    const { result, requests, parentAborted } = await reviewAfter([100_000]);
+    expect(result).toEqual({ kind: 'review', value: { verdict: 'approved', feedback: 'Evidence verified.' } });
+    expect(requests).toBe(1);
+    expect(parentAborted).toBe(false);
+  });
+
+  it('gives the output recovery request its own generation budget', async () => {
+    const { result, requests } = await reviewAfter([240_000, 120_000]);
+    expect(result).toEqual({ kind: 'review', value: { verdict: 'approved', feedback: 'Evidence verified.' } });
+    expect(requests).toBe(2);
+  });
+
+  it('identifies an expired review deadline even when the gateway reports cancellation', async () => {
+    const { result, parentAborted } = await reviewAfter([600_000]);
+    expect(result).toMatchObject({ kind: 'review', value: { verdict: 'unavailable',
+      feedback: expect.stringMatching(/timed out.*stage=deadline/i) } });
+    expect(parentAborted).toBe(false);
+  });
+
+  it('propagates a genuine user abort without retrying the review', async () => {
+    const { result, requests, parentAborted } = await reviewAfter([100_000], 25_000);
+    expect(result.kind).toBe('error');
+    expect(parentAborted).toBe(true);
+    expect(requests).toBe(1);
   });
 });
 

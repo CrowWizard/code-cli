@@ -5,6 +5,8 @@ import { ApiError } from '../../providers/errors.js';
 import type { RunBudgetGate } from './RunBudget.js';
 import { RunBudgetExceededError } from './RunBudget.js';
 
+const REVIEW_REQUEST_TIMEOUT_MS = 300_000;
+
 export type AdvisorCheckpoint = 'plan' | 'repeated_failure' | 'commit' | 'completion';
 export interface AdvisorReview {
   verdict: 'approved' | 'changes_requested' | 'unavailable';
@@ -69,11 +71,12 @@ export class CheckpointAdvisor implements TurnAdvisor {
 
   async review(checkpoint: AdvisorCheckpoint, context: AdvisorContext): Promise<AdvisorReview> {
     context.signal.throwIfAborted();
-    const signal = AbortSignal.any([context.signal, AbortSignal.timeout(90_000)]);
+    let signal = context.signal;
     try {
       for (const maxTokens of [8000, 16000]) {
-        signal.throwIfAborted();
+        context.signal.throwIfAborted();
         this.options.budget?.assertRequestAllowed();
+        signal = AbortSignal.any([context.signal, AbortSignal.timeout(REVIEW_REQUEST_TIMEOUT_MS)]);
         this.options.budget?.recordRequest();
         const response = await this.options.provider.complete({
           model: 'moa',
@@ -117,9 +120,12 @@ export class CheckpointAdvisor implements TurnAdvisor {
     } catch (error) {
       context.signal.throwIfAborted();
       if (error instanceof RunBudgetExceededError) throw error;
+      if (signal.aborted) {
+        return unavailableReview(`Moa review timed out after ${REVIEW_REQUEST_TIMEOUT_MS / 1000} seconds.`, 'deadline');
+      }
       const kind = error instanceof SyntaxError ? 'SyntaxError'
         : error instanceof ApiError ? `ApiError; code=${error.code}; httpStatus=${error.httpStatus}`
-        : signal.aborted ? 'Deadline exceeded' : 'Provider request failed';
+        : 'Provider request failed';
       const requestId = error instanceof ApiError ? /Request ID: ([\w-]{1,128})/.exec(error.message)?.[1] : undefined;
       return unavailableReview(`Moa review unavailable: ${kind}${requestId ? `; requestId=${requestId}` : ''}.`, 'provider');
     }
