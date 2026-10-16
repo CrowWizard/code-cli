@@ -1,11 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import stripAnsi from 'strip-ansi';
+import { renderAutohandLogo } from '../../src/utils/asciiArt.js';
 import { formatBrandLogo, resolveBrandColorMode, shouldAnimateBrand } from '../../src/ui/brand.js';
 import { BRAND_FRAME_COUNT } from '../../src/ui/brand.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
 describe('portable monochrome brand rendering', () => {
+  it.each(['truecolor', '256', '16', 'none'] as const)('inherits the unmodified terminal foreground in %s mode', (mode) => {
+    const art = '  ⢀⣀⣀⡀ ·\n  ⠈⠉⠉⠁ ●';
+    expect(formatBrandLogo(art, 0, mode)).toBe(art);
+    expect(formatBrandLogo(art, 20, mode)).toBe(art);
+  });
+
   it('keeps a monochrome terminal animation moving when NO_COLOR disables ANSI colour', () => {
     vi.stubEnv('TERM', 'xterm-256color');
     vi.stubEnv('NO_COLOR', '1');
@@ -15,27 +22,15 @@ describe('portable monochrome brand rendering', () => {
     expect(shouldAnimateBrand(true, 'none')).toBe(false);
   });
 
-  it('sweeps achromatic light over the body without introducing coloured foregrounds', () => {
-    const art = '  _p8888q_  \n  Y8    8P  \n   Y8888P   ';
-    const first = formatBrandLogo(art, 0, 'truecolor');
-    const later = formatBrandLogo(art, 20, 'truecolor');
+  it('preserves visible geometry animation without changing terminal colour or intensity', () => {
+    const firstArt = renderAutohandLogo({ columns: 80, rows: 16, frame: 0 });
+    const laterArt = renderAutohandLogo({ columns: 80, rows: 16, frame: 20 });
+    const first = formatBrandLogo(firstArt, 0, 'truecolor');
+    const later = formatBrandLogo(laterArt, 20, 'truecolor');
     expect(first).not.toBe(later);
-    expect(stripAnsi(first)).toBe(art);
-    expect(stripAnsi(later)).toBe(art);
-    expect(first + later).not.toMatch(/\x1b\[(?:38|48);/u);
-  });
-
-  it('keeps one inherited foreground instead of cycling a rainbow palette', () => {
-    const art = ' .##.  .##.\n+#  #++#  #+\n .##.  .##.';
-    const first = formatBrandLogo(art, 0, 'truecolor');
-    const next = formatBrandLogo(art, 8, 'truecolor');
-    expect(next).not.toBe(first);
-    expect(stripAnsi(first)).toBe(art);
-    expect(stripAnsi(next)).toBe(art);
-    expect(first).toContain('\x1b[2m');
-    expect(first).not.toContain('\x1b[38;');
-    expect(first.replace(/\x1b\[[\d;]+m/g, '')).toBe(art);
-    expect(first).not.toMatch(/\x1b\[[^m]*[HJAB]/);
+    expect(first).toBe(firstArt);
+    expect(later).toBe(laterArt);
+    expect(first + later).not.toContain('\x1b');
   });
 
   it.each(['256', '16', 'none'] as const)('degrades to %s colour without altering geometry', (mode) => {
@@ -43,8 +38,7 @@ describe('portable monochrome brand rendering', () => {
     const frame = formatBrandLogo(art, 3, mode);
     expect(stripAnsi(frame)).toBe(art);
     expect(frame).not.toContain(';2;');
-    if (mode !== 'none') expect(frame).toContain('\x1b[2m');
-    if (mode === 'none') expect(frame).toBe(art);
+    expect(frame).toBe(art);
   });
 
   it('respects NO_COLOR, redirected output, and dumb terminals', () => {

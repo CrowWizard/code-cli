@@ -36,9 +36,7 @@ describe('startup theme formatting', () => {
     try {
       const art = ' .##.\n# @ #';
       const banner = formatStartupBanner(art);
-      expect(banner).toContain('\x1b[2m');
-      expect(banner).not.toContain('\x1b[38;');
-      expect(stripAnsi(banner)).toBe(art);
+      expect(banner).toBe(art);
       vi.stubEnv('NO_COLOR', '1');
       expect(formatStartupBanner(art)).toBe(art);
     } finally {

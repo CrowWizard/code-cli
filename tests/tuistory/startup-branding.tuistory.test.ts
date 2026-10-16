@@ -50,6 +50,19 @@ function artColors(current: Session): string {
     .flatMap((line) => line.spans.filter((span) => span.text.trim()).map((span) => span.fg)))]);
 }
 
+function expectDefaultLogoStyle(current: Session): void {
+  const terminal = current.getTerminalData();
+  const spans = terminal.lines.slice(-terminal.rows)
+    .filter((line) => isStartupLogoRow(line.spans.map((span) => span.text).join('')))
+    .flatMap((line) => line.spans.filter((span) => span.text.trim()));
+  expect(spans.length).toBeGreaterThan(0);
+  for (const span of spans) {
+    expect(span.fg).toBeNull();
+    expect(span.bg).toBeNull();
+    expect(span.flags).toBe(0);
+  }
+}
+
 async function waitForScreen(current: Session, predicate: (screen: string) => boolean): Promise<string> {
   const deadline = Date.now() + 10_000;
   let screen = '';
@@ -100,6 +113,7 @@ describe('startup branding in real terminals', () => {
     const initialColors = artColors(current);
     const outputStart = current.getRawOutput().length;
     expect(initialArt.length).toBeGreaterThanOrEqual(3);
+    expectDefaultLogoStyle(current);
     expect(initialScreen.match(/(?:^|\n)\s*autohand\s*(?=\n|$)/gu)).toHaveLength(1);
 
     const deadline = Date.now() + 2_000;
@@ -107,6 +121,7 @@ describe('startup branding in real terminals', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
     expect(artRows(viewport(current))).not.toEqual(initialArt);
+    expectDefaultLogoStyle(current);
     expect(artColors(current)).toBe(initialColors);
     expect(JSON.parse(initialColors)).toHaveLength(1);
     const changedFrame = await waitForScreen(current, (screen) => screen.includes('ESC Cancel'));
@@ -143,11 +158,12 @@ describe('startup branding in real terminals', () => {
     const first = viewport(current);
     const outputStart = current.getRawOutput().length;
     expect(artRows(first).length).toBeGreaterThanOrEqual(3);
+    expectDefaultLogoStyle(current);
     await new Promise<void>((resolve) => setTimeout(resolve, 800));
     expect(viewport(current)).toBe(first);
     expect(current.getRawOutput().slice(outputStart)).toBe('');
     if (hasColor) {
-      expect(current.getRawOutput()).toContain('\x1b[2m');
+      expect(current.getRawOutput()).toMatch(/\x1b\[(?:38;|3[0-7]m|9[0-7]m)/u);
     } else {
       expect(current.getRawOutput()).not.toMatch(/\x1b\[(?:38;|3[0-7]m|9[0-7]m)/u);
     }
