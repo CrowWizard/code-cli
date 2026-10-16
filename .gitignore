@@ -3,6 +3,8 @@ dist/
 binaries/
 .DS_Store
 .tmp/
+.artifacts/
+.cloud-build.log
 CHANGELOG.md
 install-local.sh
 PATH_SETUP.md
