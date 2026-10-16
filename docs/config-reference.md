@@ -32,6 +32,7 @@ For local repository scanning and credential reuse during workflow uploads, see
 - [Configuration File Location](#configuration-file-location)
 - [Environment Variables](#environment-variables)
 - [Bare Mode](#bare-mode)
+- [Foreground Mode](#foreground-mode)
 - [Provider Settings](#provider-settings)
 - [Workspace Settings](#workspace-settings)
 - [UI Settings](#ui-settings)
@@ -162,6 +163,16 @@ AUTOHAND_THINKING_LEVEL=extended autohand --prompt "refactor this module"
 ```
 
 ---
+
+## Foreground Mode
+
+Run `autohand --no-daemon` to disable automatic background services for this invocation. Normal foreground model requests, file tools, shell commands, Git, slash commands, and session history remain available.
+
+The flag skips trace-daemon reconciliation, settings sync, pings, account polling, peer heartbeats, update/catalog/announcement prefetches, suggestions, automatic memory reflection, repository readiness, hooks, MCP and computer/browser helpers. Native search indexing and watchers are replaced by foreground search. Background shell tools, teammate processes, scheduled tasks and service-starting commands are blocked. Local-model setup can connect to an existing server and will not start one. Existing services started by another invocation are left alone. These overrides are never saved to your configuration. `--tmux` cannot be combined with `--no-daemon`.
+
+`/clear` compacts the current session into a bounded handoff containing the user request, learned facts, changes and final answer. With a configured hosted Autohand AI provider it makes one Weka `/decisions` call to select useful evidence; Weka is a typed decision API, so the CLI assembles the handoff from that evidence. It falls back to local extraction when credentials are absent, Weka fails, or its ten-second deadline expires. Escape cancels without replacing the conversation. The original transcript stays on disk, and resume starts from the latest saved compaction checkpoint.
+
+`/new` archives the current session and starts a new session ID with fresh conversation and accounting state. It does not wait for an inference or memory-extraction call.
 
 ## Bare Mode
 
@@ -2858,6 +2869,7 @@ These flags override config file settings:
 | `--dry-run`                   | Preview without executing                                                                      |
 | `-d, --debug`                 | Enable verbose debug output                                                                    |
 | `--bare`                      | Minimal explicit mode; also sets `AUTOHAND_CODE_SIMPLE=1` and disables slash commands          |
+| `--no-daemon`                 | Disable background services and child processes for this run; retain foreground tools and slash commands |
 | `--ephemeral`                 | Keep the run out of session history: no session directory or index entry, no automatic memory extraction, no session sync. Files the agent writes in the workspace are unaffected. Cannot be combined with `--resume` or `--fork` |
 | `--profile <name>`            | Layer `profiles.<name>` from the config onto this run; see [Profiles and One-Run Overrides](#profiles-and-one-run-overrides) |
 | `--set <key=value>`           | Override one setting for this run by dotted path; repeatable; never saved                       |
@@ -3072,8 +3084,8 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | ------------- | ----------------------------------------------------- |
 | `/quit`       | Exit the current session                              |
 | `/exit`       | Exit the current session                              |
-| `/new`        | Start fresh conversation (with memory extraction)     |
-| `/clear`      | Clear conversation with automatic memory extraction   |
+| `/new`        | Archive current session and start a fresh session ID   |
+| `/clear`      | Compact context and retain a resumable session handoff |
 | `/session`    | Show current session details                          |
 | `/sessions`   | List past sessions                                    |
 | `/resume`     | Resume a previous session                             |

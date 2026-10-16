@@ -357,7 +357,7 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/exit`            | Exit the session                                                                 |
 | `/model`           | Switch LLM models                                                                |
 | `/new`             | Start fresh conversation                                                         |
-| `/clear`           | Clear conversation history                                                       |
+| `/clear`           | Compact context, retaining requests, learnings, changes and final answer           |
 | `/undo`            | Revert the last recorded agent file mutation and conversation turn               |
 | `/session`         | Show current session details                                                     |
 | `/sessions`        | List past sessions                                                               |
@@ -722,6 +722,12 @@ bun run typecheck
 
 # Run tests
 bun run test
+
+# Full proof (unit tests, build, and Tuistory)
+bun run proof
+
+# Limit local test workers on resource-constrained hosts
+AUTOHAND_TEST_WORKERS=1 bun run proof
 ```
 
 ## Docker

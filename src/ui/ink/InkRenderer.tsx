@@ -1079,6 +1079,7 @@ export class InkRenderer {
   resetAndClearScreen(): void {
     const newState = {
       ...createInitialUIState(),
+      chatHistoryEpoch: this.state.chatHistoryEpoch + 1,
       interactionMode: this.options.getInteractionMode?.() ?? this.state.interactionMode,
       announcement: this.state.announcement,
       feedbackSurvey: this.state.feedbackSurvey,

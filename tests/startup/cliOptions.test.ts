@@ -14,6 +14,14 @@ import {
 } from '../../src/startup/cliOptions.js';
 
 describe('CLI option normalization', () => {
+  it('turns off automatic browser and settings sync for --no-daemon', () => {
+    const options: RootCliOptions = { daemon: false, browser: true, syncSettings: true };
+    normalizeInitialCliOptions(options, {});
+    expect(options.browser).toBe(false);
+    expect(options.syncSettings).toBe(false);
+    expect(options.bare).toBeUndefined();
+    expect(normalizeTmuxWorktreeOption({ daemon: false, tmux: true })).toBe('--tmux cannot be used with --no-daemon');
+  });
   it('normalizes Commander boolean option values and yes aliases', () => {
     const options: RootCliOptions = { y: true };
     Reflect.set(options, 'prompt', true);

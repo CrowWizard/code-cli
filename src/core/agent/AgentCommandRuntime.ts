@@ -27,6 +27,7 @@ import { openPlanFile } from '../../modes/planMode/openPlanFile.js';
 import { renderTerminalMarkdown } from '../immediateCommandRouter.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js';
+import { NO_DAEMON_MESSAGE } from '../../runtime/noDaemon.js';
 import { buildCommandUseData } from '../../telemetry/commandUsage.js';
 import type { CommandUseSurface } from '../../telemetry/types.js';
 import type { ThreadLease } from '../agents/SessionThreadBudget.js';
@@ -64,14 +65,17 @@ export async function runCancellableAgentCommand<T>(
   ]);
   signal.throwIfAborted();
   const cancel = () => controller.abort();
+  const forwardAbort = () => controller.abort(signal.reason);
   let cleanup = () => {};
   host.activeAbortController = controller;
   host.currentInkAbortController = controller;
   host.currentInkOnCancel = cancel;
   try {
+    signal.addEventListener('abort', forwardAbort, { once: true });
     if (!host.inkRenderer?.isRunning()) cleanup = host.setupEscListener(controller, cancel, true);
     return await operation(signal);
   } finally {
+    signal.removeEventListener('abort', forwardAbort);
     if (signal.aborted) host.programStatus?.cancel();
     cleanup();
     if (host.activeAbortController === controller) host.activeAbortController = previous.active;
@@ -208,6 +212,7 @@ export function applyAgentAcpConfigOption(host: AgentCommandRuntimeHost, configI
   }
 
 export async function connectAgentAcpMcpServers(host: AgentCommandRuntimeHost, configs: McpServerConfig[]): Promise<void> {
+    if (configs.length > 0 && host.runtime.options.daemon === false) throw new Error(NO_DAEMON_MESSAGE);
     if (configs.length === 0) {
       return;
     }
@@ -237,6 +242,9 @@ export async function runAgentSlashCommandWithInput(host: AgentCommandRuntimeHos
     }
 
     try {
+      if (command === '/clear') {
+        return await runCancellableAgentCommand(host as CancellableCommandHost, () => host.handleSlashCommand(command, args));
+      }
       const result = await host.handleSlashCommand(command, args);
       return result;
     } finally {
@@ -274,6 +282,9 @@ export async function handleAgentSlashCommand(
   args: string[] = [],
   surface: CommandUseSurface = 'interactive',
 ): Promise<string | null> {
+    if (host.runtime.options.daemon === false && ['/browser', '/chrome', '/mcp', '/mcp install', '/mcp-install', '/squad', '/traces', '/hooks', '/repeat'].includes(command)) {
+      return NO_DAEMON_MESSAGE;
+    }
     if (host.runtime.options.bare) {
       return BARE_SLASH_COMMANDS_DISABLED_MESSAGE;
     }

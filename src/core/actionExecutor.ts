@@ -98,6 +98,7 @@ import {
   type ToolParameter,
 } from './toolManager.js';
 import type { FFFSearchProvider } from '../search/fffSearchProvider.js';
+import { NO_DAEMON_MESSAGE } from '../runtime/noDaemon.js';
 import { ToolsRegistry, createToolsRegistry, type MetaToolDefinition } from './toolsRegistry.js';
 import { MetaToolService } from './metaTools/MetaToolService.js';
 import type { MemoryManager } from '../memory/MemoryManager.js';
@@ -471,12 +472,21 @@ export class ActionExecutor {
 
     const { FFFSearchProvider } = await import('../search/fffSearchProvider.js');
     this.fffSearchWorkspaceRoot = workspaceRoot;
-    this.fffSearchProviderPromise = FFFSearchProvider.create(workspaceRoot);
+    this.fffSearchProviderPromise = this.runtime.options.daemon === false
+      ? FFFSearchProvider.create(workspaceRoot, { background: false })
+      : FFFSearchProvider.create(workspaceRoot);
     return this.fffSearchProviderPromise;
   }
 
   private scheduleFFFSearchProviderCleanup(): void {
     if (!this.fffSearchProviderPromise) {
+      return;
+    }
+    if (this.runtime.options.daemon === false) {
+      const provider = this.fffSearchProviderPromise;
+      this.fffSearchProviderPromise = null;
+      this.fffSearchWorkspaceRoot = null;
+      void provider.then(value => value.destroy()).catch(() => {});
       return;
     }
 
@@ -1104,6 +1114,10 @@ export class ActionExecutor {
     context?: ToolExecutionContext,
     capture?: ToolOutcomeCapture,
   ): Promise<string | undefined> {
+    if (this.runtime.options.daemon === false && (
+      ((action.type === 'run_command' || action.type === 'shell') && action.background === true)
+      || action.type === 'add_teammate' || action.type === 'compose_team'
+    )) return this.recordToolFailure(capture, 'authorization', NO_DAEMON_MESSAGE, NO_DAEMON_MESSAGE);
     const command = this.commandForPeerGuard(action);
     const executionState: ActionExecutionState = { started: false };
     try {

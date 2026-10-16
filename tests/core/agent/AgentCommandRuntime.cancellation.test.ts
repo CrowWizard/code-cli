@@ -62,11 +62,14 @@ describe('cancellable command runtime', () => {
     await runCancellableAgentCommand(host, async signal => {
       parent.abort();
       expect(signal.aborted).toBe(true);
+      expect(host.activeAbortController?.signal.aborted).toBe(true);
+      expect(host.currentInkAbortController?.signal.aborted).toBe(true);
     });
     host.activeAbortController = null;
     await runCancellableAgentCommand(host, async signal => {
       host.runtimeResourceShutdownController.abort();
       expect(signal.aborted).toBe(true);
+      expect(host.activeAbortController?.signal.aborted).toBe(true);
     });
   });
 

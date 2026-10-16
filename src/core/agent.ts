@@ -192,6 +192,7 @@ import {
   logAgentQueuedProcessingMessage,
   performAgentBackgroundInit,
   prepareMobileAgentSession,
+  startFreshAgentSession,
   resetFreshAgentSessionState,
   requestAgentExit,
   removeAgentExitSignalHandlers,
@@ -955,7 +956,7 @@ export class AutohandAgent {
   }
 
   private shouldRunTurnMemoryReflection(): boolean {
-    if (this.runtime.options?.bare || this.runtime.options?.ephemeral) return false;
+    if (this.runtime.options?.bare || this.runtime.options?.ephemeral || this.runtime.options?.daemon === false) return false;
     if (this.runtime.isCommandMode || this.runtime.options?.prompt) return false;
     return this.runtime.config?.agent?.autoMemory !== false;
   }
@@ -1188,6 +1189,10 @@ export class AutohandAgent {
       injectSessionBootstrap: () => agent.injectSessionBootstrap(),
       restoreSessionState: (sessionId: string) => agent.restoreSessionState(sessionId),
     };
+  }
+
+  private async startNewConversationSession(): Promise<void> {
+    await startFreshAgentSession(this.createFreshAgentSessionHost(), 'Session ended - new conversation started');
   }
 
   private async runInstructionWithPeerActivity(
@@ -1725,7 +1730,7 @@ export class AutohandAgent {
   }
 
   private startAccountPlanRefresh(): void {
-    if (this.accountPlanTimer) return;
+    if (this.runtime.options.daemon === false || this.accountPlanTimer) return;
     void this.refreshAccountPlan();
     this.accountPlanTimer = setInterval(() => {
       void this.refreshAccountPlan();
@@ -2457,7 +2462,7 @@ export class AutohandAgent {
   async applyManagedMcpSettings(mcp: McpSettings | undefined): Promise<void> {
     this.runtime.config.mcp = mcp;
     this.runtimeMcpServers = resolveRuntimeMcpServers(this.runtime.config, {
-      bare: this.runtime.options.bare,
+      bare: this.runtime.options.bare || this.runtime.options.daemon === false,
     });
     await this.mcpManager.disconnectAll();
     if (mcp?.enabled !== false) {
@@ -3058,6 +3063,7 @@ export class AutohandAgent {
   }
 
   private async startActiveAgentHeartbeat(): Promise<void> {
+    if (this.runtime.options.daemon === false) return;
     if (this.runtimeResourceShutdownPromise || this.runtimeResourceShutdownController?.signal.aborted) return;
 
     const previousHeartbeat = this.activeAgentHeartbeat;

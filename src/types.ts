@@ -1247,6 +1247,8 @@ export interface CLIOptions {
   json?: string | boolean;
   /** Minimal mode: disable featureful startup and require explicit context/auth. */
   bare?: boolean;
+  /** Disable background services and background child processes for this run. */
+  daemon?: boolean;
   /** Disable startup network operations while retaining local cached state. */
   offline?: boolean;
   path?: string;

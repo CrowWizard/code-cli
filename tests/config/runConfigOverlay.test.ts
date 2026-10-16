@@ -97,6 +97,13 @@ describe('loadConfig run overlay control', () => {
 });
 
 describe('restoreRunConfigOverlay', () => {
+  it('does not mutate live run settings when restoring a shallow serialization copy', () => {
+    const { config, snapshot } = applyRunConfigOverlay(base(), { sets: ['ui.promptSuggestions=false'] });
+    const data = { ...config } as unknown as Record<string, unknown>;
+    restoreRunConfigOverlay(data, snapshot!);
+    expect(config.ui?.promptSuggestions).toBe(false);
+    expect(data.ui).not.toHaveProperty('promptSuggestions');
+  });
   it('restores the file values for untouched paths and keeps values the user changed during the run', () => {
     const { config, snapshot } = applyRunConfigOverlay(base(), { profile: 'review', sets: ['ui.theme=aurora'] });
     const data = structuredClone(config) as unknown as Record<string, unknown>;

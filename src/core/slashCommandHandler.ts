@@ -254,6 +254,7 @@ export class SlashCommandHandler {
           const { newConversation } = await import('../commands/new.js');
           return newConversation({
             resetConversation: this.ctx.resetConversation,
+            startNewSession: this.ctx.startNewSession,
             sessionManager: this.ctx.sessionManager,
             memoryManager: this.ctx.memoryManager,
             llm: this.ctx.llm,
@@ -267,6 +268,8 @@ export class SlashCommandHandler {
           const { clearConversation } = await import('../commands/clear.js');
           return clearConversation({
             resetConversation: this.ctx.resetConversation,
+            compactionSettings: this.ctx.provider === 'autohandai' ? this.ctx.config?.autohandai : undefined,
+            signal: this.ctx.commandSignal,
             sessionManager: this.ctx.sessionManager,
             memoryManager: this.ctx.memoryManager,
             llm: this.ctx.llm,
@@ -287,7 +290,7 @@ export class SlashCommandHandler {
           if (args.length > 0 && !opensPositionPicker) {
             return await settings({
               config: this.ctx.config,
-              onSettingChanged: (change) => applyTraceSettingChange(this.ctx.config!, change),
+              onSettingChanged: (change) => this.ctx.backgroundServicesEnabled === false ? undefined : applyTraceSettingChange(this.ctx.config!, change),
             }, args);
           }
           // Pause the InkRenderer for the entire /settings session.
@@ -298,7 +301,7 @@ export class SlashCommandHandler {
           try {
             return await settings({
               config: this.ctx.config,
-              onSettingChanged: (change) => applyTraceSettingChange(this.ctx.config!, change),
+              onSettingChanged: (change) => this.ctx.backgroundServicesEnabled === false ? undefined : applyTraceSettingChange(this.ctx.config!, change),
             }, args);
           } finally {
             await this.ctx.onAfterModal?.();
