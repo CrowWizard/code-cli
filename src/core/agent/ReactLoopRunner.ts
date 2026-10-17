@@ -175,6 +175,7 @@ export interface ReactLoopInkRenderer {
   setTokens(tokens: string): void;
   setContextTokens?(contextTokens: { used: number; total: number } | undefined): void;
   setWorking(isWorking: boolean): void;
+  addAssistantMessage?(message: string, renderMarkdown?: boolean): void;
   setFinalResponse(response: string): void;
   setStreamingResponse?(response: string | null): void;
 }
@@ -679,6 +680,21 @@ export async function runAgentReactLoop(
     // streamed to output listeners are flagged so protocol hosts do not repeat them.
     let streamedOutput: StreamedOutputRelay | undefined;
 
+    let visibleDraft: string | undefined;
+    const renderProvisionalResponse = async (response: string, reason: string): Promise<void> => {
+      const notice = `Turn update: ${reason}`;
+      const content = visibleDraft === response ? notice : `Draft — completion is not confirmed\n\n${response}\n\n${notice}`;
+      visibleDraft = response;
+      host.emitOutput({ type: 'message', content });
+      if (host.inkRenderer) {
+        host.inkRenderer.setStreamingResponse?.(null);
+        host.inkRenderer.addAssistantMessage?.(content);
+      } else if (!host.runtime.commandOutputCaptured) {
+        console.log(content);
+      }
+      await host.saveAssistantMessage(notice, undefined);
+    };
+
     const renderFinalResponse = (
       response: string,
       options: { thought?: string } = {},
@@ -1049,6 +1065,7 @@ export async function runAgentReactLoop(
           if (toolsWithheldByLoopGuard) {
             invalidLoopGuardFinalCount += 1;
             if (invalidLoopGuardFinalCount >= 2) {
+              renderFinalResponse('The repeated-tool loop stopped without a complete answer. The task remains incomplete; the available tool results are preserved in the session.');
               throw new LoopAbortedError('The model could not provide a complete answer after the repeated-tool loop guard');
             }
             host.conversation.addSystemNote(
@@ -1775,9 +1792,13 @@ export async function runAgentReactLoop(
       // A steer that arrived while the model was answering deserves a reply
       // of its own instead of being read only by the next turn.
       if (drainSteering()) {
+        await renderProvisionalResponse(turnOutcome.response, 'new user instructions arrived while this reply was being prepared.');
         continue;
       }
-      if ((await host.peerCommunicationRuntime?.finishTurn())?.continueTurn) continue;
+      if ((await host.peerCommunicationRuntime?.finishTurn())?.continueTurn) {
+        await renderProvisionalResponse(turnOutcome.response, 'new peer messages need to be handled before this turn finishes.');
+        continue;
+      }
       if (host.hasIncompleteTodoActivity?.()) {
         if (!pendingTodoReminderSent && !toolsWithheldByLoopGuard) {
           pendingTodoReminderSent = true;
@@ -1785,13 +1806,23 @@ export async function runAgentReactLoop(
             '[Completion Check] The current turn still has unfinished todo items. '
             + 'Continue the work and update the todo list explicitly before providing a final answer.'
           );
+          await renderProvisionalResponse(turnOutcome.response, 'the current turn still has unfinished todo items.');
           continue;
         }
         renderFinalResponse(turnOutcome.response, { thought: payload.thought });
         return { status: 'incomplete', reason: 'pending_todos' };
       }
       if (advisor && hadToolWork) {
-        const review = await consultAdvisor('completion', turnOutcome.response);
+        await renderProvisionalResponse(turnOutcome.response, 'completion review is pending.');
+        let review: AdvisorReview;
+        try {
+          review = await consultAdvisor('completion', turnOutcome.response);
+        } catch (error) {
+          if (abortController.signal.aborted) {
+            await renderProvisionalResponse(turnOutcome.response, 'completion review was interrupted; this draft has not been approved.');
+          }
+          throw error;
+        }
         if (review.verdict !== 'approved') {
           advisorRejections += 1;
           if (review.verdict === 'unavailable' || advisorRejections >= 3) {
@@ -1799,6 +1830,7 @@ export async function runAgentReactLoop(
             renderFinalResponse(`${label}\n\n${turnOutcome.response}\n\nWork remains pending Moa review: ${review.feedback}\nResolve the review feedback and ask to continue before treating this work as complete.`);
             return { status: 'incomplete', reason: 'advisor_review' };
           }
+          await renderProvisionalResponse(turnOutcome.response, `completion review requested changes. ${review.feedback}`);
           continue;
         }
       }

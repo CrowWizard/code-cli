@@ -7,14 +7,7 @@ import type { CLIOptions, LoadedConfig, SearchProvider } from '../types.js';
 import { isTmuxEnabled } from '../utils/tmux.js';
 import type { DeprecatedBrowserOption } from '../browser/compatibility.js';
 
-const SEARCH_PROVIDERS = [
-  'browser-profile',
-  'exa',
-  'google',
-  'brave',
-  'duckduckgo',
-  'parallel',
-] as const satisfies readonly SearchProvider[];
+import { SEARCH_PROVIDERS } from '../search/providers.js';
 
 export interface RootCliOptions extends CLIOptions {
   _authConfig?: LoadedConfig;

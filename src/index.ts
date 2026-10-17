@@ -507,7 +507,7 @@ program
   .option('--display-language <locale>', 'Set display language (e.g., en, id, zh-cn, fr, de, ja)')
   .option('--cc, --context-compact', 'Enable context compaction (default: on)')
   .option('--no-cc, --no-context-compact', 'Disable context compaction')
-  .option('--search-engine <provider>', 'Set web search provider (browser-profile, exa, google, brave, duckduckgo, parallel)')
+  .option('--search-engine <provider>', 'Set web search provider (autohand, browser-profile, exa, google, brave, duckduckgo, parallel)')
   .option('--sys-prompt <value>', 'Replace entire system prompt (inline string or file path)')
   .option('--system-prompt <value>', 'Replace entire system prompt (inline string or file path)')
   .option('--system-prompt-file <path>', 'Replace entire system prompt with file contents')
@@ -2110,12 +2110,11 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     }
 
     // Configure web search provider from CLI flag, config file, or environment
-    const searchConfig = config.search ?? {};
-    const { configureSearchFromSettings } = await awaitCliLifecycleStep(
+    const { configureSearchFromAccount } = await awaitCliLifecycleStep(
       import('./actions/web.js'),
       commandLifecycleController.signal,
     );
-    configureSearchFromSettings(searchConfig, options.searchEngine);
+    await configureSearchFromAccount(config, options.searchEngine, commandLifecycleController.signal);
 
     // Pipe mode: read stdin once if piped, then compose with prompt text (if any).
     // This must happen before AutohandAgent construction because dependency
@@ -2776,9 +2775,8 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
   console.error(chalk.cyan('Patch Mode: Changes will be captured without modifying files\n'));
 
   // Configure web search provider
-  const searchConfig = config.search ?? {};
-  const { configureSearchFromSettings } = await import('./actions/web.js');
-  configureSearchFromSettings(searchConfig);
+  const { configureSearchFromAccount } = await import('./actions/web.js');
+  await configureSearchFromAccount(config, opts.searchEngine);
 
   let agent: AutohandAgent | null = null;
   let exitCode = 0;
@@ -2973,9 +2971,8 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
     };
 
     // Configure web search provider
-    const searchConfig = config.search ?? {};
-    const { configureSearchFromSettings } = await import('./actions/web.js');
-    configureSearchFromSettings(searchConfig);
+    const { configureSearchFromAccount } = await import('./actions/web.js');
+    await configureSearchFromAccount(config, opts.searchEngine);
 
     const { AutohandAgent } = await import('./core/agent.js');
     agent = new AutohandAgent(llmProvider, files, runtime);

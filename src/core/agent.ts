@@ -373,6 +373,8 @@ interface TurnMemoryReflectionRequest {
   sessionId?: string;
   projectMemoryScope?: string;
   sharedProjectMemory?: boolean;
+  session?: ReturnType<SessionManager['getCurrentSession']>;
+  requestLabel?: string;
 }
 
 export class AutohandAgent {
@@ -920,11 +922,15 @@ export class AutohandAgent {
         && typeof message.content === 'string'
         && message.content.includes('[Auto Memory Update]'))
     );
+    const session = this.sessionManager?.getCurrentSession?.();
+    const requestLabel = [...conversationHistory].reverse().find(message => message.role === 'user' && typeof message.content === 'string')?.content;
     this.turnMemoryReflectionQueue ??= [];
     this.turnMemoryReflectionQueue.push({
       outcome,
       conversationHistory,
-      sessionId: this.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
+      sessionId: session?.metadata?.sessionId,
+      session,
+      requestLabel: typeof requestLabel === 'string' ? requestLabel.replace(/\s+/g, ' ').slice(0, 120) : undefined,
       projectMemoryScope: this.memoryManager?.getProjectMemoryScope?.(),
       sharedProjectMemory: this.memoryManager?.hasSharedProjectMemory?.() ?? false,
     });
@@ -995,10 +1001,16 @@ export class AutohandAgent {
         return;
       }
 
-      this.conversation.addSystemNote(
-        formatTurnMemoryUpdate(currentSaved, request.sharedProjectMemory),
-        '[Auto Memory Update]',
-      );
+      const receipt = `Memories saved for “${request.requestLabel ?? 'previous request'}”:\n${currentSaved.map(memory => `- ${memory.level}: ${memory.content}`).join('\n')}`;
+      await request.session?.append?.({ role: 'system', content: receipt, timestamp: new Date().toISOString(), _meta: { kind: 'memory_receipt' } });
+      if (abortController.signal.aborted || this.runtimeResourceShutdownPromise) return;
+      if (request.sessionId === this.sessionManager?.getCurrentSession?.()?.metadata?.sessionId) {
+        this.conversation.addSystemNote(
+          formatTurnMemoryUpdate(currentSaved, request.sharedProjectMemory),
+          '[Auto Memory Update]',
+        );
+        this.inkRenderer?.setCommandResult('/memory', receipt);
+      }
       this.writeTurnMemoryDebugLine(
         `[memory] turn reflection saved ${currentSaved.length} ${currentSaved.length === 1 ? 'memory' : 'memories'}`,
       );

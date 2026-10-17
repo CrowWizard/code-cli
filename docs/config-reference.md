@@ -3398,3 +3398,11 @@ Cloud Autohand sessions expose a Moa reasoning effort control through
 values are \`medium\`, \`high\` (default), and \`xhigh\`. Changes apply to the
 active session's subsequent Moa requests and do not overwrite the global config.
 Fantail ignores this setting; local sessions do not advertise it.
+
+## Web search
+
+`search.provider` accepts `autohand`, `browser-profile`, `exa`, `brave`, `parallel`, `google`, and `duckduckgo`. An explicit `--search-engine` wins over the saved setting in interactive, patch, automatic, RPC, and ACP modes.
+
+When no provider is selected, a signed-in account with server-verified paid access uses Autohand Web Search. Lite, Pro, Pro Plus, Max, Team, and Enterprise include this service through `https://dev.autohand.ai/api/native/web-search`; Free users configure an existing provider during standard or quick setup, or with `/search`. Queries are limited to 1,024 characters, 10 results, and 30 requests per account per minute. Access uses the selected Autohand account and existing account credentials; customers do not need Cloudflare credentials. A failed hosted search reports its status and does not change providers.
+
+Browser Profile is the local default. Connect Chromium through `/browser` or provide an available Chrome/Brave profile. A missing, locked, or blocked profile produces a setup error instead of silently switching to Google. Exa, Brave, and Parallel require `search.exaApiKey`, `search.braveApiKey`, or `search.parallelApiKey`, respectively, or `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or `PARALLEL_API_KEY`. Onboarding never saves a keyed provider with a blank key. Google and DuckDuckGo can be selected explicitly; automated requests may receive CAPTCHA challenges.

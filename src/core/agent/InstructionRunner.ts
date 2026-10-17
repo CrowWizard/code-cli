@@ -469,7 +469,7 @@ export class InstructionRunner {
       if (!canceledByUser) {
         canceledByUser = true;
         host.stopStatusUpdates();
-        host.stopUI();
+        host.stopUI(true);
         // Don't console.log here — terminal regions may still be active,
         // which routes output through writeAbove and corrupts the composer.
         // The cancel message is printed in the finally block after cleanup.
@@ -512,7 +512,7 @@ export class InstructionRunner {
       if (!canceledByUser) {
         canceledByUser = true;
         host.stopStatusUpdates();
-        host.stopUI();
+        host.stopUI(true);
         // Don't console.log here — terminal regions may still be active,
         // which routes output through writeAbove and corrupts the composer.
         // The cancel message is printed in the finally block after cleanup.
@@ -760,6 +760,7 @@ export class InstructionRunner {
         `[DEBUG] runInstruction finally: useInkRenderer=${host.useInkRenderer}, inkRenderer exists=${!!host.inkRenderer}`,
         host.writeDebugLine?.bind(host)
       );
+      if (abortController.signal.aborted) host.stopUI(true);
       await host.cleanupUI(host.useInkRenderer);
 
       if (host.persistentInputActiveTurn && !keepPersistentInputForNextTurn) {

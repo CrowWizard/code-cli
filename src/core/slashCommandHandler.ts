@@ -132,7 +132,12 @@ export class SlashCommandHandler {
         }
         case '/search': {
           const { search } = await import('../commands/search.js');
-          return search(this.ctx);
+          await this.ctx.onBeforeModal?.();
+          try {
+            return await search(this.ctx);
+          } finally {
+            await this.ctx.onAfterModal?.();
+          }
         }
         case '/init': {
           const { init } = await import('../commands/init.js');

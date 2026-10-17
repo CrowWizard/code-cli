@@ -1109,7 +1109,7 @@ export interface AutohandConfig {
 }
 
 /** Supported web search providers */
-export type SearchProvider = 'brave' | 'duckduckgo' | 'parallel' | 'google' | 'browser-profile' | 'exa';
+export type SearchProvider = 'autohand' | 'brave' | 'duckduckgo' | 'parallel' | 'google' | 'browser-profile' | 'exa';
 
 /** Web search provider settings */
 export interface SearchSettings {

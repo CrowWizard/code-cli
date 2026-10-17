@@ -50,7 +50,7 @@ import { isSessionWorktreeEnabled, prepareSessionWorktree } from '../../utils/se
 import { ApiError, classifyApiError, type ApiErrorCode } from '../../providers/errors.js';
 import type { SessionMessage } from '../../session/types.js';
 import { isGoalFeatureEnabled } from '../../goals/feature.js';
-import { configureSearchFromSettings } from '../../actions/web.js';
+import { configureSearchFromAccount } from '../../actions/web.js';
 import { resolveReviewCommand } from '../../commands/review.js';
 import {
   executeReviewWithLifecycle,
@@ -219,7 +219,7 @@ export class AutohandAcpAdapter implements Agent {
           ?? await loadConfig(this.cliOptions.config, process.cwd()),
         this.cliOptions
       );
-      configureSearchFromSettings(this.config.search, this.cliOptions.searchEngine);
+      await configureSearchFromAccount(this.config, this.cliOptions.searchEngine);
       // ACP clients cannot answer a trust prompt; the warning goes to stderr, never the protocol stream.
       if (!this.cliOptions.bare) {
         await resolveWorkspaceTrust(this.config, { interactive: false });
