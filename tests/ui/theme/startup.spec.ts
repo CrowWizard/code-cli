@@ -10,6 +10,7 @@ import { COLOR_TOKENS, type ResolvedColors } from '../../../src/ui/theme/types.j
 import {
   formatStartupBanner,
   formatPeerSessionsLine,
+  formatWelcomeDirectory,
   formatWelcomeStatusLine,
   formatWelcomeSuggestion,
 } from '../../../src/ui/theme/startup.js';
@@ -55,5 +56,14 @@ describe('startup theme formatting', () => {
   it('formats active peers for the TTY welcome block', () => {
     expect(formatPeerSessionsLine(1)).toContain('1 other session');
     expect(formatPeerSessionsLine(3)).toContain('3 other sessions');
+  });
+
+  it('shows the home folder as ~ in the welcome directory, like the status line', () => {
+    expect(formatWelcomeDirectory('/Users/ana/demo/kowhai-coffee', '/Users/ana')).toBe('~/demo/kowhai-coffee');
+    expect(formatWelcomeDirectory('/Users/ana', '/Users/ana')).toBe('~');
+    expect(formatWelcomeDirectory('/Users/anabel/repo', '/Users/ana')).toBe('/Users/anabel/repo');
+    expect(formatWelcomeDirectory('/srv/repo', '/Users/ana')).toBe('/srv/repo');
+    expect(formatWelcomeDirectory('C:\\Users\\ana\\repo', 'C:\\Users\\ana')).toBe('~\\repo');
+    expect(formatWelcomeDirectory('/srv/repo', '')).toBe('/srv/repo');
   });
 });

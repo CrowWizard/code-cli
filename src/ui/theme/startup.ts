@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import os from 'node:os';
 import chalk from 'chalk';
 import { themedFg } from './Theme.js';
 import { t } from '../../i18n/index.js';
@@ -35,6 +36,17 @@ export function formatWelcomeGreeting(nameOrEmail: string): string {
   return themedFg('success', `Welcome back, ${nameOrEmail}!`, chalk.green);
 }
 
+/** Shows the home folder as `~`, so the banner matches the status line and doesn't print a username. */
+export function formatWelcomeDirectory(dir: string, home: string = os.homedir()): string {
+  if (!home) return dir;
+  if (dir === home) return '~';
+  for (const sep of ['/', '\\']) {
+    const prefix = home.endsWith(sep) ? home : home + sep;
+    if (dir.startsWith(prefix)) return `~${sep}${dir.slice(prefix.length)}`;
+  }
+  return dir;
+}
+
 export function formatWelcomeStatusLine(model: string, ccEnabled: boolean, dir: string): string {
   const ccStatus = ccEnabled
     ? themedFg('success', '[CC: ON]', chalk.green)
@@ -45,7 +57,7 @@ export function formatWelcomeStatusLine(model: string, ccEnabled: boolean, dir: 
     themedFg('accent', model, chalk.cyan),
     ccStatus,
     themedFg('muted', '| directory:', chalk.gray),
-    themedFg('accent', dir, chalk.cyan),
+    themedFg('accent', formatWelcomeDirectory(dir), chalk.cyan),
   ].join('  ');
 }
 
