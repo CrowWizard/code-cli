@@ -38,6 +38,7 @@ import { SlashCommandHandler } from '../slashCommandHandler.js';
 import { routeOutput } from '../immediateCommandRouter.js';
 import { SLASH_COMMANDS } from '../slashCommands.js';
 import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js';
+import { applyNoDaemonConfig, NO_DAEMON_TOOLS } from '../../runtime/noDaemon.js';
 import { parseYoloPattern, buildPermissionSettingsFromYolo } from '../../permissions/yoloMode.js';
 import { SessionManager, type Session } from '../../session/SessionManager.js';
 import { ProjectManager } from '../../session/ProjectManager.js';
@@ -473,14 +474,15 @@ export function initializeAgentDependencies(
   files: FileActionManager,
   runtime: AgentRuntime
 ): void {
+    runtime.config = applyNoDaemonConfig(runtime.config, runtime.options);
     host.runtimeMcpServers = resolveRuntimeMcpServers(runtime.config, {
-      bare: runtime.options.bare,
+      bare: runtime.options.bare || runtime.options.daemon === false,
     });
     const initialProvider = runtime.config.provider ?? 'openrouter';
     const providerSettings = getProviderConfig(runtime.config, initialProvider);
     const model = runtime.options.model ?? providerSettings?.model ?? 'unconfigured';
     host.contextWindow = getContextWindow(model, providerSettings?.contextWindow);
-    if (!runtime.options.bare && initialProvider === 'openrouter' && !providerSettings?.contextWindow && model !== 'unconfigured') {
+    if (!runtime.options.bare && runtime.options.daemon !== false && initialProvider === 'openrouter' && !providerSettings?.contextWindow && model !== 'unconfigured') {
       void getOpenRouterModelContextWindow(model)
         .then((contextWindow) => {
           if (!contextWindow || contextWindow === host.contextWindow) return;
@@ -1029,7 +1031,7 @@ export function initializeAgentDependencies(
     });
     host.specialistOrchestrator = new SpecialistOrchestrator(host.delegator, {
       maxParallel: runtime.config.teams?.maxTeammates,
-      offline: runtime.options.offline === true || runtime.options.bare === true,
+      offline: runtime.options.offline === true || runtime.options.bare === true || runtime.options.daemon === false,
       getAllowedTools: () => new Set(
         (host.toolManager?.listAllDefinitions() ?? []).map((definition: ToolDefinition) => definition.name),
       ),
@@ -1057,18 +1059,18 @@ export function initializeAgentDependencies(
       companySecret: runtime.config.telemetry?.companySecret || runtime.config.api?.companySecret || '',
       authToken: runtime.config.auth?.token,
       clientVersion: packageJson.version,
-      offline: runtime.options.offline === true || runtime.options.bare === true,
+      offline: runtime.options.offline === true || runtime.options.bare === true || runtime.options.daemon === false,
     });
     host.featureFlagManager = new RemoteFeatureFlagManager(runtime.config);
-    if (!runtime.options.bare) {
+    if (!runtime.options.bare && runtime.options.daemon !== false) {
       host.featureFlagManager.refreshFeatureFlags().catch(() => {});
     }
     host.announcementManager = getAnnouncementManager(runtime.config);
-    host.announcementManager.setNetworkEnabled(!runtime.options.bare && !runtime.options.offline);
+    host.announcementManager.setNetworkEnabled(!runtime.options.bare && runtime.options.daemon !== false && !runtime.options.offline);
     host.announcementUnsubscribe = host.announcementManager.subscribe(() => {
       syncAgentAnnouncementLine(host);
     });
-    if (!runtime.options.bare && !runtime.options.offline) {
+    if (!runtime.options.bare && runtime.options.daemon !== false && !runtime.options.offline) {
       host.announcementManager.refresh().catch(() => {});
     }
 
@@ -1373,9 +1375,11 @@ export function initializeAgentDependencies(
       ?? (runtime.options.restricted ? 'restricted' : 'cli');
 
     // Block ask_followup_question in command mode (--prompt flag) since it requires interactive terminal
-    const customPolicy = runtime.options.prompt ? {
-      blockedTools: ['ask_followup_question']
-    } : undefined;
+    const blockedTools = [
+      ...(runtime.options.prompt ? ['ask_followup_question'] : []),
+      ...(runtime.options.daemon === false ? NO_DAEMON_TOOLS : []),
+    ];
+    const customPolicy = blockedTools.length > 0 ? { blockedTools } : undefined;
 
     host.toolManager = new ToolManager({
       getActiveProvider: () => host.activeProvider ?? runtime.config.provider ?? 'openrouter',
@@ -2142,9 +2146,14 @@ export function initializeAgentDependencies(
         const providerSettings = getProviderConfig(runtime.config, provider);
         return runtime.options.model ?? providerSettings?.model ?? model;
       },
-      resetConversation: async () => {
+      get commandSignal() { return host.activeAbortController?.signal ?? host.runtimeResourceShutdownController.signal; },
+      backgroundServicesEnabled: runtime.options.daemon !== false,
+      startNewSession: () => host.startNewConversationSession(),
+      resetConversation: async (summary?: string) => {
         await host.resetConversationContext();
         await host.injectSessionBootstrap();
+        if (summary) host.conversation.addSystemNote(summary);
+        host.updateContextUsage(host.conversation.history());
       },
       restoreSession: async (sessionId: string) => {
         await host.restoreSessionState(sessionId);

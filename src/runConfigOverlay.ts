@@ -141,9 +141,15 @@ export function applyRunConfigOverlay(
  * during the run (for example with /model) keeps the user's value.
  */
 export function restoreRunConfigOverlay(data: Record<string, unknown>, snapshot: RunConfigOverlaySnapshot): void {
+  const copiedSections = new Set<string>();
   for (const entry of [...snapshot.entries].reverse()) {
     const current = readPath(data, entry.path);
     if (!current.present || !sameValue(current.value, entry.applied)) continue;
+    const section = entry.path[0]!;
+    if (entry.path.length > 1 && !copiedSections.has(section)) {
+      data[section] = structuredClone(data[section]);
+      copiedSections.add(section);
+    }
     if (entry.hadBase) writePath(data, entry.path, structuredClone(entry.base));
     else deletePath(data, entry.path);
   }

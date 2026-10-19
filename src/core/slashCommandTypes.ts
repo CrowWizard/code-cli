@@ -45,7 +45,10 @@ export interface SlashCommandContext {
     promptModelSelection: () => Promise<void>;
     promptApprovalMode?: () => Promise<void>;
     createAgentsFile: () => Promise<void>;
-    resetConversation: () => void | Promise<void>;
+    resetConversation: (summary?: string) => void | Promise<void>;
+    startNewSession?: () => Promise<unknown>;
+    commandSignal?: AbortSignal;
+    backgroundServicesEnabled?: boolean;
     setComposerInput?: (text: string) => void;
     sessionManager: SessionManager;
     currentSession?: Session;

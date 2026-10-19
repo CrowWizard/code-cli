@@ -318,6 +318,7 @@ export interface FreshAgentSessionHost {
 
 export async function startFreshAgentSession(
   host: FreshAgentSessionHost,
+  closeReason = 'Session ended - new mobile task started',
 ): Promise<AgentSessionIdentity> {
   const previousSession = host.sessionManager.getCurrentSession();
 
@@ -326,7 +327,7 @@ export async function startFreshAgentSession(
   await host.flushScheduledSessionSnapshot?.();
 
   if (previousSession) {
-    await host.sessionManager.closeSession('Session ended - new mobile task started');
+    await host.sessionManager.closeSession(closeReason);
     const endedAt = Date.now();
     if (host.runtime?.options?.bare !== true) {
       await Promise.allSettled([
@@ -1376,9 +1377,17 @@ export async function restoreAgentSessionState(host: AgentLifecycleHost, session
 
     await host.resetConversationContext();
     await host.injectSessionBootstrap();
-    const messages = session.getMessages();
-    host.restoredChatMessages = buildSessionChatLog(messages);
-    for (const msg of messages) {
+    const messages: import('../../session/types.js').SessionMessage[] = session.getMessages();
+    let checkpoint = -1;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index].role === 'system' && messages[index]._meta?.contextCompaction === true) {
+        checkpoint = index;
+        break;
+      }
+    }
+    const activeMessages = checkpoint >= 0 ? messages.slice(checkpoint) : messages;
+    host.restoredChatMessages = buildSessionChatLog(activeMessages);
+    for (const msg of activeMessages) {
       if (msg.role === 'system') {
         if (!msg.content.startsWith('You are Autohand')) {
           host.conversation.addSystemNote(msg.content);

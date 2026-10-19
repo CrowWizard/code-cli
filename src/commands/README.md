@@ -15,6 +15,7 @@ Each command is a separate TypeScript file that exports:
 | `/undo` | `undo.ts` | Undo the last recorded agent file mutation |
 | `/model` | `model.ts` | Choose AI model |
 | `/new` | `new.ts` | Start new conversation |
+| `/clear` | `clear.ts` | Compact context into a resumable handoff using Weka decisions when configured |
 | `/init` | `init.ts` | Create AGENTS.md file |
 | `/quit` | `quit.ts` | Exit Autohand |
 | `/exit` | `quit.ts` | Exit Autohand |

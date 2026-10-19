@@ -86,6 +86,10 @@ export function normalizeInitialCliOptions(
     options.contextCompact = false;
     options.browser = false;
   }
+  if (options.daemon === false) {
+    options.syncSettings = false;
+    options.browser = false;
+  }
   return result;
 }
 
@@ -105,6 +109,7 @@ export function normalizeTmuxWorktreeOption(options: RootCliOptions): string | n
   if (!isTmuxEnabled(options.tmux)) {
     return null;
   }
+  if (options.daemon === false) return '--tmux cannot be used with --no-daemon';
   if (options.worktree === false) {
     return '--tmux cannot be used with --no-worktree';
   }

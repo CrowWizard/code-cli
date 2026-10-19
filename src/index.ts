@@ -101,6 +101,7 @@ import {
   resolveStartupInteractionMode,
 } from './startup/modeRouter.js';
 import { prepareBareModeConfig } from './runtime/bareMode.js';
+import { applyNoDaemonConfig, NO_DAEMON_MESSAGE } from './runtime/noDaemon.js';
 import {
   awaitCliLifecycleStep,
   CliRuntimeResourceOwner,
@@ -365,11 +366,12 @@ const collectRepeatable = (value: string, previous: string[] = []): string[] => 
 // --profile and --set apply to every command, including subcommands, and to
 // every config load in this process, before any of them reads the config.
 program.hook('preAction', async (thisCommand, actionCommand) => {
-  const { profile, set, config, bare, tracesOn, tracesOff, mode, acp } = thisCommand.opts<{
+  const { profile, set, config, bare, daemon, tracesOn, tracesOff, mode, acp } = thisCommand.opts<{
     profile?: string;
     set?: string[];
     config?: string;
     bare?: boolean;
+    daemon?: boolean;
     tracesOn?: boolean;
     tracesOff?: boolean;
     mode?: string;
@@ -378,8 +380,12 @@ program.hook('preAction', async (thisCommand, actionCommand) => {
   configureRunConfigOverlay({ profile, sets: set });
 
   const commandPath = commandPathOf(actionCommand);
+  if (daemon === false && (tracesOn || commandPath[0] === 'traces' || commandPath[0] === 'computer' || commandPath[0] === 'squad')) {
+    actionCommand.error(NO_DAEMON_MESSAGE);
+  }
   const traceControlCommand = commandPath[0] === 'traces' || commandPath[0] === 'computer';
   const traceSupervision = !tracesOn
+    && daemon !== false
     && !tracesOff
     && !traceControlCommand
     && shouldReconcileAhTracesAtStartup(bare === true)
@@ -398,7 +404,7 @@ program.hook('preAction', async (thisCommand, actionCommand) => {
   // site in AgentCommandRuntime; top-level commands never reach that runtime,
   // so all of them were invisible. Hooking the program means a command added
   // later is reported without anyone remembering to instrument it.
-  void reportCliCommand({
+  if (daemon !== false) void reportCliCommand({
     commandPath: commandPathOf(actionCommand),
     loadConfig: () => loadConfig(undefined, undefined, { createIfMissing: false, initializeTheme: false }),
     clientVersion: getVersionString(),
@@ -440,6 +446,7 @@ program
   .option('--json [mode]', 'Command JSON output: stream (default) or local')
   .option('--output-schema <file>', 'Command mode only: the final answer must be one JSON document valid against this JSON Schema file')
   .option('--bare', 'Minimal mode: skip hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and AGENTS.md auto-discovery', false)
+  .option('--no-daemon', 'Disable background services and child processes; keep foreground tools and session commands')
   .option('--offline', 'Disable startup network operations, including model catalog refreshes', false)
   .option('--path <path>', 'Workspace path to operate in')
   .option('--dir <path>', 'Alias for --path')
@@ -1611,6 +1618,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     SyncService
   >({
     process,
+    backgroundEnabled: options.daemon !== false,
     stopPing: () => shutdownPingService(),
     setSyncService: setRuntimeSyncService,
     onSignal: (signal) => {
@@ -1631,6 +1639,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     );
     startupTimeline.mark('config loaded');
     config = applyCliProviderOverride(config, options.provider);
+    config = applyNoDaemonConfig(config, options);
     if (options.bare) {
       config = await awaitCliLifecycleStep(
         prepareBareModeConfig(config, options),
@@ -1735,7 +1744,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       return;
     }
 
-    const canPromptForTraceConsent = !options.bare
+    const canPromptForTraceConsent = !options.bare && options.daemon !== false
       && (options.mode === undefined || options.mode === 'interactive')
       && options.prompt === undefined
       && !structuredOutput
@@ -1923,7 +1932,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
 
     // Initialize and start ping service (45-minute intervals for usage tracking)
     // This runs independently of telemetry opt-in for basic usage counting
-    if (!options.bare) {
+    if (!options.bare && options.daemon !== false) {
       runtimeResourceOwner.startPing(() => {
         initPingService({
           cliVersion: runtimeVersion,
@@ -1934,7 +1943,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     }
 
     const announcementManager = getAnnouncementManager(config);
-    announcementManager.setNetworkEnabled(!options.bare && !options.offline);
+    announcementManager.setNetworkEnabled(!options.bare && options.daemon !== false && !options.offline);
 
     // Size the first banner against cached welcome content and local peer metadata before network checks.
     if (!structuredOutput && process.stdout.isTTY) {
@@ -1998,7 +2007,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
 
     // Run auth, version check, sync in background (fire-and-forget).
     // These are network-bound and should not block the prompt.
-    if (!options.bare && runtimeResourceOwner) {
+    if (!options.bare && options.daemon !== false && runtimeResourceOwner) {
       runtimeResourceOwner.startBackgroundStartup({
         resolveAuthAndVersion: async () => {
           const versionCheckPromise = config.ui?.checkForUpdates !== false
@@ -3146,7 +3155,7 @@ function argvOptionValue(argv: string[], option: string): string | undefined {
 }
 
 async function prepareRuntimeExtensionsForCli(command: Command, argv: string[]): Promise<void> {
-  if (argv.includes('--bare') || isDiscoveryInvocation(command, argv)) {
+  if (argv.includes('--bare') || argv.includes('--no-daemon') || isDiscoveryInvocation(command, argv)) {
     return;
   }
   const workspaceRoot = path.resolve(argvOptionValue(argv, '--path') ?? argvOptionValue(argv, '--dir') ?? process.cwd());
