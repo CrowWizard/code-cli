@@ -627,6 +627,60 @@ describe('interactive built CLI Tuistory tests: processes, research, usage, sett
     await exitInteractive(restarted);
   });
 
+  it('renders the autohand brand theme from --set without blue, teal or cyan', async () => {
+    const authServer = await createMockAuthServer();
+    mockAuthServers.push(authServer);
+    const state = await createTempAutohandHome({ config: { ui: { theme: 'aurora', promptSuggestions: false } } });
+    tempStates.push(state);
+    const session = await trackSession(launchBuiltAutohand([
+      '--path', state.workspaceRoot, '--config', state.configPath, '--set', 'ui.theme=autohand',
+    ], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: {
+        NO_COLOR: undefined, FORCE_COLOR: '3', COLORTERM: 'truecolor', TERM: 'xterm-256color',
+        AUTOHAND_API_URL: authServer.baseUrl,
+        AUTOHAND_AUTH_URL: authServer.baseUrl,
+        AUTOHAND_AUTH_API_URL: `${authServer.baseUrl}/api/auth`,
+      },
+    }));
+    await waitForComposer(session);
+    await session.type('Ship the brand theme');
+    expect(await session.text({ only: { foreground: '#f4f7f5', background: '#171a1f' } }))
+      .toContain('Ship the brand theme');
+    expect(await session.text({ only: { foreground: '#2a2e36' } })).toContain('▔');
+    await clearComposerInput(session);
+    await session.type('/the');
+    expect(await session.text({ only: { foreground: '#08090a', background: '#f4f7f5' } })).toContain('/theme');
+    await clearComposerInput(session);
+    await session.type('/theme');
+    await session.press('enter');
+    await session.waitForText('autohand (current)');
+    expect(await session.text({ only: { foreground: '#08090a', background: '#f4f7f5' } })).toContain('autohand (current)');
+    await session.press('escape');
+    await waitForComposer(session);
+    await session.type('/help');
+    await session.press('enter');
+    await session.waitForText('docs.autohand.ai');
+    expect(await session.text({ only: { foreground: '#f4f7f5' } })).toContain('/theme');
+    await waitForComposer(session);
+
+    const coolColours = [...session.getRawOutput().matchAll(/\x1b\[(?:[\d;]*;)?([34]8);2;(\d+);(\d+);(\d+)m/g)]
+      .map(([, , r, g, b]) => [Number(r), Number(g), Number(b)])
+      .filter(([r, g, b]) => {
+        const max = Math.max(r, g, b);
+        const delta = max - Math.min(r, g, b);
+        if (delta / 255 <= 0.08) return false;
+        const sector = max === r ? ((g - b) / delta) % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+        const hue = (sector * 60 + 360) % 360;
+        return hue >= 150 && hue <= 270;
+      });
+    expect(coolColours).toEqual([]);
+    expect(session.getRawOutput()).not.toMatch(/\x1b\[(?:[\d;]*;)?(?:34|36|94|96|44|46)m/);
+    expect((await fs.readJson(state.configPath)).ui.theme).toBe('aurora');
+    await exitInteractive(session);
+  });
+
   it('preserves one visible copy of chat history across repeated slash menu cycles', async () => {
     const userMessage = 'Keep this history visible after the model picker.';
     const assistantMessage = 'MODEL_PICKER_HISTORY_SENTINEL';

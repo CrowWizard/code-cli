@@ -116,6 +116,7 @@ describe('/theme command', () => {
   it.each([
     { name: 'tuatara', accent: '#b7c98a', description: 'Tuatara-inspired lichen, warm stone, and soft amber' },
     { name: 'aurora', accent: '#9b9ef5', description: 'Default theme with charcoal, cool neutrals, and soft periwinkle' },
+    { name: 'autohand', accent: '#F4F7F5', description: 'Autohand brand: black and white, with status colours for status only' },
   ])('offers $name and persists it before resuming the composer', async ({ name, accent, description }) => {
     const config = { ui: { theme: 'tui' } } as LoadedConfig;
     initTheme('tui');

@@ -53,7 +53,9 @@ export function createCommandTheme(): CommandTheme {
     link: (value) => theme ? theme.underline(accent(value)) : chalk.cyan.underline(value),
     tab: (value) => muted(` ${value} `),
     selectedTab: (value) => theme
-      ? theme.fgBg('userMessageText', 'accent', ` ${value} `)
+      ? theme.has('selectionBg')
+        ? theme.fgBg('selectionText', 'selectionBg', ` ${value} `)
+        : theme.fgBg('userMessageText', 'accent', ` ${value} `)
       : chalk.bgWhite.black(` ${value} `),
     progressFilled: accent,
     progressEmpty: muted,

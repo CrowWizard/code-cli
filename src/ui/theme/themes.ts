@@ -720,6 +720,72 @@ export const australiaTheme: ThemeDefinition = {
 };
 
 /**
+ * Autohand brand theme (BRAND.md v1.1): black and white, with the accent in ink.
+ * Status colours (red, green, amber) appear only on the status and diff tokens.
+ */
+export const autohandTheme: ThemeDefinition = {
+  name: 'autohand',
+  neutralGreys256: true,
+  vars: {
+    canvas: '#08090A',
+    card: '#171A1F',
+    ink: '#F4F7F5',
+    secondary: '#C9CBCA',
+    tertiary: '#8E908F',
+    hairline: '#2A2E36',
+    // Status only: each is at least 4.5:1 on canvas and card.
+    red: '#E05D5D',
+    green: '#46A758',
+    amber: '#E2A336',
+  },
+  colors: {
+    accent: 'ink',
+    border: 'hairline',
+    borderAccent: 'ink',
+    borderMuted: 'hairline',
+    success: 'green',
+    error: 'red',
+    warning: 'amber',
+    muted: 'tertiary',
+    dim: 'secondary',
+    text: 'ink',
+    userMessageBg: 'card',
+    userMessageText: 'ink',
+    toolPendingBg: 'card',
+    toolSuccessBg: 'card',
+    toolErrorBg: 'card',
+    toolTitle: 'ink',
+    toolOutput: 'secondary',
+    diffAdded: 'green',
+    diffRemoved: 'red',
+    diffContext: 'tertiary',
+    syntaxComment: 'tertiary',
+    syntaxKeyword: 'ink',
+    syntaxFunction: 'ink',
+    syntaxVariable: 'secondary',
+    syntaxString: 'secondary',
+    syntaxNumber: 'ink',
+    syntaxType: 'ink',
+    syntaxOperator: 'secondary',
+    syntaxPunctuation: 'tertiary',
+    mdHeading: 'ink',
+    mdLink: 'ink',
+    mdLinkUrl: 'tertiary',
+    mdCode: 'ink',
+    mdCodeBlock: 'secondary',
+    mdCodeBlockBorder: 'hairline',
+    mdQuote: 'secondary',
+    mdQuoteBorder: 'hairline',
+    mdHr: 'hairline',
+    mdListBullet: 'tertiary',
+    composerBorder: 'hairline',
+    selectionText: 'canvas',
+    selectionBg: 'ink',
+    commandAccent: 'ink',
+  },
+};
+
+/**
  * Light theme - optimized for light terminal backgrounds.
  * Uses darker, more saturated colors for visibility against light backgrounds.
  */
@@ -812,6 +878,7 @@ export const builtInThemes: Record<string, ThemeDefinition> = {
   cappadocia: cappadociaTheme,
   rio: rioTheme,
   australia: australiaTheme,
+  autohand: autohandTheme,
 };
 
 const legacyBuiltInThemeAliases: Record<string, string> = {

@@ -8,7 +8,7 @@
  * All available color tokens in the theme system.
  * Each token represents a semantic color role in the UI.
  */
-export type ColorToken =
+export type CoreColorToken =
   // Core UI (10 tokens)
   | 'accent'
   | 'border'
@@ -53,6 +53,19 @@ export type ColorToken =
   | 'mdQuoteBorder'
   | 'mdHr'
   | 'mdListBullet';
+
+/**
+ * Optional tokens that inherit from a core token when a theme leaves them out,
+ * so themes written before they existed render exactly as they did.
+ */
+export type DerivedColorToken =
+  | 'composerBorder'
+  | 'selectionText'
+  | 'selectionBg'
+  | 'commandAccent';
+
+/** Every token a resolved theme provides. */
+export type ColorToken = CoreColorToken | DerivedColorToken;
 
 /**
  * Color value can be:
@@ -112,6 +125,18 @@ export interface ThemeColors {
   mdQuoteBorder: ColorValue;
   mdHr: ColorValue;
   mdListBullet: ColorValue;
+  // Optional (fall back per DERIVED_COLOR_TOKENS)
+  /** Composer top and bottom rules. Defaults to borderAccent. */
+  composerBorder?: ColorValue;
+  /** Text of the selected row in pickers and dropdowns. Defaults to accent. */
+  selectionText?: ColorValue;
+  /** Background of the selected row. Defaults to none (no fill). */
+  selectionBg?: ColorValue;
+  /**
+   * Titles and highlights printed by slash commands such as /help, /theme and /settings.
+   * Themes that leave it out keep each command's own fixed colour.
+   */
+  commandAccent?: ColorValue;
 }
 
 /**
@@ -129,12 +154,17 @@ export interface ThemeDefinition {
   vars?: Record<string, ColorValue>;
   /** Color token values */
   colors: PartialThemeColors;
+  /**
+   * In 256-colour terminals, map near-neutral colours to the grey ramp instead
+   * of the nearest colour-cube entry, which can tint dark greys blue.
+   */
+  neutralGreys256?: boolean;
 }
 
 /**
  * All colors resolved to their final string representation.
  */
-export type ResolvedColors = Record<ColorToken, string>;
+export type ResolvedColors = Record<CoreColorToken, string> & Partial<Record<DerivedColorToken, string>>;
 
 /**
  * Terminal color capabilities.
@@ -144,7 +174,7 @@ export type ColorMode = 'truecolor' | '256' | '16' | 'none';
 /**
  * List of all color tokens for validation.
  */
-export const COLOR_TOKENS: readonly ColorToken[] = [
+export const COLOR_TOKENS: readonly CoreColorToken[] = [
   // Core UI
   'accent',
   'border',
@@ -190,6 +220,23 @@ export const COLOR_TOKENS: readonly ColorToken[] = [
   'mdHr',
   'mdListBullet',
 ] as const;
+
+/**
+ * Optional tokens and what they inherit when a theme leaves them out.
+ * `null` means "no colour" (an empty string, the terminal default).
+ */
+export const DERIVED_COLOR_TOKENS: Readonly<Record<DerivedColorToken, CoreColorToken | null>> = {
+  composerBorder: 'borderAccent',
+  selectionText: 'accent',
+  selectionBg: null,
+  commandAccent: null,
+};
+
+/** Every token, core and optional. */
+export const ALL_COLOR_TOKENS: readonly ColorToken[] = [
+  ...COLOR_TOKENS,
+  ...(Object.keys(DERIVED_COLOR_TOKENS) as DerivedColorToken[]),
+];
 
 /**
  * Check if a value is a valid hex color.

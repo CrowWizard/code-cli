@@ -63,7 +63,7 @@ describe('SlashCommandDropdown utilities', () => {
       path.resolve(process.cwd(), 'src/ui/ink/SlashCommandDropdown.tsx'),
       'utf8'
     );
-    expect(source).toContain("theme.fg(isSelected ? 'accent' : 'text'");
+    expect(source).toContain('isSelected ? theme.selected(');
     expect(source).not.toContain("color={isSelected ? 'cyan'");
   });
 

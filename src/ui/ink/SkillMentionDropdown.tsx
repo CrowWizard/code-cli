@@ -59,7 +59,7 @@ function SkillMentionDropdownComponent({ suggestions, activeIndex, visible }: Sk
         return (
           <Box key={suggestion.name}>
             <Text>
-              {theme.fg(isSelected ? 'accent' : 'text', `${pointer} ${name}`)}
+              {isSelected ? theme.selected(`${pointer} ${name}`) : theme.fg('text', `${pointer} ${name}`)}
               {suggestion.isActive ? theme.fg('success', ' ●') : null}
             </Text>
             {desc && <Text>{theme.fg('muted', `  ${desc}`)}</Text>}

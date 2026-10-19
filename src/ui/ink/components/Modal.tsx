@@ -761,12 +761,7 @@ function Modal(props: ModalProps) {
       // from the option objects themselves (see `choices` above).
       const header = isFilterQueryActive ? undefined : (vi === 0 ? inheritedHeader(i) : choice.header);
 
-      let color: ColorToken | undefined;
-      if (isDisabled) {
-        color = 'dim';
-      } else if (isSelected) {
-        color = 'accent';
-      }
+      const color: ColorToken | undefined = isDisabled ? 'dim' : undefined;
 
       const isHeader = choice.value.startsWith('__header');
       const isAction = choice.action === true;
@@ -781,7 +776,9 @@ function Modal(props: ModalProps) {
           {header && vi > 0 && <Text> </Text>}
           {header && <Text>{theme.fg('muted', header)}</Text>}
           <Text>
-            {theme.fg(color ?? 'text', `${isSelected ? '\u25b8 ' : '  '}${checkbox}${numberPrefix}${choice.label}${disabledSuffix}`)}
+            {isSelected && !isDisabled
+              ? theme.selected(`\u25b8 ${checkbox}${numberPrefix}${choice.label}${disabledSuffix}`)
+              : theme.fg(color ?? 'text', `${isSelected ? '\u25b8 ' : '  '}${checkbox}${numberPrefix}${choice.label}${disabledSuffix}`)}
           </Text>
           {choice.description && (
             <Text>{theme.fg('muted', `     ${choice.description}`)}</Text>

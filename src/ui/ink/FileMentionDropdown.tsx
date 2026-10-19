@@ -53,7 +53,7 @@ function FileMentionDropdownComponent({ suggestions, activeIndex, visible }: Fil
 
         return (
           <Box key={suggestion.path}>
-            <Text>{theme.fg(isSelected ? 'accent' : 'text', `${pointer} ${filename}`)}</Text>
+            <Text>{isSelected ? theme.selected(`${pointer} ${filename}`) : theme.fg('text', `${pointer} ${filename}`)}</Text>
             {dir && (
               <Text>{theme.fg('muted', `  ${dir}`)}</Text>
             )}
