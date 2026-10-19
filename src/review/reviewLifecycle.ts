@@ -3,6 +3,8 @@
  * Copyright 2026 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { RunToolScope } from '../permissions/runToolScope.js';
+import { REVIEW_INSPECTION_SCOPE } from './reviewToolScope.js';
 import type { ReviewRequest } from './reviewRequest.js';
 
 export type ReviewExecutionSurface = 'interactive' | 'cli' | 'acp' | 'json_rpc';
@@ -41,6 +43,7 @@ export interface ReviewHookExecutor {
 export type ReviewPermissionMode = 'interactive' | 'unrestricted' | 'restricted' | 'external';
 
 export interface ReviewPermissionManager {
+  addRunToolScope?(scope: RunToolScope): () => void;
   getMode(): ReviewPermissionMode;
   setMode(mode: ReviewPermissionMode): void;
 }
@@ -75,6 +78,7 @@ export async function executeReviewWithLifecycle(
   let status: ReviewLifecycleStatus = 'running';
   let failure: string | undefined;
   let previousPermissionMode: ReviewPermissionMode | undefined;
+  let releaseInspectionScope: (() => void) | undefined;
 
   const context = (includeOutcome: boolean): ReviewLifecycleContext => ({
     ...(execution.sessionId ? { sessionId: execution.sessionId } : {}),
@@ -107,7 +111,9 @@ export async function executeReviewWithLifecycle(
 
   await notify('review:start');
   try {
-    if (execution.permissionManager) {
+    if (execution.permissionManager?.addRunToolScope) {
+      releaseInspectionScope = execution.permissionManager.addRunToolScope(REVIEW_INSPECTION_SCOPE);
+    } else if (execution.permissionManager) {
       previousPermissionMode = execution.permissionManager.getMode();
       if (previousPermissionMode !== 'restricted') {
         execution.permissionManager.setMode('restricted');
@@ -149,10 +155,14 @@ export async function executeReviewWithLifecycle(
     await notify('review:failed', true);
     throw error;
   } finally {
-    await notify('review:end', true);
-    if (execution.permissionManager && previousPermissionMode !== undefined
-      && previousPermissionMode !== 'restricted') {
-      execution.permissionManager.setMode(previousPermissionMode);
+    try {
+      await notify('review:end', true);
+    } finally {
+      releaseInspectionScope?.();
+      if (execution.permissionManager && previousPermissionMode !== undefined
+        && previousPermissionMode !== 'restricted') {
+        execution.permissionManager.setMode(previousPermissionMode);
+      }
     }
   }
 }

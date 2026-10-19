@@ -190,6 +190,8 @@ export interface AgentInstructionHost {
 }
 
 export interface RunInstructionOptions extends QueuedInstructionPolicy {
+  /** Native read-only operations already supply their specialist contract. */
+  specialistPreparation?: 'skip';
   peerReferences?: PeerReference[];
   mentionedFiles?: string[];
   hookInstruction?: string;
@@ -530,7 +532,8 @@ export class InstructionRunner {
     // return and any failure raised while preparing specialists.
     let stopPreparation: () => void = () => {};
     try {
-      const specialistResults = await host.prepareSpecialists?.(instruction);
+      const specialistResults = options.specialistPreparation === 'skip'
+        ? undefined : await host.prepareSpecialists?.(instruction);
       if (specialistResults) {
         host.conversation.addSystemNote(specialistResults, '[Specialist Results]');
       }

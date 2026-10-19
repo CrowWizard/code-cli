@@ -183,6 +183,8 @@ export interface GoalTurnUsageInput {
 
 export interface GoalUpdateInput {
   expectedGoalId?: string;
+  /** Internal compare-and-set guard for workflow cleanup. */
+  expectedStatus?: GoalStatus;
   objective?: string;
   completionEvidence?: GoalCompletionEvidence;
   stopReason?: string;

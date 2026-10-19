@@ -1148,3 +1148,13 @@ describe('incomplete turn status', () => {
     expect(host.stopUI).toHaveBeenCalledWith(true);
   });
 });
+
+
+it('skips automatic specialists for an explicitly scoped native instruction', async () => {
+  const host = createHost();
+  host.prepareSpecialists = vi.fn().mockResolvedValue('Unrequested specialists');
+  expect(await new InstructionRunner(host).run('Inspect the diff', { specialistPreparation: 'skip' })).toBe(true);
+  expect(host.prepareSpecialists).not.toHaveBeenCalled();
+  expect(await new InstructionRunner(host).run('Inspect again')).toBe(true);
+  expect(host.prepareSpecialists).toHaveBeenCalledTimes(1);
+});

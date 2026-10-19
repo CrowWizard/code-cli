@@ -367,6 +367,9 @@ export class GoalManager {
     if (input.expectedGoalId !== undefined && current.goalId !== input.expectedGoalId) {
       return this.result(snapshot, false, 'The active goal changed before completion. The current goal was not modified.');
     }
+    if (input.expectedStatus !== undefined && current.status !== input.expectedStatus) {
+      return this.result(snapshot, false, 'The goal status changed. The current goal was not modified.');
+    }
     if (input.completionEvidence !== undefined && input.status !== 'complete') {
       return this.result(snapshot, false, 'completion evidence can only be submitted when completing a goal.');
     }
