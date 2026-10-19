@@ -1454,6 +1454,7 @@ export class AutohandAgent {
       isContextOverflowError: (errorOrMessage) => agent.isContextOverflowError(errorOrMessage),
       isPromptCachingEnabled: () => agent.isPromptCachingEnabled(),
       promptCacheToolSet: agent.promptCacheToolSet,
+      saveUserMessage: content => agent.saveUserMessage(content),
       saveAssistantMessage: (content, toolCalls) => agent.saveAssistantMessage(content, toolCalls),
       saveToolMessage: (name, content, toolCallId) => agent.saveToolMessage(name, content, toolCallId),
       setComposerFinalResponse: (response) => agent.setComposerFinalResponse(response),

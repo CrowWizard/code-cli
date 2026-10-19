@@ -730,6 +730,7 @@ describe('InstructionRunner command mode UI', () => {
       category: 'loop-guard',
       reason: 'Repeated tool-call limit exceeded',
     });
+    expect(host.stopUI).toHaveBeenCalledWith(true);
   });
 
   it('marks a deep research turn incomplete when the report contract is unmet', async () => {

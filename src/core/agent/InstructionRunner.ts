@@ -626,6 +626,7 @@ export class InstructionRunner {
       // error UI so we don't double-print failure messages.
       if (error instanceof Error && error.name === 'LoopAbortedError') {
         recordReflectionFailure('loop-guard', error.message);
+        host.stopUI(true);
         host.clearActivityForCompletedTurn?.();
         // Fall through to finally with success = false
       } else {

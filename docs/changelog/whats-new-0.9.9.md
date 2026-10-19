@@ -2,6 +2,8 @@
 
 ### Answers and continuity
 
+- Ctrl+Enter steers the next or selected queued message into the running conversation, preserves an unrelated draft, and leaves other queued work in order. Enter continues to queue new messages.
+- Streamed tool calls retain their identity when continuation chunks contain blank IDs. Genuinely incomplete headers are withheld from execution and enter bounded continuation without replaying the accepted request.
 - Replies stay visible while completion review, pending todos, steering, or peer updates continue. Interrupted reviews retain the draft and its status in the session; a draft never completes a goal. Fixes [#674](https://github.com/autohandai/code-cli/issues/674).
 - Final answers lead with the result and include a short recap of the request, useful facts learned, and confirmed memories saved. Pending automatic reflection is identified honestly. Successful background memory writes produce a receipt tied to the originating request and session. Research citations, experiment state, goal acceptance, and structured output remain authoritative.
 

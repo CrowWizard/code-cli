@@ -885,6 +885,7 @@ describe('ReactLoopRunner composer status', () => {
         workspaceRoot: process.cwd(),
         spinner: { stop: vi.fn() },
       },
+      saveUserMessage: vi.fn(async () => {}),
       saveAssistantMessage: vi.fn(async () => {}),
       saveToolMessage: vi.fn(async () => {}),
       searchQueries: [],
@@ -1009,6 +1010,7 @@ describe('ReactLoopRunner composer status', () => {
         workspaceRoot: process.cwd(),
         spinner: { stop: vi.fn() },
       },
+      saveUserMessage: vi.fn(async () => {}),
       saveAssistantMessage,
       saveToolMessage: vi.fn(async () => {}),
       searchQueries: [],
@@ -1135,6 +1137,7 @@ describe('ReactLoopRunner composer status', () => {
         workspaceRoot: process.cwd(),
         spinner: { stop: vi.fn() },
       },
+      saveUserMessage: vi.fn(async () => {}),
       saveAssistantMessage,
       saveToolMessage: vi.fn(async () => {}),
       searchQueries: [],
@@ -2051,6 +2054,7 @@ function createReactLoopTestHost(
       workspaceRoot: process.cwd(),
       spinner: { stop: vi.fn() },
     },
+    saveUserMessage: vi.fn(async () => {}),
     saveAssistantMessage: vi.fn(async () => {}),
     saveToolMessage: vi.fn(async () => {}),
     searchQueries: [],
@@ -2186,7 +2190,8 @@ describe('steering messages during a turn', () => {
         return { id: 'step', created: 1, content: '{"toolCalls":[{"tool":"read_file","args":{"path":"src/index.ts"}}]}', raw: {} };
       })
       .mockResolvedValueOnce({ id: 'answer', created: 2, content: '{"finalResponse":"Done."}', raw: {} });
-    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    const saveUserMessage = vi.fn(async () => {});
+    const host = Object.assign(createReactLoopTestHost(llmComplete, new ReactionParser()), { saveUserMessage });
     host.inkRenderer = inkStub();
     host.steering = steering;
     host.toolManager.execute = vi.fn(async (_calls, onResult) => {
@@ -2199,6 +2204,9 @@ describe('steering messages during a turn', () => {
 
     const addMessage = host.conversation.addMessage as ReturnType<typeof vi.fn>;
     const steerCall = addMessage.mock.calls.findIndex(([message]) => message.role === 'user' && message.content === 'Only touch the tests.');
+    expect(saveUserMessage).toHaveBeenCalledWith('Only touch the tests.');
+    expect(saveUserMessage).toHaveBeenCalledTimes(1);
+    expect(saveUserMessage.mock.invocationCallOrder[0]).toBeLessThan(llmComplete.mock.invocationCallOrder[1]);
     expect(steerCall).toBeGreaterThanOrEqual(0);
     expect(addMessage.mock.invocationCallOrder[steerCall]).toBeLessThan(llmComplete.mock.invocationCallOrder[1]);
     const toolResultCall = addMessage.mock.calls.findIndex(([message]) => message.role === 'tool');
@@ -2224,5 +2232,16 @@ describe('steering messages during a turn', () => {
     expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledTimes(1);
     expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledWith('Second answer with changelog.');
     expect(host.conversation.addMessage).toHaveBeenCalledWith({ role: 'user', content: 'Also update the changelog.' });
+  });
+
+  it('does not send unpersisted steering to the model when storage fails', async () => {
+    const { SteeringQueue } = await import('../../../src/core/agent/SteeringQueue.js');
+    const steering = new SteeringQueue();
+    steering.push('Keep this correction durable.');
+    const llmComplete = vi.fn().mockResolvedValue({ id: 'answer', content: '{"finalResponse":"Done."}' });
+    const saveUserMessage = vi.fn(async () => { throw new Error('Storage unavailable'); });
+    const host = Object.assign(createReactLoopTestHost(llmComplete, new ReactionParser()), { saveUserMessage, steering });
+    await expect(runAgentReactLoop(host, new AbortController())).rejects.toThrow('Storage unavailable');
+    expect(llmComplete).not.toHaveBeenCalled();
   });
 });

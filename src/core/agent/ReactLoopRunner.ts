@@ -248,6 +248,7 @@ export interface AgentReactLoopHost {
   isPromptCachingEnabled?(): boolean;
   /** Keeps Autohand AI cloud tool lists stable for the session; see PromptCacheToolSet. */
   promptCacheToolSet?: PromptCacheToolSet;
+  saveUserMessage(content: string): Promise<void>;
   saveAssistantMessage(content: string, toolCalls?: ToolCallRequest[]): Promise<void>;
   saveToolMessage(name: AgentAction['type'], content: string, toolCallId?: string): Promise<void>;
   setComposerFinalResponse(response: string): void;
@@ -760,9 +761,10 @@ export async function runAgentReactLoop(
     // Steered messages join the conversation only between iterations, once
     // every tool result of the previous assistant turn is in place; a user
     // message between a tool call and its result is a shape providers reject.
-    const drainSteering = (): boolean => {
+    const drainSteering = async (): Promise<boolean> => {
       const steered = host.steering?.drain() ?? [];
       for (const content of steered) {
+        await host.saveUserMessage(content);
         host.conversation.addMessage({ role: 'user', content });
         host.inkRenderer?.setStatus?.('Applying your steering message...');
       }
@@ -775,7 +777,7 @@ export async function runAgentReactLoop(
         if (debugMode) host.writeDebugLine('[AGENT DEBUG] Abort detected at loop start, breaking');
         break;
       }
-      drainSteering();
+      await drainSteering();
 
       // Filter tools by relevance to reduce token overhead
       await host.peerCommunicationRuntime?.safeBoundary();
@@ -1791,7 +1793,7 @@ export async function runAgentReactLoop(
       }
       // A steer that arrived while the model was answering deserves a reply
       // of its own instead of being read only by the next turn.
-      if (drainSteering()) {
+      if (await drainSteering()) {
         await renderProvisionalResponse(turnOutcome.response, 'new user instructions arrived while this reply was being prepared.');
         continue;
       }

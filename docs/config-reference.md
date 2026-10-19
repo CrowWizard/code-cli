@@ -1027,7 +1027,7 @@ machine), in `/settings` → UI → Keyboard shortcuts, or directly:
 autohand config set ui.keybindingProfile codex
 ```
 
-Every profile keeps Autohand's fixed keys: Enter submits (while a turn runs it queues drafts; select a queued message and submit it to steer, see `ui.enterWhileWorking`), Esc interrupts,
+Every profile keeps Autohand's fixed keys: Enter submits (while a turn runs it queues drafts; select a queued message and submit it to steer, see `ui.enterWhileWorking`), Ctrl+Enter steers queued input, and Esc interrupts.
 Shift+Tab cycles interaction modes, Ctrl+C clears the input and exits on a
 second press, `?` on an empty composer shows the shortcuts panel, and Ctrl+O,
 Ctrl+T and Ctrl+G expand command output and toggle the team and goals panels.
@@ -1329,6 +1329,8 @@ Three ways to enable debug mode (in order of precedence):
 When `enableRequestQueue` is enabled, you can continue typing messages while the agent processes a previous request. Your input will be queued and processed automatically when the current task completes.
 
 - Type your message and press Enter to add it to the queue
+- Press Ctrl+Enter to steer the highlighted queued message, or the oldest queued message when none is highlighted
+- Ctrl+Enter preserves an unrelated composer draft and the remaining queue. The active turn reads the message on its next model request, after any in-flight request or tool completes
 - The status line shows how many requests are queued
 - Requests are processed in FIFO (first-in, first-out) order
 - Maximum queue size is 10 requests

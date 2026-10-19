@@ -341,7 +341,7 @@ interface TextBufferKeyInfo {
 }
 
 /** Chords no extension may take, whichever profile is active. */
-const FIXED_RESERVED_KEYBINDINGS = ['ctrl+c', 'ctrl+d', 'ctrl+x', 'escape', 'enter', 'return'];
+const FIXED_RESERVED_KEYBINDINGS = ['ctrl+c', 'ctrl+d', 'ctrl+x', 'ctrl+enter', 'escape', 'enter', 'return'];
 
 /** Normalises an Ink keypress into the shape the keybinding matcher reads. */
 export function toInkKeyEvent(input: string, key: InkKey): KeyEvent {
@@ -1668,7 +1668,11 @@ export function AgentUI({
   // Stable input handler that reads mutable values from refs.
   // Empty dependency array means useInput never re-registers, eliminating
   // a major source of flicker during rapid keystrokes.
-  const handleInput = useCallback((char: string, key: InkKey) => {
+  const handleInput = useCallback((char: string, rawKey: InkKey) => {
+    // Ink leaves xterm modifyOtherKeys Enter as an unparsed escape fragment.
+    const key = /^(?:\x1b)?\[27;5;13~$/.test(char)
+      ? { ...rawKey, return: true, ctrl: true, shift: false, meta: false, escape: false }
+      : rawKey;
     syncBufferViewport();
     const keyEvent = toInkKeyEvent(char, key);
     const activeKeybindings = keybindingsRef.current;
@@ -1782,6 +1786,24 @@ export function AgentUI({
     if (pasteResult.handled) {
       if (pasteResult.completedText !== undefined) {
         insertPastedText(pasteResult.completedText);
+      }
+      return;
+    }
+
+    if (key.return && key.ctrl && !key.shift && !key.meta && !key.super && !key.hyper
+      && (key.eventType === 'release' || key.eventType === 'repeat')) return;
+
+    if (key.return && key.ctrl && !key.shift && !key.meta && !key.super && !key.hyper
+      && isWorkingRef.current && enableQueueInputRef.current
+      && editingQueueIndexRef.current === null && editingGoalRef.current === null
+      && queuedInstructionsRef.current.length > 0 && onSteerQueuedInstructionRef.current) {
+      const index = queueSelectionIndexRef.current ?? 0;
+      const text = queuedInstructionsRef.current[index];
+      if (text !== undefined && canSteerComposerInput(text)
+        && onSteerQueuedInstructionRef.current(index, queuedInstructionSequencesRef.current?.[index], text, text)) {
+        queueSelectionIndexRef.current = null;
+        setQueueSelectionIndex(null);
+        setCtrlCCount(0);
       }
       return;
     }
@@ -2793,6 +2815,7 @@ export function AgentUI({
         elapsed={state.elapsed}
         tokens={state.tokens}
         queuedInstructions={state.queuedInstructions}
+        queueSteeringEnabled={enableQueueInput && Boolean(onSteerQueuedInstruction)}
         selectedQueueIndex={queueSelectionIndex}
         completionStats={
           // The renderer archives a summary into the transcript and clears this
@@ -3136,6 +3159,7 @@ interface StatusSectionProps {
   elapsed: string;
   tokens: string;
   queuedInstructions: string[];
+  queueSteeringEnabled?: boolean;
   selectedQueueIndex: number | null;
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
   activityItems?: ActivityItem[];
@@ -3158,6 +3182,7 @@ interface StatusSectionProps {
 
 interface QueuedInstructionsPanelProps {
   queuedInstructions: string[];
+  queueSteeringEnabled?: boolean;
   selectedQueueIndex: number | null;
 }
 
@@ -3172,6 +3197,7 @@ function formatQueuedInstructionRow(instruction: string, width: number): string 
 
 const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
   queuedInstructions,
+  queueSteeringEnabled,
   selectedQueueIndex,
 }: QueuedInstructionsPanelProps) {
   const { colors } = useTheme();
@@ -3183,6 +3209,7 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
     <Box flexDirection="column" marginTop={1}>
       <Text color={colors.muted} bold>
         Queue · {queuedInstructions.length} pending
+        {queueSteeringEnabled ? <Text bold={false}> · ctrl+enter steer {focused ? 'selected' : 'next'}</Text> : null}
       </Text>
       {queuedInstructions.map((instruction, idx) => {
         const selected = selectedQueueIndex === idx;
@@ -3204,6 +3231,7 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
   );
 }, (prev, next) => (
   prev.queuedInstructions === next.queuedInstructions &&
+  prev.queueSteeringEnabled === next.queueSteeringEnabled &&
   prev.selectedQueueIndex === next.selectedQueueIndex
 ));
 
@@ -3233,6 +3261,7 @@ const StatusSection = memo(function StatusSection({
   elapsed,
   tokens,
   queuedInstructions,
+  queueSteeringEnabled,
   selectedQueueIndex,
   completionStats,
   activityItems = [],
@@ -3302,6 +3331,7 @@ const StatusSection = memo(function StatusSection({
       {showQueue && (
         <QueuedInstructionsPanel
           queuedInstructions={queuedInstructions}
+          queueSteeringEnabled={queueSteeringEnabled}
           selectedQueueIndex={selectedQueueIndex}
         />
       )}
@@ -3323,6 +3353,7 @@ const StatusSection = memo(function StatusSection({
          prev.contextTokens?.used === next.contextTokens?.used &&
          prev.contextTokens?.total === next.contextTokens?.total &&
          prev.queuedInstructions === next.queuedInstructions &&
+         prev.queueSteeringEnabled === next.queueSteeringEnabled &&
          prev.selectedQueueIndex === next.selectedQueueIndex &&
          prev.completionStats?.elapsed === next.completionStats?.elapsed &&
          prev.completionStats?.tokens === next.completionStats?.tokens &&
@@ -3620,6 +3651,7 @@ interface FixedBottomProps {
   elapsed: string;
   tokens: string;
   queuedInstructions: string[];
+  queueSteeringEnabled?: boolean;
   selectedQueueIndex: number | null;
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
   activityItems?: ActivityItem[];
@@ -3736,6 +3768,7 @@ const FixedBottom = memo(function FixedBottom({
   elapsed,
   tokens,
   queuedInstructions,
+  queueSteeringEnabled,
   selectedQueueIndex,
   completionStats,
   activityItems = [],
@@ -3802,6 +3835,7 @@ const FixedBottom = memo(function FixedBottom({
         elapsed={elapsed}
         tokens={tokens}
         queuedInstructions={queuedInstructions}
+        queueSteeringEnabled={queueSteeringEnabled}
         selectedQueueIndex={selectedQueueIndex}
         completionStats={completionStats}
         activityItems={activityItems}
