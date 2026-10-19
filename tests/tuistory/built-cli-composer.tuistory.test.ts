@@ -417,7 +417,7 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
     const screen = await session.text({ trimEnd: true });
 
     expect(screen).toContain('Autohand');
-    expect(screen).toContain('model:');
+    expect(screen).toContain('Autohand (OpenRouter, openai/gpt-4o-mini)');
 
     await exitInteractive(session);
   });

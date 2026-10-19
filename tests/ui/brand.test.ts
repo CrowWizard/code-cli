@@ -52,6 +52,8 @@ describe('portable monochrome brand rendering', () => {
   });
 
   it('honours reduced motion and explicit static presentation', () => {
+    vi.stubEnv('TERM', 'xterm-256color');
+    vi.stubEnv('AUTOHAND_REDUCED_MOTION', undefined);
     expect(shouldAnimateBrand(true, 'truecolor', true)).toBe(true);
     expect(shouldAnimateBrand(false, 'truecolor', true)).toBe(false);
     expect(shouldAnimateBrand(true, 'none', true)).toBe(true);
