@@ -9,6 +9,7 @@ import { cleanup, render } from 'ink-testing-library';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GoalSessionSnapshot } from '../../../src/goals/types.js';
 import { GoalPanel } from '../../../src/ui/ink/GoalPanel.js';
+import { FullScreenTranscript } from '../../../src/ui/ink/fullScreenTranscript.js';
 import { AgentUI, createInitialUIState } from '../../../src/ui/ink/AgentUI.js';
 import { I18nProvider } from '../../../src/ui/i18n/index.js';
 import { ThemeProvider } from '../../../src/ui/theme/ThemeContext.js';
@@ -218,10 +219,12 @@ describe('live goal panel', () => {
     }));
   });
 
-  it('preserves an edit draft during refresh and never submits a removed goal as an agent instruction', async () => {
+  it.each([false, true])('preserves a removed-goal edit and its warning with fullScreen=%s', async fullScreen => {
+    const fullScreenTranscript = fullScreen ? new FullScreenTranscript() : undefined;
     const onInstruction = vi.fn();
     const onEditGoalObjective = vi.fn();
     const view = (goalActivity: GoalSessionSnapshot) => wrap(<AgentUI
+      fullScreenTranscript={fullScreenTranscript}
       state={{ ...createInitialUIState(), goalPanelVisible: true, goalActivity }}
       onInstruction={onInstruction} onEscape={vi.fn()} onCtrlC={vi.fn()} onEditGoalObjective={onEditGoalObjective}
     />);

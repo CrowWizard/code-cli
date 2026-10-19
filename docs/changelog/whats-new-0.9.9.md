@@ -7,6 +7,10 @@
 - Replies stay visible while completion review, pending todos, steering, or peer updates continue. Interrupted reviews retain the draft and its status in the session; a draft never completes a goal. Fixes [#674](https://github.com/autohandai/code-cli/issues/674).
 - Final answers lead with the result and include a short recap of the request, useful facts learned, and confirmed memories saved. Pending automatic reflection is identified honestly. Successful background memory writes produce a receipt tied to the originating request and session. Research citations, experiment state, goal acceptance, and structured output remain authoritative.
 
+### Terminal layout
+
+- Experimental full-screen mode keeps the composer and status at the bottom while history streams, scrolls, or is searched. Menus open above the input, and drafts survive resize and modal return. Enable it with `/experiments enable full_screen_mode`, then restart. Ctrl+Enter steering remains available.
+
 ### Search and provider setup
 
 - Signed-in Lite, Pro, Pro Plus, Max, Team, and Enterprise accounts can use included Autohand Web Search through the authenticated API, backed by Cloudflare Web Search. Queries support up to 1,024 characters and 10 results, with an account limit of 30 searches per minute. Access is verified on the server for the selected account.

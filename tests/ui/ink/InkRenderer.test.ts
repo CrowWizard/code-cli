@@ -734,3 +734,17 @@ describe('InkRenderer live command blocks', () => {
     expect(output).toContain('latest-completed-warning');
   });
 });
+
+describe('preformatted transcript messages', () => {
+  it('preserves edge whitespace for terminal art while trimming ordinary replies and ignoring empty output', () => {
+    const renderer = new InkRenderer({ onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {} });
+    const content = '\n    logo top  \n  logo bottom\n';
+    renderer.addAssistantMessage(content, false);
+    renderer.addAssistantMessage('   \n', false);
+    renderer.addAssistantMessage('  ordinary reply  \n');
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'assistant', content, renderMarkdown: false },
+      { role: 'assistant', content: 'ordinary reply' },
+    ]);
+  });
+});

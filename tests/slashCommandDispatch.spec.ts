@@ -281,14 +281,18 @@ describe('slash command dispatch – output vs instruction', () => {
     }
   });
 
-  // ── Commands that MUST return null (self-printing) ────────────────────
+  // ── Retained output and modal ownership ───────────────────────────────
 
-  it('/help returns null (prints its own output)', async () => {
-    const ctx = createMinimalContext();
+  it.each(['/help', '/?'])('%s returns retained help without taking input ownership', async (command) => {
+    const ctx = { ...createMinimalContext(), onBeforeModal: vi.fn(), onAfterModal: vi.fn() };
     const handler = new SlashCommandHandler(ctx, SLASH_COMMANDS);
 
-    const result = await handler.handle('/help');
-    expect(result).toBeNull();
+    const result = await handler.handle(command);
+    expect(result).toContain('/about');
+    expect(result).toContain('docs.autohand.ai');
+    expect(consoleSpy).not.toHaveBeenCalled();
+    expect(ctx.onBeforeModal).not.toHaveBeenCalled();
+    expect(ctx.onAfterModal).not.toHaveBeenCalled();
   });
 
   it('/model returns null (handles its own UI)', async () => {
@@ -299,14 +303,14 @@ describe('slash command dispatch – output vs instruction', () => {
     expect(result).toBeNull();
   });
 
-  // ── Unknown commands return null (don't forward garbage to LLM) ───────
+  // ── Unknown commands return a visible diagnostic ───────
 
-  it('unknown slash commands return null', async () => {
+  it('unknown slash commands return a visible diagnostic', async () => {
     const ctx = createMinimalContext();
     const handler = new SlashCommandHandler(ctx, SLASH_COMMANDS);
 
     const result = await handler.handle('/nonexistent-command');
-    expect(result).toBeNull();
+    expect(result).toContain('Command /nonexistent-command is not supported.');
   });
 
   // ── Multi-word commands ───────────────────────────────────────────────
@@ -421,7 +425,7 @@ describe('slash command dispatch – output vs instruction', () => {
 
     // /help should still work
     const helpResult = await handler.handle('/help');
-    expect(helpResult).toBeNull(); // help prints its own output
+    expect(helpResult).toContain('docs.autohand.ai');
 
     // /mcp should still work
     const mcpResult = await handler.handle('/mcp');

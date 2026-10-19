@@ -110,6 +110,7 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
 
 /** Operational command results that belong with the fixed composer controls. */
 const FIXED_COMPOSER_RESULT_COMMANDS = new Set(['/tasks', '/team', '/teams', '/squad']);
+const MARKDOWN_REPORT_COMMANDS = new Set(['/pr-review', '/deslop', '/tester']);
 
 export function shouldPreserveComposerDraftAfterCommand(command: string): boolean {
   return command === '/whatityped' || command === '/peers' || command === '/feedback' || command === '/sync';
@@ -134,7 +135,8 @@ export function renderAgentSlashCommandResult(
   if (shouldRenderSlashCommandResultInComposer(command)) {
     host.inkRenderer.setCommandResult?.(command, result);
   } else {
-    host.inkRenderer.addAssistantMessage?.(result, false);
+    const renderMarkdown = MARKDOWN_REPORT_COMMANDS.has(command) && !result.startsWith('Usage:');
+    host.inkRenderer.addAssistantMessage?.(result, renderMarkdown);
   }
   return true;
 }

@@ -70,10 +70,10 @@ function statusStream(response: ServerResponse, incomplete: boolean) {
 }
 
 const ui = { promptSuggestions: false, showCompletionNotification: false, terminalBell: false };
-async function fixtureState(baseUrl: string) {
+async function fixtureState(baseUrl: string, fullScreen = false) {
   return createTempAutohandHome({ config: {
     provider: 'autohandai',
-    features: { autohand_inference: true, automaticSpecialists: false },
+    features: { autohand_inference: true, automaticSpecialists: false, fullScreenMode: fullScreen },
     autohandai: { plan: 'cloud', authMode: 'api-key', apiKey: 'fixture-only', baseUrl, model: 'fantail', orchestration: false },
     search: { provider: 'browser-profile' },
     agent: { autoMemory: false, maxIterations: 6, sessionRetryLimit: 0, enableRequestQueue: true },
@@ -92,8 +92,10 @@ async function persistedUserMessages(home: string): Promise<string[]> {
 
 describe('queued steering and streamed tool-call recovery in the built CLI', () => {
   it.each([
-    { sequence: '\x1b[13;5u', selected: false },
-    { sequence: '\x1b[27;5;13~', selected: true },
+    { sequence: '\x1b[13;5u', selected: false, fullScreen: false },
+    { sequence: '\x1b[27;5;13~', selected: true, fullScreen: false },
+    { sequence: '\x1b[13;5u', selected: false, fullScreen: true },
+    { sequence: '\x1b[27;5;13~', selected: true, fullScreen: true },
   ])('steers queued input into the active request sequence: %j', async options => {
     let releaseFirst = () => {};
     const first = new Promise<void>(resolve => { releaseFirst = resolve; });
@@ -104,7 +106,7 @@ describe('queued steering and streamed tool-call recovery in the built CLI', () 
       } else jsonReply(response, index === 2 ? 'ACTIVE_TURN_FINISHED' : 'QUEUED_TURN_FINISHED');
     });
     const auth = await createMockAuthServer();
-    const state = await fixtureState(server.baseUrl);
+    const state = await fixtureState(server.baseUrl, options.fullScreen);
     let session: Session | undefined;
     try {
       session = await launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath, '--yes'], {
@@ -113,8 +115,15 @@ describe('queued steering and streamed tool-call recovery in the built CLI', () 
       });
       await startQueuedSteeringTurn(session);
       expect(session.getRawOutput()).toContain('\x1b[>1u');
+      if (options.fullScreen) expect(session.getRawOutput().includes('\x1b[?1049h')).toBe(true);
       await vi.waitFor(() => expect(server.requests).toHaveLength(1), { timeout: 15_000 });
       const screen = await steerPendingMessage(session, options);
+      if (options.fullScreen) {
+        const lines = (await session.text()).split('\n');
+        const composerRow = lines.findLastIndex(line => line.trimStart().startsWith('❯'));
+        expect(composerRow).toBeGreaterThanOrEqual(session.currentRows - 7);
+        expect(composerRow).toBeLessThan(session.currentRows);
+      }
       expect(pendingQueueSnapshot(screen)).toMatchInlineSnapshot(`
         [
           "Queue · 1 pending · ctrl+enter steer next",
@@ -133,6 +142,7 @@ describe('queued steering and streamed tool-call recovery in the built CLI', () 
       expect(JSON.stringify(server.requests)).not.toContain('KEEP_THIS_DRAFT');
       await exitInteractive(session);
       expect(session.getRawOutput()).toContain('\x1b[<u');
+      if (options.fullScreen) expect(session.getRawOutput().includes('\x1b[?1049l')).toBe(true);
       const messages = await persistedUserMessages(state.autohandHome);
       expect(messages.filter(message => message.includes('STEER_NOW'))).toHaveLength(1);
       expect(messages.filter(message => message.includes('QUEUE_LATER'))).toHaveLength(1);
