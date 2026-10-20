@@ -63,6 +63,10 @@ export function normalizeInitialCliOptions(
   if (prompt === true) {
     options.prompt = undefined;
   }
+  if (typeof options.json === 'string' && !['stream', 'local'].includes(options.json.toLowerCase()) && !options.prompt) {
+    options.prompt = options.json;
+    options.json = true;
+  }
   if (options.y === true) {
     options.yes = true;
   }

@@ -1299,6 +1299,7 @@ export async function runAgentCommandMode(
       if (succeeded) {
         if (
           host.runtime.config.ui?.terminalBell !== false
+          && process.stdout.isTTY
           && !options.review
           && (host.runtime.options.commandOutputFormat ?? 'text') === 'text'
         ) {

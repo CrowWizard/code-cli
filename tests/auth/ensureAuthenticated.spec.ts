@@ -61,6 +61,7 @@ const mockCheckForUpdates = checkForUpdates as unknown as ReturnType<typeof vi.f
 describe('ensureAuthenticated', () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
   const originalIsTTY = process.stdout.isTTY;
+  const originalStdinIsTTY = process.stdin.isTTY;
   const originalColumns = process.stdout.columns;
   const originalApiKey = process.env.AUTOHAND_API_KEY;
   const originalStartupAuthMenu = process.env.AUTOHAND_STARTUP_AUTH_MENU;
@@ -84,6 +85,8 @@ describe('ensureAuthenticated', () => {
       throw new Error('PROCESS_EXIT');
     });
     Object.defineProperty(process.stdout, 'isTTY', { value: true, writable: true });
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, writable: true });
+    vi.stubEnv('CI', 'false');
   });
 
   afterEach(() => {
@@ -99,7 +102,45 @@ describe('ensureAuthenticated', () => {
     }
     exitSpy.mockRestore();
     Object.defineProperty(process.stdout, 'isTTY', { value: originalIsTTY, writable: true });
+    Object.defineProperty(process.stdin, 'isTTY', { value: originalStdinIsTTY, writable: true });
     Object.defineProperty(process.stdout, 'columns', { value: originalColumns, writable: true, configurable: true });
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    { stdinTTY: false, stdoutTTY: true, ci: 'false' },
+    { stdinTTY: true, stdoutTTY: false, ci: 'false' },
+    { stdinTTY: true, stdoutTTY: true, ci: '1' },
+    { stdinTTY: true, stdoutTTY: true, ci: 'true' },
+    { stdinTTY: false, stdoutTTY: false, ci: '1', expired: true },
+  ])('fails promptly without interactive login for $stdinTTY/$stdoutTTY/CI=$ci', async ({ stdinTTY, stdoutTTY, ci, expired }) => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: stdinTTY, writable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: stdoutTTY, writable: true });
+    vi.stubEnv('CI', ci);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(ensureAuthenticated({ configPath: '/tmp/unused-config.json',
+        ...(expired ? { auth: { token: 'expired-session-fixture', expiresAt: '2000-01-01T00:00:00.000Z' } } : {}),
+      })).rejects.toThrow('PROCESS_EXIT');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(mockLogin).not.toHaveBeenCalled();
+      expect(mockShowModal).not.toHaveBeenCalled();
+      expect(mockCheckForUpdates).not.toHaveBeenCalled();
+      expect(error.mock.calls.flat().join(' ')).toContain('autohand login');
+      expect(error.mock.calls.flat().join(' ')).toContain('AUTOHAND_API_KEY');
+      expect(error.mock.calls.flat().join(' ')).toContain('--bare');
+      expect(error.mock.calls.flat().join(' ')).toContain(expired ? 'Your Autohand sign-in has expired.' : 'Not signed in.');
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('accepts a valid existing credential in CI without interactive login', async () => {
+    vi.stubEnv('CI', '1');
+    const config: LoadedConfig = { configPath: '/tmp/config.json', auth: { token: 'ahc_fixture' } };
+    expect(await ensureAuthenticated(config)).toBe(config);
+    expect(mockLogin).not.toHaveBeenCalled();
+    expect(mockShowModal).not.toHaveBeenCalled();
   });
 
   it('returns config immediately for a locally valid token without blocking on server validation', async () => {

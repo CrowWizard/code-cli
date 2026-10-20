@@ -15,7 +15,7 @@ import { checkForUpdates } from '../utils/versionCheck.js';
 import packageJson from '../../package.json' with { type: 'json' };
 import type { LoadedConfig } from '../types.js';
 import { spawn, spawnSync } from 'node:child_process';
-import { platform } from 'node:os';
+import { getUpdateCommand } from '../utils/installMethod.js';
 
 /**
  * Get git commit hash (short)
@@ -44,25 +44,7 @@ async function getGitCommit(): Promise<string> {
  * Run the appropriate upgrade command based on platform
  */
 async function runUpgrade(): Promise<void> {
-  const os = platform();
-  let command: string;
-  let args: string[];
-  const shell: string | boolean = false;
-
-  if (os === 'win32') {
-    // Windows
-    command = 'powershell.exe';
-    args = ['-Command', 'iwr -useb https://autohand.ai/install.ps1 | iex'];
-  } else if (os === 'darwin') {
-    // macOS - try brew first, fallback to curl
-    command = 'sh';
-    args = ['-c', 'brew install autohandai/code/autohand-code || curl -fsSL https://autohand.ai/install.sh | sh'];
-  } else {
-    // Linux - use curl
-    command = 'sh';
-    args = ['-c', 'curl -fsSL https://autohand.ai/install.sh | sh'];
-  }
-
+  const { command, args, hint } = getUpdateCommand(packageJson.version.includes('-alpha.') ? 'alpha' : 'stable');
   console.log(chalk.gray('Upgrading Autohand...'));
   console.log(chalk.gray(`Running: ${command} ${args.join(' ')}`));
   console.log();
@@ -70,7 +52,6 @@ async function runUpgrade(): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: 'inherit',
-      shell: shell || undefined,
       // The installer offers to start Autohand with a first message; a nested
       // session inside the one being upgraded must never start.
       env: { ...process.env, AUTOHAND_INSTALL_FIRST_RUN: 'no' },
@@ -86,14 +67,7 @@ async function runUpgrade(): Promise<void> {
         console.log();
         console.log(chalk.red('Upgrade failed.'));
         console.log(chalk.gray('You can try manually:'));
-        if (os === 'win32') {
-          console.log(chalk.gray('  iwr -useb https://autohand.ai/install.ps1 | iex'));
-        } else {
-          console.log(chalk.gray('  curl -fsSL https://autohand.ai/install.sh | sh'));
-          console.log(chalk.gray('  or: brew install autohandai/code/autohand-code'));
-        }
-        console.log(chalk.gray('  or: npm i -g autohand-cli'));
-        console.log(chalk.gray('  or: bun i -g autohand-cli'));
+        console.log(chalk.gray(`  ${hint}`));
         reject(new Error(`Upgrade failed with exit code ${code}`));
       }
     });
@@ -224,6 +198,13 @@ function isTokenExpiredLocally(config: LoadedConfig): boolean {
  * Reloads config after login. Exits if login fails.
  */
 async function promptLogin(config: LoadedConfig): Promise<LoadedConfig> {
+  const ci = process.env.CI?.trim().toLowerCase();
+  if (!process.stdin.isTTY || !process.stdout.isTTY || (ci && ci !== 'false' && ci !== '0')) {
+    const status = config.auth?.token ? 'Your Autohand sign-in has expired.' : 'Not signed in.';
+    console.error(chalk.red(`${status} Run \`autohand login\`, or in CI set AUTOHAND_API_KEY and add --bare.`));
+    console.error('CI sign-in: https://docs.autohand.ai/guides/ci-cd-automation');
+    process.exit(1);
+  }
   // Show modal with logo and login/exit options
   if (process.stdout.isTTY) {
     const commit = await getGitCommit();

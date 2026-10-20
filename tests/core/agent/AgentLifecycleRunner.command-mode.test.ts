@@ -62,9 +62,12 @@ function lifecycleHookOptions() {
 }
 
 describe('runAgentCommandMode', () => {
+  const originalStdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    if (originalStdoutTTY) Object.defineProperty(process.stdout, 'isTTY', originalStdoutTTY);
+    else Reflect.deleteProperty(process.stdout, 'isTTY');
   });
 
   it('returns false and suppresses success-only effects after a failed turn', async () => {
@@ -150,6 +153,7 @@ describe('runAgentCommandMode', () => {
   });
 
   it('returns true and preserves successful command-mode completion effects', async () => {
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
     const host = createHost(true);
     const stdoutWrite = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
@@ -175,6 +179,13 @@ describe('runAgentCommandMode', () => {
     expect(host.hookManager.executeHooks).toHaveBeenCalledOnce();
     expect(host.runtime.isCommandMode).toBe(false);
     expect(host.useInkRenderer).toBe(true);
+  });
+
+  it('does not write a bell into captured command output', async () => {
+    Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
+    const stdoutWrite = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    await expect(runAgentCommandMode(createHost(true), 'successful captured instruction')).resolves.toBe(true);
+    expect(stdoutWrite).not.toHaveBeenCalledWith('\x07');
   });
 
   it('brackets a non-interactive review command with review lifecycle hooks', async () => {

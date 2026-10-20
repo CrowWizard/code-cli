@@ -10,6 +10,7 @@ import {
   refreshModelCatalog,
 } from '../providers/modelCatalogUpdater.js';
 import { checkForUpdates, getInstallHint } from '../utils/versionCheck.js';
+import { getUpdateCommand } from '../utils/installMethod.js';
 
 export interface UpdateOptions {
   currentVersion: string;
@@ -98,12 +99,13 @@ export async function runUpdate(opts: UpdateOptions): Promise<void> {
   }
 
   // Install mode: run the install script
-  const installCmd = getInstallHint(channel);
+  const updateCommand = getUpdateCommand(channel);
+  const installCmd = updateCommand.hint;
   console.log();
   console.log(chalk.gray(`Running: ${installCmd}`));
   console.log();
 
-  const exitCode = await runInstallScript(installCmd);
+  const exitCode = await runInstallScript(updateCommand);
 
   if (exitCode === 0) {
     console.log();
@@ -121,10 +123,11 @@ export async function runUpdate(opts: UpdateOptions): Promise<void> {
  * Spawn the install script and stream its output.
  * Returns the exit code.
  */
-function runInstallScript(command: string): Promise<number> {
+function runInstallScript(plan: ReturnType<typeof getUpdateCommand>): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn('sh', ['-c', command], {
+    const child = spawn(plan.command, plan.args, {
       stdio: 'inherit',
+      env: { ...process.env, AUTOHAND_INSTALL_FIRST_RUN: 'no' },
     });
 
     child.on('close', (code) => {

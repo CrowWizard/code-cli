@@ -26,13 +26,13 @@ import { collectToolPatternOption } from './permissions/cliPolicyMutation.js';
 import { configureRunConfigOverlay } from './runConfigOverlay.js';
 import { loadOutputSchema } from './modes/outputSchema.js';
 import { startupTimeline } from './startup/startupTimeline.js';
-import { Command, Option } from 'commander';
+import { Command, InvalidArgumentError, Option } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
+import { applyCliModelOverride, applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
 import { reportCliCommand } from './telemetry/commandUsage.js';
 import {
   reconcileAhTraces,
@@ -44,7 +44,7 @@ import { setTraceMonitoringEnabled } from './integrations/ahtraces/preferences.j
 import { runStartupChecks, printStartupCheckResults, validateWorkspacePath } from './startup/checks.js';
 import { checkWorkspaceSafety, printDangerousWorkspaceWarning } from './startup/workspaceSafety.js';
 import { ensureAuthenticated } from './auth/index.js';
-import type { AuthUser, BuiltInProviderName, LoadedConfig, SkillInstallScope } from './types.js';
+import type { AuthUser, LoadedConfig, SkillInstallScope } from './types.js';
 import { validateAuthOnStartup } from './auth/startupAuth.js';
 import { installProcessErrorHandlers } from './reporting/processErrorReporting.js';
 import { checkForUpdates, getInstallHint, type VersionCheckResult } from './utils/versionCheck.js';
@@ -123,7 +123,6 @@ import { ActiveAgentRegistry } from './session/ActiveAgentRegistry.js';
 import { AgentsGenerator } from './onboarding/agentsGenerator.js';
 import { buildAutomodeIterationPrompt } from './core/automodePrompt.js';
 import { looksLikeInlineAgents, parseInlineAgents } from './core/agents/AgentRegistry.js';
-import { getCustomProviderConfig, isCustomProviderName } from './providers/customProviders.js';
 import { GIT_VERSION_LOOKUP_TIMEOUT_MS, runtimeVersion } from './utils/runtimeVersion.js';
 import {
   getAnnouncementManager,
@@ -163,28 +162,6 @@ async function applyServedAutohandModel(config: LoadedConfig, opts: { model?: st
   const served = normalizeAutohandAIStartupModel(config);
   if (served && opts.model) {
     opts.model = served;
-  }
-}
-
-function applyCliModelOverride(config: LoadedConfig, model: string): void {
-  const providerName = config.provider ?? 'openrouter';
-  if (isCustomProviderName(providerName)) {
-    const customProvider = getCustomProviderConfig(config, providerName);
-    if (customProvider) {
-      config.customProviders = {
-        ...config.customProviders,
-        [customProvider.id]: {
-          ...customProvider,
-          model,
-        },
-      };
-    }
-    return;
-  }
-
-  const providerConfig = config[providerName as BuiltInProviderName];
-  if (providerConfig) {
-    providerConfig.model = model;
   }
 }
 
@@ -478,7 +455,9 @@ program
   .option('--no-worktree', 'Disable git worktree isolation in auto-mode')
   .option('--checkpoint-interval <n>', 'Git commit every N iterations (default: 5)', parseInt)
   .option('--max-runtime <m>', 'Max runtime in minutes (default: 120)', parseInt)
-  .option('--max-cost <d>', 'Max API cost in dollars (default: 10)', parseFloat)
+  .addOption(new Option('--max-cost <d>').hideHelp().argParser(() => {
+    throw new InvalidArgumentError('--max-cost is not supported. Use --max-iterations or --max-runtime instead.');
+  }))
   .option('--max-requests <n>', 'Stop the run after this many model requests, sub-agents included', parseInt)
   .option('--max-tokens <n>', 'Stop the run once reported token usage reaches this total, sub-agents included', parseInt)
   .option('--max-duration <seconds>', 'Stop the run after this much wall time', parseInt)
@@ -1594,7 +1573,9 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       commandLifecycleController.signal,
     );
     startupTimeline.mark('config loaded');
-    config = applyCliProviderOverride(config, options.provider);
+    config = options.model
+      ? applyCliModelOverride(config, options.model, options.provider)
+      : applyCliProviderOverride(config, options.provider);
     if (options.bare) {
       config = await awaitCliLifecycleStep(
         prepareBareModeConfig(config, options),
@@ -1735,6 +1716,14 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       printDangerousWorkspaceWarning(originalWorkspaceRoot, safetyCheck);
       process.exitCode = 1;
       return;
+    }
+
+    if (!structuredOutput && resolveAgentLaunchMode(options) === 'interactive'
+      && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+      const { hasLegacyAutomodeState } = await import('./core/AutomodeState.js');
+      if (await awaitCliLifecycleStep(hasLegacyAutomodeState(originalWorkspaceRoot), commandLifecycleController.signal)) {
+        console.warn(chalk.gray('Ignored old auto-mode state in .autohand/automode.local.md. Auto mode now starts only when you choose it.'));
+      }
     }
 
     // loadConfig held back project hooks and MCP servers from an untrusted
@@ -2011,11 +2000,6 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
 
     // Note: Git repo check is passed to the agent via runtime.
     // The agent/LLM can suggest initializing git if needed for complex tasks.
-
-    // Override model from CLI if provided
-    if (options.model) {
-      applyCliModelOverride(config, options.model);
-    }
 
     // Override debug mode from CLI if provided
     if (options.debug) {
@@ -2671,7 +2655,7 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
   const fs = await import('fs-extra');
   const { generateUnifiedPatch, formatChangeSummary } = await import('./utils/patch.js');
 
-  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+  let config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
   let workspaceRoot = originalWorkspaceRoot;
 
@@ -2703,7 +2687,7 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
 
   // Override model from CLI if provided
   if (opts.model) {
-    applyCliModelOverride(config, opts.model);
+    config = applyCliModelOverride(config, opts.model, opts.provider);
   }
   await applyServedAutohandModel(config, opts);
 
@@ -2792,7 +2776,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
     process.exit(1);
   }
 
-  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+  let config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
 
   await exitUnlessWorkspaceIsSafe(originalWorkspaceRoot);
@@ -2807,7 +2791,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
 
   // Override model from CLI if provided
   if (opts.model) {
-    applyCliModelOverride(config, opts.model);
+    config = applyCliModelOverride(config, opts.model, opts.provider);
   }
   await applyServedAutohandModel(config, opts);
 
@@ -2980,6 +2964,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
         success,
         actions,
         error,
+        output: success ? activeAgent.getLastAssistantResponse() : undefined,
         filesModified: fileChanges.count,
         modifiedFiles: fileChanges.paths,
       };

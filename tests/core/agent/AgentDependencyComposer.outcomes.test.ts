@@ -1,3 +1,4 @@
+import { executeReviewWithLifecycle } from '../../../src/review/reviewLifecycle.js';
 /**
  * @license
  * Copyright 2025 Autohand AI LLC
@@ -881,6 +882,23 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     expect(confirmApproval).not.toHaveBeenCalled();
     expect(internals.specialistOrchestrator.installStagedCatalogSelections).toHaveBeenCalledOnce();
     expect(result.success).toBe(true);
+  });
+
+  it('suppresses specialist preparation inside a read-only review and restores it afterwards', async () => {
+    const { agent, internals } = createAgent({}, 'unrestricted', true);
+    const continuation = vi.fn().mockResolvedValue(undefined);
+    internals.specialistOrchestrator.continueInterview = continuation;
+    await executeReviewWithLifecycle({
+      request: { kind: 'changes', audience: 'technical', format: 'markdown' },
+      surface: 'cli', permissionManager: agent.getPermissionManager(),
+      execute: async () => {
+        await internals.prepareSpecialists('The primary user is an engineer.');
+        expect(continuation).not.toHaveBeenCalled();
+        return true;
+      },
+    });
+    await internals.prepareSpecialists('The primary user is an engineer.');
+    expect(continuation).toHaveBeenCalledOnce();
   });
 
   it('routes a later user answer through the active specialist interview', async () => {

@@ -76,8 +76,8 @@ describe('CLI mode routing', () => {
 describe('startup interaction mode', () => {
   const interactive = { options: {}, isInteractiveTerminal: true } as const;
 
-  it('starts interactive terminal sessions in auto mode by default', () => {
-    expect(resolveStartupInteractionMode(interactive)).toBe('automode');
+  it('starts interactive terminal sessions with normal approvals by default', () => {
+    expect(resolveStartupInteractionMode(interactive)).toBe('default');
   });
 
   it('keeps an explicit --auto-mode request in auto mode even when the config opts out', () => {
@@ -125,8 +125,8 @@ describe('startup interaction mode', () => {
     },
   );
 
-  it('does not treat the wizard-written interactive permission mode as an opt-out', () => {
-    expect(resolveStartupInteractionMode({ ...interactive, permissionMode: 'interactive' })).toBe('automode');
+  it('preserves the wizard-written interactive permission mode on startup', () => {
+    expect(resolveStartupInteractionMode({ ...interactive, permissionMode: 'interactive' })).toBe('default');
   });
 
   it.each(['default', 'plan', 'automode', 'yolo'] as const)(

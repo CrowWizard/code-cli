@@ -10,6 +10,15 @@ interface TerminalLaunchOptions extends LaunchOptions {
   waitForDataTimeout?: number;
 }
 
+export async function launchPipedTuistorySession(producer: string[], options: TerminalLaunchOptions): Promise<Session> {
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  return launchTuistorySession({
+    ...options,
+    command: '/bin/sh',
+    args: ['-c', `${producer.map(quote).join(' ')} | ${[options.command, ...(options.args ?? [])].map(quote).join(' ')}`],
+  });
+}
+
 export async function launchTuistorySession(options: TerminalLaunchOptions): Promise<Session> {
   const session = new Session(options);
   try {
