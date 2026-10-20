@@ -279,6 +279,13 @@ export function buildReviewInstruction(input: {
     '# Autohand Review invocation',
     '',
     'Run the public-beta review workflow as a read-only inspection. Do not modify the workspace.',
+    'Work as a single reviewer. Do not delegate to sub-agents or launch a sequence of specialist reviews.',
+    'For a small diff, inspect the diff and directly affected files, then return a verdict within two minutes. State any remaining blind spots.',
+    'Use the dedicated file/search/Git inspection tools. Do not execute shell commands, project code, tests, or skills that request them.',
+    ...(request.kind === 'changes' && !request.base && !request.head ? [
+      'For pending changes, start with git_diff_range with {"range":"HEAD"}; this includes staged and unstaged changes against HEAD. Do not substitute HEAD~1 or another commit comparison.',
+      'Read the directly affected files. Once the changed contract and its direct effect are clear, return the verdict. Inspect history or search for additional consumers only when a concrete finding depends on them.',
+    ] : []),
     '',
     '## Specialist contract',
     '',

@@ -413,6 +413,8 @@ describe('OllamaProvider', () => {
             expect(apiErr.httpStatus).toBe(404);
             // Should suggest running ollama pull
             expect(apiErr.message).toMatch(/ollama pull/i);
+            expect(apiErr.message).toContain('Ollama');
+            expect(apiErr.message).toContain(config.model);
         });
 
         it('returns friendly message for 500 server error', async () => {

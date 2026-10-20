@@ -17,7 +17,9 @@ export interface PlanSummary {
 
 const TIER_LABELS: Record<string, string> = {
   free: 'Free',
+  lite: 'Lite',
   pro: 'Pro',
+  pro_plus: 'Pro+',
   max: 'Max',
   team: 'Team',
   enterprise: 'Enterprise',
@@ -66,13 +68,15 @@ export function formatComposerPlanLabel(plan: PlanSummary | null | undefined): s
   return plan.tier === 'team' ? plan.accountName || plan.label : plan.label;
 }
 
-export type UpgradeTarget = 'pro' | 'max' | 'team';
+export type UpgradeTarget = 'lite' | 'pro' | 'pro_plus' | 'max' | 'team';
 
 /** Self-serve tiers in purchase order. Team and enterprise are managed in billing. */
-const PLAN_LADDER: ReadonlyArray<'free' | UpgradeTarget> = ['free', 'pro', 'max', 'team'];
+const PLAN_LADDER: ReadonlyArray<'free' | UpgradeTarget> = ['free', 'lite', 'pro', 'pro_plus', 'max', 'team'];
 
 /** Next paid tier for a self-serve plan; null for team, enterprise and unknown tiers. */
 export function nextPlanTier(tier: string | undefined): UpgradeTarget | null {
+  // Keep Free's existing destination until the separate Q-0018 decision.
+  if (tier === 'free') return 'pro';
   const index = PLAN_LADDER.indexOf(tier as 'free' | UpgradeTarget);
   if (index < 0) return null;
   return (PLAN_LADDER[index + 1] as UpgradeTarget | undefined) ?? null;

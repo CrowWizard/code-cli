@@ -55,7 +55,7 @@ describe('/upgrade', () => {
       }),
       { openBrowser },
     );
-    expect(result).toBe('Upgrade your Autohand plan: https://console.autohand.ai/?upgrade=max&source=cli');
+    expect(result).toBe('Upgrade your Autohand plan: https://console.autohand.ai/?upgrade=pro_plus&source=cli');
     expect(openBrowser).not.toHaveBeenCalled();
   });
 });

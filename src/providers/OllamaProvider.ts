@@ -410,7 +410,7 @@ export class OllamaProvider implements LLMProvider {
         if (response.status === 404) {
             const baseError = classifyApiError(response.status, errorBody, response.headers);
             return new ApiError(
-                `Model not found. Run 'ollama pull ${String(body.model)}' to download it.\n${errorBody}`,
+                `Ollama could not find model "${String(body.model)}". Run 'ollama pull ${String(body.model)}' to download it, or select a hosted model with 'autohand --model fantail'.\n${errorBody}`,
                 baseError.code,
                 baseError.httpStatus,
                 baseError.retryable,

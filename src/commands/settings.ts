@@ -209,7 +209,6 @@ export const SETTINGS_REGISTRY: SettingDef[] = [
   // Auto-mode
   { key: 'automode.maxIterations', labelKey: 'commands.settings.automode.maxIterations', descriptionKey: 'commands.settings.automode.maxIterationsDesc', category: 'automode', type: 'number', defaultValue: 50 },
   { key: 'automode.maxRuntime', labelKey: 'commands.settings.automode.maxRuntime', descriptionKey: 'commands.settings.automode.maxRuntimeDesc', category: 'automode', type: 'number', defaultValue: 120 },
-  { key: 'automode.maxCost', labelKey: 'commands.settings.automode.maxCost', descriptionKey: 'commands.settings.automode.maxCostDesc', category: 'automode', type: 'number', defaultValue: 10 },
   { key: 'automode.checkpointInterval', labelKey: 'commands.settings.automode.checkpointInterval', descriptionKey: 'commands.settings.automode.checkpointIntervalDesc', category: 'automode', type: 'number', defaultValue: 5 },
   { key: 'automode.useWorktree', labelKey: 'commands.settings.automode.useWorktree', descriptionKey: 'commands.settings.automode.useWorktreeDesc', category: 'automode', type: 'boolean', defaultValue: true },
 

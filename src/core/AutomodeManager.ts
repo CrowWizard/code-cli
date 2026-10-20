@@ -11,6 +11,7 @@ import { EventEmitter } from 'events';
 import { execSync } from 'child_process';
 import { getCommandCoordination, executeCoordinatedFile } from '../session/peers/CommandCoordinationGate.js';
 import path from 'path';
+import os from 'node:os';
 import chalk from 'chalk';
 import crypto from 'crypto';
 import type {
@@ -364,6 +365,12 @@ export class AutomodeManager extends EventEmitter {
         // the iteration that produced the decision.
         await this.state.recordIteration(iterationLog);
 
+        if (result.success && result.output && this.state.checkCompletionPromise(result.output)) {
+          console.log(chalk.green('\n✓ Task complete'));
+          await this.complete();
+          break;
+        }
+
         // Check circuit breaker
         const hasChanges = (result.filesCreated ?? 0) + (result.filesModified ?? 0) > 0;
         const errorHash = result.error ? hashError(result.error) : null;
@@ -387,13 +394,6 @@ export class AutomodeManager extends EventEmitter {
         if (circuitResult.triggered) {
           console.log(chalk.yellow(`\n⚡ Circuit breaker triggered: ${circuitResult.reason}`));
           await this.cancel('circuit_breaker');
-          break;
-        }
-
-        // Check for completion promise
-        if (result.output && this.state.checkCompletionPromise(result.output)) {
-          console.log(chalk.green(`\n✅ Completion promise detected!`));
-          await this.complete();
           break;
         }
 
@@ -542,10 +542,6 @@ export class AutomodeManager extends EventEmitter {
         automodeFilesModified: currentState.filesModified,
       });
 
-      // Merge worktree if using one
-      if (this.worktreePath && this.branchName && this.originalBranch) {
-        await this.mergeWorktree();
-      }
     }
   }
 
@@ -627,7 +623,7 @@ export class AutomodeManager extends EventEmitter {
     if (result.status !== 0) throw new Error(result.stderr || 'Git operation failed.');
   }
 
-  private async setupWorktree(_sessionId: string): Promise<void> {
+  private async setupWorktree(sessionId: string): Promise<void> {
     // Save original branch
     try {
       this.originalBranch = execSync('git rev-parse --abbrev-ref HEAD', {
@@ -639,21 +635,22 @@ export class AutomodeManager extends EventEmitter {
     }
 
     // Generate branch name
-    this.branchName = `autohand-automode-${Date.now()}`;
+    this.branchName = `autohand-${sessionId}`;
 
     // Create worktree in temp directory
-    const tempDir = path.join('/tmp', `autohand-worktree-${crypto.randomBytes(4).toString('hex')}`);
+    const tempDir = path.join(os.tmpdir(), `autohand-worktree-${crypto.randomBytes(4).toString('hex')}`);
     this.worktreePath = tempDir;
 
     try {
       // Create new branch and worktree
-      await this.executeGitMutation(`git worktree add -b ${this.branchName} ${tempDir}`, {
+      await this.executeGitMutation(`git worktree add -b ${quoteRecoveryArgument(this.branchName)} ${quoteRecoveryArgument(tempDir)}`, {
         cwd: this.workspaceRoot,
         encoding: 'utf-8',
       });
 
-      // Update workspace root for operations
-      // Note: Actual implementation would need to update the agent's workspace
+      this.patternDetector = new PatternDetector(tempDir);
+      this.agentsMdUpdater = new AgentsMdUpdater(tempDir);
+      this.memoryManager?.setWorkspace(tempDir);
     } catch (error) {
       this.worktreePath = null;
       this.branchName = null;
@@ -712,62 +709,6 @@ export class AutomodeManager extends EventEmitter {
   }
 
   /**
-   * Merge worktree back to original branch
-   */
-  private async mergeWorktree(): Promise<void> {
-    if (!this.worktreePath || !this.branchName || !this.originalBranch) {
-      return;
-    }
-
-    try {
-      console.log(chalk.cyan(`\n🔀 Merging ${this.branchName} to ${this.originalBranch}...`));
-
-      // Switch back to original branch
-      await this.executeGitMutation(`git checkout ${this.originalBranch}`, {
-        cwd: this.workspaceRoot,
-        encoding: 'utf-8',
-      });
-
-      // Merge the automode branch
-      await this.executeGitMutation(`git merge ${this.branchName} --no-edit`, {
-        cwd: this.workspaceRoot,
-        encoding: 'utf-8',
-      });
-
-      console.log(chalk.green(`   ✅ Successfully merged to ${this.originalBranch}`));
-
-      // Clean up worktree
-      await this.cleanupWorktree();
-    } catch (error) {
-      console.log(chalk.yellow(`   ⚠ Merge failed: ${error}`));
-      console.log(chalk.gray(`   Worktree preserved at: ${this.worktreePath}`));
-    }
-  }
-
-  /**
-   * Clean up worktree
-   */
-  private async cleanupWorktree(): Promise<void> {
-    if (!this.worktreePath || !this.branchName) return;
-
-    try {
-      // Remove worktree
-      await this.executeGitMutation(`git worktree remove ${this.worktreePath} --force`, {
-        cwd: this.workspaceRoot,
-        encoding: 'utf-8',
-      });
-
-      // Delete branch
-      await this.executeGitMutation(`git branch -d ${this.branchName}`, {
-        cwd: this.workspaceRoot,
-        encoding: 'utf-8',
-      });
-    } catch {
-      // Ignore cleanup errors
-    }
-  }
-
-  /**
    * Clean up after auto-mode ends
    */
   private async cleanup(): Promise<void> {
@@ -780,7 +721,7 @@ export class AutomodeManager extends EventEmitter {
     if (currentState) {
       try {
         const changelogPath = await generateChangelog(
-          this.workspaceRoot,
+          this.getEffectiveWorkspace(),
           currentState,
           this.state.getIterations(),
           this.gitCommits
@@ -789,6 +730,10 @@ export class AutomodeManager extends EventEmitter {
       } catch (error) {
         console.log(chalk.gray(`   ⚠ Changelog generation failed: ${error}`));
       }
+    }
+
+    if (currentState?.status === 'completed' && this.worktreePath) {
+      await this.createCheckpoint(currentState.currentIteration);
     }
 
     // Print summary
@@ -805,7 +750,7 @@ export class AutomodeManager extends EventEmitter {
     const durationMs = Date.now() - this.startTime;
     const durationMinutes = Math.round(durationMs / 60000);
 
-    console.log(chalk.cyan('\n📊 Auto-Mode Summary'));
+    console.log(chalk.bold('\nAuto-mode summary'));
     console.log(chalk.gray(`   Status: ${state.status}`));
     console.log(chalk.gray(`   Iterations: ${state.currentIteration}`));
     console.log(chalk.gray(`   Duration: ${durationMinutes} minutes`));
@@ -816,6 +761,19 @@ export class AutomodeManager extends EventEmitter {
     }
     if (state.branch) {
       console.log(chalk.gray(`   Branch: ${state.branch}`));
+    }
+    if (state.worktreePath && state.branch) {
+      console.log(chalk.gray(`   Worktree: ${state.worktreePath}`));
+      console.log('');
+      if (process.platform === 'win32') console.log(chalk.gray('   Recovery commands (PowerShell):'));
+      console.log(chalk.gray('   Review: ') + recoveryGitCommand(state.worktreePath, 'status', '--short'));
+      console.log(chalk.gray('   Commit any further changes in the worktree before merging.'));
+      if (this.originalBranch && this.originalBranch !== 'HEAD') {
+        console.log(chalk.gray('   Switch: ') + recoveryGitCommand(this.workspaceRoot, 'switch', '--', this.originalBranch));
+      }
+      console.log(chalk.gray('   Merge: ') + recoveryGitCommand(this.workspaceRoot, 'merge', '--', state.branch));
+      console.log(chalk.gray('   Cleanup worktree: ') + recoveryGitCommand(this.workspaceRoot, 'worktree', 'remove', '--', state.worktreePath));
+      console.log(chalk.gray('   Cleanup branch: ') + recoveryGitCommand(this.workspaceRoot, 'branch', '-d', '--', state.branch));
     }
     console.log('');
   }
@@ -858,6 +816,12 @@ export function getAutomodeOptions(
   }
 
   const configSettings = config.automode ?? {};
+  if (cliOptions.maxCost !== undefined) {
+    throw new Error('--max-cost is not supported. Use --max-iterations or --max-runtime instead.');
+  }
+  if (configSettings.maxCost !== undefined) {
+    throw new Error("automode.maxCost in your config isn't supported: Autohand can't enforce a dollar limit. Remove it and use --max-iterations or --max-runtime.");
+  }
 
   return {
     prompt: cliOptions.autoMode,
@@ -866,7 +830,16 @@ export function getAutomodeOptions(
     useWorktree: cliOptions.noWorktree === true ? false : (configSettings.useWorktree ?? DEFAULTS.useWorktree),
     checkpointInterval: cliOptions.checkpointInterval ?? configSettings.checkpointInterval ?? DEFAULTS.checkpointInterval,
     maxRuntime: cliOptions.maxRuntime ?? configSettings.maxRuntime ?? DEFAULTS.maxRuntime,
-    maxCost: cliOptions.maxCost ?? configSettings.maxCost ?? DEFAULTS.maxCost,
+    maxCost: undefined,
     dryRun: cliOptions.dryRun,
   };
+}
+
+function quoteRecoveryArgument(value: string): string {
+  if (/^[a-zA-Z0-9_./:@=-]+$/.test(value)) return value;
+  return "'" + value.replaceAll("'", process.platform === 'win32' ? "''" : "'\\''") + "'";
+}
+
+function recoveryGitCommand(cwd: string, ...args: string[]): string {
+  return ['git', '-C', cwd, ...args].map(quoteRecoveryArgument).join(' ');
 }

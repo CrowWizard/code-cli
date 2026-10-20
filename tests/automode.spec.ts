@@ -530,7 +530,7 @@ describe('getAutomodeOptions', () => {
     expect(result?.useWorktree).toBe(true);
     expect(result?.checkpointInterval).toBe(5);
     expect(result?.maxRuntime).toBe(120);
-    expect(result?.maxCost).toBe(10);
+    expect(result?.maxCost).toBeUndefined();
   });
 
   it('respects noWorktree flag', () => {

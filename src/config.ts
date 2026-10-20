@@ -153,6 +153,27 @@ export function applyCliProviderOverride<T extends AutohandConfig>(config: T, va
   };
 }
 
+export function applyCliModelOverride(config: LoadedConfig, model: string, explicitProvider?: unknown): LoadedConfig {
+  const hostedId = model.trim().replace(/^autohand(?:ai)?\//i, '').toLowerCase();
+  const hosted = getProviderModelOptions('autohandai').some(entry => entry.id === hostedId);
+  const requestedProvider = explicitProvider ?? (hosted ? 'autohandai' : config.provider ?? 'openrouter');
+  const provider = normalizeProviderName(requestedProvider);
+  if (!provider) throw new Error(`Unknown provider: ${String(requestedProvider)}`);
+  const selected = provider === config.provider ? config : applyCliProviderOverride(config, provider);
+  const settingsPath = isCustomProviderName(provider)
+    ? `customProviders.${getCustomProviderConfig(selected, provider)?.id ?? provider.slice('custom:'.length)}`
+    : provider;
+  const selectedModel = provider === 'autohandai' && hosted ? hostedId : model;
+  const { config: layered, snapshot } = applyRunConfigOverlay(selected, {
+    sets: [`${settingsPath}.model=${JSON.stringify(selectedModel)}`],
+  });
+  return {
+    ...selected,
+    ...layered,
+    runOverlay: { ...selected.runOverlay, entries: [...(selected.runOverlay?.entries ?? []), ...(snapshot?.entries ?? [])] },
+  };
+}
+
 export interface LoadConfigOptions {
   /**
    * Persist the safe default config when no file exists. Answer-only

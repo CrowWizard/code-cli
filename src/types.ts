@@ -720,7 +720,7 @@ export type AutomodeCancelReason =
   | 'completion'       // Completion promise detected
   | 'error';           // Error occurred
 
-/** Auto-mode session state (stored in .autohand/automode.local.md) */
+/** Auto-mode progress stored in a private run directory under AUTOHAND_HOME. */
 export interface AutomodeSessionState {
   /** Session ID */
   sessionId: string;

@@ -241,6 +241,9 @@ describe('project lifecycle hooks in the built CLI', () => {
   const readHookLog = (state: TuistoryTempState) =>
     fs.readFile(path.join(state.workspaceRoot, 'project-hooks.log'), 'utf8').catch(() => '');
   const trustStorePath = (state: TuistoryTempState) => path.join(state.autohandHome, 'trusted-workspaces.json');
+  const waitForDeclineNotice = (session: Session) => vi.waitFor(() => {
+    expect(session.readAll().replace(/\s+/g, '')).toContain('Autohandwillaskagainnexttime');
+  }, { timeout: 5_000 });
 
   it('asks before running project hooks, runs them once trusted, and asks again only after they change', async () => {
     const { state, authServer } = await createProject([{ content: 'PROJECT_HOOKS_PROMPT_COMPLETE' }, { content: 'TRUSTED_AGAIN_COMPLETE' }]);
@@ -284,7 +287,7 @@ describe('project lifecycle hooks in the built CLI', () => {
     let session = await launchFromOutside(state, authServer);
     await session.waitForText(TRUST_PROMPT);
     await session.press('escape');
-    await session.waitForText('Autohand will ask again next time');
+    await waitForDeclineNotice(session);
     await session.waitForText('❯');
     await submitHookScenarioPrompt(session, 'run without project hooks', 'UNTRUSTED_PROMPT_COMPLETE');
     expect(await readHookLog(state)).toBe('');
@@ -294,7 +297,7 @@ describe('project lifecycle hooks in the built CLI', () => {
     session = await launchFromOutside(state, authServer);
     await session.waitForText(TRUST_PROMPT);
     await session.press(['ctrl', 'c']);
-    await session.waitForText('Autohand will ask again next time');
+    await waitForDeclineNotice(session);
     await session.waitForText('❯');
     expect(session.exitInfo).toBeNull();
     await exitInteractive(session);
