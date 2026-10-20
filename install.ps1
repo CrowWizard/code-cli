@@ -241,6 +241,23 @@ function Get-ArchiveAssetName {
     }
 }
 
+function Resolve-ReleaseArchitecture {
+    param([string]$Architecture, [string]$TargetVersion)
+
+    if ($Architecture -ne 'windows-arm64') { return $Architecture }
+    $asset = Get-ArchiveAssetName -Architecture $Architecture
+    $url = "https://github.com/$REPO/releases/download/v$TargetVersion/$asset"
+    try {
+        Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 15 | Out-Null
+        return $Architecture
+    }
+    catch {
+        if ($null -eq $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 404) { throw }
+        Write-Host "No ARM64 build for v$TargetVersion yet, installing x64 (runs under emulation)"
+        return 'windows-x64'
+    }
+}
+
 function Remove-ExistingInstallation {
     Write-Step "Cleaning up existing installation..."
 
@@ -806,6 +823,7 @@ function Install-Autohand {
     }
 
     # Construct bundle download URL
+    $arch = Resolve-ReleaseArchitecture -Architecture $arch -TargetVersion $targetVersion
     $archiveName = Get-ArchiveAssetName -Architecture $arch
     $downloadUrl = "https://github.com/$REPO/releases/download/v$targetVersion/$archiveName"
     $checksumUrl = "$downloadUrl.sha256"

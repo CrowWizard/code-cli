@@ -138,6 +138,19 @@ function runVersionStep(manualVersion: string): string {
 }
 
 describe('release workflow', () => {
+  it('builds and bundles both musl architectures alongside glibc Linux', () => {
+    const workflow = loadReleaseWorkflow();
+    const targets = workflow.jobs.build.strategy?.matrix?.include ?? [];
+    const bundle = workflow.jobs.release.steps.find(step => step.name === 'Create bundled archives for installers and ACP registry')?.run ?? '';
+    for (const arch of ['x64', 'arm64']) {
+      expect(targets).toContainEqual(expect.objectContaining({
+        target: `linux-${arch}-musl`, artifact: `autohand-linux-${arch}-musl`, tracesArtifact: `ahtraces-linux-${arch}-musl`,
+      }));
+      expect(bundle).toContain(`bundle_unix "autohand-linux-${arch}-musl" "ahtraces-linux-${arch}-musl"`);
+      expect(targets).toContainEqual(expect.objectContaining({ target: `linux-${arch}` }));
+    }
+  });
+
   it('installs native dependencies for cross-compiled architectures before compiling', () => {
     const steps = loadReleaseWorkflow().jobs.build.steps;
     const compileIndex = steps.findIndex(step => step.name === 'Compile binaries');

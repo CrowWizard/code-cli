@@ -87,6 +87,40 @@ Install-Zit -InstallPath '.'
     expect(result.stdout).toContain('https://getzit.org');
   });
 
+  powerShellTest('selects x64 only for a missing ARM64 release asset and preserves network errors', () => {
+    const result = runPowerShellProbe(`${installerWithoutEntrypoint}
+class ReleaseProbeException : System.Exception {
+    [object] $Response
+    ReleaseProbeException([int] $status) { $this.Response = [pscustomobject]@{ StatusCode = $status } }
+}
+$script:probeStatus = 200
+$script:probeCount = 0
+function Invoke-WebRequest {
+    param($Uri, $Method, $TimeoutSec, [switch]$UseBasicParsing)
+    if ($Method -ne 'Head') { throw 'Expected HEAD' }
+    if ($Uri -notlike '*/v0.9.8/autohand-windows-arm64.zip') { throw "Wrong asset: $Uri" }
+    $script:probeCount++
+    if ($script:probeStatus -ne 200) { throw [ReleaseProbeException]::new($script:probeStatus) }
+}
+$native = Resolve-ReleaseArchitecture -Architecture 'windows-arm64' -TargetVersion '0.9.8'
+$script:probeStatus = 404
+$fallback = Resolve-ReleaseArchitecture -Architecture 'windows-arm64' -TargetVersion '0.9.8'
+$existingX64 = Resolve-ReleaseArchitecture -Architecture 'windows-x64' -TargetVersion '0.9.8'
+$errors = @()
+foreach ($status in @(403, 503)) {
+    $script:probeStatus = $status
+    try { Resolve-ReleaseArchitecture -Architecture 'windows-arm64' -TargetVersion '0.9.8' | Out-Null }
+    catch { $errors += [int]$_.Exception.Response.StatusCode }
+}
+@{ native=$native; fallback=$fallback; x64=$existingX64; errors=$errors; count=$script:probeCount } | ConvertTo-Json -Compress
+`);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('No ARM64 build for v0.9.8 yet, installing x64 (runs under emulation)');
+    expect(JSON.parse(result.stdout.trim().split(/\r?\n/u).at(-1)!)).toEqual({
+      native: 'windows-arm64', fallback: 'windows-x64', x64: 'windows-x64', errors: [403, 503], count: 4,
+    });
+  });
+
   it('falls back to native Windows architecture signals when RuntimeInformation is empty', () => {
     expect(installer).toContain('$env:PROCESSOR_ARCHITEW6432');
     expect(installer).toContain('$env:PROCESSOR_ARCHITECTURE');

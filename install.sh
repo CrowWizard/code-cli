@@ -280,6 +280,12 @@ EOF
     local _checksum_path="${_archive_path}.sha256"
 
     if ! curl -fsSL "$_url" -o "$_archive_path" 2>/dev/null; then
+        case "$_arch" in
+            *-musl)
+                rm -rf "$_tmp_dir"
+                err "Alpine/musl binary unavailable for this release. Use: npm i -g autohand-cli (Node 22+)"
+                ;;
+        esac
         printf "${RED}Error: Failed to download from $_url${NC}\n"
         printf "${YELLOW}Hint: Check if the version exists at https://github.com/${REPO}/releases${NC}\n"
         rm -rf "$_tmp_dir"
@@ -316,6 +322,12 @@ EOF
 
     local _binary_version
     if ! _binary_version=$(probe_binary_version "${_tmp_dir}/autohand" "${_tmp_dir}/version"); then
+        case "$_arch" in
+            *-musl)
+                rm -rf "$_tmp_dir"
+                err "Alpine/musl binary could not start. Use: npm i -g autohand-cli (Node 22+)"
+                ;;
+        esac
         printf "${RED}Error: Downloaded Autohand CLI failed to start${NC}\n"
         printf "${YELLOW}The existing installation was not changed.${NC}\n"
         rm -rf "$_tmp_dir"
@@ -684,8 +696,12 @@ get_latest_alpha_tag() {
     return 1
 }
 
+is_musl() {
+    [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }
+}
+
 get_architecture() {
-    local _ostype _cputype
+    local _ostype _cputype _libc=""
 
     _ostype="$(uname -s)"
     _cputype="$(uname -m)"
@@ -693,6 +709,7 @@ get_architecture() {
     case "$_ostype" in
         Linux)
             _ostype="linux"
+            if is_musl; then _libc="-musl"; fi
             ;;
         Darwin)
             _ostype="macos"
@@ -701,7 +718,7 @@ get_architecture() {
             _ostype="windows"
             ;;
         FreeBSD)
-            _ostype="linux"
+            err "FreeBSD is not supported by standalone binaries. Use: npm i -g autohand-cli (Node 22+)"
             ;;
         *)
             err "Unsupported operating system: $_ostype"
@@ -730,7 +747,7 @@ get_architecture() {
             ;;
     esac
 
-    RETVAL="${_ostype}-${_cputype}"
+    RETVAL="${_ostype}-${_cputype}${_libc}"
 }
 
 say() {
