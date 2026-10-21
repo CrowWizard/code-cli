@@ -590,7 +590,9 @@ program
     }
 
     const { extensionRuntimeHost } = await import('./extensions/ExtensionRuntimeHost.js');
-    extensionRuntimeHost.setCliOptions(opts as unknown as Record<string, unknown>);
+    extensionRuntimeHost.setCliOptions(opts as unknown as Record<string, unknown>, program.options
+      .map((option) => option.attributeName())
+      .filter((name) => program.getOptionValueSource(name) === 'default'));
 
     // `--agents` accepts inline JSON (Claude Code format) or a directory path.
     // Parse and validate inline JSON up front so users get a clear error before

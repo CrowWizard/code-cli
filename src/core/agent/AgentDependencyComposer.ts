@@ -132,6 +132,7 @@ import type { GoalSessionSnapshot } from '../../goals/types.js';
 import { isLikelyFilePathSlashInput } from '../slashInputDetection.js';
 import { SuggestionEngine } from '../SuggestionEngine.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
+import { ExtensionReloadController } from '../../extensions/ExtensionReloadController.js';
 import { configureAgentRegistry, syncDynamicRuntimeExtensions } from './dynamicRuntimeExtensions.js';
 import { runCancellableAgentCommand } from './AgentCommandRuntime.js';
 import { SquadRunMonitor } from '../agents/SquadRunSnapshot.js';
@@ -585,6 +586,21 @@ export function initializeAgentDependencies(
           .map((skill) => skill.name),
       }),
     });
+    if (!runtime.options.bare && runtime.options.daemon !== false && !runtime.options.prompt
+      && !runtime.isCommandMode && !runtime.isRpcMode) {
+      host.extensionReloadController = new ExtensionReloadController({
+        roots: [AUTOHAND_PATHS.extensions, join(runtime.workspaceRoot, PROJECT_DIR_NAME, 'extensions')],
+        signal: host.runtimeResourceShutdownController?.signal,
+        isIdle: () => !host.isInstructionActive && !host.modalActive,
+        reload: async () => {
+          const snapshot = await syncDynamicRuntimeExtensions(host, runtime);
+          for (const diagnostic of snapshot.diagnostics) {
+            host.notifyUser(`Extension ${diagnostic.extensionId ?? diagnostic.scope}: ${diagnostic.message}`);
+          }
+        },
+        onError: (error) => host.writeDebugLine(`Extension reload: ${error instanceof Error ? error.message : String(error)}`),
+      });
+    }
     host.memoryManager = new MemoryManager(runtime.workspaceRoot, {
       getSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
       projectMemory: runtime.options.bare || runtime.options.ephemeral
@@ -2131,8 +2147,8 @@ export function initializeAgentDependencies(
       }),
       toolsRegistry: host.toolsRegistry,
       extensionService: host.extensionService,
-      refreshDynamicExtensions: async () => {
-        await syncDynamicRuntimeExtensions(host, host.runtime);
+      refreshDynamicExtensions: async (options?: { force?: boolean }) => {
+        await syncDynamicRuntimeExtensions(host, host.runtime, options);
       },
       mcpManager: host.mcpManager,
       backgroundProcessRegistry: host.backgroundProcessRegistry,

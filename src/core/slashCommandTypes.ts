@@ -101,7 +101,7 @@ export interface SlashCommandContext {
     /** Declarative extension lifecycle service for /extensions commands. */
     extensionService?: ExtensionService;
     /** Refresh extension-owned tools and agents after a lifecycle mutation. */
-    refreshDynamicExtensions?: () => Promise<void>;
+    refreshDynamicExtensions?: (options?: { force?: boolean }) => Promise<void>;
     /** Auto-mode manager for /automode commands */
     automodeManager?: AutomodeManager;
     /** Interactive auto-mode toggle state for /automode commands */

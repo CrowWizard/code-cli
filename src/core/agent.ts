@@ -11,6 +11,7 @@ import { syncAgentTerminalTitleName } from './agent/AgentSessionTitle.js';
 import { shouldWriteTerminalTitle, TerminalTitleController } from '../ui/terminalTitle.js';
 import { isITerm2 } from '../ui/mouseReporting.js';
 import type { SessionAutoNamer } from './agent/SessionAutoNamer.js';
+import type { ExtensionReloadController } from '../extensions/ExtensionReloadController.js';
 import type { RepositoryReadiness } from './agent/RepositoryReadiness.js';
 import type { AxoResponder } from './agent/AxoResponder.js';
 import { randomUUID } from 'node:crypto';
@@ -492,6 +493,7 @@ export class AutohandAgent {
   readonly programStatus: AgentProgramStatus;
   sessionAutoNamer: SessionAutoNamer | null = null;
   repositoryReadiness: RepositoryReadiness | null = null;
+  extensionReloadController?: ExtensionReloadController;
   /** Answers `~axo <question>`; see AxoResponder. */
   axoResponder: AxoResponder | null = null;
   sessionTitleRefined = false;

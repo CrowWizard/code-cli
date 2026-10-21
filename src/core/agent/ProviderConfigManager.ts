@@ -4224,6 +4224,14 @@ export class ProviderConfigManager {
   /**
    * Reset the LLM client with a new provider and model
    */
+  refreshExtensionProvider(): void {
+    const provider = this.runtime.config.provider;
+    if (!provider?.startsWith('extension:')) return;
+    const settings = getProviderConfig(this.runtime.config, provider);
+    const model = this.runtime.options.model ?? settings?.model;
+    if (model) this.resetLlmClient(provider, model);
+  }
+
   private resetLlmClient(provider: ProviderName, model: string): void {
     // Update config to use the selected provider and model
     this.runtime.config.provider = provider;

@@ -95,6 +95,7 @@ function readCompletedTurnUsage(host: AgentInstructionHost): TurnUsage {
 }
 
 export interface AgentInstructionHost {
+  extensionReloadController?: Pick<import('../../extensions/ExtensionReloadController.js').ExtensionReloadController, 'withStableExtensions'>;
   repositoryReadiness?: Pick<import('./RepositoryReadiness.js').RepositoryReadiness, 'markTurnCompleted'> | null;
   programStatus?: AgentProgramStatus;
   computerUseLifecycle?: ComputerUseLifecycle;
@@ -215,10 +216,14 @@ export class InstructionRunner {
   constructor(private readonly host: AgentInstructionHost) {}
 
   async run(instruction: string, options: RunInstructionOptions = {}): Promise<boolean> {
-    while (true) {
-      const result = await this.runAttempt(instruction, options);
-      if (result !== 'retry-provider') return result;
-    }
+    const execute = async (): Promise<boolean> => {
+      while (true) {
+        const result = await this.runAttempt(instruction, options);
+        if (result !== 'retry-provider') return result;
+      }
+    };
+    return this.host.extensionReloadController
+      ? this.host.extensionReloadController.withStableExtensions(execute) : execute();
   }
 
   private async runAttempt(instruction: string, options: RunInstructionOptions): Promise<boolean | 'retry-provider'> {

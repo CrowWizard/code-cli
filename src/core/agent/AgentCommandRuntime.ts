@@ -284,6 +284,17 @@ export async function handleAgentSlashCommand(
   args: string[] = [],
   surface: CommandUseSurface = 'interactive',
 ): Promise<string | null> {
+    const execute = () => handleStableAgentSlashCommand(host, command, args, surface);
+    return host.extensionReloadController
+      ? host.extensionReloadController.withStableExtensions(execute) : execute();
+}
+
+async function handleStableAgentSlashCommand(
+  host: AgentCommandRuntimeHost,
+  command: string,
+  args: string[],
+  surface: CommandUseSurface,
+): Promise<string | null> {
     if (host.runtime.options.daemon === false && ['/browser', '/chrome', '/mcp', '/mcp install', '/mcp-install', '/squad', '/traces', '/hooks', '/repeat'].includes(command)) {
       return NO_DAEMON_MESSAGE;
     }

@@ -3,6 +3,7 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import { extensionRuntimeHost } from '../../extensions/ExtensionRuntimeHost.js';
 import chalk from 'chalk';
 import { isAxoInput } from '../../ui/axo/axoCommand.js';
 import { isStartupTimingEnabled, startupTimeline } from '../../startup/startupTimeline.js';
@@ -750,6 +751,10 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       callResourceCleanupSync(() => process.stdin.pause());
 
       const cleanupTasks: Promise<unknown>[] = [];
+      cleanupTasks.push(callResourceCleanup(async () => {
+        await host.extensionReloadController?.stop();
+        await extensionRuntimeHost.deactivateAll();
+      }));
       if (host.repositoryReadiness) cleanupTasks.push(callResourceCleanup(() => host.repositoryReadiness.stop()));
       if (host.ui) {
         const ui = host.ui;
@@ -841,6 +846,8 @@ export async function performAgentBackgroundInit(
     try {
       // Phase 1: Parallel manager initialization
       await awaitLifecycleStep(Promise.resolve(host.initializeManagers()), signal);
+      if (isRuntimeResourceShutdownStarted(host)) return;
+      await host.extensionReloadController?.start();
       if (isRuntimeResourceShutdownStarted(host)) return;
       startupTimeline.mark('managers ready (sessions, memory, skills, hooks, workspace files)');
 
