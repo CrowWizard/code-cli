@@ -7,7 +7,8 @@ import chalk from 'chalk';
 import type { PermissionManager } from '../../permissions/PermissionManager.js';
 import { getProviderConfig } from '../../config.js';
 import { isSearchConfigured } from '../../actions/web.js';
-import { formatToolOutputForDisplay, type ToolOutputDisplay } from '../../ui/toolOutput.js';
+import { DEFAULT_TOOL_OUTPUT_MODE, formatToolOutputForDisplay, type ToolOutputDisplay, type ToolOutputMode } from '../../ui/toolOutput.js';
+import { COMPUTER_USE_TOOL_PREFIX } from '../../computer/computerUseOutput.js';
 import { getPlanModeManager } from '../../commands/plan.js';
 import type {
   AgentAction,
@@ -38,7 +39,7 @@ import type { ContextOrchestrator } from '../context/orchestrator.js';
 import type { ToolManager } from '../toolManager.js';
 import type { ToolsRegistry } from '../toolsRegistry.js';
 import { calculateContextUsage } from '../context/tokenizer.js';
-import { filterToolsByRelevance } from '../toolFilter.js';
+import { filterToolsByRelevance, limitToolSelection } from '../toolFilter.js';
 import type { PeerCommunicationRuntime } from './PeerCommunicationRuntime.js';
 import type { AgentPeerRuntime } from './AgentPeerRuntime.js';
 import { pushBounded } from '../../utils/bounded.js';
@@ -76,8 +77,11 @@ import {
   PromptCacheToolSet,
 } from './PromptCache.js';
 import { usesAutohandAICloud } from '../../providers/AutohandAIProvider.js';
-import { StreamingResponsePreview } from './StreamingResponsePreview.js';
+import { combineDeltaHandlers, StreamedOutputRelay, StreamingResponsePreview } from './StreamingResponsePreview.js';
 import type { RunBudgetGate } from './RunBudget.js';
+import { CheckpointAdvisor, checkpointForCalls, type AdvisorCheckpoint, type AdvisorReview, type TurnAdvisor } from './CheckpointAdvisor.js';
+import { canUseMoaAdvisor, isAutohandOrchestrationEnabled, ORCHESTRATION_INSTRUCTIONS } from './AutohandOrchestration.js';
+import { createTeamMemberProvider } from '../teams/TeamModelPolicy.js';
 
 const COMPLETION_REMINDER_TOOL_BATCH_THRESHOLD = 3;
 const MAX_TOOL_FREE_RECOVERIES = 2;
@@ -150,7 +154,6 @@ class LoopAbortedError extends Error {
 function extractStreamedFinalResponse(rawContent: string): string | undefined {
   const match = rawContent.match(/"(?:finalResponse|response)"\s*:\s*"((?:\\.|[^"\\])*)/);
   if (!match) return undefined;
-
   try {
     return JSON.parse(`"${match[1]}"`) as string;
   } catch {
@@ -159,6 +162,8 @@ function extractStreamedFinalResponse(rawContent: string): string | undefined {
 }
 
 export interface ReactLoopInkRenderer {
+  startComputerUseStep?(id: string, tool: string, args: Record<string, unknown>): void;
+  finishComputerUseStep?(id: string, success: boolean, output: string): void;
   setStatus(status: string): void;
   addToolCall(tool: AgentAction['type'], detail: string): void;
   addToolOutputBatch(
@@ -183,6 +188,9 @@ export interface ReactLoopInkRenderer {
 }
 
 export interface AgentReactLoopHost {
+  accountTier?: string;
+  createCheckpointAdvisor?(): TurnAdvisor | undefined;
+  captureAdvisorDiff?(): Promise<string>;
   peerCommunicationRuntime?: PeerCommunicationRuntime;
   peerRuntime?: AgentPeerRuntime;
   activeProvider?: ProviderName;
@@ -271,7 +279,7 @@ export interface ReactLoopControl {
 
 export type ReactLoopResult =
   | { status: 'completed' }
-  | { status: 'incomplete'; reason: 'iteration_limit' | 'pending_todos' }
+  | { status: 'incomplete'; reason: 'iteration_limit' | 'pending_todos' | 'advisor_review' }
   | { status: 'stopped'; stepNumber: number }
   | { status: 'aborted' };
 
@@ -282,20 +290,26 @@ function getSessionPromptCacheDirective(host: AgentReactLoopHost) {
 }
 
 /**
- * Relevance filtering still decides which tools join the list; on Autohand AI
- * cloud the list then only grows, so the cached prefix survives the next iteration.
+ * Seed cloud sessions with available tools so moving from reading to editing does
+ * not invalidate the entire conversation cache. Bound the seed for large MCP
+ * registries; current relevant tools still take precedence at the provider limit.
  */
 function selectCacheStableTools(
   host: AgentReactLoopHost,
   allTools: FunctionDefinition[],
   relevant: FunctionDefinition[],
   toolSet: PromptCacheToolSet,
+  messages: LLMMessage[],
 ): FunctionDefinition[] {
   if (!usesAutohandAICloud(host.runtime.config, host.activeProvider) || host.isPromptCachingEnabled?.() !== true) {
     return relevant;
   }
   const sessionId = host.sessionManager.getCurrentSession()?.metadata.sessionId;
-  return toolSet.select(sessionId, allTools, relevant);
+  if (!sessionId) return relevant;
+  const initialTools = limitToolSelection(
+    allTools, relevant, messages, host.llm.getCapabilities?.().maxTools ?? 128,
+  );
+  return toolSet.select(sessionId, allTools, relevant, initialTools);
 }
 
 /**
@@ -366,6 +380,11 @@ function joinDetailParts(parts: Array<string | undefined>): string {
  * `sleep {"reason":"...","seconds":180}`.
  */
 const TOOL_DETAIL_FORMATTERS: Record<string, (args: ToolArgs | undefined) => string> = {
+  // A script is many lines of code; its one-line purpose is what belongs in the log.
+  run_tool_script: (args) =>
+    getStringArg(args, 'description')
+    ?? getStringArg(args, 'script')?.split('\n').map((line) => line.trim()).find(Boolean)
+    ?? '',
   sleep: (args) => {
     const seconds = getNumberArg(args, 'seconds');
     return joinDetailParts([seconds === undefined ? undefined : `${seconds}s`, getStringArg(args, 'reason')]);
@@ -590,6 +609,65 @@ export async function runAgentReactLoop(
       : null;
 
     try {
+    const advisor = host.createCheckpointAdvisor ? host.createCheckpointAdvisor()
+      : canUseMoaAdvisor({ ...host.runtime.config, provider: host.activeProvider ?? host.runtime.config.provider }, host.accountTier, host.runtime.options.model ?? host.runtime.config.autohandai?.model)
+        ? new CheckpointAdvisor({
+            provider: createTeamMemberProvider(host.runtime.config, { provider: 'autohandai', model: 'moa', reasoningEffort: 'high', source: 'agent-nature' }),
+            budget: host.runBudget,
+            recordUsage: usage => {
+              if (usage) {
+                host.currentTurnActualUsage = addUsageToTurn(host.currentTurnActualUsage, host.activeProvider, usage);
+                host.totalTokensUsed += usage.totalTokens;
+                host.sessionPromptTokens += usage.promptTokens;
+                host.sessionCompletionTokens += usage.completionTokens;
+              } else {
+                host.currentTurnHadUnavailableUsage = true;
+                host.currentTurnActualUsage = { kind: 'unavailable', provider: host.activeProvider, reason: 'not_reported' };
+              }
+            },
+          }) : undefined;
+    const orchestrationEnabled = isAutohandOrchestrationEnabled(host.runtime.config, host.activeProvider);
+    const orchestrationKey = '[Autohand AI orchestration]';
+    const orchestrationHistory = host.conversation.history();
+    const previousOrchestrationNote = [...orchestrationHistory].reverse().find(message => message.role === 'system' && message.content?.startsWith(orchestrationKey));
+    if (usesAutohandAICloud(host.runtime.config, host.activeProvider ?? host.runtime.config.provider)
+      || orchestrationHistory.some(message => message.role === 'system'
+        && (message.content?.includes(orchestrationKey) || message.content?.includes(ORCHESTRATION_INSTRUCTIONS)))) {
+      const instruction = orchestrationEnabled
+        ? `${ORCHESTRATION_INSTRUCTIONS}${advisor ? '' : ' Moa reviews are unavailable for the current account/model; verify the work yourself.'}`
+        : 'Autohand AI orchestration is disabled for the current provider or setting. This supersedes earlier orchestration instructions. Use ordinary delegation with the selected worker models and tools; no Moa checkpoint review will run.';
+      const note = `${orchestrationKey} ${instruction}`;
+      if (previousOrchestrationNote?.content !== note) host.conversation.addSystemNote(note);
+    }
+    let hadToolWork = false;
+    let advisorRejections = 0;
+    const consultAdvisor = async (checkpoint: AdvisorCheckpoint, evidence: string): Promise<AdvisorReview> => {
+      host.setSpinnerStatus(`Moa reviewing ${checkpoint.replaceAll('_', ' ')}... (esc to interrupt)`);
+      let context = evidence;
+      if (checkpoint === 'commit' || checkpoint === 'completion') {
+        try {
+          if (host.captureAdvisorDiff) context += `\n${await host.captureAdvisorDiff()}`;
+          else {
+            const changes = await WorkspaceChangeCapture.pending(host.runtime.workspaceRoot);
+            if (changes?.omittedFiles || changes?.files.some(file => file.patch.includes('[diff truncated]'))) {
+              return { verdict: 'unavailable', feedback: 'The workspace diff exceeds the review limit. Review a smaller change before completing.' };
+            }
+            context += `\nWorkspace diff against HEAD (includes staged and untracked files): ${JSON.stringify(changes ?? { unavailable: 'This workspace is not a Git repository; use the session evidence and disclose this limit.' })}`;
+          }
+        } catch (error) {
+          return { verdict: 'unavailable', feedback: `Cannot capture the workspace diff: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+      const reviewContext = { history: host.conversation.history(), context, signal: abortController.signal };
+      let review = await advisor!.review(checkpoint, reviewContext);
+      if (review.verdict === 'unavailable') {
+        abortController.signal.throwIfAborted();
+        host.setSpinnerStatus('Moa review unavailable; retrying review... (esc to interrupt)');
+        review = await advisor!.review(checkpoint, reviewContext);
+      }
+      host.conversation.addSystemNote(`[Moa ${checkpoint} review: ${review.verdict}] ${review.feedback}`);
+      return review;
+    };
     const perToolFailureLimit = 2; // Max consecutive failures for same tool (regardless of args)
     const loopGuard = new ToolLoopGuard();
     const toolConsecutiveFailures = new Map<string, number>();
@@ -604,6 +682,9 @@ export async function runAgentReactLoop(
     let toolFreeRecoveryCount = 0;
     let invalidLoopGuardFinalCount = 0;
     let pendingTodoReminderSent = false;
+    // The relay of the most recent model request; the final events it already
+    // streamed to output listeners are flagged so protocol hosts do not repeat them.
+    let streamedOutput: StreamedOutputRelay | undefined;
 
     const renderFinalResponse = (
       response: string,
@@ -614,13 +695,21 @@ export async function runAgentReactLoop(
       host.lastAssistantResponseForNotification = response;
 
       if (options.thought) {
-        host.emitOutput({ type: 'thinking', thought: options.thought });
+        host.emitOutput({
+          type: 'thinking',
+          thought: options.thought,
+          ...(streamedOutput?.hasStreamedThought(options.thought) ? { streamed: true } : {}),
+        });
       }
       const remainingResponse = options.streamedResponse && response.startsWith(options.streamedResponse)
         ? response.slice(options.streamedResponse.length)
         : response;
       if (remainingResponse) {
-        host.emitOutput({ type: 'message', content: remainingResponse });
+        host.emitOutput({
+          type: 'message',
+          content: remainingResponse,
+          ...(streamedOutput?.hasStreamedContent(response) ? { streamed: true } : {}),
+        });
       }
 
       if (host.inkRenderer) {
@@ -688,12 +777,16 @@ export async function runAgentReactLoop(
       await host.peerCommunicationRuntime?.safeBoundary();
       if (abortController.signal.aborted) break;
       const messages = host.conversation.history();
-      let tools = selectCacheStableTools(host, allTools, filterToolsByRelevance(allTools, messages, {
+      const relevantTools = filterToolsByRelevance(allTools, messages, {
         cache: host.runtime.config.agent?.toolSelectionCache !== false,
         // The browser side panel is browser-first by definition, so browser_*
         // tools stay available even before the user mentions a page.
         baselineCategories: host.runtime.options.clientContext === 'browser' ? ['browser'] : [],
-      }), promptCacheToolSet);
+      });
+      let tools = limitToolSelection(
+        selectCacheStableTools(host, allTools, relevantTools, promptCacheToolSet, messages),
+        relevantTools, messages, host.llm.getCapabilities?.().maxTools,
+      );
 
       // Filter tools for plan mode (read-only tools only during planning phase)
       const planModeManager = getPlanModeManager();
@@ -818,9 +911,17 @@ export async function runAgentReactLoop(
         // the answer is still being generated, and the client no longer has to
         // wait for the whole completion inside one timeout budget.
         const supportsStreaming = host.llm.getCapabilities?.().streaming === true;
-        const preview = supportsStreaming && host.inkRenderer?.setStreamingResponse
+        const deferReviewedOutput = Boolean(advisor && hadToolWork);
+        const preview = supportsStreaming && !deferReviewedOutput && host.inkRenderer?.setStreamingResponse
           ? new StreamingResponsePreview((text) => host.inkRenderer?.setStreamingResponse?.(text))
           : undefined;
+        // Output listeners (ACP, RPC, command output) receive the same deltas
+        // as the terminal preview, so protocol hosts show the reply as it arrives.
+        streamedOutput = supportsStreaming && !deferReviewedOutput ? new StreamedOutputRelay((event) => host.emitOutput(event)) : undefined;
+        const relay = streamedOutput;
+        const onRetry = relay
+          ? (event: LLMRetryEvent) => { retryWait.handle(event); relay.onRetry(event); }
+          : retryWait.handle;
         try {
           completion = await host.llm.complete({
             messages: messagesWithImages,
@@ -832,9 +933,10 @@ export async function runAgentReactLoop(
             maxTokens: 16000,  // Allow large outputs for file generation
             thinkingLevel,
             promptCache: getSessionPromptCacheDirective(host),
-            onRetry: retryWait.handle,
-            ...(supportsStreaming ? { stream: true, onDelta: preview?.onDelta } : {}),
+            onRetry,
+            ...(supportsStreaming ? { stream: true, onDelta: combineDeltaHandlers(preview?.onDelta, relay?.onDelta) } : {}),
             onTextDelta: (delta) => {
+              if (deferReviewedOutput) return;
               streamedRawContent += delta;
               const nextResponse = extractStreamedFinalResponse(streamedRawContent);
               if (!nextResponse?.startsWith(streamedResponse)) return;
@@ -1124,6 +1226,21 @@ export async function runAgentReactLoop(
       }
 
       if (payload.toolCalls && payload.toolCalls.length > 0) {
+        hadToolWork = true;
+        const checkpoint = checkpointForCalls(payload.toolCalls);
+        if (advisor && checkpoint) {
+          const review = await consultAdvisor(checkpoint, JSON.stringify(payload));
+          if (review.verdict !== 'approved') {
+            await recordRejectedNativeToolCalls(payload.toolCalls, `Checkpoint review: ${review.feedback}`);
+            expectedOutboundToolResultIds = currentAssistantToolCallIds;
+            advisorRejections += 1;
+            if (review.verdict === 'unavailable' || advisorRejections >= 3) {
+              renderFinalResponse(`Work paused for Moa review: ${review.feedback}`);
+              return { status: 'incomplete', reason: 'advisor_review' };
+            }
+            continue;
+          }
+        }
         const loopDecision = loopGuard.observeCalls(payload.toolCalls);
         if (loopDecision.type === 'reject') {
           await recordRejectedNativeToolCalls(
@@ -1180,7 +1297,15 @@ export async function runAgentReactLoop(
           : undefined;
 
         if (host.inkRenderer && displayToolOutput) {
-          for (const line of collapseToolCallLogLines(payload.toolCalls)) {
+          const nativeLane = Boolean(host.inkRenderer.startComputerUseStep && host.inkRenderer.finishComputerUseStep);
+          if (nativeLane) {
+            otherCalls.forEach((call, index) => {
+              if (call.tool.startsWith(COMPUTER_USE_TOOL_PREFIX)) {
+                host.inkRenderer?.startComputerUseStep?.(call.id ?? `computer-${iteration}-${index}`, call.tool, call.args ?? {});
+              }
+            });
+          }
+          for (const line of collapseToolCallLogLines(payload.toolCalls.filter(call => !nativeLane || !call.tool.startsWith(COMPUTER_USE_TOOL_PREFIX)))) {
             host.inkRenderer.addToolCall(line.tool, line.detail);
           }
         }
@@ -1214,6 +1339,11 @@ export async function runAgentReactLoop(
           let completedCount = 0;
           const totalTools = otherCalls.length;
           const charLimit = host.runtime.config.ui?.readFileCharLimit ?? 300;
+          // A preview is only worth showing where it can be opened again: the
+          // Ink transcript. Plain and command output print the result in full.
+          const toolOutputMode: ToolOutputMode = host.inkRenderer
+            ? host.runtime.config.ui?.toolOutput ?? DEFAULT_TOOL_OUTPUT_MODE
+            : 'full';
           const deferredDiffResults: Array<{
             result: ToolExecutionResult;
             call: ToolCallRequest | undefined;
@@ -1232,12 +1362,16 @@ export async function runAgentReactLoop(
                 tool: result.tool,
                 content: result.output ?? '',
                 charLimit,
+                mode: toolOutputMode,
                 filePath,
                 command,
                 commandArgs,
               });
             }
             const output = result.error ?? result.output ?? 'Tool failed';
+            if (toolOutputMode === 'compact') {
+              return formatToolOutputForDisplay({ tool: result.tool, content: output, charLimit, mode: 'compact', failed: true });
+            }
             return { output, truncated: false, totalChars: output.length };
           };
 
@@ -1359,6 +1493,12 @@ export async function runAgentReactLoop(
               }
               const resultThought = completedCount === 1 ? thought : undefined;
               const call = otherCalls[index];
+              if (displayToolOutput && result.tool.startsWith(COMPUTER_USE_TOOL_PREFIX)
+                && host.inkRenderer?.startComputerUseStep && host.inkRenderer.finishComputerUseStep) {
+                host.inkRenderer.finishComputerUseStep(call?.id ?? `computer-${iteration}-${index}`, result.success,
+                  result.success ? result.output ?? '' : result.error ?? result.output ?? '');
+                return;
+              }
               const group = host.inkRenderer && displayToolOutput ? pendingGroups.get(result.tool) : undefined;
               if (!group) {
                 renderToolResult(result, call, resultThought);
@@ -1498,7 +1638,20 @@ export async function runAgentReactLoop(
           }
 
           // Track per-tool consecutive failures (catches loops where LLM varies args but same tool keeps failing)
-          for (const result of results) {
+          for (const [resultIndex, result] of results.entries()) {
+            const call = otherCalls[resultIndex];
+            if (advisor && call && advisor.observeFailure(call, result)) {
+              const review = await consultAdvisor('repeated_failure', JSON.stringify({ call, result }));
+              if (review.verdict !== 'approved') {
+                advisorRejections += 1;
+                if (review.verdict === 'unavailable' || advisorRejections >= 3) {
+                  renderFinalResponse(`Work paused for Moa review: ${review.feedback}`);
+                  return { status: 'incomplete', reason: 'advisor_review' };
+                }
+              }
+              toolConsecutiveFailures.delete(result.tool);
+              continue;
+            }
             if (!result.success) {
               const count = (toolConsecutiveFailures.get(result.tool) ?? 0) + 1;
               toolConsecutiveFailures.set(result.tool, count);
@@ -1654,13 +1807,21 @@ export async function runAgentReactLoop(
           );
           continue;
         }
-        renderFinalResponse(turnOutcome.response, { thought: payload.thought });
+        renderFinalResponse(turnOutcome.response, { thought: payload.thought, streamedResponse });
         return { status: 'incomplete', reason: 'pending_todos' };
       }
-      renderFinalResponse(turnOutcome.response, {
-        thought: payload.thought,
-        streamedResponse,
-      });
+      if (advisor && hadToolWork) {
+        const review = await consultAdvisor('completion', turnOutcome.response);
+        if (review.verdict !== 'approved') {
+          advisorRejections += 1;
+          if (review.verdict === 'unavailable' || advisorRejections >= 3) {
+            renderFinalResponse(`Work remains pending Moa review: ${review.feedback}`);
+            return { status: 'incomplete', reason: 'advisor_review' };
+          }
+          continue;
+        }
+      }
+      renderFinalResponse(turnOutcome.response, { thought: payload.thought, streamedResponse });
       return { status: 'completed' };
     }
     if (abortController.signal.aborted) {

@@ -14,6 +14,7 @@ import { AutohandAgent } from '../../src/core/agent.js';
 import { ReactionParser } from '../../src/core/agent/ReactionParser.js';
 import { runAgentReactLoop } from '../../src/core/agent/ReactLoopRunner.js';
 import { ToolReflectionGuard } from '../../src/core/agent/ToolLoopPolicy.js';
+import type { TurnAdvisor } from '../../src/core/agent/CheckpointAdvisor.js';
 import {
   DEFAULT_RESPONSE_COMPLETION_HOOKS,
   type ResponseCompletionHook,
@@ -55,6 +56,8 @@ function createReactLoopHarness(
     responseCompletionHooks?: readonly ResponseCompletionHook[];
     nativeToolCalling?: boolean;
     hasIncompleteTodoActivity?: () => boolean;
+    advisor?: TurnAdvisor;
+    provider?: 'openai' | 'autohandai';
   } = {},
 ) {
   const parser = createParser();
@@ -79,7 +82,9 @@ function createReactLoopHarness(
   });
 
   const host = {
-    activeProvider: 'openai' as const,
+    createCheckpointAdvisor: () => harnessOptions.advisor,
+    captureAdvisorDiff: async () => 'diff --git a/file.ts b/file.ts',
+    activeProvider: harnessOptions.provider ?? 'openai',
     ...(harnessOptions.responseCompletionHooks
       ? { responseCompletionHooks: harnessOptions.responseCompletionHooks }
       : {}),
@@ -173,6 +178,97 @@ function createReactLoopHarness(
 }
 
 /* ── Tests ────────────────────────────────────────────────── */
+
+describe('checkpoint review in the live execution loop', () => {
+  it('refreshes orchestration instructions across setting and provider changes without losing history', async () => {
+    const { host } = createReactLoopHarness(Array.from({ length: 5 }, () => ({ content: 'The requested source review is complete and its findings are ready.' })), { provider: 'autohandai' });
+    host.runtime.config.provider = 'autohandai';
+    host.runtime.config.autohandai = { plan: 'cloud', model: 'moa' };
+    const instruction = () => host.conversation.history().filter(message => message.role === 'system' && message.content?.startsWith('[Autohand AI orchestration]'));
+    await runAgentReactLoop(host, new AbortController());
+    expect(instruction()).toHaveLength(1);
+    expect(instruction()[0].content).toContain('orchestration is enabled');
+    host.runtime.config.autohandai.orchestration = false;
+    await runAgentReactLoop(host, new AbortController());
+    expect(instruction()).toHaveLength(2);
+    expect(instruction().at(-1)?.content).toContain('orchestration is disabled');
+    host.runtime.config.autohandai.orchestration = true;
+    await runAgentReactLoop(host, new AbortController());
+    expect(instruction().at(-1)?.content).toContain('orchestration is enabled');
+    host.activeProvider = 'openai';
+    await runAgentReactLoop(host, new AbortController());
+    expect(instruction()).toHaveLength(4);
+    expect(instruction().at(-1)?.content).toContain('orchestration is disabled');
+    await runAgentReactLoop(host, new AbortController());
+    expect(instruction()).toHaveLength(4);
+    expect(host.conversation.history()).toContainEqual({ role: 'user', content: 'check reflection' });
+  });
+
+  it('reviews before staging and before completion, and never on an ordinary read', async () => {
+    const order: string[] = [];
+    const advisor: TurnAdvisor = {
+      review: vi.fn(async checkpoint => { order.push(checkpoint); return { verdict: 'approved', feedback: 'Reviewed.' }; }),
+      observeFailure: () => false,
+    };
+    const { host } = createReactLoopHarness([
+      { content: 'Inspecting the source before making the final staging decision.', toolCalls: [createNativeToolCall('read')] },
+      { content: 'The inspected source preserves the contract, so I can stage it.', toolCalls: [createNativeToolCall('stage', 'git_add', { paths: ['file.ts'] })] },
+      { content: 'The source was checked and staged successfully. Completed.' },
+    ], { advisor });
+    host.toolManager.execute.mockImplementation(async calls => calls.map(call => {
+      order.push(call.tool); return { tool: call.tool, success: true, output: 'ok' };
+    }));
+    expect(await runAgentReactLoop(host, new AbortController())).toEqual({ status: 'completed' });
+    expect(order).toEqual(['read_file', 'commit', 'git_add', 'completion']);
+  });
+  it('does not execute a rejected plan, and records a matching native tool result', async () => {
+    const review = vi.fn<TurnAdvisor['review']>().mockResolvedValueOnce({ verdict: 'changes_requested', feedback: 'Preserve the auth invariant.' }).mockResolvedValue({ verdict: 'approved', feedback: 'Reviewed.' });
+    const { host, executedCalls, systemNotes } = createReactLoopHarness([
+      { content: 'A plan for updating auth across the request and schema modules.', toolCalls: [createNativeToolCall('plan-review', 'plan', { plan: 'Remove auth checks.' })] },
+      { content: 'I revised the plan to preserve authentication in both modules.' },
+    ], { advisor: { review, observeFailure: () => false } });
+    expect(await runAgentReactLoop(host, new AbortController())).toEqual({ status: 'completed' });
+    expect(executedCalls).toHaveLength(0);
+    expect(systemNotes.join('\n')).toContain('Preserve the auth invariant');
+    expect(host.conversation.history()).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: 'plan-review' }));
+  });
+  it('reports incomplete when the final audit cannot run', async () => {
+    const advisor: TurnAdvisor = { review: async () => ({ verdict: 'unavailable', feedback: 'Provider unavailable.' }), observeFailure: () => false };
+    const { host } = createReactLoopHarness([
+      { content: 'Reading the relevant file before finishing.', toolCalls: [createNativeToolCall('read')] },
+      { content: 'The requested source review is complete.' },
+    ], { advisor });
+    expect(await runAgentReactLoop(host, new AbortController())).toEqual({ status: 'incomplete', reason: 'advisor_review' });
+    expect(host.emitOutput).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', content: expect.stringContaining('Provider unavailable') }));
+  });
+  it('retries a transient unavailable staging review before executing the tool exactly once', async () => {
+    const review = vi.fn<TurnAdvisor['review']>()
+      .mockResolvedValueOnce({ verdict: 'unavailable', feedback: 'Moa returned no verdict.' })
+      .mockResolvedValue({ verdict: 'approved', feedback: 'Diff verified.' });
+    const { host, executedCalls } = createReactLoopHarness([
+      { content: 'The verified change can now be staged for the requested commit.', toolCalls: [createNativeToolCall('stage', 'git_add', { paths: ['file.ts'] })] },
+      { content: 'The change was staged successfully and the work is complete.' },
+    ], { advisor: { review, observeFailure: () => false } });
+    expect(await runAgentReactLoop(host, new AbortController())).toEqual({ status: 'completed' });
+    expect(executedCalls).toEqual([expect.objectContaining({ tool: 'git_add' })]);
+    expect(review.mock.calls.map(call => call[0])).toEqual(['commit', 'commit', 'completion']);
+  });
+  it('stops after two failed commands when the advisor is unavailable', async () => {
+    const review = vi.fn<TurnAdvisor['review']>().mockResolvedValue({ verdict: 'unavailable', feedback: 'Review timed out.' });
+    let failures = 0;
+    const { host, complete } = createReactLoopHarness([
+      { content: 'Running the project tests to check the implementation.', toolCalls: [createNativeToolCall('first-test', 'run_command', { command: 'bun test' })] },
+      { content: 'Retrying after inspecting the failure.', toolCalls: [createNativeToolCall('second-test', 'run_command', { command: 'bun test' })] },
+      { content: 'The checks have finished.' },
+    ], { advisor: { review, observeFailure: () => ++failures === 2 } });
+    host.toolManager.execute.mockImplementation(async calls => calls.map(call => ({ tool: call.tool, success: false, error: 'Expected 1, received 2' })));
+    expect(await runAgentReactLoop(host, new AbortController())).toEqual({ status: 'incomplete', reason: 'advisor_review' });
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(review).toHaveBeenCalledTimes(2);
+    expect(review).toHaveBeenNthCalledWith(2, 'repeated_failure', expect.anything());
+    expect(host.conversation.history()).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: 'second-test' }));
+  });
+});
 
 describe('parseAssistantReactPayload reflection extraction', () => {
   let parser: ReactionParser;

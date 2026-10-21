@@ -6,6 +6,9 @@
 import chalk from 'chalk';
 import { resolveMouseComposerCursor } from '../ui/mouseReporting.js';
 import { KEYBINDING_PROFILE_IDS } from '../keybindings/profiles.js';
+import { DEFAULT_TOOL_OUTPUT_MODE, TOOL_OUTPUT_MODES } from '../ui/toolOutput.js';
+import { INTERACTION_MODE_SEQUENCE } from '../core/agent/InteractionModeController.js';
+import { DEFAULT_STARTUP_INTERACTION_MODE } from '../startup/modeRouter.js';
 import { getCurrentLocale, t } from '../i18n/index.js';
 import { getTheme, initTheme, isThemeInitialized, listAvailableThemes } from '../ui/theme/index.js';
 import { getDefaultThemeName } from '../ui/theme/themes.js';
@@ -166,7 +169,11 @@ export const SETTINGS_REGISTRY: SettingDef[] = [
   { key: 'ui.activitySymbol', labelKey: 'commands.settings.ui.activitySymbol', descriptionKey: 'commands.settings.ui.activitySymbolDesc', category: 'ui', type: 'string', defaultValue: '\u2733' },
   { key: 'ui.showTips', labelKey: 'commands.settings.ui.showTips', descriptionKey: 'commands.settings.ui.showTipsDesc', category: 'ui', type: 'boolean', defaultValue: true },
   { key: 'ui.statusLine', labelKey: 'commands.settings.ui.statusLine', descriptionKey: 'commands.settings.ui.statusLineDesc', category: 'ui', type: 'string', redirect: '/statusline' },
+  { key: 'ui.statusBar', labelKey: 'commands.settings.ui.statusBar', descriptionKey: 'commands.settings.ui.statusBarDesc', category: 'ui', type: 'string', redirect: '/statusbar' },
   { key: 'ui.updateCheckInterval', labelKey: 'commands.settings.ui.updateCheckInterval', descriptionKey: 'commands.settings.ui.updateCheckIntervalDesc', category: 'ui', type: 'number', defaultValue: 24 },
+  // New UI settings go last: the numbered shortcuts of the entries above are muscle memory.
+  { key: 'ui.toolOutput', labelKey: 'commands.settings.ui.toolOutput', descriptionKey: 'commands.settings.ui.toolOutputDesc', category: 'ui', type: 'enum', enumValues: [...TOOL_OUTPUT_MODES], defaultValue: DEFAULT_TOOL_OUTPUT_MODE },
+  { key: 'ui.defaultInteractionMode', labelKey: 'commands.settings.ui.defaultInteractionMode', descriptionKey: 'commands.settings.ui.defaultInteractionModeDesc', category: 'ui', type: 'enum', enumValues: [...INTERACTION_MODE_SEQUENCE], defaultValue: DEFAULT_STARTUP_INTERACTION_MODE },
 
   // Agent Behavior
   { key: 'agent.maxIterations', labelKey: 'commands.settings.agent.maxIterations', descriptionKey: 'commands.settings.agent.maxIterationsDesc', category: 'agent', type: 'number', defaultValue: 100 },
@@ -202,7 +209,6 @@ export const SETTINGS_REGISTRY: SettingDef[] = [
   // Auto-mode
   { key: 'automode.maxIterations', labelKey: 'commands.settings.automode.maxIterations', descriptionKey: 'commands.settings.automode.maxIterationsDesc', category: 'automode', type: 'number', defaultValue: 50 },
   { key: 'automode.maxRuntime', labelKey: 'commands.settings.automode.maxRuntime', descriptionKey: 'commands.settings.automode.maxRuntimeDesc', category: 'automode', type: 'number', defaultValue: 120 },
-  { key: 'automode.maxCost', labelKey: 'commands.settings.automode.maxCost', descriptionKey: 'commands.settings.automode.maxCostDesc', category: 'automode', type: 'number', defaultValue: 10 },
   { key: 'automode.checkpointInterval', labelKey: 'commands.settings.automode.checkpointInterval', descriptionKey: 'commands.settings.automode.checkpointIntervalDesc', category: 'automode', type: 'number', defaultValue: 5 },
   { key: 'automode.useWorktree', labelKey: 'commands.settings.automode.useWorktree', descriptionKey: 'commands.settings.automode.useWorktreeDesc', category: 'automode', type: 'boolean', defaultValue: true },
 

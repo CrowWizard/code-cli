@@ -132,8 +132,11 @@ describe('Autohand AI native session agent inspector', () => {
     await session.type(originalRequest);
     await session.press('enter');
     await vi.waitFor(() => expect(slowStarted).toBe(true), { timeout: 20_000 });
-    const workerRequests = requests.filter(payload => (payload.messages as Array<{ role: string; content?: string }>).some(message => message.role === 'system' && message.content?.startsWith('INSPECTOR_')));
-    expect(workerRequests.length).toBeGreaterThanOrEqual(2);
+    const workerRequests = await vi.waitFor(() => {
+      const workers = requests.filter(payload => (payload.messages as Array<{ role: string; content?: string }>).some(message => message.role === 'system' && message.content?.startsWith('INSPECTOR_')));
+      expect(workers.length).toBeGreaterThanOrEqual(2);
+      return workers;
+    }, { timeout: 20_000 });
     for (const payload of workerRequests) {
       const messages = payload.messages as Array<{ role: string; content?: string }>;
       expect(messages).toEqual(expect.arrayContaining([

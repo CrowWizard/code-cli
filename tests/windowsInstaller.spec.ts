@@ -57,6 +57,40 @@ function runPowerShellProbe(script: string): { stdout: string; stderr: string; s
 }
 
 describe('Windows installer architecture detection', () => {
+  powerShellTest('selects x64 only for a missing ARM64 release asset and preserves network errors', () => {
+    const result = runPowerShellProbe(`${installerWithoutEntrypoint}
+class ReleaseProbeException : System.Exception {
+    [object] $Response
+    ReleaseProbeException([int] $status) { $this.Response = [pscustomobject]@{ StatusCode = $status } }
+}
+$script:probeStatus = 200
+$script:probeCount = 0
+function Invoke-WebRequest {
+    param($Uri, $Method, $TimeoutSec, [switch]$UseBasicParsing)
+    if ($Method -ne 'Head') { throw 'Expected HEAD' }
+    if ($Uri -notlike '*/v0.9.8/autohand-windows-arm64.zip') { throw "Wrong asset: $Uri" }
+    $script:probeCount++
+    if ($script:probeStatus -ne 200) { throw [ReleaseProbeException]::new($script:probeStatus) }
+}
+$native = Resolve-ReleaseArchitecture -Architecture 'windows-arm64' -TargetVersion '0.9.8'
+$script:probeStatus = 404
+$fallback = Resolve-ReleaseArchitecture -Architecture 'windows-arm64' -TargetVersion '0.9.8'
+$existingX64 = Resolve-ReleaseArchitecture -Architecture 'windows-x64' -TargetVersion '0.9.8'
+$errors = @()
+foreach ($status in @(403, 503)) {
+    $script:probeStatus = $status
+    try { Resolve-ReleaseArchitecture -Architecture 'windows-arm64' -TargetVersion '0.9.8' | Out-Null }
+    catch { $errors += [int]$_.Exception.Response.StatusCode }
+}
+@{ native=$native; fallback=$fallback; x64=$existingX64; errors=$errors; count=$script:probeCount } | ConvertTo-Json -Compress
+`);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('No ARM64 build for v0.9.8 yet, installing x64 (runs under emulation)');
+    expect(JSON.parse(result.stdout.trim().split(/\r?\n/u).at(-1)!)).toEqual({
+      native: 'windows-arm64', fallback: 'windows-x64', x64: 'windows-x64', errors: [403, 503], count: 4,
+    });
+  });
+
   it('falls back to native Windows architecture signals when RuntimeInformation is empty', () => {
     expect(installer).toContain('$env:PROCESSOR_ARCHITEW6432');
     expect(installer).toContain('$env:PROCESSOR_ARCHITECTURE');
@@ -602,5 +636,63 @@ Write-Output (Start-FirstRun -BinaryPath '${fixture}' -Answer $null)
     } finally {
       cleanup();
     }
+  });
+});
+
+describe('required computer use installation', () => {
+  powerShellTest('propagates a companion installation failure', () => {
+    const result = runPowerShellProbe([
+      installerWithoutEntrypoint,
+      'function Invoke-FailedComputerInstall { $global:LASTEXITCODE = 7 }',
+      '$env:AUTOHAND_SKIP_COMPUTER_CONTROL_INSTALL = "0"',
+      'Install-ComputerControl -BinaryPath "Invoke-FailedComputerInstall"',
+    ].join('\n'));
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain('autohand computer install');
+    expect(result.stdout).not.toContain('still ready');
+  });
+});
+
+
+describe('fresh alpha profile', () => {
+  it('offers an explicit fresh alpha install and forces companion replacement', () => {
+    expect(installer).toContain('[switch]$Fresh');
+    expect(installer).toContain('Prepare-FreshAlphaProfile -InstallPath $installPath');
+    expect(installer).toContain('$computerArguments += "--force"');
+  });
+  powerShellTest('creates a new empty profile per install and retains earlier state', () => {
+    const root = mkdtempSync(join(tmpdir(), 'autohand-fresh-windows-'));
+    try {
+      const result = runPowerShellProbe(`${installerWithoutEntrypoint}
+$env:USERPROFILE = '${root.replaceAll("'", "''")}'
+$normal = Join-Path $env:USERPROFILE '.autohand'
+New-Item -ItemType Directory -Path $normal | Out-Null
+Set-Content (Join-Path $normal 'config.json') 'normal sentinel'
+$install = Join-Path $env:USERPROFILE 'bin'
+New-Item -ItemType Directory -Path $install | Out-Null
+Prepare-FreshAlphaProfile -InstallPath $install
+$first = (Get-Content (Join-Path $install 'autohand-alpha.profile') -Raw).Trim()
+Set-Content (Join-Path $first 'session') 'previous run'
+Prepare-FreshAlphaProfile -InstallPath $install
+$second = (Get-Content (Join-Path $install 'autohand-alpha.profile') -Raw).Trim()
+Write-Output ('DIFFERENT=' + ($first -ne $second))
+Write-Output ('EMPTY=' + (@(Get-ChildItem $second).Count -eq 0))
+Write-Output ('RETAINED=' + (Test-Path (Join-Path $first 'session')))
+Write-Output ('LAUNCHER=' + (Test-Path (Join-Path $install 'autohand-alpha.cmd')))
+Write-Output ('RESET=' + (-not (Test-Path (Join-Path $normal 'config.json'))))
+$backups = @(Get-ChildItem $env:USERPROFILE -Directory -Force | Where-Object Name -Like '.autohand.backup.*')
+Write-Output ('BACKUPS=' + $backups.Count)
+Write-Output ('BACKUP_CONTENT=' + ((Get-Content (Join-Path $backups[0].FullName 'profile/config.json') -ErrorAction SilentlyContinue) + (Get-Content (Join-Path $backups[1].FullName 'profile/config.json') -ErrorAction SilentlyContinue)))
+
+`);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('DIFFERENT=True');
+      expect(result.stdout).toContain('EMPTY=True');
+      expect(result.stdout).toContain('RETAINED=True');
+      expect(result.stdout).toContain('LAUNCHER=True');
+      expect(result.stdout).toContain('RESET=True');
+      expect(result.stdout).toContain('BACKUPS=2');
+      expect(result.stdout).toContain('BACKUP_CONTENT=normal sentinel');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

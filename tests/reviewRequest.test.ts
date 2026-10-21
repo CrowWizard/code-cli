@@ -137,6 +137,8 @@ describe('review instruction construction', () => {
 
     expect(instruction).toContain('Autohand Review');
     expect(instruction).toContain('read-only');
+    expect(instruction).toContain('single reviewer');
+    expect(instruction).toContain('Do not delegate');
     expect(instruction).toContain('"kind": "forensics"');
     expect(instruction).toContain('"target": "packages/runtime"');
     expect(instruction).toContain('"base": "v1.2.0"');
@@ -147,6 +149,16 @@ describe('review instruction construction', () => {
     expect(instruction).toContain('Technical findings');
     expect(instruction).toContain('Forensic appendix');
     expect(instruction).toContain('Evidence boundary');
+  });
+
+  it('gives pending changes an explicit HEAD diff without assuming a previous commit', () => {
+    const instruction = buildReviewInstruction({
+      request: { kind: 'changes', audience: 'technical', format: 'markdown' },
+      workspaceRoot: '/workspace', specialistInstructions: 'Review evidence.',
+    });
+    expect(instruction).toContain('git_diff_range with {"range":"HEAD"}');
+    expect(instruction).toContain('Do not substitute HEAD~1');
+    expect(instruction).toContain('Once the changed contract and its direct effect are clear, return the verdict');
   });
 
   it('requires machine-readable output without weakening evidence rules', () => {

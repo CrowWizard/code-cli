@@ -5,7 +5,10 @@
  */
 import chalk from 'chalk';
 import type { HookManager, HookExecutionResult } from '../HookManager.js';
+import type { ComputerUseLifecycle } from '../../computer/ComputerUseLifecycle.js';
 import { ProviderNotConfiguredError } from '../../providers/ProviderFactory.js';
+import { getManagedComputerUsePermissionIssue } from '../../computer/autohandComputerUse.js';
+import { matchesComputerControlIntent } from '../../skills/computerControlIntent.js';
 import { ApiError } from '../../providers/errors.js';
 import { formatRecoveryWait, resolveSessionRecoveryDelay } from './sessionRecoveryDelay.js';
 import {
@@ -13,7 +16,7 @@ import {
   type DirectoryPermissionOptions,
 } from '../../permissions/directoryPermissionPrompt.js';
 import type { PermissionManager } from '../../permissions/PermissionManager.js';
-import type { AgentOutputEvent, AgentRuntime, TurnUsage } from '../../types.js';
+import type { AgentOutputEvent, AgentRuntime, TurnUsage, McpServerConfigEntry } from '../../types.js';
 import type { Intent, IntentResult } from '../IntentDetector.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { GoalManager } from '../../goals/GoalManager.js';
@@ -37,6 +40,7 @@ import {
 const INCOMPLETE_LOOP_REASONS: Record<Extract<ReactLoopResult, { status: 'incomplete' }>['reason'], string> = {
   iteration_limit: 'The agent loop reached its iteration limit before completion',
   pending_todos: 'The turn ended with unfinished todo items',
+  advisor_review: 'The turn ended before its Moa checkpoint review was resolved',
 };
 
 interface InstructionConversation {
@@ -89,6 +93,7 @@ function readCompletedTurnUsage(host: AgentInstructionHost): TurnUsage {
 }
 
 export interface AgentInstructionHost {
+  computerUseLifecycle?: ComputerUseLifecycle;
   peerCommunicationRuntime?: PeerCommunicationRuntime;
   recordPeerReferences?: (instruction: string, references: PeerReference[]) => Promise<void>;
   isInstructionActive: boolean;
@@ -113,6 +118,7 @@ export interface AgentInstructionHost {
   sessionRetryCount: number;
   sessionTokensUsed: number;
   runtime: AgentRuntime;
+  runtimeMcpServers?: McpServerConfigEntry[];
   sessionManager?: InstructionSessionManager;
   permissionManager?: PermissionManager;
   hookManager?: HookManager;
@@ -145,7 +151,7 @@ export interface AgentInstructionHost {
     ctrlCInterrupt?: boolean
   ): () => void;
   startPreparationStatus(instruction: string): () => void;
-  buildUserMessage(instruction: string): Promise<string>;
+  buildTurnContext(instruction: string): Promise<string>;
   setUIStatus(status: string): void;
   saveUserMessage(instruction: string): Promise<void>;
   updateContextUsage(history: unknown[]): void;
@@ -297,7 +303,8 @@ export class InstructionRunner {
       host.currentInkOnCancel = null;
     }
     const stopPromptInput = !host.runtime.isRpcMode && !useInkInput && process.stdin.isTTY
-      && (host.hookManager?.getHooksForEvent('pre-prompt').length ?? 0) > 0
+      && ((host.hookManager?.getHooksForEvent('pre-prompt').length ?? 0) > 0
+        || matchesComputerControlIntent(instruction))
       ? host.setupEscListener(abortController, () => {}, true) : () => {};
     let promptInputClosed = false;
     const cleanupPromptInterrupts = (): void => {
@@ -313,6 +320,33 @@ export class InstructionRunner {
         sessionId: host.sessionManager?.getCurrentSession()?.metadata?.sessionId,
         mentionedFiles: options.mentionedFiles,
       }, { signal: abortController.signal }) ?? [];
+      if (abortController.signal.aborted) {
+        if (!host.runtime.isRpcMode) console.log(chalk.yellow('Request canceled.'));
+        return false;
+      }
+      const blocked = hookResults.find(result => result.blockingError
+        || result.response?.decision === 'block' || result.response?.decision === 'deny'
+        || result.response?.continue === false);
+      if (blocked) {
+        const reason = blocked.response?.reason ?? blocked.response?.stopReason ?? blocked.error ?? 'Prompt blocked by hook';
+        host.emitOutput({ type: 'error', content: reason });
+        if (!host.runtime.isRpcMode) console.log(chalk.yellow(reason));
+        return false;
+      }
+      for (const result of hookResults) {
+        if (result.response?.additionalContext) {
+          host.conversation.addSystemNote(result.response.additionalContext, '[Pre-prompt Hook Context]');
+        }
+      }
+
+      if (!abortController.signal.aborted && matchesComputerControlIntent(instruction)) {
+        const issue = await getManagedComputerUsePermissionIssue(host.runtimeMcpServers);
+        if (!abortController.signal.aborted && issue) {
+          host.emitOutput({ type: 'error', content: issue });
+          if (!host.runtime.isRpcMode) console.log(chalk.yellow(issue));
+          return false;
+        }
+      }
     } finally {
       abortController.signal.removeEventListener('abort', cleanupPromptInterrupts);
       cleanupPromptInterrupts();
@@ -326,21 +360,6 @@ export class InstructionRunner {
       if (!host.runtime.isRpcMode) console.log(chalk.yellow('Request canceled.'));
       return false;
     }
-    const blocked = hookResults.find(result => result.blockingError
-      || result.response?.decision === 'block' || result.response?.decision === 'deny'
-      || result.response?.continue === false);
-    if (blocked) {
-      const reason = blocked.response?.reason ?? blocked.response?.stopReason ?? blocked.error ?? 'Prompt blocked by hook';
-      host.emitOutput({ type: 'error', content: reason });
-      if (!host.runtime.isRpcMode) console.log(chalk.yellow(reason));
-      return false;
-    }
-    for (const result of hookResults) {
-      if (result.response?.additionalContext) {
-        host.conversation.addSystemNote(result.response.additionalContext, '[Pre-prompt Hook Context]');
-      }
-    }
-
     if (deepResearch.runId) {
       await markDeepResearchRunStarted(host.runtime.workspaceRoot, deepResearch.runId);
     }
@@ -388,7 +407,9 @@ export class InstructionRunner {
     if (intentResult.intent === 'implementation' && options.environmentBootstrap !== 'skip') {
       const bootstrapResult = await host.runEnvironmentBootstrap();
       if (!bootstrapResult.success) {
-        console.log(chalk.red('\n[BLOCKED] Environment setup failed. Fix issues before proceeding.'));
+        const issue = 'Environment setup failed. Check the dependency installation and toolchain before retrying.';
+        console.log(chalk.red(`\n[BLOCKED] ${issue}`));
+        host.emitOutput({ type: 'error', content: issue });
         host.isInstructionActive = false;
         return false;
       }
@@ -511,10 +532,11 @@ export class InstructionRunner {
       }
 
       stopPreparation = host.startPreparationStatus(instruction);
-      const userMessage = await host.buildUserMessage(instruction);
+      const turnContext = await host.buildTurnContext(instruction);
       stopPreparation();
       host.setUIStatus('Reasoning with the AI (ReAct loop)...');
-      host.conversation.addMessage({ role: 'user', content: userMessage });
+      host.conversation.addMessage({ role: 'user', content: instruction });
+      if (turnContext) host.conversation.addSystemNote(turnContext);
 
       // Save user message to session
       await host.saveUserMessage(instruction);
@@ -541,7 +563,7 @@ export class InstructionRunner {
         return recordIncompleteLoop(loopResult);
       }
 
-      if (host.lastIntent === 'implementation' && host.filesModifiedThisSession) {
+      if (host.lastIntent === 'implementation' && host.filesModifiedThisSession && options.qualityPipeline !== 'agent-managed') {
         host.modalActive = true;
         try {
           // PersistentInput uses terminal scroll regions that must be torn down
@@ -713,6 +735,7 @@ export class InstructionRunner {
       cleanupEsc();
       stopPreparation();
       host.stopStatusUpdates();
+      await host.computerUseLifecycle?.finish(abortController.signal.aborted ? 'cancelled' : success ? 'finished' : 'failed');
       const keepPersistentInputForNextTurn =
         host.persistentInputActiveTurn &&
         (host.persistentInput.hasQueued() || host.persistentInput.getCurrentInput().trim().length > 0);

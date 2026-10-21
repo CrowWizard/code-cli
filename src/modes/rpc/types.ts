@@ -328,6 +328,10 @@ export const RPC_NOTIFICATIONS = {
   HOOK_SESSION_START: 'autohand.hook.sessionStart',
   HOOK_SESSION_END: 'autohand.hook.sessionEnd',
   HOOK_SUBAGENT_STOP: 'autohand.hook.subagentStop',
+  HOOK_COMPUTER_USE_START: 'autohand.hook.computerUseStart',
+  HOOK_COMPUTER_USE_PROGRESS: 'autohand.hook.computerUseProgress',
+  HOOK_COMPUTER_USE_ERROR: 'autohand.hook.computerUseError',
+  HOOK_COMPUTER_USE_STOP: 'autohand.hook.computerUseStop',
   HOOK_SUBAGENT_START: 'autohand.hook.subagentStart',
   HOOK_SUBAGENT_PROGRESS: 'autohand.hook.subagentProgress',
   HOOK_SUBAGENT_MESSAGE: 'autohand.hook.subagentMessage',
@@ -798,6 +802,8 @@ export interface MessageEndParams {
 
 export interface ToolStartParams {
   toolId: string;
+  /** Present when the call was made by a `run_tool_script` script: that script's toolId. */
+  parentToolId?: string;
   toolName: string;
   args: Record<string, unknown>;
   timestamp: string;
@@ -812,6 +818,8 @@ export interface ToolUpdateParams {
 
 export interface ToolEndParams {
   toolId: string;
+  /** Present when the call was made by a `run_tool_script` script: that script's toolId. */
+  parentToolId?: string;
   toolName: string;
   success: boolean;
   output?: string;
@@ -972,6 +980,19 @@ export interface HookSubagentActivityNotificationParams {
   workspace?: string;
   activity?: string;
   message?: string;
+  timestamp: string;
+}
+
+export interface HookComputerUseNotificationParams {
+  runId: string;
+  status?: 'running' | 'done' | 'unverified' | 'failed' | 'cancelled' | 'finished';
+  action?: string;
+  tool?: string;
+  toolCallId?: string;
+  success?: boolean;
+  error?: string;
+  duration?: number;
+  toolCallsCount?: number;
   timestamp: string;
 }
 

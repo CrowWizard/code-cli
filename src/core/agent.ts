@@ -10,6 +10,7 @@ import { syncAgentTerminalTitleName } from './agent/AgentSessionTitle.js';
 import { shouldWriteTerminalTitle, TerminalTitleController } from '../ui/terminalTitle.js';
 import { isITerm2 } from '../ui/mouseReporting.js';
 import type { SessionAutoNamer } from './agent/SessionAutoNamer.js';
+import type { AxoResponder } from './agent/AxoResponder.js';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,6 +32,7 @@ import {
 /** Slow on purpose: the plan changes rarely and this must not add load. */
 const ACCOUNT_PLAN_REFRESH_MS = 30_000;
 import { safePrompt } from '../utils/prompt.js';
+import { t } from '../i18n/index.js';
 import { maybeOfferAutohandAISwitch } from '../commands/login.js';
 import { getFeatureState, isAwsBedrockProviderEnabled } from '../features/featureRegistry.js';
 import type { RemoteFeatureFlagManager } from '../features/RemoteFeatureFlagManager.js';
@@ -85,7 +87,7 @@ import {
 } from './agents/SpecialistOrchestrator.js';
 import type { ToolDefinition } from './toolManager.js';
 import { ErrorLogger } from './errorLogger.js';
-import { MemoryManager } from '../memory/MemoryManager.js';
+import { MemoryManager, wrapSharedProjectMemory } from '../memory/MemoryManager.js';
 import { FeedbackManager } from '../feedback/FeedbackManager.js';
 import type { FeedbackSurveyController } from './agent/FeedbackSurveyController.js';
 import { TelemetryManager } from '../telemetry/TelemetryManager.js';
@@ -156,13 +158,15 @@ import {
 } from './agent/ReactLoopRunner.js';
 import { DEFAULT_RESPONSE_COMPLETION_HOOKS } from './agent/ResponseCompletionClassifier.js';
 import { initializeAgentDependencies, type AgentDependencyHost } from './agent/AgentDependencyComposer.js';
+import type { ComputerUseLifecycle } from '../computer/ComputerUseLifecycle.js';
 import {
   InstructionRunner,
   type AgentInstructionHost,
   type RunInstructionOptions,
   type SessionFailureBugReportOptions,
 } from './agent/InstructionRunner.js';
-import { buildStatusLineExtension, getConfigStatusLineSettings } from './agent/StatusLineSettings.js';
+import { getConfigStatusLineSettings } from './agent/StatusLineSettings.js';
+import { buildStatusBarActivityData, buildStatusBarExtensions } from './agent/StatusBarRenderer.js';
 import {
   agentSleep,
   injectAgentContinuationMessage,
@@ -263,7 +267,7 @@ import {
   steerAgentActiveInstruction,
 } from './agent/AgentUIRuntime.js';
 import {
-  buildAgentUserMessage,
+  buildAgentTurnContext,
   collectAgentContextSummary,
   formatAgentStatusLine,
   generateAgentSessionBootstrap,
@@ -352,10 +356,11 @@ import {
   type PostTurnActionHost,
 } from './agent/PostTurnActionCoordinator.js';
 
-function formatTurnMemoryUpdate(saved: ExtractedMemory[]): string {
+function formatTurnMemoryUpdate(saved: ExtractedMemory[], sharedProject = false): string {
   const lines = ['[Auto Memory Update] Background reflection saved these memories for future turns:'];
   for (const memory of saved) {
-    lines.push(`- ${memory.level}: ${memory.content}`);
+    const line = `- ${memory.level}: ${memory.content}`;
+    lines.push(memory.level === 'project' && sharedProject ? wrapSharedProjectMemory(line) : line);
   }
   return lines.join('\n');
 }
@@ -363,6 +368,9 @@ function formatTurnMemoryUpdate(saved: ExtractedMemory[]): string {
 interface TurnMemoryReflectionRequest {
   outcome: TurnMemoryReflectionOutcome;
   conversationHistory: LLMMessage[];
+  sessionId?: string;
+  projectMemoryScope?: string;
+  sharedProjectMemory?: boolean;
 }
 
 export class AutohandAgent {
@@ -400,6 +408,7 @@ export class AutohandAgent {
   private turnMemoryReflectionAbortController: AbortController | null = null;
   private permissionManager!: PermissionManager;
   private hookManager!: HookManager;
+  private computerUseLifecycle?: ComputerUseLifecycle;
   private delegator!: AgentDelegator;
   private specialistOrchestrator!: SpecialistOrchestrator;
   private feedbackManager!: FeedbackManager;
@@ -476,6 +485,8 @@ export class AutohandAgent {
     { tabColour: isITerm2() },
   );
   sessionAutoNamer: SessionAutoNamer | null = null;
+  /** Answers `~axo <question>`; see AxoResponder. */
+  axoResponder: AxoResponder | null = null;
   sessionTitleRefined = false;
   private readonly runtimeResourceShutdownController = new AbortController();
   private runtimeResourceShutdownPromise: Promise<void> | null = null;
@@ -887,7 +898,13 @@ export class AutohandAgent {
         && message.content.includes('[Auto Memory Update]'))
     );
     this.turnMemoryReflectionQueue ??= [];
-    this.turnMemoryReflectionQueue.push({ outcome, conversationHistory });
+    this.turnMemoryReflectionQueue.push({
+      outcome,
+      conversationHistory,
+      sessionId: this.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
+      projectMemoryScope: this.memoryManager?.getProjectMemoryScope?.(),
+      sharedProjectMemory: this.memoryManager?.hasSharedProjectMemory?.() ?? false,
+    });
     this.startQueuedTurnMemoryReflection();
   }
 
@@ -942,17 +959,25 @@ export class AutohandAgent {
         options: {
           minUserMessages: 1,
           source: 'turn-reflection',
+          origin: request.sessionId ? { sessionId: request.sessionId } : null,
+          expectedProjectScope: request.projectMemoryScope,
           turnOutcome: request.outcome,
         },
       });
 
-      if (abortController.signal.aborted || this.runtimeResourceShutdownPromise || saved.length === 0) {
+      const currentScope = this.memoryManager?.getProjectMemoryScope?.();
+      const currentSaved = saved.filter(memory => memory.level !== 'project'
+        || request.projectMemoryScope === undefined || request.projectMemoryScope === currentScope);
+      if (abortController.signal.aborted || this.runtimeResourceShutdownPromise || currentSaved.length === 0) {
         return;
       }
 
-      this.conversation.addSystemNote(formatTurnMemoryUpdate(saved), '[Auto Memory Update]');
+      this.conversation.addSystemNote(
+        formatTurnMemoryUpdate(currentSaved, request.sharedProjectMemory),
+        '[Auto Memory Update]',
+      );
       this.writeTurnMemoryDebugLine(
-        `[memory] turn reflection saved ${saved.length} ${saved.length === 1 ? 'memory' : 'memories'}`,
+        `[memory] turn reflection saved ${currentSaved.length} ${currentSaved.length === 1 ? 'memory' : 'memories'}`,
       );
     } finally {
       if (this.turnMemoryReflectionAbortController === abortController) {
@@ -1071,7 +1096,10 @@ export class AutohandAgent {
   }
 
   private async executeAdmittedInstruction(instruction: string, options?: RunInstructionOptions): Promise<boolean> {
-    await this.refreshAccountPlan();
+    // The turn runs on the last known plan; the refresh completes in the
+    // background so a slow or failing /auth/me never delays the prompt.
+    await this.alignCloudModelWithTier(this.accountPlan?.tier);
+    void this.refreshAccountPlan();
     if (options?.signal?.aborted || this.shouldExit) return false;
     this.currentInstructionText = instruction;
     try {
@@ -1292,6 +1320,7 @@ export class AutohandAgent {
 
   async shutdown(options: AgentShutdownOptions = {}): Promise<void> {
     this.shutdownPromise ??= (async () => {
+      await this.computerUseLifecycle?.finish('cancelled');
       await this.flushTurnMemoryReflection();
       await closeAgentSession(this as unknown as AgentSessionAccountingHost, options);
     })();
@@ -1330,6 +1359,7 @@ export class AutohandAgent {
 
     return {
       get activeProvider() { return agent.activeProvider; },
+      get accountTier() { return agent.accountPlan?.tier; },
       autoReportManager: agent.autoReportManager,
       steering: agent.steering,
       get permissionManager() { return agent.permissionManager; },
@@ -1438,8 +1468,8 @@ export class AutohandAgent {
     return `Cropped ${removed.length} message(s) from the ${direction}.`;
   }
 
-  private async buildUserMessage(instruction: string): Promise<string> {
-    return buildAgentUserMessage(this as unknown as AgentContextRuntimeHost, instruction);
+  private async buildTurnContext(instruction: string): Promise<string> {
+    return buildAgentTurnContext(this as unknown as AgentContextRuntimeHost, instruction);
   }
 
   private async prepareSpecialists(instruction: string): Promise<string | undefined> {
@@ -1449,14 +1479,21 @@ export class AutohandAgent {
     if (!this.specialistOrchestrator) {
       return undefined;
     }
+    if (this.permissionManager.isReadOnlyReview()) return undefined;
 
+    this.specialistOrchestrator.beginTurn();
     const request = detectSpecialistRequest(instruction);
     if (!request) {
       const continuation = await this.specialistOrchestrator.continueInterview(instruction, { signal: this.activeAbortController?.signal });
       return continuation ? formatSpecialistResults(continuation) : undefined;
     }
 
-    return this.runSpecialistOrchestration(request);
+    const { results, completed } = await this.runSpecialistOrchestration(request);
+    // Only a roster that fully ran is worth reusing; a partial one may be retried.
+    if (completed) {
+      this.specialistOrchestrator.rememberTurnResult(request.requestedRoles, results);
+    }
+    return results;
   }
 
   private async orchestrateSpecialistsFromTool(
@@ -1464,16 +1501,18 @@ export class AutohandAgent {
     requestedRoles: string[],
     signal?: AbortSignal,
   ): Promise<string> {
-    return this.runSpecialistOrchestration(
-      createSpecialistRequest(objective, requestedRoles, 'tool'),
-      signal,
-    );
+    const request = createSpecialistRequest(objective, requestedRoles, 'tool');
+    const alreadyRun = this.specialistOrchestrator.turnResultFor(request.requestedRoles);
+    if (alreadyRun) {
+      return `These specialists already ran for this turn. Use their results below instead of running them again.\n${alreadyRun}`;
+    }
+    return (await this.runSpecialistOrchestration(request, signal)).results;
   }
 
   private async runSpecialistOrchestration(
     request: SpecialistRequest,
     signal = this.activeAbortController?.signal,
-  ): Promise<string> {
+  ): Promise<{ results: string; completed: boolean }> {
     signal?.throwIfAborted();
     const plan = await this.specialistOrchestrator.resolve(request);
     signal?.throwIfAborted();
@@ -1493,11 +1532,17 @@ export class AutohandAgent {
       signal?.throwIfAborted();
     }
     if (plan.selectedAgents.length === 0) {
-      return formatSpecialistResults({ plan, batches: [], completed: false });
+      return {
+        results: formatSpecialistResults({ plan, batches: [], completed: false }),
+        completed: false,
+      };
     }
 
     const result = await this.specialistOrchestrator.execute(plan, { signal });
-    return formatSpecialistResults(result);
+    return {
+      results: formatSpecialistResults(result),
+      completed: result.completed && plan.unresolvedRoles.length === 0,
+    };
   }
 
   private async buildSystemPrompt(): Promise<string> {
@@ -1592,6 +1637,8 @@ export class AutohandAgent {
    * Refresh the plan and payment notice without requiring a restart. At an idle
    * instruction boundary, align the Cloud model with current access. Failed
    * refreshes retain the last known display; the API enforces each request.
+   * Prompt admission does not wait for this: the turn starts on the last known
+   * plan and picks up the fresh one afterwards.
    */
   private refreshAccountPlan(): Promise<void> {
     if (this.accountPlanRefresh) return this.accountPlanRefresh;
@@ -1624,13 +1671,7 @@ export class AutohandAgent {
         if (!this.runtime.isRpcMode) this.notifyUser(content);
       }
       this.lastPaymentNotice = noticeId;
-      const settings = this.runtime.config.autohandai;
-      const model = this.runtime.options.model ?? settings?.model;
-      const resolvedModel = resolveAutohandAIModelForTier({ provider: this.activeProvider, plan: settings?.plan, model, tier: entitlement.tier });
-      if (!this.isInstructionActive && model && resolvedModel !== model && this.providerConfigManager) {
-        if (settings) delete settings.reasoningEffort;
-        await this.providerConfigManager.applyModelChangeRemote('autohandai', resolvedModel);
-      }
+      await this.alignCloudModelWithTier(entitlement.tier);
       const changed =
         next?.tier !== this.accountPlan?.tier ||
         next?.interval !== this.accountPlan?.interval ||
@@ -1642,6 +1683,22 @@ export class AutohandAgent {
     } catch {
       // Leave the last known plan in place rather than blanking the status line.
     }
+  }
+
+  /**
+   * Downgrade a Cloud model the tier cannot run (Moa on Free) before a request
+   * is made. Only idle boundaries switch models, so a refresh landing mid-turn
+   * defers to the next prompt admission, which re-applies the last known tier.
+   */
+  private async alignCloudModelWithTier(tier: string | undefined): Promise<void> {
+    if (this.isInstructionActive || !this.providerConfigManager) return;
+    const settings = this.runtime.config.autohandai;
+    const model = this.runtime.options.model ?? settings?.model;
+    if (!model) return;
+    const resolvedModel = resolveAutohandAIModelForTier({ provider: this.activeProvider, plan: settings?.plan, model, tier });
+    if (resolvedModel === model) return;
+    if (settings) delete settings.reasoningEffort;
+    await this.providerConfigManager.applyModelChangeRemote('autohandai', resolvedModel);
   }
 
   private startAccountPlanRefresh(): void {
@@ -1669,13 +1726,23 @@ export class AutohandAgent {
     this.ui?.setProviderModel?.(providerLabel, model);
     this.ui?.setPlanLabel?.(formatComposerPlanLabel(this.accountPlan));
     const statusLineSettings = getConfigStatusLineSettings(this.runtime.config);
-    this.inkRenderer?.setConfiguredLineExtensions?.(withPeerLineExtension(buildStatusLineExtension({
-      settings: statusLineSettings,
+    this.inkRenderer?.setConfiguredLineExtensions?.(withPeerLineExtension(buildStatusBarExtensions(this.runtime.config, {
       workspaceRoot: this.runtime.workspaceRoot,
       homeDir: os.homedir(),
       gitLabel: resolveStatusLineGitLabel(this as unknown as StatusLineGitLabelHost),
       sessionDiffStats: this.sessionDiffStatsTracker?.getStats(),
       sessionHasFileChanges: this.filesModifiedThisSession === true,
+      ...(this.runtime.config.ui?.statusBar !== undefined ? {
+        ...buildStatusBarActivityData(this.inkRenderer?.getState(), this.mcpManager?.getServers()),
+        interactionMode: this.getInteractionMode(),
+        model,
+        providerLabel,
+        planLabel: formatComposerPlanLabel(this.accountPlan),
+        contextPercentLeft: this.contextPercentLeft,
+        sessionTokensUsed: this.totalTokensUsed ?? 0,
+        sessionTokenUsageUnavailable: this.sessionTokenUsageUnavailable,
+        commandHint: t('ui.commandHint'),
+      } : {}),
     }), this.peerAwareness.getPeers().length));
     this.inkRenderer?.setShowModeLabel?.(statusLineSettings.showModeLabel);
   }
@@ -2120,6 +2187,13 @@ export class AutohandAgent {
    */
   getSessionManager(): SessionManager {
     return this.sessionManager;
+  }
+
+  /**
+   * The most recent final assistant response, e.g. to summarise a session.
+   */
+  getLastAssistantResponse(): string {
+    return this.lastAssistantResponseForNotification;
   }
 
   /**

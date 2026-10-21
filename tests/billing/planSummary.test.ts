@@ -12,6 +12,8 @@ describe('plan summary', () => {
 
     expect(planSummaryFromEntitlement({ tier: 'free' })?.label).toBe('Free');
     expect(planSummaryFromEntitlement({ tier: 'pro' })?.label).toBe('Pro');
+    expect(planSummaryFromEntitlement({ tier: 'lite' })?.label).toBe('Lite');
+    expect(planSummaryFromEntitlement({ tier: 'pro_plus' })?.label).toBe('Pro+');
     expect(planSummaryFromEntitlement({ tier: 'max' })?.label).toBe('Max');
     expect(planSummaryFromEntitlement({ tier: 'team' })?.label).toBe('Team');
     expect(planSummaryFromEntitlement({ tier: 'enterprise' })?.label).toBe('Enterprise');
@@ -76,22 +78,26 @@ describe('plan summary', () => {
     expect(formatPlan(null)).toBeNull();
   });
 
-  it('walks the self-serve ladder and stops at team', async () => {
+  it.each([
+    { tier: 'free', next: 'pro' },
+    { tier: 'lite', next: 'pro' },
+    { tier: 'pro', next: 'pro_plus' },
+    { tier: 'pro_plus', next: 'max' },
+    { tier: 'max', next: 'team' },
+    { tier: 'team', next: null },
+    { tier: 'enterprise', next: null },
+    { tier: undefined, next: null },
+    { tier: 'mystery', next: null },
+  ])('routes $tier to $next without changing Free policy', async ({ tier, next }) => {
     const { nextPlanTier } = await import('../../src/billing/planSummary.js');
-
-    expect(nextPlanTier('free')).toBe('pro');
-    expect(nextPlanTier('pro')).toBe('max');
-    expect(nextPlanTier('max')).toBe('team');
-    expect(nextPlanTier('team')).toBeNull();
-    expect(nextPlanTier('enterprise')).toBeNull();
-    expect(nextPlanTier(undefined)).toBeNull();
-    expect(nextPlanTier('mystery')).toBeNull();
+    expect(nextPlanTier(tier)).toBe(next);
   });
 
   it('builds console upgrade links with the source attached', async () => {
     const { buildUpgradeUrl } = await import('../../src/billing/planSummary.js');
 
     expect(buildUpgradeUrl('pro')).toBe('https://console.autohand.ai/?upgrade=pro&source=cli');
+    expect(buildUpgradeUrl('pro_plus')).toBe('https://console.autohand.ai/?upgrade=pro_plus&source=cli');
     expect(buildUpgradeUrl('team', 'vscode')).toBe('https://console.autohand.ai/?upgrade=team&source=vscode');
     expect(buildUpgradeUrl(null)).toBe('https://console.autohand.ai/billing?source=cli');
   });

@@ -8,6 +8,7 @@ import type { ThemeDefinition } from './ui/theme/types.js';
 import type { KeybindingProfileId } from './keybindings/profiles.js';
 import type { TeamActivitySnapshot } from './core/teams/types.js';
 import type { GoalCheckpointInput, GoalCompletionEvidence } from './goals/types.js';
+import type { ZitClaimGuard } from './utils/sessionZit.js';
 
 // InkRenderer type defined inline to avoid tsx dev mode issues with .tsx imports
 interface InkRendererInterface {
@@ -114,6 +115,7 @@ export type AutohandAIAuthMode = 'account' | 'api-key';
 
 export interface AutohandAISettings extends ProviderSettings {
   plan: AutohandAIPlan;
+  orchestration?: boolean;
   authMode?: AutohandAIAuthMode;
   apiKey?: string;
   /** Autohand account token for CLI-authenticated Cloud usage. SDKs must use apiKey. */
@@ -297,6 +299,47 @@ export interface StatusLineSettings {
   showModeLabel?: boolean;
 }
 
+// ── Status bar section model ──────────────────────────────────────────────
+
+/** Priority tier for overflow pipeline (lowest dropped first). */
+export type SectionPriority = 'critical' | 'high' | 'normal' | 'low' | 'ambient';
+
+/** A single pluggable status bar section. */
+export interface StatusSectionConfig {
+  /** Section identifier — must be a known section ID (see STATUS_SECTION_IDS). */
+  id: string;
+  /** Which line this section renders on (1 = identity, 2 = state). */
+  line: 1 | 2;
+  /** Whether this section is enabled (default: true). */
+  enabled?: boolean;
+  /** Override the default priority for this section. */
+  priority?: SectionPriority;
+  /** Override the theme color token for this section. */
+  color?: string;
+}
+
+/** All known section IDs from the design doc. */
+export const STATUS_SECTION_IDS = [
+  // Line 1: identity
+  'project', 'git', 'gitAhead', 'gitBehind', 'dirty', 'worktree', 'pr',
+  'model', 'provider', 'mode', 'context', 'tokens', 'cost', 'clock',
+  // Line 2: state
+  'agents', 'mcp', 'diff', 'research', 'tasks', 'hints',
+] as const;
+
+export type StatusSectionId = (typeof STATUS_SECTION_IDS)[number];
+
+/** Layout mode for the status bar. */
+export type StatusBarLayout = 'classic' | 'two-line';
+
+/** New section-based status bar configuration. */
+export interface StatusBarConfig {
+  /** Layout mode (default: classic for backward compatibility). */
+  layout?: StatusBarLayout;
+  /** Ordered list of sections to render. */
+  sections?: StatusSectionConfig[];
+}
+
 export type TaskListPosition = 'up' | 'above-composer';
 
 export interface UISettings {
@@ -309,6 +352,11 @@ export interface UISettings {
   readFileCharLimit?: number;
   /** Hide tool output blocks from terminal display while preserving transcript/model context (default: false) */
   silentToolOutput?: boolean;
+  /**
+   * How tool results appear in the transcript: `compact` shows the first lines and
+   * opens the rest on demand, `full` prints everything (default: compact).
+   */
+  toolOutput?: 'compact' | 'full';
   /** Position of the active task list in the Ink composer area (default: above-composer). */
   taskListPosition?: TaskListPosition;
   /** Show notification when work is completed (default: true) */
@@ -347,12 +395,19 @@ export interface UISettings {
    * Shift+Enter steering shortcuts for existing configurations. Default: select.
    */
   enterWhileWorking?: 'select' | 'steer' | 'queue';
+  /**
+   * Interaction mode an interactive terminal session starts in (default: automode).
+   * Explicit flags and a restricted permission mode always take precedence.
+   */
+  defaultInteractionMode?: 'default' | 'plan' | 'automode' | 'yolo';
   /** Enable mouse click-to-position editing in the Ink composer (default: true). */
   mouseComposerCursor?: boolean;
   /** Shortcut profile for the Ink composer: Autohand defaults or another agent's conventions (default: autohand). */
   keybindingProfile?: KeybindingProfileId;
-  /** Fixed composer status-line display preferences. */
+  /** Legacy fixed composer status-line display preferences (migrated to statusBar). */
   statusLine?: StatusLineSettings;
+  /** New section-based status bar configuration. */
+  statusBar?: StatusBarConfig;
 }
 
 export interface AgentSettings {
@@ -447,6 +502,8 @@ export interface FeatureFlagSettings {
   awsBedrockProvider?: boolean;
   /** Enable the experimental persistent /goal surface across CLI, tools, RPC, and ACP. */
   slashGoal?: boolean;
+  /** Expose `run_tool_script`: one sandboxed script that calls tools and returns only its result (default: false). */
+  codeMode?: boolean;
   /** Show real-time token usage (tokens up/down + context window occupancy) in the status line. */
   tokenUsageStatus?: boolean;
   /** Enable experimental provider-native prompt cache affinity. */
@@ -665,7 +722,7 @@ export type AutomodeCancelReason =
   | 'completion'       // Completion promise detected
   | 'error';           // Error occurred
 
-/** Auto-mode session state (stored in .autohand/automode.local.md) */
+/** Auto-mode progress stored in a private run directory under AUTOHAND_HOME. */
 export interface AutomodeSessionState {
   /** Session ID */
   sessionId: string;
@@ -791,6 +848,10 @@ export type HookEvent =
   | 'subagent-message'
   | 'subagent-cancel-requested'
   | 'subagent-stop'     // Subagent (Task tool) finished
+  | 'computer-use-start'
+  | 'computer-use-progress'
+  | 'computer-use-error'
+  | 'computer-use-stop'
   | 'session-start'     // Session begins (startup, resume, clear)
   | 'session-end'       // Session ends (quit, exit)
   | 'pre-clear'          // Fires before memory extraction on /clear or /new
@@ -1266,6 +1327,8 @@ export interface CLIOptions {
   completionPromise?: string;
   /** Run the session in an isolated git worktree (optional explicit worktree name) */
   worktree?: boolean | string;
+  /** Run the session in a Zit workspace (optional explicit intent) */
+  zit?: boolean | string;
   /** Disable git worktree isolation */
   noWorktree?: boolean;
   /** Checkpoint interval (default: 5) */
@@ -1292,6 +1355,8 @@ export interface CLIOptions {
   appendSysPrompt?: string;
   /** File path appended to the system prompt. Alias for appendSysPrompt. */
   appendSystemPromptFile?: string;
+  /** Session-scoped instructions appended after the system prompt (set internally, e.g. by --zit). */
+  sessionInstructions?: string;
   /** Explicit MCP config file for bare mode or custom startup. */
   mcpConfig?: string;
   /**
@@ -1789,6 +1854,7 @@ export type AgentAction =
   | { type: 'custom_command'; name: string; command: string; args?: string[]; description?: string; dangerous?: boolean }
   | { type: 'plan'; notes: string }
   | { type: 'exit_plan_mode'; summary?: string }
+  | { type: 'run_tool_script'; script: string; description?: string; timeout_ms?: number }
   | { type: 'multi_file_edit'; file_path: string; edits: Array<{ old_string: string; new_string: string; replace_all?: boolean }> }
   | { type: 'todo_write'; tasks: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed'; activeForm: string }> }
   | {
@@ -2051,6 +2117,13 @@ export interface ToolExecutionContext {
   approvalHandled?: boolean;
   /** Active instruction cancellation signal for foreground work. */
   signal?: AbortSignal;
+  /** Set on a call made by a `run_tool_script` script: the id of that script's own tool call. */
+  parentToolCallId?: string;
+  /**
+   * False when the result goes to a script, not into the model's context. Such
+   * a read must not count as the model having seen the file.
+   */
+  modelVisible?: boolean;
   /** Privately retain tool-returned images without placing image bytes in tool output or history. */
   registerToolImages?: (
     images: readonly ToolImageInput[],
@@ -2080,6 +2153,8 @@ export interface AgentRuntime {
   isCommandMode?: boolean;
   /** True when final command output is emitted by a transport writer. */
   commandOutputCaptured?: boolean;
+  /** Claims files in the --zit workspace before tools write them. */
+  zitClaims?: ZitClaimGuard;
 }
 
 export interface AgentStatusSnapshot {
@@ -2092,13 +2167,25 @@ export interface AgentStatusSnapshot {
 }
 
 export interface AgentOutputEvent {
-  type: 'message' | 'thinking' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update';
+  /**
+   * `message_delta` and `thought_delta` carry one streamed fragment of the
+   * model's reply in `content` / `thought` while the completion is still in
+   * flight; the whole reply still follows as `message` / `thinking`.
+   */
+  type: 'message' | 'message_delta' | 'thinking' | 'thought_delta' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update';
   peerEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   resourceEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   content?: string;
+  /**
+   * True on a `message` / `thinking` event whose text already reached listeners
+   * in full through delta events, so incremental consumers must not repeat it.
+   */
+  streamed?: boolean;
   thought?: string;
   toolName?: string;
   toolId?: string;
+  /** On tool events for a call made by a script: the id of the `run_tool_script` call. */
+  parentToolId?: string;
   toolArgs?: Record<string, unknown>;
   toolOutput?: string;
   toolSuccess?: boolean;

@@ -1,3 +1,4 @@
+import { executeReviewWithLifecycle } from '../../../src/review/reviewLifecycle.js';
 /**
  * @license
  * Copyright 2025 Autohand AI LLC
@@ -34,6 +35,7 @@ import type {
 } from '../../../src/types.js';
 
 interface AgentOutcomeInternals {
+  mcpReady: Promise<void> | null;
   modalActive: boolean;
   activeAbortController?: AbortController;
   agentRunStore: AgentRunStore;
@@ -123,6 +125,47 @@ function createAgent(
 }
 
 describe('AgentDependencyComposer typed tool outcomes', () => {
+  it.each(['reported', 'thrown', 'aborted'] as const)('reports native %s outcomes to lifecycle hooks', async (mode) => {
+    const { internals } = createAgent();
+    const tool = 'mcp__autohand-computer-use__type_text' as AgentAction['type'];
+    internals.toolManager.register({ name: tool, description: 'Type', parameters: { type: 'object', properties: {} } });
+    const error = 'type_text incomplete: delivered 0 of 11 characters';
+    internals.mcpManager.callTool = mode === 'reported'
+      ? vi.fn().mockResolvedValue({ isError: true, content: [{ type: 'text', text: error }] })
+      : vi.fn().mockRejectedValue(Object.assign(new Error(error), { name: mode === 'aborted' ? 'AbortError' : 'Error' }));
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+    await internals.toolManager.execute([{ id: 'native-write', tool, args: {} }]);
+    const calls = internals.hookManager.executeHooks.mock.calls;
+    expect(calls.some(([event]) => event === 'post-tool')).toBe(true);
+    const failures = calls.filter(([event]) => event === 'computer-use-error');
+    if (mode === 'aborted') {
+      expect(failures).toHaveLength(0);
+      expect(calls.at(-1)?.[1]).toMatchObject({ computerUseStatus: 'cancelled' });
+    } else {
+      expect(failures).toHaveLength(1);
+      expect(failures[0]?.[1]).toMatchObject({
+        tool, toolCallId: 'native-write', computerUseStatus: 'failed', success: false,
+        error: expect.stringContaining(error),
+      });
+    }
+  });
+
+  it('emits Computer Use lifecycle progress alongside the generic tool hooks', async () => {
+    const { internals } = createAgent();
+    const tool = 'mcp__autohand-computer-use__type_text' as AgentAction['type'];
+    internals.toolManager.register({ name: tool, description: 'Type', parameters: { type: 'object', properties: {} } });
+    internals.mcpManager.callTool = vi.fn().mockResolvedValue({ structuredContent: { effect: 'unverifiable' } });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+    await internals.toolManager.execute([{ id: 'native-write', tool, args: {} }]);
+    expect(internals.hookManager.executeHooks.mock.calls.map(([event]) => event)).toEqual([
+      'pre-tool', 'computer-use-start', 'computer-use-progress', 'post-tool', 'computer-use-progress',
+    ]);
+    const progress = internals.hookManager.executeHooks.mock.calls.filter(([event]) => event === 'computer-use-progress');
+    expect(progress[0]?.[1]).toMatchObject({ toolCallId: 'native-write', computerUseStatus: 'running' });
+    expect(progress[1]?.[1]).toMatchObject({ toolCallId: 'native-write', computerUseStatus: 'unverified' });
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     getPlanModeManager().restore({ enabled: false, plan: null, phase: 'planning' });
@@ -452,6 +495,114 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     });
   });
 
+  it('deduplicates native observations while retaining actionable state and screenshot references', async () => {
+    const { internals } = createAgent();
+    const tool = 'mcp__autohand-computer-use__get_window_state' as AgentAction['type'];
+    internals.toolManager.register({ name: tool, description: 'Observe a window', parameters: { type: 'object', properties: {} } });
+    const tree = 'selector:(null)]]\n' + '[22] AXTextField = "iMessage" (Message) actions=[press,scrolltovisible,cancel,showmenu]\n'.repeat(12);
+    const state = {
+      _note: 'Prefer elements over tree_markdown',
+      pid: 31493, window_id: 23893, snapshot_id: 's00000002',
+      elements: [{ element_token: 's00000002:22', role: 'AXTextField', label: 'Message', value: 'iMessage' }],
+      elements_complete: false, total_element_count: 149, returned_element_count: 1,
+      screenshot_scale: 2, screenshot_width: 1568, screenshot_height: 926,
+      tree_markdown: tree,
+    };
+    internals.mcpManager.callTool = vi.fn().mockResolvedValue({
+      content: [{ type: 'text', text: tree }, { type: 'image', data: 'fixture-image', mimeType: 'image/png' }],
+      structuredContent: state,
+    });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+    const [result] = await internals.toolManager.execute([{ id: 'observe', tool, args: {} }], undefined, {
+      registerToolImages: async () => ({ refs: ['tool-image:00000000-0000-4000-8000-000000000000'] }),
+    });
+    expect(result).toMatchObject({ success: true });
+    expect(result.output).not.toContain('tree_markdown');
+    expect(result.output).not.toContain('selector:(null)');
+    expect(result.output).not.toContain('_note');
+    expect(result.output).toContain('s00000002:22');
+    expect(result.output).toContain('"elements_complete":false');
+    expect(result.output).toContain('"screenshot_scale":2');
+    expect(result.imageRefs).toEqual(['tool-image:00000000-0000-4000-8000-000000000000']);
+    expect(result.output!.length).toBeLessThan(JSON.stringify(state).length / 2);
+  });
+
+  it('does not duplicate a structured observation whose tree is a single line', async () => {
+    const { internals } = createAgent();
+    const tool = 'mcp__autohand-computer-use__get_window_state' as AgentAction['type'];
+    internals.toolManager.register({ name: tool, description: 'Observe', parameters: { type: 'object', properties: {} } });
+    const state = { elements: [{ element_token: 's1:22', role: 'AXButton' }], tree_markdown: '[22] AXButton' };
+    internals.mcpManager.callTool = vi.fn().mockResolvedValue({
+      content: [{ type: 'text', text: JSON.stringify(state) }], structuredContent: state,
+    });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+    const [result] = await internals.toolManager.execute([{ id: 'observe', tool, args: {} }]);
+    expect(result.output).toBe('{"elements":[{"element_token":"s1:22","role":"AXButton"}]}');
+  });
+
+  it.each([
+    { server: 'autohand-computer-use', isError: true, elements: [{ element_token: 's1:2' }] },
+    { server: 'autohand-computer-use', isError: false, elements: [] },
+    { server: 'other', isError: false, elements: [{ element_token: 's1:2' }] },
+  ])('preserves error evidence, tree fallbacks, and other servers: %j', async ({ server, isError, elements }) => {
+    const { internals } = createAgent();
+    const tool = `mcp__${server}__get_window_state` as AgentAction['type'];
+    internals.toolManager.register({ name: tool, description: 'Observe', parameters: { type: 'object', properties: {} } });
+    internals.mcpManager.callTool = vi.fn().mockResolvedValue({ isError,
+      content: [{ type: 'text', text: 'delivered 0 of 11 characters; retry only the remaining suffix' }],
+      structuredContent: { elements, tree_markdown: '[2] Message field', elements_complete: false },
+    });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+    const [result] = await internals.toolManager.execute([{ id: 'evidence', tool, args: {} }]);
+    expect(result.success).toBe(!isError);
+    expect(result.output).toContain('retry only the remaining suffix');
+    expect(result.output).toContain('tree_markdown');
+    expect(result.output).toContain('"elements_complete":false');
+  });
+
+  it.each([false, true])('preserves structured MCP window IDs alongside a text summary (error=%s)', async (isError) => {
+    const { internals } = createAgent();
+    const tool = 'mcp__autohand-computer-use__list_windows' as AgentAction['type'];
+    internals.toolManager.register({
+      name: tool,
+      description: 'List windows',
+      parameters: { type: 'object', properties: {} },
+    });
+    internals.mcpManager.callTool = vi.fn().mockResolvedValue({
+      isError,
+      content: [{ type: 'text', text: 'Found 1 window(s).' }],
+      structuredContent: { windows: [{ window_id: 280, pid: 6844, title: 'Spotify Free' }] },
+    });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+
+    const [result] = await internals.toolManager.execute([{ id: 'windows', tool, args: {} }]);
+
+    expect(result.success).toBe(!isError);
+    expect(result.output).toBe('Found 1 window(s).\n{"windows":[{"window_id":280,"pid":6844,"title":"Spotify Free"}]}');
+  });
+
+  it('dispatches a ready native tool while an unrelated MCP server is still starting', async () => {
+    const { internals } = createAgent();
+    const tool = 'mcp__autohand-computer-use__list_windows' as AgentAction['type'];
+    internals.toolManager.register({ name: tool, description: 'List windows', parameters: { type: 'object', properties: {} } });
+    let release!: () => void;
+    internals.mcpReady = new Promise<void>(resolve => { release = resolve; });
+    internals.mcpManager.callTool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'Spotify' }] });
+    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
+    const pending = internals.toolManager.execute([{ id: 'windows', tool, args: {} }]);
+    try {
+      await vi.waitFor(() => expect(internals.mcpManager.callTool).toHaveBeenCalledOnce(), { timeout: 100 });
+    } finally {
+      release();
+      await pending;
+    }
+  });
+
   it('keeps MCP image bytes out of textual tool output while registering a runtime observation', async () => {
     const { internals } = createAgent();
     const screenshotData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
@@ -472,6 +623,7 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
         platform: 'macos',
         screenshot_width: 3456,
         screenshot_height: 2234,
+        preview: { type: 'image', data: screenshotData, mimeType: 'image/png' },
       },
     });
     internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
@@ -489,7 +641,10 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     expect(result).toEqual({
       tool: 'mcp__cua-driver__get_state',
       success: true,
-      output: 'desktop screenshot 3456x2234 px (screen 1728x1117 pts @ 2x)\n[1 image available for visual inspection.]',
+      output: 'desktop screenshot 3456x2234 px (screen 1728x1117 pts @ 2x)\n'
+        + JSON.stringify({ display: 'primary', platform: 'macos', screenshot_width: 3456, screenshot_height: 2234,
+          preview: { type: 'image', data: `[binary content omitted: ${screenshotData.length} characters]`, mimeType: 'image/png' } })
+        + '\n[1 image available for visual inspection.]',
       imageRefs: [imageRef],
     });
     expect(JSON.stringify(result)).not.toContain(screenshotData);
@@ -727,6 +882,23 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     expect(confirmApproval).not.toHaveBeenCalled();
     expect(internals.specialistOrchestrator.installStagedCatalogSelections).toHaveBeenCalledOnce();
     expect(result.success).toBe(true);
+  });
+
+  it('suppresses specialist preparation inside a read-only review and restores it afterwards', async () => {
+    const { agent, internals } = createAgent({}, 'unrestricted', true);
+    const continuation = vi.fn().mockResolvedValue(undefined);
+    internals.specialistOrchestrator.continueInterview = continuation;
+    await executeReviewWithLifecycle({
+      request: { kind: 'changes', audience: 'technical', format: 'markdown' },
+      surface: 'cli', permissionManager: agent.getPermissionManager(),
+      execute: async () => {
+        await internals.prepareSpecialists('The primary user is an engineer.');
+        expect(continuation).not.toHaveBeenCalled();
+        return true;
+      },
+    });
+    await internals.prepareSpecialists('The primary user is an engineer.');
+    expect(continuation).toHaveBeenCalledOnce();
   });
 
   it('routes a later user answer through the active specialist interview', async () => {

@@ -7,6 +7,7 @@ import chalk from 'chalk';
 import { resolveRunToolScope } from '../../permissions/runToolScope.js';
 import { RunBudget } from './RunBudget.js';
 import { SessionAutoNamer } from './SessionAutoNamer.js';
+import { AxoResponder } from './AxoResponder.js';
 import { syncAgentTerminalTitleName } from './AgentSessionTitle.js';
 import type { PeerComposerDraft } from '../../ui/peerMention.js';
 import { randomUUID } from 'node:crypto';
@@ -49,15 +50,18 @@ import type {
   ToolImageMimeType,
 } from '../../types.js';
 import { AgentDelegator } from '../agents/AgentDelegator.js';
+import { orchestrationThreadLimit } from './AutohandOrchestration.js';
 import { AgentRunStore, type AgentRunsSnapshot, type AgentRunSource } from '../agents/AgentRunStore.js';
 import { createAgentRunLifecycleHandler } from '../agents/AgentRunLifecycle.js';
 import { attachTeamActivityBridge, enableAutomaticCoordinationMode } from './TeamActivityBridge.js';
 import { buildTeamTaskPayload, taskToolTruncatesDescriptions } from '../teams/taskPayload.js';
 import { ErrorLogger } from '../errorLogger.js';
 import { MemoryManager } from '../../memory/MemoryManager.js';
+import { ProjectMemorySync } from '../../sync/ProjectMemorySync.js';
 import type { CapabilityUsageInput } from '../../memory/types.js';
 import { FeedbackManager } from '../../feedback/FeedbackManager.js';
 import { FeedbackSurveyController } from './FeedbackSurveyController.js';
+import { CODE_MODE_TOOL_NAME, codeModeToolDefinitions, runCodeModeScript, syncCodeModeTool } from './CodeModeRunner.js';
 import { TelemetryManager } from '../../telemetry/TelemetryManager.js';
 import { SkillsRegistry } from '../../skills/SkillsRegistry.js';
 import type { SkillDefinition } from '../../skills/types.js';
@@ -66,6 +70,8 @@ import { CommunitySkillsCache } from '../../skills/CommunitySkillsCache.js';
 import { GitHubRegistryFetcher } from '../../skills/GitHubRegistryFetcher.js';
 import { fetchRegistryWithFallback, installSkillWithSecurity } from '../../skills/communityInstaller.js';
 import { McpClientManager } from '../../mcp/McpClientManager.js';
+import { compactComputerUseResult, COMPUTER_USE_TOOL_PREFIX } from '../../computer/computerUseOutput.js';
+import { ComputerUseLifecycle } from '../../computer/ComputerUseLifecycle.js';
 import { resolveRuntimeMcpServers } from '../../computer/cuaDriver.js';
 import {
   findCommunityMcpServers,
@@ -81,7 +87,7 @@ import { executeHookTool, HOOK_TOOL_DEFINITIONS, isHookAction } from '../hookToo
 import { isAllowedPermissionPrompt, normalizePermissionPromptResponse, type PermissionMode } from '../../permissions/types.js';
 import { TeamManager } from '../teams/TeamManager.js';
 import { authorizeTeammateTool, createTeammateConfirmation } from '../teams/TeammateAuthorization.js';
-import { SessionThreadBudget, DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION } from '../agents/SessionThreadBudget.js';
+import { SessionThreadBudget } from '../agents/SessionThreadBudget.js';
 import type { TeamMember, TeamTask } from '../teams/types.js';
 import { createTeamMemberProvider, resolveTeamModelAssignment } from '../teams/TeamModelPolicy.js';
 import { RepeatManager } from '../RepeatManager.js';
@@ -361,6 +367,9 @@ function stringifyMcpValue(value: unknown): string | undefined {
       if (entry !== null && typeof entry === 'object') {
         if (seen.has(entry)) return '[circular reference omitted]';
         seen.add(entry);
+        if (isPlainRecord(entry) && (entry.type === 'image' || entry.type === 'audio') && typeof entry.data === 'string') {
+          return { ...entry, data: `[binary content omitted: ${entry.data.length} characters]` };
+        }
       }
       return entry;
     });
@@ -430,8 +439,8 @@ async function normalizeMcpToolOutcome(
   if (unsupportedImages > 0) {
     notes.push(`[Visual inspection unavailable] ${unsupportedImages} unsupported image${unsupportedImages === 1 ? ' was' : 's were'} omitted.`);
   }
-  const structured = text.length === 0 ? stringifyMcpValue(result.structuredContent) : undefined;
-  const outputParts = [...text, ...(structured ? [structured] : []), ...notes];
+  const structured = stringifyMcpValue(result.structuredContent);
+  const outputParts = [...text, ...(structured && !text.some(part => part.trim() === structured) ? [structured] : []), ...notes];
   const output = outputParts.length > 0 ? outputParts.join('\n') : undefined;
 
   if (result.isError === true) {
@@ -532,6 +541,12 @@ export function initializeAgentDependencies(
       getProvider: () => host.llm,
       enabled: !runtime.options.bare && runtime.options.offline !== true && runtime.config.ui?.promptSuggestions !== false,
     });
+    // Offline means no Autohand cloud services, not no model: turns still reach the
+    // provider, so a question the user puts to Axo does too.
+    host.axoResponder = new AxoResponder({
+      getProvider: () => host.llm,
+      enabled: !runtime.options.bare,
+    });
 
     const agentRegistry = configureAgentRegistry(runtime);
     const pluginDir = (runtime.config as typeof runtime.config & { pluginDir?: string }).pluginDir;
@@ -552,7 +567,13 @@ export function initializeAgentDependencies(
           .map((skill) => skill.name),
       }),
     });
-    host.memoryManager = new MemoryManager(runtime.workspaceRoot);
+    host.memoryManager = new MemoryManager(runtime.workspaceRoot, {
+      getSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
+      projectMemory: runtime.options.bare || runtime.options.ephemeral
+        ? undefined
+        : new ProjectMemorySync({ configPath: runtime.config.configPath }),
+      onProjectMemoryError: (error) => promptNotify(chalk.yellow(`Project memory: ${error.message}`)),
+    });
 
     // Initialize context orchestrator for auto-compaction
     // Default enabled, can be toggled with --no-cc or /cc command
@@ -674,6 +695,7 @@ export function initializeAgentDependencies(
         }
       }
     });
+    host.computerUseLifecycle = new ComputerUseLifecycle(host.hookManager);
     host.permissionManager.setModeChangeListener?.(async (mode: PermissionMode, previousMode: PermissionMode) => {
       await host.hookManager.executeHooks('mode-change', { mode, previousMode });
     });
@@ -727,9 +749,7 @@ export function initializeAgentDependencies(
     });
     // One budget for the whole run: lead requests and in-process sub-agents alike.
     host.runBudget = RunBudget.fromSettings(runtime.options, runtime.config.agent?.budget);
-    host.sessionThreadBudget = new SessionThreadBudget(() =>
-      runtime.config.features?.multi_agent_v2?.max_concurrent_threads_per_session
-        ?? DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION);
+    host.sessionThreadBudget = new SessionThreadBudget(() => orchestrationThreadLimit(runtime.config, host.activeProvider));
     host.teamManager = new TeamManager({
       bindPeerRun: (runId, alias) => host.peerRuntime?.bindRun(runId, alias),
       runStore: host.agentRunStore,
@@ -874,6 +894,7 @@ export function initializeAgentDependencies(
         const hookContext = {
           tool: context.tool,
           toolCallId: context.toolCallId,
+          ...(context.parentToolCallId === undefined ? {} : { parentToolCallId: context.parentToolCallId }),
           args: context.args,
           path: context.path,
         };
@@ -885,6 +906,7 @@ export function initializeAgentDependencies(
         const hookContext = {
           tool: context.tool,
           toolCallId: context.toolCallId,
+          ...(context.parentToolCallId === undefined ? {} : { parentToolCallId: context.parentToolCallId }),
           args: context.args,
           ...(context.path === undefined ? {} : { path: context.path }),
           ...(context.command === undefined ? {} : { command: context.command }),
@@ -933,6 +955,7 @@ export function initializeAgentDependencies(
         return resolveTeamModelAssignment({
           config: runtime.config,
           active: { provider, model },
+          accountTier: host.accountPlan?.tier,
           agentName: definition.name,
           agentModel: definition.model,
           agentReasoning: definition.reasoning,
@@ -1350,12 +1373,17 @@ export function initializeAgentDependencies(
         let toolSuccess = false;
         let toolOutput: string | undefined;
         let toolError: string | undefined;
+        let toolAborted = false;
+        const parentToolCall = context?.parentToolCallId === undefined ? {} : { parentToolCallId: context.parentToolCallId };
+        const parentToolEvent = context?.parentToolCallId === undefined ? {} : { parentToolId: context.parentToolCallId };
 
         try {
           // Emit tool_start only after ToolManager's canonical authorization.
+          await host.computerUseLifecycle.startAction({ tool: action.type, toolCallId: toolId, args: action });
           host.emitOutput({
             type: 'tool_start',
             toolId,
+            ...parentToolEvent,
             toolName: action.type,
             toolArgs: action as Record<string, unknown>,
           });
@@ -1500,6 +1528,7 @@ export function initializeAgentDependencies(
             const assignment = resolveTeamModelAssignment({
               config: host.runtime.config,
               active: { provider: activeProvider, model: activeModel },
+              accountTier: host.accountPlan?.tier,
               override: { provider: action.provider, model: action.model },
               agentName: action.agent_name,
               agentModel: agentDefinition?.model,
@@ -1781,9 +1810,15 @@ export function initializeAgentDependencies(
                 }
               }
             }
+          } else if (action.type === CODE_MODE_TOOL_NAME) {
+            outcome = await runCodeModeScript(host.toolManager, {
+              script: action.script,
+              timeoutMs: action.timeout_ms,
+              toolCallId: toolId,
+              signal: context?.signal,
+              context,
+            });
           } else if (McpClientManager.isMcpTool(action.type)) {
-            // Ensure MCP servers have finished connecting before dispatching
-            if (host.mcpReady) await host.mcpReady;
             // Route MCP tool calls to the MCP client manager
             const parsed = McpClientManager.parseMcpToolName(action.type);
             if (parsed) {
@@ -1794,7 +1829,10 @@ export function initializeAgentDependencies(
                 mcpArgs,
                 { signal: context?.signal },
               );
-              outcome = await normalizeMcpToolOutcome(mcpResult, context);
+              outcome = await normalizeMcpToolOutcome(
+                action.type.startsWith(COMPUTER_USE_TOOL_PREFIX) ? compactComputerUseResult(mcpResult) : mcpResult,
+                context,
+              );
             } else {
               const error = `Invalid MCP tool name: ${action.type}`;
               outcome = { success: false, kind: 'validation', error, output: error };
@@ -1825,6 +1863,7 @@ export function initializeAgentDependencies(
           const postToolContext = {
             tool: action.type,
             toolCallId: toolId,
+            ...parentToolCall,
             args: action as Record<string, unknown>,
             success: finalOutcome.success,
             output: readableOutput,
@@ -1839,6 +1878,7 @@ export function initializeAgentDependencies(
           toolSuccess = finalOutcome.success;
           toolOutput = readableOutput;
           toolError = finalOutcome.success ? undefined : finalOutcome.error;
+          toolAborted = !finalOutcome.success && finalOutcome.kind === 'aborted';
 
           return finalOutcome;
         } catch (error) {
@@ -1846,6 +1886,7 @@ export function initializeAgentDependencies(
           const errorMessage = rawMessage.trim() || 'Tool execution failed.';
           toolOutput = errorMessage;
           toolError = errorMessage;
+          toolAborted = context?.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError');
 
           // Track failed tool use
           await host.telemetryManager.trackToolUse({
@@ -1859,6 +1900,7 @@ export function initializeAgentDependencies(
           const failedPostToolContext = {
             tool: action.type,
             toolCallId: toolId,
+            ...parentToolCall,
             args: action as Record<string, unknown>,
             success: false,
             output: errorMessage,
@@ -1872,10 +1914,7 @@ export function initializeAgentDependencies(
 
           return {
             success: false,
-            kind: context?.signal?.aborted === true
-              || (error instanceof Error && error.name === 'AbortError')
-              ? 'aborted'
-              : 'operational',
+            kind: toolAborted ? 'aborted' : 'operational',
             error: errorMessage,
           } satisfies ToolActionOutcome;
         } finally {
@@ -1883,15 +1922,24 @@ export function initializeAgentDependencies(
           host.emitOutput({
             type: 'tool_end',
             toolId,
+            ...parentToolEvent,
             toolName: action.type,
             toolSuccess,
             toolOutput,
             toolError,
           });
+          await host.computerUseLifecycle.finishAction({ tool: action.type, toolCallId: toolId, args: action,
+            success: toolSuccess, output: toolOutput, error: toolError, duration: Date.now() - startTime,
+          }, toolAborted || context?.signal?.aborted === true);
         }
       },
       confirmApproval: (message, context) => host.confirmDangerousAction(message, context),
-      definitions: [...featureGatedToolDefinitions, ...delegationTools, ...HOOK_TOOL_DEFINITIONS],
+      definitions: [
+        ...featureGatedToolDefinitions,
+        ...codeModeToolDefinitions(runtime.config),
+        ...delegationTools,
+        ...HOOK_TOOL_DEFINITIONS,
+      ],
       clientContext,
       customPolicy,
       authorization: toolAuthorization,
@@ -2132,6 +2180,7 @@ export function initializeAgentDependencies(
             host.toolManager.unregister(definition.name);
           }
         }
+        syncCodeModeTool(host.toolManager, runtime.config);
         void mobileRelayController?.refreshDeliveryStatus();
       },
       refreshStatusLine: () => {

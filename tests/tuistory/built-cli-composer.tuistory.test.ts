@@ -64,8 +64,8 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
           servers: [{
             name: 'hung',
             transport: 'stdio',
-            command: process.execPath,
-            args: ['-e', 'setTimeout(() => {}, 120000)'],
+            command: process.platform === 'win32' ? process.execPath : '/bin/sh',
+            args: process.platform === 'win32' ? ['-e', 'setTimeout(() => {}, 120000)'] : ['-c', 'exec sleep 120'],
           }],
         },
       },
@@ -250,13 +250,13 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
 
     await session.type('/upgrade');
     await session.press('enter');
-    // The mock account is on Pro, so the next plan is Max. AUTOHAND_NO_BROWSER
+    // The mock account is on Pro, so the next plan is Pro+. AUTOHAND_NO_BROWSER
     // makes the opener print the link instead of launching a browser.
     const output = stripAnsi(await session.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes('upgrade=max'),
+      waitFor: (text) => text.includes('upgrade=pro_plus'),
     }));
-    expect(output).toContain('https://console.autohand.ai/?upgrade=max&source=cli');
+    expect(output).toContain('https://console.autohand.ai/?upgrade=pro_plus&source=cli');
 
     await exitInteractive(session);
   });
@@ -466,7 +466,7 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
 
     await waitForComposer(session);
 
-    for (const indicator of ['[PLAN]', '[AUTO]', '[YOLO]']) {
+    for (const indicator of ['● PLAN', '● AUTO', '● YOLO']) {
       await session.press(['shift', 'tab']);
       const screen = await session.text({
         timeout: 5_000,
@@ -481,16 +481,21 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
       timeout: 5_000,
       waitFor: (text) => (
         text.includes('❯')
-        && !text.includes('[PLAN]')
-        && !text.includes('[YOLO]')
-        && !text.includes('[AUTO]')
+        && !text.includes('● PLAN')
+        && !text.includes('● YOLO')
+        && !text.includes('● AUTO')
       ),
       trimEnd: true,
     });
 
-    expect(defaultScreen).not.toContain('[PLAN]');
-    expect(defaultScreen).not.toContain('[YOLO]');
-    expect(defaultScreen).not.toContain('[AUTO]');
+    expect(defaultScreen).not.toContain('● PLAN');
+    expect(defaultScreen).not.toContain('● YOLO');
+    expect(defaultScreen).not.toContain('● AUTO');
+
+    // The help-line label replaced the banner that used to sit above the composer.
+    const everything = session.readAll();
+    expect(everything).not.toContain('mode active');
+    expect(everything).not.toMatch(/\[(?:PLAN|AUTO|YOLO)\]/u);
 
     await exitInteractive(session);
   });
@@ -539,7 +544,7 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
     await session.waitForText('Status: complete', { timeout: 5_000 });
 
     const output = session.readAll();
-    expect(output).toContain('Interactive auto mode active');
+    expect(output).toContain('● AUTO');
     expect(output).toContain('GOAL_CONTINUATION_FINISHED');
     expect(output.match(/GOAL_CONTINUATION_FINISHED/gu)).toHaveLength(1);
 

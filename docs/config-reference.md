@@ -127,6 +127,7 @@ Precedence, lowest first: config file, workspace `.autohand` overlays, environme
 | `AUTOHAND_CODE`                        | Environment detection flag (set automatically)   | `1`                              |
 | `AUTOHAND_CODE_SIMPLE`                 | Enable bare mode without passing `--bare`        | `1`                              |
 | `AUTOHAND_DISABLE_STATEFUL_READ`       | Emergency opt-out for all stateful-read experiments | `1`                           |
+| `AUTOHAND_COMPUTER_USE_GLIDE_MS`       | Initial managed cursor movement duration, 0–5000 ms; default 50, zero uses engine timing | `150` |
 
 ### Process provider selection
 
@@ -211,6 +212,14 @@ These explicit inputs remain available in bare mode:
 ### `features.autohand_inference`
 
 Autohand-hosted inference (the `autohandai` provider, Fantail/Moa) is enabled by default. Set this to `false` to hide it — for example, to keep a workspace pinned to a different provider without it appearing in `/model`.
+
+Autohand AI Cloud also enables [orchestration](autohand-orchestration.md) by default:
+Moa leads new account sessions and Fantail handles read-only research workers.
+Known Free accounts retain Fantail. Set `autohandai.orchestration` to `false`, or
+use `/agents orchestration off`, to restore ordinary worker behavior and disable
+Moa checkpoint reviews. The default thread limit is four (lead plus three
+workers); an explicit `features.multi_agent_v2.max_concurrent_threads_per_session`
+overrides it. `/model` and `/agents provider` retain model selection controls.
 
 ```json
 {
@@ -758,12 +767,14 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `autoConfirm`                | boolean | `false` | Skip confirmation prompts for safe operations                                                  |
 | `readFileCharLimit`          | number | `300`   | Max characters to display from read/find tool output (full content is still sent to the model) |
 | `silentToolOutput`           | boolean | `false` | Hide tool output blocks in the terminal while still preserving tool results for the model/session |
+| `toolOutput`                 | `"compact"` or `"full"` | `"compact"` | How tool results appear in the interactive transcript. `compact` shows the first 3 lines of a result (the last 5 of a failure) followed by `+ N lines (ctrl+o to expand)`; press Ctrl+O or click above the composer to open the latest result, and again to close it. Diffs also use a preview. Expanded results stay within a portion of the terminal; use Page Up/Page Down to read the remaining rows while keeping the composer available. `full` prints results as before. The model, hooks, RPC and ACP clients always receive the complete output, and `--prompt` runs always print it |
 | `taskListPosition`           | `"up"` or `"above-composer"` | `"above-composer"` | Place the live task list above the status line or directly above the composer |
 | `activityVerbs`              | string or string[] | built-in pool | Custom activity verb or verb pool for the working indicator, rendered as `Verb...` |
 | `activityVerbsEnabled`       | boolean | `true`  | Show rotating activity verbs like `Compiling...` while the agent is working |
 | `activitySymbol`             | string | `"✳"`   | Symbol shown before the activity verb in activity indicator output |
 | `showTips`                   | boolean | `true`  | Rotate tips about slash commands, the `/ @ $ ! : ?` triggers and shortcuts beside the idle composer |
 | `enterWhileWorking`          | string  | `select` | While a turn runs, Enter queues a draft; select a queued message with the arrow keys, press Enter to edit it, then Enter to steer or Shift+Enter to save it in the queue. `steer` and `queue` retain the earlier direct steering shortcuts for configured sessions |
+| `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"default"` | Mode an interactive terminal session starts in. The default asks before risky actions. Auto mode requires an explicit flag, mode selection, or `defaultInteractionMode` set to `"automode"`, and runs without approval prompts. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
 | `statusLine.showProviderModel` | boolean | `true`  | Show the active provider and model in the composer status line |
 | `statusLine.showContext`       | boolean | `true`  | Show the context percentage in the composer status line |
 | `statusLine.showCommandHint`   | boolean | `true`  | Show command, mention, skill, and terminal-entry hints in the composer status line |
@@ -776,12 +787,37 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `completionReportEnabled`    | boolean | `true`  | Ask the model to include a concise completion report after completed action turns |
 | `showCompletionNotification` | boolean | `true`  | Show system notification when task completes                                                   |
 | `showThinking`               | boolean | `false` | Display LLM's reasoning/thought process                                                        |
-| `renderMarkdown`             | boolean | `true`  | Render assistant markdown in the terminal: headings, emphasis, inline and fenced code, lists, task lists, quotes, rules, links, and tables. Set `false` to show the markdown as written. Toggle it in `/settings` under UI & Display, or run `/settings render_markdown off` |
+| `renderMarkdown`             | boolean | `true`  | Render assistant markdown with readable wrapping, aligned lists and tables, code rails, and clickable links and image labels in compatible terminals. Ink replies use up to 100 columns and reflow on resize. Image contents are not downloaded or displayed inline. Set `false` to show the markdown as written. Toggle it in `/settings` under UI & Display, or run `/settings render_markdown off` |
 | `mouseComposerCursor`        | boolean | on, except iTerm2 | Enable click-to-position editing in the Ink composer                                           |
 | `keybindingProfile`          | string | `"autohand"` | Shortcut profile for the composer: `autohand`, `claude-code`, `codex`, `cursor`, `antigravity`, `devin` or `factory`. See [Keyboard Shortcut Profiles](#keyboard-shortcut-profiles) |
 | `terminalBell`               | boolean | `true`  | Ring terminal bell when task completes (shows badge on terminal tab/dock)                      |
 | `checkForUpdates`            | boolean | `true`  | Check for CLI updates on startup                                                               |
 | `updateCheckInterval`        | number | `24`    | Hours between update checks (uses cached result within interval)                               |
+
+### Status bar layout
+
+Run `/statusbar` to choose a classic or two-line layout and toggle individual sections. Use the arrow keys to navigate, Space to toggle a section, and Enter on Done to return. Changes are saved when you leave the main menu.
+
+```json
+{
+  "ui": {
+    "statusBar": {
+      "layout": "two-line",
+      "sections": [
+        { "id": "project", "line": 1 },
+        { "id": "git", "line": 1 },
+        { "id": "model", "line": 1 },
+        { "id": "tasks", "line": 2 },
+        { "id": "agents", "line": 2 },
+        { "id": "mcp", "line": 2 },
+        { "id": "hints", "line": 2 }
+      ]
+    }
+  }
+}
+```
+
+Sections without current data stay hidden. Working status, cancellation hints, and queue information remain controlled by `ui.statusLine`. Existing configurations keep their current display until `ui.statusBar` is configured; `/statusline` remains available.
 
 ### Aurora theme
 
@@ -1340,12 +1376,12 @@ Fine-grained control over tool permissions.
 {
   "permissions": {
     "mode": "interactive",
-    "whitelist": [
+    "allowList": [
       "run_command:npm *",
       "run_command:bun *",
       "run_command:git status"
     ],
-    "blacklist": ["run_command:rm -rf *", "run_command:sudo *"],
+    "denyList": ["run_command:rm -rf *", "run_command:sudo *"],
     "rules": [
       {
         "tool": "run_command",
@@ -1366,21 +1402,23 @@ Fine-grained control over tool permissions.
 | `"unrestricted"` | No prompts, allow everything                          |
 | `"restricted"`   | Deny all dangerous operations                         |
 
-### `whitelist`
+### `allowList`
 
-Array of tool patterns that never require approval.
+Array of tool patterns that never require approval. Entries use the `tool:pattern` form, and `*` matches any text.
 
 ```json
 ["run_command:npm *", "run_command:bun test"]
 ```
 
-### `blacklist`
+### `denyList`
 
-Array of tool patterns that are always blocked.
+Array of tool patterns that are always blocked, including runs started with `--yes` or `--unrestricted`.
 
 ```json
 ["run_command:rm -rf /", "run_command:sudo *"]
 ```
+
+`whitelist` and `blacklist` are deprecated aliases for `allowList` and `denyList`. They are read only when the matching new key is absent, so a config that sets both uses `allowList` and `denyList` and ignores the older keys.
 
 ### `rules`
 
@@ -1408,7 +1446,7 @@ When you approve a file operation (edit, write, delete), it's automatically save
 {
   "version": 1,
   "permissions": {
-    "whitelist": [
+    "allowList": [
       "apply_patch:src/components/Button.tsx",
       "write_file:package.json",
       "run_command:bun test"
@@ -1447,8 +1485,8 @@ This displays:
 
 - Current permission mode (interactive, unrestricted, restricted)
 - Workspace and config file paths
-- All approved patterns (whitelist)
-- All denied patterns (blacklist)
+- All approved patterns (`allowList`)
+- All denied patterns (`denyList`)
 - Summary statistics
 
 **Interactive Command:**
@@ -1459,8 +1497,8 @@ This displays:
 
 In interactive mode, the `/permissions` command provides the same information plus options to:
 
-- Remove items from the whitelist
-- Remove items from the blacklist
+- Remove items from the `allowList`
+- Remove items from the `denyList`
 - Clear all saved permissions
 
 ---
@@ -2549,8 +2587,8 @@ autohand --no-browser       # Start with browser bridge disabled
   },
   "permissions": {
     "mode": "interactive",
-    "whitelist": ["run_command:npm *", "run_command:bun *"],
-    "blacklist": ["run_command:rm -rf /"],
+    "allowList": ["run_command:npm *", "run_command:bun *"],
+    "denyList": ["run_command:rm -rf /"],
     "rememberSession": true
   },
   "network": {
@@ -2641,10 +2679,10 @@ agent:
 
 permissions:
   mode: interactive
-  whitelist:
+  allowList:
     - "run_command:npm *"
     - "run_command:bun *"
-  blacklist:
+  denyList:
     - "run_command:rm -rf /"
   rememberSession: true
 
@@ -2742,8 +2780,8 @@ debug = false
 
 [permissions]
 mode = "interactive"
-whitelist = ["run_command:npm *", "run_command:bun *"]
-blacklist = ["run_command:rm -rf /"]
+allowList = ["run_command:npm *", "run_command:bun *"]
+denyList = ["run_command:rm -rf /"]
 rememberSession = true
 ```
 
@@ -2838,7 +2876,7 @@ These flags override config file settings:
 | `--yolo [pattern]`            | Auto-approve tool calls matching pattern (e.g., `allow:read,write` or `deny:delete`)           |
 | `--allowed-tools <patterns>`  | Only offer and authorize these tools this run; comma-separated or repeated (e.g. `read_file,run_command(git:*)`). A run-only restriction on top of every configured policy: never saved, never widened by a local or extension allowlist |
 | `--disallowed-tools <patterns>` | Never offer or authorize these tools this run. Matched on the tool the model names, before capability mapping, so `delete_path` stays blocked even when unrestricted. Applies to MCP and delegated tools too |
-| `--timeout <seconds>`         | Timeout in seconds for auto-approve mode                                                       |
+| `--timeout <seconds>`         | Time window for `--yolo` auto-approval; when it ends, the permission settings from before `--yolo` return and normal approval resumes |
 | `--max-requests <n>`          | Stop the run after this many model requests, sub-agents included; the turn fails with the limit named and exit code 1 in command mode |
 | `--max-tokens <n>`            | Stop the run once reported token usage reaches this total, sub-agents included                  |
 | `--max-duration <seconds>`    | Stop the run after this much wall time; checked before each model request                       |
@@ -2849,10 +2887,36 @@ These flags override config file settings:
 | ----------------------------- | ---------------------------------------------------------------------------------------------- |
 | `--worktree [name]`           | Run session in isolated git worktree (optional worktree/branch name)                           |
 | `--tmux`                      | Launch in a dedicated tmux session (implies `--worktree`; cannot be used with `--no-worktree`) |
+| `--zit [intent]`              | Run session in a disposable Zit workspace, recorded as a Zit change on exit (optional intent)  |
 | `--no-worktree`               | Disable git worktree isolation in auto-mode                                                    |
 | `-c, --auto-commit`           | Auto-commit changes after completing tasks                                                     |
 | `--patch`                     | Generate git patch without applying changes                                                    |
 | `--output <file>`             | Output file for patch (used with --patch)                                                      |
+
+### Zit Sessions
+
+`--zit` is the counterpart of `--worktree` for repositories shared by several agents through [Zit](https://github.com/autohandai/getzit). Instead of a git worktree and branch, the session runs in a disposable copy of the repository's current Zit state, and its edits are recorded as one Zit change when the session ends.
+
+```bash
+# Interactive session; the intent defaults to "Autohand session"
+autohand --zit "Add a Usage section to README.md"
+
+# One-shot prompt; the intent defaults to the prompt's first line
+autohand --zit -p "Add a short Usage section to README.md" --yes
+```
+
+What happens:
+
+1. Autohand requires a git repository and the `zit` CLI (`ZIT_BIN`, else `zit` on `PATH`; install with `cargo install zit`).
+2. If the repository has no Zit graph yet (`refs/zit/current`), it runs `zit init`.
+3. It runs `zit materialise --agent autohand --intent <intent>` and uses the printed directory as the session workspace. `ZIT_WORKSPACE` is set to the workspace id, so the agent's `zit claim` and `zit status` commands target it; when `ZIT_BIN` points outside `PATH`, its directory is added to `PATH` for the agent's shell. Zit ignores Autohand's own session state (`.autohand/memory/`, `goals.local.json`, `settings.local.json`, `session-permissions.json`), so it never becomes part of the recorded change.
+4. Before any file tool writes (`write_file`, `append_file`, `apply_patch`, `search_replace`, `multi_file_edit`, `notebook_edit`, `format_file`, `delete_path`, `rename_path`, `copy_path`, `git_apply_patch`, `git_checkout <path>`, dependency edits to `package.json`), Autohand claims what the tool changes, once per resource per session. For an edit to an existing file it writes the new content to a temporary file and asks Zit which resources the edit changes (`zit claim --workspace <id> --edit <path> --content <file> --dry-run --json`), then claims those it does not already hold: the changed functions, types and methods, imports, module-level code (`path#`) or Markdown sections, as Zit indexes them; files Zit cannot parse are claimed whole. New files, deletes, renames, copies and patches claim the whole file (`zit claim --workspace <id> <path>`). A claim on one function or section does not conflict with another agent's work on a different one in the same file. With a Zit that predates `claim --edit`, Autohand falls back to its own Markdown section diff and claims other files whole. If Zit refuses, the tool writes nothing and returns Zit's refusal, naming the holder, with "Another agent holds this. Pick other work or stop." If `zit` fails for another reason, the tool also writes nothing and returns the error.
+5. Shell commands that edit files cannot be intercepted reliably, so for those the agent is only told to run `zit claim <path>` (or `path#Symbol`, `path#Section heading`) itself. It is also told to pick other work if a claim is refused, and never to commit.
+6. When the session ends (normal exit, `SIGINT` or `SIGTERM`), Autohand runs `zit record --workspace <id> --dispose` once, with the agent's final response as the summary (trimmed to the last 8000 characters). It prints `zit: recorded <change>` or `zit: nothing to record` on stderr.
+
+Inspect the result with `zit status` and `zit show <change>`; accepting the change into the current state is left to you (`zit accept`).
+
+`--zit` cannot be combined with `--worktree`, `--tmux`, `--patch`, `--mode rpc|acp`, or a standalone `--auto-mode` loop.
 
 ### Auto-Mode
 
@@ -2863,7 +2927,6 @@ These flags override config file settings:
 | `--completion-promise <text>` | Completion marker text (default: "DONE")                                                       |
 | `--checkpoint-interval <n>`   | Git commit every N iterations (default: 5)                                                     |
 | `--max-runtime <m>`           | Max runtime in minutes (default: 120)                                                          |
-| `--max-cost <d>`              | Max API cost in dollars (default: 10)                                                          |
 | `--interactive-on-complete`   | After auto-mode ends, hand off directly to interactive mode (TTY only)                         |
 
 ### Skills & Learning
@@ -2953,6 +3016,14 @@ Remote feature flags are fetched from `/v1/feature-flags/evaluate`, cached at `~
 
 `cli_usage_v2` is an experimental feature switch for the project token activity dashboard shown by `/usage`, `/usage weekly`, and `/usage monthly` (config path `features.cliUsageV2`, default on). Disable it with `autohand experiments disable cli_usage_v2`.
 
+In an interactive terminal, `/usage` opens a dedicated keyboard-driven screen with Overview, Usage, Messages, Extensions, Skills, Sessions, and Traces reports. Tab/Shift+Tab or 1–7 selects a report, left/right selects a chart day, up/down and Page Up/Page Down browse content, and Enter opens session details. Press `r` for 7/30 days, `p` for this project/all local projects, `s` to sort sessions, `R` to refresh, and `?` for help. Escape goes back; Escape at the report level or Ctrl+C closes the screen and restores the composer.
+
+Local reports use session metadata and recorded project capability events. Tokens are provider-reported; missing totals remain unavailable. Message counts include all roles. Historical token/message charts group whole session totals by their last active UTC day, because older metadata does not record daily usage. Extension activity counts recorded extension skill/command activations, not inferred tool calls; the installed extension inventory remains scoped to the current workspace. The report loads up to 1,000 newest indexed sessions and capability-log tails from up to 20 projects (256 KiB per log). Coverage limits and unreadable sources are marked as partial.
+
+Account plan and quotas come from the existing authenticated Autohand API. Local data remains available when the API is unavailable. The Traces report loads ahtraces Work Map aggregates on demand when local trace monitoring and discovery are enabled; it includes outcomes, verification, tool errors, models, reasoning, and workflows. Trace totals remain separate from local session totals to avoid double counting. Opening `/usage` does not enable monitoring or cloud sync.
+
+Use `/usage --text`, `/usage weekly --text`, or `/usage monthly --text` for the existing printable report. Non-interactive/RPC/ACP callers continue receiving text.
+
 `usage_v2` is the legacy model, provider, context, and usage-limits dashboard plus the enhanced `/status` Usage tab. Enable it with `autohand experiments enable usage_v2`.
 
 `token_usage_status` is an experimental feature switch (config path `features.tokenUsageStatus`, default off) that shows real-time token usage in the working status line — cumulative tokens up (`↑`) and down (`↓`) plus context-window occupancy, e.g. `↑15.7k ↓3.2k · context: 6.0% (15.7k/262.1k)`. The context window is resolved per model across all providers. Enable it with `autohand experiments enable token_usage_status`.
@@ -3009,7 +3080,7 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | `/export`     | Export session to markdown/JSON/HTML                  |
 | `/share`      | Share current session                                 |
 | `/status`     | Show session status and the signed-in Autohand plan   |
-| `/usage`      | Show Autohand plan limits and project token activity  |
+| `/usage`      | Explore usage, sessions, skills, extensions, and trace insights |
 | `/upgrade`    | Open the console to upgrade your Autohand plan        |
 
 `/undo` never resets or cleans the Git worktree. It preserves unrelated tracked and untracked work, and refuses to overwrite a file that changed after the recorded agent mutation.
@@ -3058,6 +3129,7 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | `/memory`     | List memory; `outline`, `zoom`, `forget`, `rebuild`, or `delete` |
 | `/settings`   | Configure Autohand settings                           |
 | `/statusline` | Configure composer status-line fields                 |
+| `/statusbar` | Configure status-bar sections and classic or two-line layout |
 | `/experiments` | Toggle experimental feature switches                  |
 | `/sync`       | Sync settings across devices                          |
 | `/import`     | Import sessions, settings, MCP, memory, skills, and hooks from supported agents |
@@ -3315,3 +3387,12 @@ The following directories cannot be added:
 - Windows system directories (`C:\Windows`, `C:\Program Files`)
 - Windows user directories (`C:\Users\username`)
 - WSL Windows mounts (`/mnt/c`, `/mnt/c/Windows`)
+
+
+### ACP session preferences
+
+Cloud Autohand sessions expose a Moa reasoning effort control through
+\`session/set_config_option\` with \`configId: "reasoning_effort"\`. Accepted
+values are \`medium\`, \`high\` (default), and \`xhigh\`. Changes apply to the
+active session's subsequent Moa requests and do not overwrite the global config.
+Fantail ignores this setting; local sessions do not advertise it.

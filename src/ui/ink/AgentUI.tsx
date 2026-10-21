@@ -9,6 +9,7 @@ import {
   StatusLine,
   formatLineSegments,
   mergeLineExtensions,
+  renderLineSegments,
   type LineExtension,
   type LineSegment,
 } from './StatusLine.js';
@@ -43,6 +44,9 @@ import { useTranslation } from '../i18n/index.js';
 import { getPlanModeManager } from '../../commands/plan.js';
 import type { InputBorderStyle } from '../box.js';
 import { PLAN_BORDER_COLOR, hexToAnsiRgb } from '../box.js';
+import { AxoBuddy, shouldShowAxo } from '../axo/AxoBuddy.js';
+import { parseAxoInput, type AxoCommand } from '../axo/axoCommand.js';
+import type { AxoUIState } from '../axo/axoState.js';
 import { TextBuffer } from '../textBuffer.js';
 import { handleTextBufferKey, type KeyHandlerResult } from '../textBufferKeyHandler.js';
 import {
@@ -66,14 +70,12 @@ import { MarkdownText } from './components/MarkdownText.js';
 import { buildFileMentionSuggestions } from '../mentionFilter.js';
 import { getContentDisplay } from '../displayUtils.js';
 import type { ChatLogMessage } from '../../session/chatLog.js';
+import type { ComputerUseStep } from '../../computer/computerUseOutput.js';
+import { ComputerUseProgress } from './ComputerUseProgress.js';
 import { TypedMessageHistory, type TypedMessageEntry } from '../../session/TypedMessageHistory.js';
 import type { TaskListPosition } from '../../types.js';
 import { formatCompactTokens } from '../../core/agent/AgentFormatter.js';
-import {
-  getInteractionModeDescription,
-  getInteractionModeIndicator,
-  type InteractionMode,
-} from '../../core/agent/InteractionModeController.js';
+import type { InteractionMode } from '../../core/agent/InteractionModeController.js';
 import { AnnouncementLine } from './AnnouncementLine.js';
 import { FeedbackSurveyLine, type FeedbackSurveyState } from './FeedbackSurveyLine.js';
 import { IdleTipRow, TipLine } from './TipLine.js';
@@ -163,6 +165,11 @@ export const MAX_TOOL_OUTPUT_ENTRIES = 50;
 export const MAX_VISIBLE_NOTIFICATIONS = 3;
 
 export interface AgentUIState {
+  /** Axo, the hidden `~axo` mascot. Absent or disabled means it stays away. */
+  axo?: AxoUIState;
+  /** How the last turn ended, whether or not it produced a summary row; cleared when the next starts. */
+  lastTurnOutcome?: TurnCompletionStatus;
+  computerUseSteps?: ComputerUseStep[];
   peerDirectoryVersion?: number;
   isWorking: boolean;
   status: string;
@@ -192,8 +199,6 @@ export interface AgentUIState {
   streamingResponse?: string | null;
   /** Completion stats shown after work finishes */
   completionStats: { elapsed: string; tokens: string; status?: TurnCompletionStatus } | null;
-  /** Plan mode indicator (e.g., '[PLAN]' or '[EXEC]') */
-  planModeIndicator?: string;
   /** Context percentage remaining (0-100) */
   contextPercent?: number;
   /** Current context occupancy and active model context window. */
@@ -263,6 +268,10 @@ export interface AgentUIProps {
   /** Select from the queue to steer by default; legacy shortcut mappings remain configurable. */
   enterWhileWorking?: 'select' | 'steer' | 'queue';
   onInstruction: (text: string, metadata?: PeerInstructionMetadata) => void;
+  /** `~axo …` typed in the composer; handled locally, never sent as a turn. */
+  onAxoCommand?: (command: AxoCommand) => void;
+  /** Axo finished its goodbye after `~axo home`. */
+  onAxoGone?: () => void;
   peerScopes?: PeerScope[];
   peersProvider?: (scope?: PeerScope) => PeerDescriptor[];
   onPeersRefresh?: (scope?: PeerScope) => Promise<unknown>;
@@ -836,6 +845,8 @@ export function AgentUI({
   state,
   typedMessageHistory,
   onInstruction,
+  onAxoCommand,
+  onAxoGone,
   onSteer,
   onSteerQueuedInstruction,
   onWorkingSpinnerFrame,
@@ -897,8 +908,6 @@ export function AgentUI({
   const [isReadingHistory, setIsReadingHistory] = useState(false);
   const readingHistoryRef = useRef(false);
   const [ctrlCCount, setCtrlCCount] = useState(0);
-  const [planModeIndicator, setPlanModeIndicator] = useState('');
-  const [planModeStatusKey, setPlanModeStatusKey] = useState('');
   const [interactionMode, setInteractionMode] = useState<InteractionMode>(
     getInteractionMode?.() ?? state.interactionMode ?? 'default'
   );
@@ -994,6 +1003,9 @@ export function AgentUI({
   isWorkingRef.current = state.isWorking;
   const liveCommandsRef = useRef(state.liveCommands);
   liveCommandsRef.current = state.liveCommands;
+  const hasExpandableToolOutput = state.toolOutputs.some((item) => item.type !== 'batch' && Boolean(item.expandedOutput));
+  const hasExpandableToolOutputRef = useRef(hasExpandableToolOutput);
+  hasExpandableToolOutputRef.current = hasExpandableToolOutput;
   const enableQueueInputRef = useRef(enableQueueInput);
   enableQueueInputRef.current = enableQueueInput;
   const enterWhileWorkingRef = useRef(enterWhileWorking);
@@ -1023,6 +1035,8 @@ export function AgentUI({
   const onEditGoalObjectiveRef = useRef(onEditGoalObjective);
   onEditGoalObjectiveRef.current = onEditGoalObjective;
   const onInstructionRef = useRef(onInstruction);
+  const onAxoCommandRef = useRef(onAxoCommand);
+  onAxoCommandRef.current = onAxoCommand;
   const onSteerRef = useRef(onSteer);
   onSteerRef.current = onSteer;
   const onSteerQueuedInstructionRef = useRef(onSteerQueuedInstruction);
@@ -1297,8 +1311,6 @@ export function AgentUI({
   useEffect(() => {
     const planModeManager = getPlanModeManager();
     const updateIndicator = () => {
-      setPlanModeIndicator(planModeManager.getPromptIndicator());
-      setPlanModeStatusKey(planModeManager.getStatusDescriptionKey());
       setInteractionMode(
         getInteractionModeRef.current?.()
           ?? (planModeManager.isEnabled() ? 'plan' : 'default')
@@ -1755,6 +1767,12 @@ export function AgentUI({
         // running subprocess rather than dropping that interaction.
         if (!clickedCell && liveCommandsRef.current.length > 0) {
           onToggleLiveCommandExpandedRef.current?.();
+          return;
+        }
+        // Finished output lives in scrollback and cannot be measured, so any
+        // click outside the composer opens the latest result that has more to show.
+        if (!clickedCell && hasExpandableToolOutputRef.current) {
+          onToggleToolOutputExpandedRef.current?.();
           return;
         }
         if (!clickedCell) {
@@ -2277,6 +2295,27 @@ export function AgentUI({
       // it back to the actual pasted text only at submit time.
       let text = resolveInkHiddenPastes(buffer.getText(), pasteState);
       text = text.trim();
+
+      // `~axo` belongs to Axo: it never becomes a turn, a queued message, or history.
+      const axoCommand = onAxoCommandRef.current ? parseAxoInput(text) : null;
+      if (axoCommand) {
+        clearInkComposerInputForSubmit(buffer, pasteState, {
+          setInput,
+          setCursorOffset,
+          onInputChange: onInputChangeRef.current,
+          clearPendingInputSync: () => {
+            pendingInputSyncRef.current = null;
+            if (inputSyncTimerRef.current) {
+              clearTimeout(inputSyncTimerRef.current);
+              inputSyncTimerRef.current = null;
+            }
+          },
+        });
+        dismissAutocompleteState();
+        onAxoCommandRef.current?.(axoCommand);
+        return;
+      }
+
       const goalEdit = editingGoalRef.current;
 
       if (goalEdit !== null) {
@@ -2711,12 +2750,6 @@ export function AgentUI({
   const effectiveLineExtensions = state.lineExtensions ?? lineExtensions;
   const effectiveConfiguredLineExtensions = state.configuredLineExtensions;
   const effectiveRuntimeLineExtensions = state.extensionLineExtensions;
-  const interactionModeIndicator = interactionMode === 'plan'
-    ? planModeIndicator || getInteractionModeIndicator('plan')
-    : getInteractionModeIndicator(interactionMode);
-  const interactionModeDescription = interactionMode === 'plan' && planModeStatusKey
-    ? t(planModeStatusKey)
-    : getInteractionModeDescription(interactionMode);
 
   return (
     <Box flexDirection="column">
@@ -2742,7 +2775,9 @@ export function AgentUI({
           : <ToolOutputStatic key={item.id} entry={item as ToolOutputEntry} />
       ))}
 
-      {expandedToolOutput ? <ExpandedToolOutput entry={expandedToolOutput} /> : null}
+      {expandedToolOutput ? <ExpandedToolOutput key={expandedToolOutput.id} entry={expandedToolOutput} terminalRows={windowSize.rows} terminalColumns={windowSize.columns} /> : null}
+
+      <ComputerUseProgress steps={state.computerUseSteps ?? []} />
 
       {/* Dynamic content section */}
       <DynamicContent
@@ -2769,6 +2804,9 @@ export function AgentUI({
           onCtrlC={onCtrlC}
         />
       ) : <FixedBottom
+        axo={state.axo}
+        lastTurnOutcome={state.lastTurnOutcome}
+        onAxoGone={onAxoGone}
         onWorkingSpinnerFrame={onWorkingSpinnerFrame}
         announcement={state.announcement}
         feedbackSurvey={state.feedbackSurvey}
@@ -2844,14 +2882,13 @@ export function AgentUI({
         isReadingHistory={isReadingHistory}
         enableMouseTargetControls={mouseComposerCursor && (
           liveCommandItems.length > 0
+          || hasExpandableToolOutput
           || (state.goalPanelVisible && goalItemsRef.current.length > 0)
         )}
         onComposerLayoutChange={handleComposerLayoutChange}
         showShortcuts={showShortcuts}
         interactionMode={interactionMode}
         showModeLabel={state.showModeLabel ?? true}
-        modeIndicator={interactionModeIndicator}
-        modeDescription={interactionModeDescription}
         taskListPosition={taskListPosition}
       />}
     </Box>
@@ -2903,7 +2940,7 @@ const DynamicContent = memo(function DynamicContent({
       <ThinkingOutput thought={thinking} />
 
       {isWorking && streamingResponse && (
-        <Box marginTop={1}><Text wrap="truncate-end">{streamingResponse}</Text></Box>
+        <Box marginTop={1}><MarkdownDiffContent content={streamingResponse} markdown /></Box>
       )}
 
       {/* Final response (when not working) */}
@@ -3001,7 +3038,7 @@ const ChatHistoryMessage = memo(function ChatHistoryMessage({
 
   return (
     <Box marginTop={1}>
-      <MarkdownDiffContent content={message.content} markdown />
+      <MarkdownDiffContent content={message.content} markdown={message.renderMarkdown !== false} />
     </Box>
   );
 });
@@ -3138,10 +3175,6 @@ interface StatusSectionProps {
   contextTokens?: ContextTokenDisplay;
   provider?: string;
   model?: string;
-  /** Bracketed mode indicator (e.g. "[AUTO]"); empty in default mode. */
-  modeIndicator?: string;
-  /** Human-readable description paired with the bracketed indicator. */
-  modeDescription?: string;
   taskListPosition: TaskListPosition;
   lineExtension?: LineExtension;
   tip?: TipLineState;
@@ -3239,8 +3272,6 @@ const StatusSection = memo(function StatusSection({
   contextTokens,
   provider,
   model,
-  modeIndicator,
-  modeDescription,
   taskListPosition,
   lineExtension,
   tip,
@@ -3292,16 +3323,6 @@ const StatusSection = memo(function StatusSection({
         />
       ) : null}
 
-      {/* Below the status line: rendering it above the dynamic output region
-          flushes it into scrollback on every repaint once tool output exceeds
-          the viewport. */}
-      {modeIndicator ? (
-        <Box>
-          <Text color={colors.accent} bold>{modeIndicator}</Text>
-          <Text color={colors.muted}> {modeDescription}</Text>
-        </Box>
-      ) : null}
-
       {/* Info section - either queue or completion stats, stable position */}
       {showQueue && (
         <QueuedInstructionsPanel
@@ -3342,8 +3363,6 @@ const StatusSection = memo(function StatusSection({
          prev.commandResult?.output === next.commandResult?.output &&
          prev.provider === next.provider &&
          prev.model === next.model &&
-         prev.modeIndicator === next.modeIndicator &&
-         prev.modeDescription === next.modeDescription &&
          prev.tip === next.tip &&
          prev.columns === next.columns &&
          prev.taskListPosition === next.taskListPosition &&
@@ -3449,7 +3468,7 @@ const HelpLineSection = memo(function HelpLineSection({
   showModeLabel = true,
   width,
 }: HelpLineSectionProps) {
-  const { colors } = useTheme();
+  const { colors, theme } = useTheme();
   const { t } = useTranslation();
 
   // Format context usage.
@@ -3464,20 +3483,41 @@ const HelpLineSection = memo(function HelpLineSection({
   const providerDisplay = provider
     ? `${namePrefix} (${t(`providers.${provider}`) ?? provider}${model ? `, ${model}` : ''})`
     : '';
-  const glyphColor = INTERACTION_MODE_GLYPH_COLOR[interactionMode];
-  const modeLabel = interactionMode !== 'default' && showModeLabel
+
+  const segments = lineExtension?.replaceDefault ? lineExtension.segments ?? [] : [];
+  const hasStatusBarSegments = segments.length > 0;
+  const hasModeSection = segments.some((segment) => segment.id === 'mode');
+  const glyphColor = !hasModeSection ? INTERACTION_MODE_GLYPH_COLOR[interactionMode] : undefined;
+  const modeLabel = interactionMode !== 'default' && showModeLabel && !hasModeSection
     ? getInteractionModeLabel(interactionMode)
     : '';
+
+  const leftSegments = segments.filter((segment) => segment.id !== 'hints');
+  const rightSegments = segments.filter((segment) => segment.id === 'hints');
+
   return (
-    <Box width={width}>
-      {glyphColor ? (
-        <Box flexShrink={0}>
-          <Text>{colorizeGlyphText(glyphColor, modeLabel ? `● ${modeLabel} ` : '● ')}</Text>
-        </Box>
-      ) : null}
-      <Text color={colors.dim}>
-        {getComposerHelpLine(isWorking, providerDisplay, contextDisplay, t('ui.commandHint'), lineExtension)}
-      </Text>
+    <Box width={width} justifyContent={rightSegments.length > 0 ? 'space-between' : undefined}>
+      <Box flexShrink={1}>
+        {glyphColor ? (
+          <Box flexShrink={0}>
+            <Text>{colorizeGlyphText(glyphColor, modeLabel ? `● ${modeLabel} ` : '● ')}</Text>
+          </Box>
+        ) : null}
+        {hasStatusBarSegments ? (
+          <Text>
+            {renderLineSegments(leftSegments, ' · ', theme)}
+          </Text>
+        ) : (
+          <Text color={colors.dim}>
+            {getComposerHelpLine(isWorking, providerDisplay, contextDisplay, t('ui.commandHint'), lineExtension)}
+          </Text>
+        )}
+      </Box>
+      {rightSegments.length > 0 && (
+        <Text>
+          {renderLineSegments(rightSegments, ' · ', theme)}
+        </Text>
+      )}
     </Box>
   );
 }, (prev, next) => {
@@ -3592,6 +3632,9 @@ const MessageTargetWrapper = memo(function MessageTargetWrapper({
  * Split into StatusSection and InputSection for better memoization
  */
 interface FixedBottomProps {
+  axo?: AxoUIState;
+  lastTurnOutcome?: TurnCompletionStatus;
+  onAxoGone?: () => void;
   onWorkingSpinnerFrame?: (frame: number) => void;
   announcement?: AnnouncementLineState;
   feedbackSurvey?: FeedbackSurveyState;
@@ -3649,10 +3692,6 @@ interface FixedBottomProps {
   interactionMode?: InteractionMode;
   /** Whether to show the mode word (PLAN/YOLO/AUTO) next to the glyph. */
   showModeLabel?: boolean;
-  /** Bracketed mode indicator (e.g. "[AUTO]"); empty in default mode. */
-  modeIndicator?: string;
-  /** Human-readable description paired with the bracketed indicator. */
-  modeDescription?: string;
   taskListPosition: TaskListPosition;
 }
 
@@ -3709,6 +3748,9 @@ function useUserDrivenComposerCursor(
 }
 
 const FixedBottom = memo(function FixedBottom({
+  axo,
+  lastTurnOutcome,
+  onAxoGone,
   onWorkingSpinnerFrame,
   announcement,
   feedbackSurvey,
@@ -3760,8 +3802,6 @@ const FixedBottom = memo(function FixedBottom({
   keybindings,
   interactionMode,
   showModeLabel,
-  modeIndicator,
-  modeDescription,
   taskListPosition,
 }: FixedBottomProps) {
   const composerCursorIntent = useUserDrivenComposerCursor(isWorking, input, cursorOffset);
@@ -3803,8 +3843,6 @@ const FixedBottom = memo(function FixedBottom({
         contextTokens={contextTokens}
         provider={provider}
         model={model}
-        modeIndicator={modeIndicator}
-        modeDescription={modeDescription}
         taskListPosition={taskListPosition}
         lineExtension={mergeLineExtensions(
           configuredLineExtensions?.status,
@@ -3812,6 +3850,17 @@ const FixedBottom = memo(function FixedBottom({
           runtimeLineExtensions?.status,
         )}
       />
+      {axo && onAxoGone && shouldShowAxo(axo.enabled, terminalColumns, terminalRows) ? (
+        <AxoBuddy
+          axo={axo}
+          isWorking={isWorking}
+          turnStatus={lastTurnOutcome}
+          input={input}
+          columns={terminalColumns}
+          rows={terminalRows}
+          onGone={onAxoGone}
+        />
+      ) : null}
       <InputLineWrapper
         enableQueueInput={enableQueueInput}
         input={input}

@@ -29,6 +29,8 @@ import { I18nProvider } from '../../../src/ui/i18n/index.js';
 import { ThemeProvider } from '../../../src/ui/theme/ThemeContext.js';
 import { getPromptBlockWidth } from '../../../src/ui/inputPrompt.js';
 import { GoalPanel } from '../../../src/ui/ink/GoalPanel.js';
+import { buildStatusBarExtensions } from '../../../src/core/agent/StatusBarRenderer.js';
+import type { LoadedConfig } from '../../../src/types.js';
 import { DEFAULT_KEYBINDINGS, resolveKeybindings } from '../../../src/keybindings/profiles.js';
 
 function stripAnsi(value: string): string {
@@ -83,6 +85,27 @@ afterEach(() => {
 });
 
 describe('AgentUI TextBuffer integration helpers', () => {
+  it('renders configured two-line sections beside working status and cancellation controls', () => {
+    const config = { ui: { statusBar: { layout: 'two-line', sections: [
+      { id: 'model', line: 1 }, { id: 'agents', line: 2 },
+    ] } } } as LoadedConfig;
+    const state = {
+      ...createInitialUIState(), isWorking: true, status: 'Reviewing...', elapsed: '12s', tokens: '100 tokens',
+      configuredLineExtensions: buildStatusBarExtensions(config, { model: 'status-bar-model', agentCount: 2 }),
+    };
+    const { lastFrame } = render(React.createElement(I18nProvider, null,
+      React.createElement(ThemeProvider, null, React.createElement(AgentUI, {
+        state, onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {},
+      })),
+    ));
+    const screen = stripAnsi(lastFrame() ?? '');
+    expect(screen).toContain('status-bar-model');
+    expect(screen).toContain('2 agents');
+    expect(screen).toContain('Reviewing...');
+    expect(screen).toContain('esc');
+    expect(screen).toContain('12s');
+  });
+
   it('updates streamed text without another working-state transition', async () => {
     const state = { ...createInitialUIState(), isWorking: true };
     const frame = (streamingResponse: string | null) => React.createElement(I18nProvider, null,
@@ -419,22 +442,26 @@ describe('AgentUI interaction mode shortcut', () => {
     );
 
     await new Promise<void>((resolve) => setImmediate(resolve));
-    for (const indicator of ['[PLAN]', '[YOLO]', '[AUTO]']) {
+    for (const label of ['● PLAN', '● YOLO', '● AUTO']) {
       stdin.write('\x1b[Z');
       await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(stripAnsi(lastFrame() ?? '')).toContain(indicator);
+      expect(stripAnsi(lastFrame() ?? '')).toContain(label);
     }
 
     stdin.write('\x1b[Z');
     await new Promise<void>((resolve) => setImmediate(resolve));
     const defaultFrame = stripAnsi(lastFrame() ?? '');
-    expect(defaultFrame).not.toContain('[PLAN]');
-    expect(defaultFrame).not.toContain('[YOLO]');
-    expect(defaultFrame).not.toContain('[AUTO]');
+    expect(defaultFrame).not.toContain('● PLAN');
+    expect(defaultFrame).not.toContain('● YOLO');
+    expect(defaultFrame).not.toContain('● AUTO');
     expect(onCycleInteractionMode).toHaveBeenCalledTimes(4);
   });
 
-  it('renders the bracketed mode indicator below the status line so busy turns cannot flood scrollback', async () => {
+  it.each([
+    ['plan', '● PLAN', '[PLAN]', 'Plan mode active'],
+    ['yolo', '● YOLO', '[YOLO]', 'YOLO mode active'],
+    ['automode', '● AUTO', '[AUTO]', 'Interactive auto mode active'],
+  ] as const)('shows %s mode only through the help-line label, with no banner above the composer', async (mode, label, banner, description) => {
     const { lastFrame } = render(
       React.createElement(
         I18nProvider,
@@ -451,7 +478,7 @@ describe('AgentUI interaction mode shortcut', () => {
             onInstruction: () => {},
             onEscape: () => {},
             onCtrlC: () => {},
-            getInteractionMode: () => 'automode',
+            getInteractionMode: () => mode,
           })
         )
       )
@@ -460,18 +487,10 @@ describe('AgentUI interaction mode shortcut', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     const frame = stripAnsi(lastFrame() ?? '');
 
-    // The indicator must still be visible while working...
-    expect(frame).toContain('[AUTO]');
-    expect(frame).toContain('Interactive auto mode active');
     expect(frame).toContain('Working... (esc to interrupt)');
-
-    // ...but anchored BELOW the status line in the stable bottom section.
-    // Rendering it above the dynamic output region makes Ink flush it into
-    // scrollback on every repaint once tool output exceeds the viewport,
-    // duplicating "[AUTO] Interactive auto mode active" dozens of times.
-    const statusIndex = frame.indexOf('Working... (esc to interrupt)');
-    const indicatorIndex = frame.indexOf('[AUTO]');
-    expect(indicatorIndex).toBeGreaterThan(statusIndex);
+    expect(frame).toContain(label);
+    expect(frame).not.toContain(banner);
+    expect(frame).not.toContain(description);
   });
 
   it('keeps every help-line row short of the last terminal column and preserves the mode glyph space', async () => {
@@ -548,9 +567,8 @@ describe('AgentUI interaction mode shortcut', () => {
 
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    // "● PLAN"/"● YOLO"/"● AUTO" (glyph + label together) uniquely identifies
-    // this new help-line indicator, distinct from the pre-existing bracketed
-    // "[PLAN]"/"[YOLO]"/"[AUTO]" indicator rendered above the scrollback.
+    // "● PLAN"/"● YOLO"/"● AUTO" (glyph + label together) is the only place
+    // the active mode is shown.
     const expectations: Record<'plan' | 'yolo' | 'automode', { glyphAndLabel: string; rgb: string }> = {
       plan: { glyphAndLabel: '● PLAN', rgb: '255;157;63' },
       yolo: { glyphAndLabel: '● YOLO', rgb: '198;120;221' },

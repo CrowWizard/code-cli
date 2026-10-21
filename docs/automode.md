@@ -23,38 +23,12 @@ autohand --auto-mode "Build a REST API for todos"
 
 ## How It Works
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      AUTO-MODE LOOP                         │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. User starts: autohand --auto-mode "Build REST API"      │
-│                         │                                   │
-│  2. Create worktree ────┼──▶ autohand-automode-<timestamp>  │
-│                         │                                   │
-│  3. Initialize state ───┼──▶ .autohand/automode.local.md    │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────┐        │
-│  │               ITERATION LOOP                     │        │
-│  │  ┌─────────────────────────────────────────┐    │        │
-│  │  │  4. Feed prompt to LLM                  │    │        │
-│  │  │  5. Execute actions (read/write/run)    │    │        │
-│  │  │  6. Agent tries to exit                 │    │        │
-│  │  │  7. Stop hook intercepts                │───┐│        │
-│  │  │  8. Check completion conditions         │   ││        │
-│  │  │     - Completion marker detected?       │   ││        │
-│  │  │     - Max iterations reached?           │   ││        │
-│  │  │     - Cancel signal received?           │   ││        │
-│  │  │  9. If not complete: feed prompt again  │◀──┘│        │
-│  │  └─────────────────────────────────────────┘    │        │
-│  └─────────────────────────────────────────────────┘        │
-│                         │                                   │
-│  10. On completion ─────┼──▶ Merge worktree to main         │
-│                         │                                   │
-│  11. Generate report ───┼──▶ AUTOMODE_CHANGELOG.md          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+1. Creates an isolated Git worktree by default.
+2. Stores private state for this run outside the project.
+3. Repeats the task until it prints the completion marker, hits a configured limit, or stops making progress.
+4. Keeps the branch and worktree for review and prints merge and cleanup commands.
+5. Writes `AUTOMODE_CHANGELOG.md` inside the worktree.
+
 
 ## CLI Usage
 
@@ -71,7 +45,6 @@ autohand --auto-mode "<prompt>" [options]
 | `--no-worktree` | Disable git worktree isolation | - |
 | `--checkpoint-interval <n>` | Git commit every N iterations | 5 |
 | `--max-runtime <m>` | Maximum runtime in minutes | 120 |
-| `--max-cost <d>` | Maximum API cost in dollars | 10 |
 | `--interactive-on-complete` | Hand off directly to interactive mode when loop ends (TTY only) | Off |
 | `--dry-run` | Preview actions without executing | - |
 
@@ -85,7 +58,6 @@ autohand --auto-mode "Build a CLI tool for file backup"
 autohand --auto-mode "Refactor auth system" \
   --max-iterations 30 \
   --max-runtime 60 \
-  --max-cost 5 \
   --completion-promise "REFACTOR_COMPLETE"
 
 # Without worktree (use current branch)
@@ -171,11 +143,12 @@ Multiple ways to stop an auto-mode loop:
 
 ### Resource Limits
 
+CLI runs reject `--max-cost` and `automode.maxCost` because they cannot enforce a dollar spend limit. Use iteration and runtime limits instead.
+
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | Max Iterations | 50 | Prevents infinite loops |
 | Max Runtime | 120 min | Limits total time |
-| Max Cost | $10 | Caps API spending |
 | Checkpoint Interval | 5 | Creates git checkpoints |
 
 ### Git Worktree Isolation
@@ -184,30 +157,29 @@ By default, auto-mode creates an isolated git worktree to protect your main bran
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                   WORKTREE LIFECYCLE                             │
+│                   WORKTREE LIFECYCLE                            │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  START                                                           │
-│  ├─ Create branch: autohand-automode-<timestamp>                 │
-│  ├─ Create worktree: /tmp/autohand-worktree-<hash>               │
-│  └─ ALL file operations now happen in the worktree               │
-│                                                                  │
-│  DURING LOOP                                                     │
-│  ├─ Agent reads/writes files in worktree                         │
-│  ├─ Every N iterations: checkpoint commit to automode branch     │
-│  └─ Main branch remains untouched                                │
-│                                                                  │
-│  ON SUCCESS                                                      │
-│  ├─ git checkout <original-branch>                               │
-│  ├─ git merge autohand-automode-xxx                              │
-│  ├─ git worktree remove /tmp/autohand-worktree-xxx               │
-│  └─ git branch -d autohand-automode-xxx                          │
-│                                                                  │
-│  ON CANCEL/ERROR                                                 │
-│  └─ Worktree PRESERVED for manual inspection                     │
-│     You can: cd /tmp/autohand-worktree-xxx                       │
-│              git log, git diff, cherry-pick, etc.                │
-│                                                                  │
+│                                                                 │
+│  START                                                          │
+│  ├─ Create branch: autohand-automode-<timestamp>-<id>           │
+│  ├─ Create worktree: <temp dir>/autohand-worktree-<hash>        │
+│  └─ ALL file operations now happen in the worktree              │
+│                                                                 │
+│  DURING LOOP                                                    │
+│  ├─ Agent reads/writes files in worktree                        │
+│  ├─ Every N iterations: checkpoint commit to automode branch    │
+│  └─ Main branch remains untouched                               │
+│                                                                 │
+│  ON SUCCESS                                                     │
+│  ├─ Commit a final checkpoint in the isolated branch            │
+│  ├─ Print branch, worktree, review and recovery commands        │
+│  └─ Preserve the branch and worktree for manual review          │
+│                                                                 │
+│  ON CANCEL, LIMIT OR ERROR                                      │
+│  └─ Worktree PRESERVED for manual inspection                    │
+│     You can: cd <worktree path from the summary>                │
+│              git log, git diff, cherry-pick, etc.               │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -215,7 +187,7 @@ By default, auto-mode creates an isolated git worktree to protect your main bran
 - **One worktree per session** (not per iteration)
 - **All agent operations** (file reads, writes, commands) happen in the worktree
 - **Checkpoints** create commits in the automode branch at regular intervals
-- **Merge happens once** at the end on successful completion
+- **Merge is manual**: completed runs keep their branch and worktree for review. The summary prints the merge and safe cleanup commands.
 - **Preserved on failure** so you can inspect, recover, or cherry-pick changes
 
 **Benefits:**
@@ -237,7 +209,7 @@ This prevents getting stuck in unproductive loops.
 
 ## State File
 
-Auto-mode maintains state in `.autohand/automode.local.md`:
+Each run stores its state in `$AUTOHAND_HOME/automode/<workspace-id>/<run-id>/automode.local.md` (`~/.autohand` is the default home). State stays outside the project and is private to the current user. Legacy `.autohand/automode.local.md` files are ignored and do not activate a later interactive session:
 
 ```markdown
 # Auto-Mode State
@@ -245,8 +217,8 @@ Auto-mode maintains state in `.autohand/automode.local.md`:
 ## Session
 - **Started:** 2026-01-06T14:30:00Z
 - **Prompt:** Build a REST API for todos with CRUD operations
-- **Branch:** autohand-automode-1736175000
-- **Worktree:** /tmp/autohand-worktree-abc123
+- **Branch:** autohand-automode-1736175000-a1b2c3d4
+- **Worktree:** <temp dir>/autohand-worktree-abc123
 
 ## Progress
 - **Current Iteration:** 12
@@ -275,7 +247,7 @@ After each session, auto-mode generates `AUTOMODE_CHANGELOG.md`:
 - **Task:** Build a REST API for todos
 - **Duration:** 45 minutes (12 iterations)
 - **Result:** Completed successfully
-- **Branch:** autohand-automode-1736175000 → merged to main
+- **Branch:** autohand-automode-1736175000-a1b2c3d4 → awaiting review
 
 ## Iterations
 ### Iteration 1 (14:30:00)
@@ -327,7 +299,6 @@ Add defaults to `~/.autohand/config.json`:
   "automode": {
     "maxIterations": 50,
     "maxRuntime": 120,
-    "maxCost": 10,
     "checkpointInterval": 5,
     "completionPromise": "DONE",
     "useWorktree": true,
@@ -366,7 +337,7 @@ Add defaults to `~/.autohand/config.json`:
 ### High cost
 
 - Lower `--max-iterations`
-- Set a stricter `--max-cost`
+- Set a shorter `--max-runtime`
 - Use a more efficient model
 - Break task into smaller chunks
 
@@ -374,7 +345,7 @@ Add defaults to `~/.autohand/config.json`:
 
 - The circuit breaker should auto-trigger
 - Press ESC to cancel manually
-- Check `.autohand/automode.local.md` for state
+- Check the run's private state under `AUTOHAND_HOME/automode/` (default: `~/.autohand/automode/`)
 
 ## Related
 

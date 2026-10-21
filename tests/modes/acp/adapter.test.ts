@@ -352,6 +352,24 @@ describe("AutohandAcpAdapter", () => {
   });
 
   describe("initialize()", () => {
+    it("tells the client that host context blocks are not read as user intent", async () => {
+      // Clients gate context they prepend to a prompt (response modes, user profile)
+      // on this: an agent that does not advertise it would scan that text for
+      // specialist requests. Advertised to every client, with or without peer events.
+      const result = await adapter.initialize(makeInitRequest());
+      expect(result._meta).toMatchObject({ hostContext: { version: 1 } });
+
+      config.sessions = { communication: { enabled: true } };
+      const withPeers = await adapter.initialize(makeInitRequest({
+        clientCapabilities: { _meta: { autohandPeerEvents: 1 } },
+      }));
+      expect(withPeers._meta).toEqual({
+        autohandWorkspaceSetup: 1,
+        hostContext: { version: 1 },
+        peerCommunication: { version: 1 },
+      });
+    });
+
     it("returns correct protocol version", async () => {
       const result = await adapter.initialize(makeInitRequest());
 
@@ -935,6 +953,24 @@ describe("AutohandAcpAdapter", () => {
         "Add unit tests for the auth module",
         { signal: expect.any(AbortSignal) },
       );
+    });
+
+    it("lets a cloud host delegate dependency setup to the agent without changing permissions", async () => {
+      await adapter.initialize(makeInitRequest({
+        clientCapabilities: { _meta: { autohandWorkspaceSetup: 'agent-managed' } },
+      }));
+      await adapter.prompt({ sessionId, prompt: [{ type: 'text', text: 'Update README.md' }] });
+      expect(mockAgent.runInstruction).toHaveBeenCalledWith('Update README.md', {
+        signal: expect.any(AbortSignal), environmentBootstrap: 'skip', qualityPipeline: 'agent-managed',
+      });
+      expect(mockAgent.applyAcpMode).not.toHaveBeenCalledWith('yolo');
+    });
+
+    it("rejects a failed instruction instead of returning a successful empty turn", async () => {
+      mockAgent.runInstruction.mockResolvedValue(false);
+      await expect(adapter.prompt({
+        sessionId, prompt: [{ type: 'text', text: 'Update README.md' }],
+      })).rejects.toMatchObject({ code: -32603 });
     });
 
     it("keeps adjacent ACP text blocks separated", async () => {
@@ -1784,6 +1820,44 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it("streams model deltas as ACP chunks and does not repeat text the final events already delivered", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      connection.sessionUpdate.mockClear();
+
+      await outputListener({ type: "thought_delta", thought: "Considering " });
+      await outputListener({ type: "thought_delta", thought: "the request." });
+      await outputListener({ type: "message_delta", content: "hello " });
+      await outputListener({ type: "message_delta", content: "world" });
+      await outputListener({ type: "thinking", thought: "Considering the request.", streamed: true });
+      await outputListener({ type: "message", content: "hello world", streamed: true });
+
+      const updates = connection.sessionUpdate.mock.calls.map((call) => call[0]);
+      expect(updates).toEqual([
+        { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Considering " } } },
+        { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "the request." } } },
+        { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello " } } },
+        { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } },
+      ]);
+      const streamedText = updates
+        .filter((call) => call.update.sessionUpdate === "agent_message_chunk")
+        .map((call) => call.update.content.text)
+        .join("");
+      expect(streamedText).toBe("hello world");
+    });
+
+    it("still delivers a final message that never reached the client as deltas", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      connection.sessionUpdate.mockClear();
+
+      await outputListener({ type: "message_delta", content: "" });
+      await outputListener({ type: "message", content: "Full answer." });
+
+      expect(connection.sessionUpdate).toHaveBeenCalledExactlyOnceWith({
+        sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Full answer." } },
+      });
+    });
+
     it("maps live team tasks to ACP plan updates", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
       connection.sessionUpdate.mockClear();
@@ -2010,6 +2084,22 @@ describe("AutohandAcpAdapter", () => {
         duration: expect.any(Number),
         output: "file contents",
       });
+    });
+
+    it("marks a tool call made by a script with its parent call, and leaves direct calls unmarked", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+
+      await outputListener({ type: "tool_start", toolId: "script-1:0", toolName: "read_file", toolArgs: { path: "a.ts" }, parentToolId: "script-1" });
+      await outputListener({ type: "tool_end", toolId: "script-1:0", toolName: "read_file", toolSuccess: true, toolOutput: "ok", parentToolId: "script-1" });
+      await outputListener({ type: "tool_start", toolId: "direct-1", toolName: "read_file", toolArgs: { path: "b.ts" } });
+
+      const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update);
+      const nested = updates.filter((update) => update.toolCallId === "script-1:0");
+      expect(nested).toHaveLength(2);
+      for (const update of nested) {
+        expect(update._meta).toEqual({ autohand: { parentToolCallId: "script-1" } });
+      }
+      expect(updates.find((update) => update.toolCallId === "direct-1")).not.toHaveProperty("_meta");
     });
 
     it("maps runtime tool failures to failed ACP updates with readable details", async () => {

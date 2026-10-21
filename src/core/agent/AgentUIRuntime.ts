@@ -5,6 +5,7 @@ import { allowedPeerScopes } from '../../session/peers/PeerScope.js';
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { isAxoInput } from '../../ui/axo/axoCommand.js';
 import { resolveMouseComposerCursor } from '../../ui/mouseReporting.js';
 import { deliverAgentTargetMessage, listAgentMessageTargets } from './AgentMessageTargets.js';
 import os from 'node:os';
@@ -19,7 +20,8 @@ import { createImmediateShellCommandBlockWriter, formatImmediateShellCommandHead
 import { SLASH_COMMANDS } from '../slashCommands.js';
 import { buildHostTokenUsageStatus, formatElapsedTime, formatSessionActualTokens, formatTurnUsage } from './AgentFormatter.js';
 import { writeAutohandDebugLine } from '../../utils/debugLog.js';
-import { buildStatusLineExtension, getConfigStatusLineSettings } from './StatusLineSettings.js';
+import { getConfigStatusLineSettings } from './StatusLineSettings.js';
+import { buildStatusBarActivityData, buildStatusBarExtensions } from './StatusBarRenderer.js';
 import { resolveStatusLineGitLabel } from './AgentContextRuntime.js';
 import { extensionRuntimeHost } from '../../extensions/ExtensionRuntimeHost.js';
 import { resolveKeybindings } from '../../keybindings/profiles.js';
@@ -303,6 +305,8 @@ export function initializeAgentUIManager(host: AgentUIRuntimeHost): void {
           typeof host.resolveLlmShellSuggestion === 'function'
             ? host.resolveLlmShellSuggestion(input)
             : Promise.resolve(null),
+        askAxo: (question: string, signal: AbortSignal) =>
+          host.axoResponder?.ask(question, signal) ?? Promise.resolve(null),
         suggestionProvider: () => host.suggestionEngine?.getNextPromptSuggestion() ?? undefined,
         // Read ui.showTips on every draw so toggling it in /settings applies at the next rotation.
         tipProvider: host.runtime?.options?.bare
@@ -609,6 +613,8 @@ function trySteerAgentActiveInstruction(host: AgentUIRuntimeHost, text: string):
 }
 
 export async function handleAgentInkSubmittedInstruction(host: AgentUIRuntimeHost, text: string, metadata?: PeerInstructionMetadata): Promise<void> {
+    // `~axo` is the composer's easter egg; the UI handles it, and it never reaches the model.
+    if (isAxoInput(text)) return;
     const peerInput = parsePeerInput(text);
     const messaging: PeerClient | undefined = host.peerMessaging;
     if (peerInput.kind === 'direct' && messaging?.policy.enabled) {
@@ -750,13 +756,23 @@ export function forceRenderAgentSpinner(host: AgentUIRuntimeHost): void {
     const footerLine = host.formatStatusLine();
     host.persistentInput.setStatusLine(footerLine);
     const statusLineSettings = getConfigStatusLineSettings(host.runtime.config);
-    host.inkRenderer?.setConfiguredLineExtensions?.(withPeerLineExtension(buildStatusLineExtension({
-      settings: statusLineSettings,
+    host.inkRenderer?.setConfiguredLineExtensions?.(withPeerLineExtension(buildStatusBarExtensions(host.runtime.config, {
       workspaceRoot: host.runtime.workspaceRoot,
       homeDir: os.homedir(),
       gitLabel: resolveStatusLineGitLabel(host),
       sessionDiffStats: host.sessionDiffStatsTracker?.getStats?.(),
       sessionHasFileChanges: host.filesModifiedThisSession === true,
+      ...(host.runtime.config?.ui?.statusBar !== undefined ? {
+        ...buildStatusBarActivityData(host.inkRenderer?.getState?.(), host.mcpManager?.getServers?.()),
+        interactionMode: host.getInteractionMode?.(),
+        model: host.runtime.options.model ?? 'unconfigured',
+        providerLabel: host.activeProvider ?? host.runtime.config.provider ?? 'openrouter',
+        planLabel: host.accountPlan?.label,
+        contextPercentLeft: host.contextPercentLeft,
+        sessionTokensUsed: sessionTotal,
+        sessionTokenUsageUnavailable: sessionStatus === 'unavailable',
+        commandHint: t('ui.commandHint'),
+      } : {}),
     }), host.peerAwareness?.getPeers?.().length ?? 0));
     host.inkRenderer?.setShowModeLabel?.(statusLineSettings.showModeLabel);
     const usingTerminalRegions = host.isUsingTerminalRegionsForActiveTurn();

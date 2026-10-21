@@ -86,6 +86,7 @@ export const TOOL_KIND_MAP: Record<string, ToolKind> = {
 
   // Execute operations
   run_command: "execute",
+  run_tool_script: "execute",
   custom_command: "execute",
   git_status: "execute",
   git_diff: "execute",
@@ -176,6 +177,7 @@ export const TOOL_DISPLAY_NAMES: Record<string, string> = {
 
   // Execute operations
   run_command: "Run",
+  run_tool_script: "Run script",
   custom_command: "Custom",
   git_status: "Git Status",
   git_diff: "Git Diff",
@@ -395,6 +397,23 @@ export function buildConfigOptions(
     })),
     currentValue: resolveDefaultModel(config),
   });
+
+  if (config.provider === "autohandai" && config.autohandai?.plan !== "local") {
+    const effort = config.autohandai?.reasoningEffort;
+    options.push({
+      type: "select",
+      id: "reasoning_effort",
+      name: "Moa Reasoning Effort",
+      description: "Depth of reasoning when using Moa",
+      category: "reasoning",
+      currentValue: effort === "medium" || effort === "high" || effort === "xhigh" ? effort : "high",
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+        { value: "xhigh", name: "Extra high" },
+      ],
+    });
+  }
 
   // Thinking level
   options.push({

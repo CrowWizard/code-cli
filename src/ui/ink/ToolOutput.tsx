@@ -3,17 +3,21 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
-import React, { memo, useEffect, useMemo, useRef } from 'react';
-import { Box, Text, measureElement, useBoxMetrics, useStdout, type DOMElement } from 'ink';
+import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { Box, Text, measureElement, useBoxMetrics, useStdout, useInput, type DOMElement } from 'ink';
 import { parsePatch } from 'diff';
+import wrapAnsi from 'wrap-ansi';
 import { useTheme } from '../theme/ThemeContext.js';
 import type { ResolvedColors } from '../theme/types.js';
 import { hexToRgb } from '../theme/Theme.js';
 import { renderTerminalMarkdown } from '../../core/immediateCommandRouter.js';
 import { stripAnsiCodes } from '../displayUtils.js';
+import { hiddenLineCount } from '../toolOutput.js';
 import { parseWorkspaceChangeSet } from '../../core/agent/WorkspaceChangeCapture.js';
 import { TodoListOutput } from './TodoListOutput.js';
 import { TeamTaskListOutput } from './TeamTaskListOutput.js';
+import { ComputerUseProgress } from './ComputerUseProgress.js';
+import { isComputerUseStep } from '../../computer/computerUseOutput.js';
 import type { OutputLayout } from './mouseInput.js';
 
 /** Tools whose JSON results are painted as panels instead of printed verbatim. */
@@ -31,6 +35,12 @@ const TEAM_TASK_TOOLS = new Set([
  * Returns null when the tool has no dedicated panel.
  */
 function specialToolRenderer(tool: string, output: string, success: boolean): React.ReactElement | null {
+  if (tool === 'computer_use') {
+    try {
+      const steps: unknown = JSON.parse(output);
+      if (Array.isArray(steps) && steps.every(isComputerUseStep)) return <ComputerUseProgress steps={steps} />;
+    } catch { return null; }
+  }
   if (tool === 'workspace_changes') {
     return <WorkspaceChangesOutput output={output} />;
   }
@@ -462,6 +472,14 @@ export interface ToolOutputProps {
   entry: ToolOutputEntry;
 }
 
+/** A preview says how much it leaves out; a summary of the detail only says it can be opened. */
+function expandHint(shown: string, expanded: string): string {
+  const hidden = hiddenLineCount(shown, expanded);
+  return hidden > 0
+    ? `+ ${hidden} ${hidden === 1 ? 'line' : 'lines'} (ctrl+o to expand)`
+    : 'Ctrl+O expand';
+}
+
 function ToolOutputComponent({ entry }: ToolOutputProps) {
   const { colors } = useTheme();
   const { tool, success, output } = entry;
@@ -493,20 +511,42 @@ function ToolOutputComponent({ entry }: ToolOutputProps) {
         )
       )}
       {entry.expandedOutput ? (
-        <Text color={colors.muted}>Ctrl+O expand</Text>
+        <Text color={colors.muted}>{expandHint(output, entry.expandedOutput)}</Text>
       ) : null}
     </Box>
   );
 }
 
-export function ExpandedToolOutput({ entry }: ToolOutputProps) {
-  const { colors } = useTheme();
-  if (!entry.expandedOutput) return null;
+export interface ExpandedToolOutputProps extends ToolOutputProps {
+  terminalRows?: number;
+  terminalColumns?: number;
+}
 
+export function ExpandedToolOutput({ entry, terminalRows = 24, terminalColumns = 80 }: ExpandedToolOutputProps) {
+  const { colors } = useTheme();
+  const [offset, setOffset] = useState(0);
+  const pageSize = Math.max(1, Math.min(40, Math.floor(terminalRows / 2) - 3, terminalRows - 16));
+  const lines = useMemo(() => {
+    const plain = stripAnsiCodes(entry.expandedOutput ?? '');
+    const styled = isDiffTool(entry.tool)
+      ? getLines(plain).map(line => renderThemedDiffLine(line, colors)).join('\n')
+      : plain;
+    return wrapAnsi(styled, Math.max(1, terminalColumns - 1), { hard: true, trim: false }).split('\n');
+  }, [entry.expandedOutput, entry.tool, colors, terminalColumns]);
+  const lastPageOffset = Math.floor((lines.length - 1) / pageSize) * pageSize;
+  const start = Math.min(Math.floor(offset / pageSize) * pageSize, lastPageOffset);
+
+  useInput((_input, key) => {
+    if (key.pageDown) setOffset(Math.min(start + pageSize, lastPageOffset));
+    if (key.pageUp) setOffset(Math.max(0, start - pageSize));
+  });
+
+  if (!entry.expandedOutput) return null;
   return (
     <Box flexDirection="column" marginBottom={1}>
-      <Text color={colors.muted}>{entry.tool} details · Ctrl+O collapse</Text>
-      <Text color={colors.toolOutput}>{entry.expandedOutput}</Text>
+      <Text color={colors.muted} wrap="truncate">{entry.tool} details · Ctrl+O collapse</Text>
+      <Text color={colors.toolOutput}>{lines.slice(start, start + pageSize).join('\n')}</Text>
+      <Text color={colors.muted} wrap="truncate">{`Rows ${start + 1}–${Math.min(start + pageSize, lines.length)} of ${lines.length} · PgUp/PgDn`}</Text>
     </Box>
   );
 }

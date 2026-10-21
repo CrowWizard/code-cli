@@ -8,6 +8,8 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import os from 'node:os';
+import path from 'node:path';
 import type { LoadedConfig } from '../src/types.js';
 
 // Mock fs-extra before imports
@@ -116,7 +118,7 @@ describe('Auto-Mode Worktree Isolation', () => {
       const worktreePath = await manager.prepareWorktree(true);
 
       expect(worktreePath).not.toBeNull();
-      expect(worktreePath).toMatch(/\/tmp\/autohand-worktree-/);
+      expect(worktreePath?.startsWith(path.join(os.tmpdir(), 'autohand-worktree-'))).toBe(true);
     });
 
     it('prepareWorktree returns null when disabled', async () => {
@@ -137,7 +139,7 @@ describe('Auto-Mode Worktree Isolation', () => {
       await manager.prepareWorktree(true);
       const effectiveWorkspace = manager.getEffectiveWorkspace();
 
-      expect(effectiveWorkspace).toMatch(/\/tmp\/autohand-worktree-/);
+      expect(effectiveWorkspace.startsWith(path.join(os.tmpdir(), 'autohand-worktree-'))).toBe(true);
       expect(effectiveWorkspace).not.toBe('/test/workspace');
     });
 
@@ -151,7 +153,7 @@ describe('Auto-Mode Worktree Isolation', () => {
       await manager.prepareWorktree(true);
       const branchName = manager.getBranchName();
 
-      expect(branchName).toMatch(/^autohand-automode-\d+$/);
+      expect(branchName).toMatch(/^autohand-automode-\d+-[a-f0-9]+$/);
     });
 
     it('creates git worktree with correct command', async () => {
@@ -161,7 +163,7 @@ describe('Auto-Mode Worktree Isolation', () => {
 
       const worktreeCmd = execSyncCalls.find(cmd => cmd.includes('git worktree add'));
       expect(worktreeCmd).toBeDefined();
-      expect(worktreeCmd).toMatch(/git worktree add -b autohand-automode-\d+ \/tmp\/autohand-worktree-/);
+      expect(worktreeCmd).toBe(`git worktree add -b ${manager.getBranchName()} ${manager.getEffectiveWorkspace()}`);
     });
   });
 
@@ -228,8 +230,8 @@ describe('Auto-Mode Worktree Isolation', () => {
     });
   });
 
-  describe('Worktree Merge on Completion', () => {
-    it('merges worktree branch on successful completion', async () => {
+  describe('Worktree preservation on completion', () => {
+    it('leaves the user branch unchanged on successful completion', async () => {
       const manager = new AutomodeManager(mockConfig, '/test/workspace');
 
       // Prepare worktree
@@ -254,14 +256,14 @@ describe('Auto-Mode Worktree Isolation', () => {
 
       // Verify merge was called
       const mergeCmds = execSyncCalls.filter(cmd => cmd.includes('git merge'));
-      expect(mergeCmds.length).toBeGreaterThan(0);
+      expect(mergeCmds.length).toBe(0);
 
       // Verify checkout back to original branch
       const checkoutCmds = execSyncCalls.filter(cmd => cmd.includes('git checkout main'));
-      expect(checkoutCmds.length).toBeGreaterThan(0);
+      expect(checkoutCmds.length).toBe(0);
     });
 
-    it('cleans up worktree after successful merge', async () => {
+    it('preserves the completed worktree and branch for explicit review', async () => {
       const manager = new AutomodeManager(mockConfig, '/test/workspace');
 
       // Prepare worktree
@@ -286,11 +288,11 @@ describe('Auto-Mode Worktree Isolation', () => {
 
       // Verify worktree removal
       const worktreeRemoveCmds = execSyncCalls.filter(cmd => cmd.includes('git worktree remove'));
-      expect(worktreeRemoveCmds.length).toBeGreaterThan(0);
+      expect(worktreeRemoveCmds.length).toBe(0);
 
       // Verify branch deletion
       const branchDeleteCmds = execSyncCalls.filter(cmd => cmd.includes('git branch -d'));
-      expect(branchDeleteCmds.length).toBeGreaterThan(0);
+      expect(branchDeleteCmds.length).toBe(0);
     });
   });
 
@@ -323,7 +325,7 @@ describe('Auto-Mode Worktree Isolation', () => {
       );
 
       // On cancellation, worktree should NOT be removed (preserved for inspection)
-      // The merge and cleanup only happen on successful completion
+      // Merge and cleanup always require the user to run the printed commands
       const mergeCmds = execSyncCalls.filter(cmd => cmd.includes('git merge'));
       expect(mergeCmds.length).toBe(0);
     });

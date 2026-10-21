@@ -118,6 +118,11 @@ const AUTOHAND_ACP_AUTH_METHODS: NonNullable<InitializeResponse['authMethods']> 
   },
 ];
 
+/** ACP has no field for nesting, so a script's tool calls name their parent in vendor metadata. */
+function parentToolCallMeta(parentToolId: string | undefined): { _meta?: { autohand: { parentToolCallId: string } } } {
+  return parentToolId === undefined ? {} : { _meta: { autohand: { parentToolCallId: parentToolId } } };
+}
+
 function isSupportedImageMimeType(mimeType: string): mimeType is ImageMimeType {
   return (
     mimeType === 'image/png'
@@ -654,8 +659,14 @@ export class AutohandAcpAdapter implements Agent {
         version: packageJson.version,
       },
       authMethods: AUTOHAND_ACP_AUTH_METHODS,
-      ...(this.config.sessions?.communication?.enabled && this.clientCapabilities?._meta?.autohandPeerEvents === 1
-        ? { _meta: { peerCommunication: { version: 1 } } } : {}),
+      _meta: {
+        autohandWorkspaceSetup: 1,
+        // Context a host prepends to a prompt (`<autohand_*>`, `<*_context>` blocks) is
+        // not read as the user asking for specialists; see userAuthoredInstruction.
+        hostContext: { version: 1 },
+        ...(this.config.sessions?.communication?.enabled && this.clientCapabilities?._meta?.autohandPeerEvents === 1
+          ? { peerCommunication: { version: 1 } } : {}),
+      },
     };
   }
 
@@ -869,6 +880,9 @@ export class AutohandAcpAdapter implements Agent {
     try {
       const runInstruction = (): Promise<boolean> => agent.runInstruction(instruction, {
         ...(reviewRequest ? { hookInstruction: trimmed } : {}),
+        ...(this.clientCapabilities?._meta?.autohandWorkspaceSetup === 'agent-managed'
+          ? { environmentBootstrap: 'skip' as const, qualityPipeline: 'agent-managed' as const }
+          : {}),
         signal: session.abortController.signal,
       });
       const success = reviewRequest
@@ -896,11 +910,15 @@ export class AutohandAcpAdapter implements Agent {
       if (!success && this.cancelledSessions.has(params.sessionId)) {
         return { stopReason: 'cancelled' };
       }
+      if (!success) {
+        throw RequestError.internalError(undefined, 'Autohand Code could not complete this turn. Check the reported setup or tool error before retrying.');
+      }
       return { stopReason: 'end_turn' };
     } catch (err) {
       if (session.abortController.signal.aborted || this.cancelledSessions.has(params.sessionId)) {
         return { stopReason: 'cancelled' };
       }
+      if (err instanceof RequestError) throw err;
       const classified = this.classifyAndFormatError(err);
       process.stderr.write(`[ACP] Prompt error (${classified.code}): ${classified.message}\n`);
       this.emitHookSessionError(params.sessionId, classified.message, classified.code);
@@ -1412,8 +1430,12 @@ export class AutohandAcpAdapter implements Agent {
           }
           break;
         }
+        // ACP chunks are incremental: streamed deltas go out as they arrive,
+        // and the whole reply only follows when it did not stream (structured
+        // protocol responses, retries that rewrote the text, non-streaming providers).
+        case 'thought_delta':
         case 'thinking':
-          if (event.thought) {
+          if (event.thought && !event.streamed) {
             await this.connection.sessionUpdate({
               sessionId,
               update: {
@@ -1427,8 +1449,9 @@ export class AutohandAcpAdapter implements Agent {
           }
           break;
 
+        case 'message_delta':
         case 'message':
-          if (event.content) {
+          if (event.content && !event.streamed) {
             await this.connection.sessionUpdate({
               sessionId,
               update: {
@@ -1467,6 +1490,7 @@ export class AutohandAcpAdapter implements Agent {
                 status: 'in_progress' as ToolCallStatus,
                 locations,
                 rawInput: event.toolArgs ?? {},
+                ...parentToolCallMeta(event.parentToolId),
               },
             });
 
@@ -1494,6 +1518,7 @@ export class AutohandAcpAdapter implements Agent {
                 toolCallId,
                 status,
                 rawOutput,
+                ...parentToolCallMeta(event.parentToolId),
               },
             });
 

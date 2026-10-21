@@ -7,10 +7,12 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { LoadedConfig } from '../../src/types.js';
 import {
+  AUTOHAND_COMPUTER_USE_MCP_SERVER_NAME,
   CUA_DRIVER_VERSION,
   ensureCuaMcpServer,
   inspectCuaDriver,
   parseCuaDriverVersion,
+  resolveComputerUseMcpServerName,
   resolveCuaDriverPath,
 } from '../../src/computer/cuaDriver.js';
 
@@ -80,17 +82,18 @@ describe('resolveCuaDriverPath', () => {
 describe('ensureCuaMcpServer', () => {
   it('adds the detected driver as a standard, promptless stdio MCP server', () => {
     const loaded = config();
-    const result = ensureCuaMcpServer(loaded, { platform: 'linux', driverPath: '/opt/cua-driver' });
+    const result = ensureCuaMcpServer(loaded, { platform: 'linux', driverPath: '/opt/cua-driver', env: { AUTOHAND_HOME: '/tmp/autohand-test-home' } });
 
     expect(result.status).toBe('added');
     expect(loaded.mcp?.servers).toEqual([{
-      name: 'cua-driver',
+      name: 'autohand-computer-use',
       transport: 'stdio',
       stdioFraming: 'newline',
       command: '/opt/cua-driver',
       args: ['mcp'],
       autoConnect: true,
       env: {
+        CUA_DRIVER_CURSOR_THEME_DIR: path.resolve('/tmp/autohand-test-home', 'computer-use', 'cursor-themes'),
         CUA_DRIVER_PERMISSION_MODE: 'standard',
         CUA_DRIVER_RS_TELEMETRY_ENABLED: '0',
       },
@@ -112,6 +115,25 @@ describe('ensureCuaMcpServer', () => {
     expect(loaded.mcp.servers).toHaveLength(1);
     expect(loaded.mcp.servers?.[0]?.command).toBe('/custom/cua-driver');
   });
+
+  it.each(['autohand-computer-use', 'cua-driver', 'cua'])(
+    'preserves a user configured native server named %s',
+    (name) => {
+      const loaded = config();
+      loaded.mcp = {
+        servers: [{
+          name,
+          transport: 'stdio',
+          command: '/custom/native-control-proxy',
+          args: ['serve'],
+        }],
+      };
+
+      expect(ensureCuaMcpServer(loaded, { driverPath: '/opt/cua-driver' }).status).toBe('existing');
+      expect(loaded.mcp.servers).toHaveLength(1);
+      expect(loaded.mcp.servers?.[0]?.name).toBe(name);
+    },
+  );
 
   it.each([
     { options: { bare: true, driverPath: '/opt/cua-driver' }, expected: 'disabled' },
@@ -143,7 +165,7 @@ describe('ensureCuaMcpServer', () => {
       path: '/Users/test/Applications/Autohand Computer Use.app/Contents/MacOS/AutohandComputerUse',
     });
     expect(loaded.mcp?.servers).toEqual([expect.objectContaining({
-      name: 'cua-driver',
+      name: 'autohand-computer-use',
       stdioFraming: 'newline',
       command: '/Users/test/Applications/Autohand Computer Use.app/Contents/MacOS/AutohandComputerUse',
       args: ['mcp', '--driver-path', '/Users/test/.local/bin/cua-driver'],
@@ -163,6 +185,25 @@ describe('ensureCuaMcpServer', () => {
       computerUseHostPath: null,
     })).toEqual({ status: 'missing' });
     expect(loaded.mcp?.servers ?? []).toEqual([]);
+  });
+});
+
+describe('Autohand Computer Use MCP identity', () => {
+  it('uses the Autohand product namespace for the managed server', () => {
+    expect(AUTOHAND_COMPUTER_USE_MCP_SERVER_NAME).toBe('autohand-computer-use');
+  });
+
+  it('resolves the configured canonical, legacy, or executable-backed server name', () => {
+    expect(resolveComputerUseMcpServerName([
+      { name: 'autohand-computer-use', transport: 'stdio' },
+    ])).toBe('autohand-computer-use');
+    expect(resolveComputerUseMcpServerName([
+      { name: 'cua-driver', transport: 'stdio' },
+    ])).toBe('cua-driver');
+    expect(resolveComputerUseMcpServerName([
+      { name: 'desktop', transport: 'stdio', command: '/custom/cua-driver' },
+    ])).toBe('desktop');
+    expect(resolveComputerUseMcpServerName([])).toBe('autohand-computer-use');
   });
 });
 

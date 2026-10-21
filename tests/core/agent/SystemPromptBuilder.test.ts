@@ -200,6 +200,26 @@ describe('SystemPromptBuilder', () => {
     expect(prompt.endsWith('Additional launch metadata')).toBe(true);
   });
 
+  it('appends session instructions after appendSysPrompt and after a replacement sysPrompt', async () => {
+    const appended = await createBuilder({
+      runtime: {
+        options: { appendSysPrompt: 'Additional launch metadata', sessionInstructions: '## Zit workspace\nClaim first' },
+        workspaceRoot: process.cwd(),
+        config: {},
+      },
+    }).build();
+    const replaced = await createBuilder({
+      runtime: {
+        options: { sysPrompt: 'Custom profile replacement only', sessionInstructions: '## Zit workspace\nClaim first' },
+        workspaceRoot: process.cwd(),
+        config: {},
+      },
+    }).build();
+
+    expect(appended.endsWith('Additional launch metadata\n\n## Zit workspace\nClaim first')).toBe(true);
+    expect(replaced).toBe('Custom profile replacement only\n\n## Zit workspace\nClaim first');
+  });
+
   it('bare mode omits implicit memories, discovered instructions, and discovered agents from the system prompt', async () => {
     const prompt = await createBuilder({
       runtime: {
@@ -225,6 +245,31 @@ describe('SystemPromptBuilder', () => {
     expect(prompt).toContain('delete_memory');
     expect(prompt).toContain('derived summaries');
     expect(prompt).toContain('canonical memory event history');
+  });
+
+  it('keeps the full skill catalog for terminal (non-ACP) sessions', async () => {
+    const prompt = await createBuilder({
+      compactSkillIndex: false,
+      listSkills: vi.fn(() => [{ name: 'alpha-docs', description: 'Documentation helper' }]),
+    }).build();
+
+    expect(prompt).toContain('- **alpha-docs**: Documentation helper');
+  });
+
+  it('lists available skills by name only for ACP clients and points to the skill tool for details', async () => {
+    const prompt = await createBuilder({
+      compactSkillIndex: true,
+      listSkills: vi.fn(() => [
+        { name: 'zeta-review', description: 'A very long description that should not be inlined '.repeat(20) },
+        { name: 'alpha-docs', description: 'Documentation helper', isActive: true },
+      ]),
+    }).build();
+
+    expect(prompt).toContain('## Available Skills');
+    expect(prompt).toContain('alpha-docs [ACTIVE], zeta-review');
+    expect(prompt).toContain('command `info`');
+    expect(prompt).not.toContain('A very long description that should not be inlined');
+    expect(prompt).not.toContain('Documentation helper');
   });
 
   it('adds an Autohand override before Codex skill installer instructions', async () => {

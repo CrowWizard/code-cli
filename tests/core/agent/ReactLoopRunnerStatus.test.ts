@@ -83,6 +83,61 @@ describe('ReactLoopRunner composer status', () => {
     expect(host.inkRenderer.setFinalResponse).toHaveBeenCalledWith('The answer is ready.');
   });
 
+  it('streams content and reasoning to output listeners without a renderer and marks the final events as streamed', async () => {
+    const complete = vi.fn(async (request) => {
+      expect(request.stream).toBe(true);
+      request.onDelta({ type: 'reasoning', text: 'think ' });
+      request.onDelta({ type: 'reasoning', text: 'hard' });
+      request.onDelta({ type: 'content', text: 'The answer' });
+      request.onDelta({ type: 'content', text: ' is ready.' });
+      return { id: 'streamed', created: 1, content: 'The answer is ready.', reasoning: 'think hard', raw: {} };
+    });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, streaming: true });
+    await runAgentReactLoop(host, new AbortController());
+    const events = vi.mocked(host.emitOutput).mock.calls.map(([event]) => event);
+    expect(events).toEqual([
+      { type: 'thought_delta', thought: 'think ' },
+      { type: 'thought_delta', thought: 'hard' },
+      { type: 'message_delta', content: 'The answer' },
+      { type: 'message_delta', content: ' is ready.' },
+      { type: 'thinking', thought: 'think hard', streamed: true },
+      { type: 'message', content: 'The answer is ready.', streamed: true },
+    ]);
+    const streamed = events.filter((event) => event.type === 'message_delta').map((event) => event.content).join('');
+    expect(streamed).toBe('The answer is ready.');
+    expect(host.saveAssistantMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not stream a structured protocol response as message text', async () => {
+    const complete = vi.fn(async (request) => {
+      request.onDelta({ type: 'content', text: '{"finalResponse":' });
+      request.onDelta({ type: 'content', text: '"Done."}' });
+      return { id: 'json', created: 1, content: '{"finalResponse":"Done."}', raw: {} };
+    });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, streaming: true });
+    await runAgentReactLoop(host, new AbortController());
+    expect(vi.mocked(host.emitOutput).mock.calls.map(([event]) => event)).toEqual([
+      { type: 'message', content: 'Done.' },
+    ]);
+  });
+
+  it('sends the whole final message when the streamed text was rewritten before delivery', async () => {
+    const complete = vi.fn(async (request) => {
+      request.onDelta({ type: 'content', text: 'Done.<|eot_id|>' });
+      return { id: 'artifact', created: 1, content: 'Done.<|eot_id|>', raw: {} };
+    });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.cleanupModelResponse = (content: string) => content.replace(/<\|.*?\|>/g, '').trim();
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, streaming: true });
+    await runAgentReactLoop(host, new AbortController());
+    expect(vi.mocked(host.emitOutput).mock.calls.map(([event]) => event)).toEqual([
+      { type: 'message_delta', content: 'Done.<|eot_id|>' },
+      { type: 'message', content: 'Done.' },
+    ]);
+  });
+
   it.each([
     { attached: 1, error: undefined },
     { attached: 0, error: 'Screenshot was removed before visual inspection.' },
@@ -445,6 +500,88 @@ describe('ReactLoopRunner composer status', () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+
+  describe('compact tool output', () => {
+    const FULL = Array.from({ length: 83 }, (_, index) => `line ${index + 1}`).join('\n');
+
+    async function runOneTool(
+      result: { tool: 'fetch_url' | 'run_command'; success: boolean; output?: string; error?: string },
+      ui: Record<string, unknown>,
+      withInk = true,
+    ) {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const addToolOutput = vi.fn();
+      const llmComplete = vi
+        .fn()
+        .mockResolvedValueOnce({
+          id: 'tool-call',
+          created: 1,
+          content: JSON.stringify({ toolCalls: [{ tool: result.tool, args: { url: 'https://example.test', command: 'bun', args: ['test'] } }] }),
+          raw: {},
+        })
+        .mockResolvedValueOnce({ id: 'answer', created: 2, content: '{"finalResponse":"Done."}', raw: {} });
+      const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+      host.runtime.config.ui = ui;
+      if (withInk) {
+        host.inkRenderer = {
+          setStatus: vi.fn(),
+          addToolCall: vi.fn(),
+          addToolOutputBatch: vi.fn(),
+          addToolOutput,
+          setThinking: vi.fn(),
+          setElapsed: vi.fn(),
+          setTokens: vi.fn(),
+          setWorking: vi.fn(),
+          setFinalResponse: vi.fn(),
+        };
+      }
+      host.toolManager.execute = vi.fn(async (_calls, onResult) => {
+        onResult(0, result);
+        return [result];
+      });
+      let logged = '';
+      try {
+        await runAgentReactLoop(host, new AbortController());
+        logged = logSpy.mock.calls.flat().join('\n');
+      } finally {
+        logSpy.mockRestore();
+      }
+      const recorded = JSON.stringify(vi.mocked(host.conversation.addMessage).mock.calls);
+      return { addToolOutput, logged, recorded };
+    }
+
+    it('shows a short preview by default and keeps the full result for expansion', async () => {
+      const { addToolOutput } = await runOneTool({ tool: 'fetch_url', success: true, output: FULL }, {});
+
+      expect(addToolOutput).toHaveBeenCalledExactlyOnceWith('fetch_url', true, 'line 1\nline 2\nline 3', undefined, FULL);
+    });
+
+    it('still records the complete result for the model', async () => {
+      const { recorded } = await runOneTool({ tool: 'fetch_url', success: true, output: FULL }, {});
+
+      expect(recorded).toContain('line 83');
+    });
+
+    it('shows everything when ui.toolOutput is full', async () => {
+      const { addToolOutput } = await runOneTool({ tool: 'fetch_url', success: true, output: FULL }, { toolOutput: 'full' });
+
+      expect(addToolOutput).toHaveBeenCalledExactlyOnceWith('fetch_url', true, FULL, undefined);
+    });
+
+    it('previews the end of a failed command and keeps the whole error', async () => {
+      const { addToolOutput } = await runOneTool({ tool: 'run_command', success: false, error: FULL }, {});
+
+      expect(addToolOutput).toHaveBeenCalledExactlyOnceWith(
+        'run_command', false, 'line 79\nline 80\nline 81\nline 82\nline 83', undefined, FULL,
+      );
+    });
+
+    it('prints the complete result where nothing can be expanded later', async () => {
+      const { logged } = await runOneTool({ tool: 'fetch_url', success: true, output: FULL }, {}, false);
+
+      expect(logged).toContain('line 83');
+    });
   });
 
   it('passes the instruction signal to tools and skips the exhaustion summary after abort', async () => {
@@ -1290,6 +1427,28 @@ describe('ReactLoopRunner composer status', () => {
     }
   });
 
+  it('bounds the actual native request after cached tool selection reaches the Grok limit', async () => {
+    const complete = vi.fn().mockResolvedValue({ id: 'bounded', created: 1, content: 'Done.', raw: {} });
+    const host = createReactLoopTestHost(complete, new ReactionParser());
+    host.activeProvider = 'autohandai';
+    host.runtime.config.autohandai = { plan: 'cloud' };
+    host.isPromptCachingEnabled = () => true;
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true, maxTools: 128 });
+    host.conversation.history = () => [{ role: 'user', content: 'Use my computer to inspect the window' }];
+    host.toolManager.toFunctionDefinitions = () => [
+      ...Array.from({ length: 134 }, (_, i) => ({ name: `fixture_${i}`, description: 'computer window' })),
+      { name: 'tool_search', description: 'Search available capabilities' },
+      { name: 'mcp__autohand-computer-use__get_window_state', description: 'Inspect the window' },
+    ];
+    await runAgentReactLoop(host, new AbortController());
+    const sent = complete.mock.calls[0]?.[0].tools;
+    expect(sent).toHaveLength(128);
+    expect(sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'tool_search' }),
+      expect.objectContaining({ name: 'mcp__autohand-computer-use__get_window_state' }),
+    ]));
+  });
+
   it('does not send native tool schemas to providers without native tool-call capability', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const parser = new ReactionParser();
@@ -1388,7 +1547,10 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
   // The first request follows a request to fix something, so the editing tools
   // are relevant; by the second request the recent messages no longer mention
   // editing, which is exactly when relevance filtering would shrink the list.
-  async function advertisedToolsPerIteration(configure: (host: AgentReactLoopHost) => void): Promise<string[][]> {
+  async function advertisedToolsPerIteration(
+    configure: (host: AgentReactLoopHost) => void,
+    instructions = ['fix the parser', 'thanks'],
+  ): Promise<string[][]> {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       const llmComplete = vi.fn()
@@ -1399,9 +1561,10 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
       host.toolManager.toFunctionDefinitions = vi.fn(() => definitions);
       host.toolManager.execute = vi.fn().mockResolvedValue([{ tool: 'read_file', success: true, output: 'code' }]);
       host.sessionManager.getCurrentSession = vi.fn(() => ({ metadata: { sessionId: 'session-123' } }));
-      host.conversation.history = vi.fn()
-        .mockReturnValueOnce([{ role: 'user', content: 'fix the parser' }])
-        .mockReturnValue([{ role: 'user', content: 'thanks' }]);
+      host.conversation.history = vi.fn(() => [{
+        role: 'user' as const,
+        content: instructions[Math.min(llmComplete.mock.calls.length, instructions.length - 1)],
+      }]);
       configure(host);
 
       await runAgentReactLoop(host, new AbortController());
@@ -1421,6 +1584,27 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
     });
 
     expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('preserves the cached cloud tool prefix when a read becomes an edit', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud', model: 'grok-4.7' };
+      host.isPromptCachingEnabled = () => true;
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it('keeps relevance filtering when there is no session cache key', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'autohandai';
+      host.runtime.config.autohandai = { plan: 'cloud' };
+      host.isPromptCachingEnabled = () => true;
+      host.sessionManager.getCurrentSession = vi.fn(() => null);
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file'], ['read_file', 'write_file']]);
   });
 
   it('keeps the tool list stable for a session across turns', async () => {

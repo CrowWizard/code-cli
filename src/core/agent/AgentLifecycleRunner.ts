@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { isAxoInput } from '../../ui/axo/axoCommand.js';
 import { isStartupTimingEnabled, startupTimeline } from '../../startup/startupTimeline.js';
 import { buildOutputSchemaInstruction, buildOutputSchemaRepairInstruction, checkOutputAgainstSchema, type OutputSchemaSpec } from '../../modes/outputSchema.js';
 import { autoNameAgentSessionFromInstruction, refineAgentSessionTitle, syncAgentTerminalTitleName } from './AgentSessionTitle.js';
@@ -31,6 +32,8 @@ import { renderTerminalMarkdown } from '../immediateCommandRouter.js';
 import { isLikelyFilePathSlashInput } from '../slashInputDetection.js';
 import { isShellCommand, parseShellCommand } from '../../ui/shellCommand.js';
 import { plan as planCommand } from '../../commands/plan.js';
+import type { SlashCommandContext } from '../slashCommandTypes.js';
+import type { InteractionMode } from './InteractionModeController.js';
 import { runWithConcurrency } from '../../utils/parallel.js';
 import { buildSessionChatLog } from '../../session/chatLog.js';
 import { formatExitCleanup, formatForceExit } from '../../ui/theme/startup.js';
@@ -59,7 +62,7 @@ import { executeReviewWithLifecycle } from '../../review/reviewLifecycle.js';
 import type { ReviewExecutionSurface } from '../../review/reviewLifecycle.js';
 import type { ReviewRequest } from '../../review/reviewRequest.js';
 import { matchesComputerControlIntent } from '../../skills/computerControlIntent.js';
-import { CUA_DRIVER_MCP_SERVER_NAME } from '../../computer/cuaDriver.js';
+import { resolveComputerUseMcpServerName } from '../../computer/cuaDriver.js';
 
 const execFileAsync = promisify(execFile);
 const RUNTIME_RESOURCE_SHUTDOWN_TIMEOUT_MS = 2_500;
@@ -1010,8 +1013,11 @@ async function waitForComputerControlTools(
   if (!matchesComputerControlIntent(instruction)) return;
   if (!host.mcpManager?.waitForServerSettlement) return;
 
+  const serverName = resolveComputerUseMcpServerName(
+    host.runtimeMcpServers ?? host.runtime.config.mcp?.servers,
+  );
   const status = await host.mcpManager.waitForServerSettlement(
-    CUA_DRIVER_MCP_SERVER_NAME,
+    serverName,
     {
       timeoutMs: COMPUTER_CONTROL_FIRST_TURN_DEADLINE_MS,
       signal: host.runtimeResourceShutdownController?.signal,
@@ -1293,6 +1299,7 @@ export async function runAgentCommandMode(
       if (succeeded) {
         if (
           host.runtime.config.ui?.terminalBell !== false
+          && process.stdout.isTTY
           && !options.review
           && (host.runtime.options.commandOutputFormat ?? 'text') === 'text'
         ) {
@@ -1741,6 +1748,12 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
         // The user moved on: an unanswered session survey must not linger.
         host.feedbackSurvey?.clear();
 
+        // `~axo` needs the full terminal UI; without it there is no Axo to show.
+        if (!mobileTurn && isAxoInput(instruction)) {
+          if (!host.inkRenderer?.isRunning()) console.log(chalk.gray('Axo only lives in the full terminal UI.'));
+          continue;
+        }
+
         // Handle ! shell commands locally (never send to LLM)
         if (!mobileTurn && isShellCommand(instruction)) {
           const shellCmd = parseShellCommand(instruction);
@@ -1809,7 +1822,15 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
               let handled: string | null = null;
               if (command === '/plan' && host.inkRenderer?.isRunning()) {
                 const logBuffer: string[] = [];
-                handled = await planCommand({} as any, args.join(' '), {
+                // The mode controller owns plan/auto/yolo exclusivity; without it
+                // /plan would enable planning while the session stays in auto mode.
+                const planContext = typeof host.setInteractionMode === 'function'
+                  ? {
+                    getInteractionMode: () => host.getInteractionMode(),
+                    setInteractionMode: (mode: InteractionMode) => host.setInteractionMode(mode),
+                  }
+                  : {};
+                handled = await planCommand(planContext as SlashCommandContext, args.join(' '), {
                   output: (msg: string) => logBuffer.push(msg),
                 });
                 if (logBuffer.length > 0) {

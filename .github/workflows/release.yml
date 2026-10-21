@@ -267,6 +267,14 @@ jobs:
             target: linux-arm64
             artifact: autohand-linux-arm64
             tracesArtifact: ahtraces-linux-arm64
+          - os: ubuntu-latest
+            target: linux-x64-musl
+            artifact: autohand-linux-x64-musl
+            tracesArtifact: ahtraces-linux-x64-musl
+          - os: ubuntu-latest
+            target: linux-arm64-musl
+            artifact: autohand-linux-arm64-musl
+            tracesArtifact: ahtraces-linux-arm64-musl
           - os: windows-latest
             target: windows-x64
             artifact: autohand-windows-x64.exe
@@ -484,7 +492,7 @@ jobs:
           file ./binaries/${{ matrix.tracesArtifact }}
 
       - name: Smoke test binary
-        if: runner.os != 'Windows' && !contains(matrix.target, 'arm64') || matrix.os == 'macos-latest' && contains(matrix.target, 'arm64')
+        if: runner.os != 'Windows' && !contains(matrix.target, 'arm64') && !contains(matrix.target, 'musl') || matrix.os == 'macos-latest' && contains(matrix.target, 'arm64')
         shell: bash
         run: |
           # Helper: run a command with a timeout (works on both Linux and macOS)
@@ -510,6 +518,17 @@ jobs:
           run_with_timeout 10 ./binaries/${{ matrix.tracesArtifact }} --version < /dev/null
           echo "Smoke test passed!"
 
+      - name: Smoke test musl binary on Alpine
+        if: matrix.target == 'linux-x64-musl'
+        timeout-minutes: 3
+        run: |
+          docker run --rm -v "$PWD/binaries:/binaries:ro" alpine:3 sh -ec '
+            apk add --no-cache libstdc++
+            /binaries/autohand-linux-x64-musl --version
+            /binaries/autohand-linux-x64-musl --help > /dev/null
+            /binaries/ahtraces-linux-x64-musl --version
+          '
+
       - name: Smoke test Windows binary
         if: runner.os == 'Windows' && !contains(matrix.target, 'arm64')
         shell: pwsh
@@ -532,6 +551,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Windows ahtraces --version smoke test failed with exit code $LASTEXITCODE"
           }
+
+      - name: Verify fresh alpha installation
+        if: runner.os != 'Windows' && !contains(matrix.target, 'arm64') && !contains(matrix.target, 'musl') || matrix.os == 'macos-latest' && contains(matrix.target, 'arm64')
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          host_archive=""
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            host_archive="./binaries/autohand-computer-use-${{ matrix.target }}.tar.gz"
+          fi
+          sh src/testing/scenarios/fresh-alpha-install.sh \
+            "./binaries/${{ matrix.artifact }}" "${{ needs.prepare.outputs.version }}" \
+            "./binaries/${{ matrix.tracesArtifact }}" "$host_archive"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -688,6 +720,15 @@ jobs:
           if [ -f "autohand-linux-arm64" ]; then
             chmod +x autohand-linux-arm64
             bundle_unix "autohand-linux-arm64" "ahtraces-linux-arm64"
+          fi
+
+          if [ -f "autohand-linux-x64-musl" ]; then
+            chmod +x autohand-linux-x64-musl
+            bundle_unix "autohand-linux-x64-musl" "ahtraces-linux-x64-musl"
+          fi
+          if [ -f "autohand-linux-arm64-musl" ]; then
+            chmod +x autohand-linux-arm64-musl
+            bundle_unix "autohand-linux-arm64-musl" "ahtraces-linux-arm64-musl"
           fi
 
           # Create bundled zip for Windows

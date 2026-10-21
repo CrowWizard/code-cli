@@ -26,16 +26,17 @@ import { collectToolPatternOption } from './permissions/cliPolicyMutation.js';
 import { configureRunConfigOverlay } from './runConfigOverlay.js';
 import { loadOutputSchema } from './modes/outputSchema.js';
 import { startupTimeline } from './startup/startupTimeline.js';
-import { Command, Option } from 'commander';
+import { Command, InvalidArgumentError, Option } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
+import { applyCliModelOverride, applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
 import { reportCliCommand } from './telemetry/commandUsage.js';
 import {
   reconcileAhTraces,
+  shouldAwaitAhTracesReconcile,
   shouldReconcileAhTracesAtStartup,
 } from './integrations/ahtraces/client.js';
 import { applyTraceSettingChange } from './integrations/ahtraces/settingsLifecycle.js';
@@ -43,7 +44,7 @@ import { setTraceMonitoringEnabled } from './integrations/ahtraces/preferences.j
 import { runStartupChecks, printStartupCheckResults, validateWorkspacePath } from './startup/checks.js';
 import { checkWorkspaceSafety, printDangerousWorkspaceWarning } from './startup/workspaceSafety.js';
 import { ensureAuthenticated } from './auth/index.js';
-import type { AuthUser, BuiltInProviderName, LoadedConfig, SkillInstallScope } from './types.js';
+import type { AuthUser, LoadedConfig, SkillInstallScope } from './types.js';
 import { validateAuthOnStartup } from './auth/startupAuth.js';
 import { installProcessErrorHandlers } from './reporting/processErrorReporting.js';
 import { checkForUpdates, getInstallHint, type VersionCheckResult } from './utils/versionCheck.js';
@@ -60,12 +61,23 @@ import {
 } from './modes/commandOutput.js';
 import { AUTOHAND_PATHS, PROJECT_DIR_NAME } from './constants.js';
 import { isSessionWorktreeEnabled, prepareSessionWorktree } from './utils/sessionWorktree.js';
+import { armPromptExitBackstop } from './runtime/promptExitBackstop.js';
+import {
+  buildZitSessionInstructions,
+  createSessionZitFinalizer,
+  isSessionZitEnabled,
+  prepareSessionZit,
+  type SessionZitFinalizer,
+  type SessionZitInfo,
+  ZitClaimGuard,
+} from './utils/sessionZit.js';
 import { buildTmuxLaunchCommand, createTmuxSessionName, isTmuxEnabled } from './utils/tmux.js';
 import { registerBrowserCommand, registerBrowserOptions } from './browser/cliCommand.js';
 import { registerComputerCommand } from './computer/cliCommand.js';
 import { registerReviewCommand } from './review/reviewCliCommand.js';
 import { registerTransferCommand } from './startup/transferCommand.js';
 import { registerResumeCommand } from './startup/resumeCommand.js';
+import { attachHerdrIntegration, type HerdrIntegration } from './integrations/herdr/index.js';
 import { probeMcpServersWithManager, registerDoctorCommand } from './startup/doctorCommand.js';
 import type { ReviewCliExecution } from './review/reviewCliRuntime.js';
 import { formatDeprecatedBrowserOptionWarning } from './browser/compatibility.js';
@@ -76,12 +88,15 @@ import {
   normalizeSearchEngineOption,
   normalizeTmuxWorktreeOption,
   type RootCliOptions,
+  validateZitOption,
 } from './startup/cliOptions.js';
 import {
+  applyStartupInteractionMode,
   resolveAgentLaunchMode,
   resolveInternalLaunchMode,
   resolvePostAuthLaunchMode,
   resolveProtocolLaunchMode,
+  resolveStartupInteractionMode,
 } from './startup/modeRouter.js';
 import { prepareBareModeConfig } from './runtime/bareMode.js';
 import {
@@ -108,7 +123,6 @@ import { ActiveAgentRegistry } from './session/ActiveAgentRegistry.js';
 import { AgentsGenerator } from './onboarding/agentsGenerator.js';
 import { buildAutomodeIterationPrompt } from './core/automodePrompt.js';
 import { looksLikeInlineAgents, parseInlineAgents } from './core/agents/AgentRegistry.js';
-import { getCustomProviderConfig, isCustomProviderName } from './providers/customProviders.js';
 import { GIT_VERSION_LOOKUP_TIMEOUT_MS, runtimeVersion } from './utils/runtimeVersion.js';
 import {
   getAnnouncementManager,
@@ -148,28 +162,6 @@ async function applyServedAutohandModel(config: LoadedConfig, opts: { model?: st
   const served = normalizeAutohandAIStartupModel(config);
   if (served && opts.model) {
     opts.model = served;
-  }
-}
-
-function applyCliModelOverride(config: LoadedConfig, model: string): void {
-  const providerName = config.provider ?? 'openrouter';
-  if (isCustomProviderName(providerName)) {
-    const customProvider = getCustomProviderConfig(config, providerName);
-    if (customProvider) {
-      config.customProviders = {
-        ...config.customProviders,
-        [customProvider.id]: {
-          ...customProvider,
-          model,
-        },
-      };
-    }
-    return;
-  }
-
-  const providerConfig = config[providerName as BuiltInProviderName];
-  if (providerConfig) {
-    providerConfig.model = model;
   }
 }
 
@@ -338,13 +330,15 @@ const collectRepeatable = (value: string, previous: string[] = []): string[] => 
 // --profile and --set apply to every command, including subcommands, and to
 // every config load in this process, before any of them reads the config.
 program.hook('preAction', async (thisCommand, actionCommand) => {
-  const { profile, set, config, bare, tracesOn, tracesOff } = thisCommand.opts<{
+  const { profile, set, config, bare, tracesOn, tracesOff, mode, acp } = thisCommand.opts<{
     profile?: string;
     set?: string[];
     config?: string;
     bare?: boolean;
     tracesOn?: boolean;
     tracesOff?: boolean;
+    mode?: string;
+    acp?: boolean;
   }>();
   configureRunConfigOverlay({ profile, sets: set });
 
@@ -374,7 +368,10 @@ program.hook('preAction', async (thisCommand, actionCommand) => {
     loadConfig: () => loadConfig(undefined, undefined, { createIfMissing: false, initializeTheme: false }),
     clientVersion: getVersionString(),
   });
-  await traceSupervision;
+  // ACP and RPC hosts answer their client's handshake first; reconciliation
+  // never rejects and nothing after this hook reads its result, so those
+  // modes let it finish in the background instead of stalling on the daemon.
+  if (shouldAwaitAhTracesReconcile({ mode, acp })) await traceSupervision;
 });
 
 /**
@@ -454,6 +451,7 @@ program
   .option('--teammate-mode <mode>', 'Legacy team display preference; live team view stays in the lead terminal')
   .option('--worktree [name]', 'Run session in isolated git worktree (optional name)')
   .option('--tmux', 'Launch in a dedicated tmux session (implies --worktree)')
+  .option('--zit [intent]', 'Run session in a disposable Zit workspace, recorded as a Zit change on exit (optional intent)')
   // Auto-mode options
   .option('--auto-mode [prompt]', 'Enable interactive auto-mode, or start a standalone loop with an inline task')
   .option('--max-iterations <n>', 'Max auto-mode iterations (default: 50)', parseInt)
@@ -461,7 +459,9 @@ program
   .option('--no-worktree', 'Disable git worktree isolation in auto-mode')
   .option('--checkpoint-interval <n>', 'Git commit every N iterations (default: 5)', parseInt)
   .option('--max-runtime <m>', 'Max runtime in minutes (default: 120)', parseInt)
-  .option('--max-cost <d>', 'Max API cost in dollars (default: 10)', parseFloat)
+  .addOption(new Option('--max-cost <d>').hideHelp().argParser(() => {
+    throw new InvalidArgumentError('--max-cost is not supported. Use --max-iterations or --max-runtime instead.');
+  }))
   .option('--max-requests <n>', 'Stop the run after this many model requests, sub-agents included', parseInt)
   .option('--max-tokens <n>', 'Stop the run once reported token usage reaches this total, sub-agents included', parseInt)
   .option('--max-duration <seconds>', 'Stop the run after this much wall time', parseInt)
@@ -567,6 +567,12 @@ program
       && process.stdin.isTTY
     ) {
       console.error(chalk.red('Structured output requires a one-shot prompt. Use -p or --prompt.'));
+      process.exit(1);
+    }
+
+    const zitOptionError = validateZitOption(opts);
+    if (zitOptionError) {
+      console.error(chalk.red(zitOptionError));
       process.exit(1);
     }
 
@@ -1529,10 +1535,17 @@ interface InternalCLIOptions extends CLIOptions {
   reviewExecution?: ReviewCliExecution['review'];
 }
 
+/**
+ * After SIGINT/SIGTERM, how long graceful shutdown (bounded at about 2.5 s
+ * per stage) may run before the zit finalizer records and exits regardless.
+ */
+const ZIT_SIGNAL_GRACE_MS = 6_000;
+
 async function runCLI(options: InternalCLIOptions): Promise<void> {
   const agentHolder: { current: AutohandAgent | null } = { current: null };
   const commandLifecycleController = new AbortController();
   let agent: AutohandAgent | null = null;
+  let herdrIntegration: HerdrIntegration | null = null;
   const structuredOutput = isStructuredCommandOutput(options.commandOutputFormat);
   const captureCommandOutput = structuredOutput || options.reviewExecution !== undefined;
   const commandOutputWriter = captureCommandOutput
@@ -1540,6 +1553,8 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     : undefined;
   const restoreConsoleOutput = captureCommandOutput ? redirectConsoleOutputToStderr() : undefined;
   let commandOutputCompleted = false;
+  // Records the --zit workspace once: in the finally block below, or on process exit.
+  let sessionZitFinalizer: SessionZitFinalizer | null = null;
   const runtimeResourceOwner = new CliRuntimeResourceOwner<
     AuthUser,
     VersionCheckResult,
@@ -1565,7 +1580,9 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       commandLifecycleController.signal,
     );
     startupTimeline.mark('config loaded');
-    config = applyCliProviderOverride(config, options.provider);
+    config = options.model
+      ? applyCliModelOverride(config, options.model, options.provider)
+      : applyCliProviderOverride(config, options.provider);
     if (options.bare) {
       config = await awaitCliLifecycleStep(
         prepareBareModeConfig(config, options),
@@ -1579,6 +1596,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     const originalWorkspaceRoot = resolveWorkspaceRoot(config, options.path);
     let workspaceRoot = originalWorkspaceRoot;
     let sessionWorktree: ReturnType<typeof import('./utils/sessionWorktree.js')['prepareSessionWorktree']> | null = null;
+    let sessionZit: SessionZitInfo | null = null;
 
     // Initialize i18n with locale detection
     const { locale: detectedLocale } = detectLocale({
@@ -1608,6 +1626,13 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       process.exitCode = 1;
       return;
     }
+
+    applyStartupInteractionMode(options, resolveStartupInteractionMode({
+      options,
+      configuredMode: config.ui?.defaultInteractionMode,
+      permissionMode: config.permissions?.mode,
+      isInteractiveTerminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    }));
 
     const normalizedYolo = normalizeYoloInput(options.yolo as string | boolean | undefined);
     if (normalizedYolo) {
@@ -1700,6 +1725,14 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       return;
     }
 
+    if (!structuredOutput && resolveAgentLaunchMode(options) === 'interactive'
+      && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+      const { hasLegacyAutomodeState } = await import('./core/AutomodeState.js');
+      if (await awaitCliLifecycleStep(hasLegacyAutomodeState(originalWorkspaceRoot), commandLifecycleController.signal)) {
+        console.warn(chalk.gray('Ignored old auto-mode state in .autohand/automode.local.md. Auto mode now starts only when you choose it.'));
+      }
+    }
+
     // loadConfig held back project hooks and MCP servers from an untrusted
     // workspace. Ask a person at the terminal; otherwise warn and skip them.
     if (!options.bare && config.workspaceTrust && !config.workspaceTrust.trusted) {
@@ -1733,6 +1766,32 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       const worktreeSafetyCheck = checkWorkspaceSafety(workspaceRoot);
       if (!worktreeSafetyCheck.safe) {
         printDangerousWorkspaceWarning(workspaceRoot, worktreeSafetyCheck);
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    // Optional disposable Zit workspace, recorded as a Zit change when the session ends
+    if (isSessionZitEnabled(options.zit)) {
+      sessionZit = prepareSessionZit({
+        cwd: originalWorkspaceRoot,
+        zit: options.zit,
+        prompt: options.prompt,
+        mode: 'cli',
+      });
+      workspaceRoot = sessionZit.workspacePath;
+      options.sessionInstructions = buildZitSessionInstructions(sessionZit);
+      // SIGINT/SIGTERM abort this command's lifecycle, which ends in the finally
+      // block below. If that stalls, the finalizer records and exits itself.
+      sessionZitFinalizer = createSessionZitFinalizer(sessionZit, {
+        getSummary: () => agent?.getLastAssistantResponse(),
+        exitOnSignal: () => true,
+        signalGraceMs: ZIT_SIGNAL_GRACE_MS,
+      });
+
+      const zitSafetyCheck = checkWorkspaceSafety(workspaceRoot);
+      if (!zitSafetyCheck.safe) {
+        printDangerousWorkspaceWarning(workspaceRoot, zitSafetyCheck);
         process.exitCode = 1;
         return;
       }
@@ -1790,7 +1849,8 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       workspaceRoot,
       options,
       commandOutputCaptured: captureCommandOutput,
-      additionalDirs: additionalDirs.length > 0 ? additionalDirs : undefined
+      additionalDirs: additionalDirs.length > 0 ? additionalDirs : undefined,
+      ...(sessionZit ? { zitClaims: new ZitClaimGuard(sessionZit) } : {}),
     };
 
     // Print banner FIRST for immediate visual feedback
@@ -1800,6 +1860,15 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     if (!structuredOutput && sessionWorktree && process.stdout.isTTY) {
       console.log(chalk.gray(`Using git worktree: ${sessionWorktree.worktreePath}`));
       console.log(chalk.gray(`Branch: ${sessionWorktree.branchName}${sessionWorktree.createdBranch ? ' (new)' : ''}\n`));
+    }
+    if (sessionZit) {
+      // Prompt mode keeps stdout for the response, so report the workspace on stderr there.
+      const zitStatus = `Using zit workspace: ${sessionZit.workspacePath}\n`;
+      if (!structuredOutput && process.stdout.isTTY) {
+        console.log(chalk.gray(zitStatus));
+      } else {
+        process.stderr.write(chalk.gray(zitStatus));
+      }
     }
     // Store whether Ink will be enabled so we can synchronize startup.
     // Ink is code-defaulted, not controlled by stale config.ui.useInkRenderer.
@@ -1939,11 +2008,6 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     // Note: Git repo check is passed to the agent via runtime.
     // The agent/LLM can suggest initializing git if needed for complex tasks.
 
-    // Override model from CLI if provided
-    if (options.model) {
-      applyCliModelOverride(config, options.model);
-    }
-
     // Override debug mode from CLI if provided
     if (options.debug) {
       config.agent = config.agent ?? {};
@@ -2055,6 +2119,7 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
     }
     agent = new AutohandAgent(llmProvider, files, runtime);
     agentHolder.current = agent;
+    herdrIntegration = attachHerdrIntegration({ hookManager: agent.getHookManager() });
     startupTimeline.mark('agent constructed');
     if (commandLifecycleController.signal.aborted) {
       agent.requestExit();
@@ -2166,8 +2231,14 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       agent?.shutdownRuntimeResources(),
       runtimeResourceOwner?.shutdown(),
     ]);
+    await herdrIntegration?.reporter.settled();
+    herdrIntegration?.detach();
+    sessionZitFinalizer?.finish(agent?.getLastAssistantResponse());
     agentHolder.current = null;
     restoreConsoleOutput?.();
+    if (resolveAgentLaunchMode(options) === 'command') {
+      armPromptExitBackstop();
+    }
   }
 }
 
@@ -2591,7 +2662,7 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
   const fs = await import('fs-extra');
   const { generateUnifiedPatch, formatChangeSummary } = await import('./utils/patch.js');
 
-  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+  let config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
   let workspaceRoot = originalWorkspaceRoot;
 
@@ -2623,7 +2694,7 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
 
   // Override model from CLI if provided
   if (opts.model) {
-    applyCliModelOverride(config, opts.model);
+    config = applyCliModelOverride(config, opts.model, opts.provider);
   }
   await applyServedAutohandModel(config, opts);
 
@@ -2712,7 +2783,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
     process.exit(1);
   }
 
-  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+  let config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
 
   await exitUnlessWorkspaceIsSafe(originalWorkspaceRoot);
@@ -2727,7 +2798,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
 
   // Override model from CLI if provided
   if (opts.model) {
-    applyCliModelOverride(config, opts.model);
+    config = applyCliModelOverride(config, opts.model, opts.provider);
   }
   await applyServedAutohandModel(config, opts);
 
@@ -2900,6 +2971,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
         success,
         actions,
         error,
+        output: success ? activeAgent.getLastAssistantResponse() : undefined,
         filesModified: fileChanges.count,
         modifiedFiles: fileChanges.paths,
       };

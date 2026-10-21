@@ -163,7 +163,7 @@ export class AutohandAIProvider implements LLMProvider {
   private model: string;
 
   constructor(
-    private readonly config: AutohandAISettings,
+    private config: AutohandAISettings,
     networkSettings?: NetworkSettings,
   ) {
     this.model = config.plan === "local"
@@ -217,13 +217,19 @@ export class AutohandAIProvider implements LLMProvider {
     const model = AUTOHAND_AI_CLOUD_MODEL_DEFINITIONS.find(
       (definition) => definition.id === this.model,
     );
-    return { nativeToolCalling: model?.toolCalls === true, streaming: true };
+    return { nativeToolCalling: model?.toolCalls === true, streaming: true,
+      ...(this.model === "grok-4.7" ? { maxTools: 128 } : {}),
+    };
   }
 
   setModel(model: string): void {
     this.model = this.localProvider ? model : resolveAutohandAICloudModel(model);
     this.localProvider?.setModel(this.model);
     this.cloudClient?.setDefaultModel(this.model);
+  }
+
+  setReasoningEffort(effort: NonNullable<AutohandAISettings["reasoningEffort"]>): void {
+    this.config = { ...this.config, reasoningEffort: effort };
   }
 
   async listModels(): Promise<string[]> {

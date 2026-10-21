@@ -26,6 +26,11 @@ export interface HookContext {
   tool?: string;
   /** Tool call ID */
   toolCallId?: string;
+  /** For a call made by a `run_tool_script` script: the id of that script's tool call. */
+  parentToolCallId?: string;
+  computerUseId?: string;
+  computerUseAction?: string;
+  computerUseStatus?: 'running' | 'done' | 'unverified' | 'failed' | 'cancelled' | 'finished';
   /** JSON-encoded tool args */
   args?: Record<string, unknown>;
   /** Tool success status (for post-tool) */
@@ -570,8 +575,14 @@ export class HookManager {
     switch (hook.event) {
       case 'pre-tool':
       case 'post-tool':
+      case 'computer-use-start':
+      case 'computer-use-progress':
+      case 'computer-use-error':
       case 'permission-request':
         value = context.tool ?? '';
+        break;
+      case 'computer-use-stop':
+        value = context.computerUseStatus ?? '';
         break;
       case 'notification':
         value = context.notificationType ?? '';
@@ -700,6 +711,10 @@ export class HookManager {
     // Tool hooks
     if (context.tool) env.HOOK_TOOL = context.tool;
     if (context.toolCallId) env.HOOK_TOOL_CALL_ID = context.toolCallId;
+    if (context.parentToolCallId) env.HOOK_PARENT_TOOL_CALL_ID = context.parentToolCallId;
+    if (context.computerUseId) env.HOOK_COMPUTER_USE_ID = context.computerUseId;
+    if (context.computerUseAction) env.HOOK_COMPUTER_USE_ACTION = context.computerUseAction;
+    if (context.computerUseStatus) env.HOOK_COMPUTER_USE_STATUS = context.computerUseStatus;
     if (context.args) env.HOOK_ARGS = JSON.stringify(context.args);
     if (context.success !== undefined) env.HOOK_SUCCESS = String(context.success);
     if (context.output) env.HOOK_OUTPUT = context.output;
@@ -846,6 +861,10 @@ export class HookManager {
       tool_name: context.tool,
       tool_input: context.args,
       tool_use_id: context.toolCallId,
+      parent_tool_use_id: context.parentToolCallId,
+      computer_use_id: context.computerUseId,
+      computer_use_action: context.computerUseAction,
+      computer_use_status: context.computerUseStatus,
       tool_response: context.output,
       tool_success: context.success,
       // File context

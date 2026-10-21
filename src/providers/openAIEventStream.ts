@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import type { LLMRequest, LLMResponse, LLMToolCall } from '../types.js';
-import { ApiError } from './errors.js';
+import { ApiError, readContentBlockedError } from './errors.js';
 import { normalizeLLMUsage } from './usage.js';
 import { joinReasoning, splitInlineThinking } from './inlineThinking.js';
 import { normalizeProviderFinishReason } from './finishReason.js';
@@ -38,6 +38,7 @@ export async function readOpenAIEventStream(
   let finishReason: LLMResponse['finishReason'];
   let usage: LLMResponse['usage'];
   let done = false;
+  let interrupted = false;
   let responseChars = 0;
   const calls = new Map<number, LLMToolCall>();
   const abort = () => { void reader.cancel().catch(() => undefined); };
@@ -53,6 +54,8 @@ export async function readOpenAIEventStream(
     try { value = JSON.parse(text); } catch { throw streamError('Malformed event in inference stream.'); }
     const data = record(value);
     if (!data) throw streamError('Invalid inference stream event.');
+    const blocked = data.error && readContentBlockedError(data.error, response.status, response.headers.get('x-autohand-request-id'));
+    if (blocked) throw blocked;
     if (data.error || data.errors) throw streamError('The inference provider returned a stream error.');
     if (typeof data.id === 'string') id = data.id;
     if (typeof data.created === 'number') created = data.created;
@@ -120,13 +123,17 @@ export async function readOpenAIEventStream(
       if (next.done) {
         buffer += decoder.decode() + '\n\n';
         processLines();
-        if (!done && !finishReason) throw streamError('Inference stream ended with an incomplete response.');
+        if (!done && !finishReason) {
+          interrupted = true;
+          finishReason = 'length';
+        }
         break;
       }
       buffer += decoder.decode(next.value, { stream: true });
       processLines();
     }
-    const toolCalls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+    // A terminal event is required before any streamed action can reach an executor.
+    const toolCalls = interrupted || finishReason === 'length' ? [] : [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
     if (toolCalls.some(call => !call.id || !call.function.name)) throw streamError('Incomplete streamed tool call.');
     // Reasoning stays out of `content` so the show-thinking setting, not the
     // transcript, decides whether the user sees it.

@@ -136,6 +136,7 @@ import type {
   HookSessionEndNotificationParams,
   HookSubagentStopNotificationParams,
   HookSubagentActivityNotificationParams,
+  HookComputerUseNotificationParams,
   HookPermissionRequestNotificationParams,
   HookNotificationNotificationParams,
   HookContextCompactedNotificationParams,
@@ -223,6 +224,7 @@ function checksScriptFromParams(params: AutoresearchStartParams): string | undef
 // ApiErrorCode → RPC-specific error shape mapping
 // ---------------------------------------------------------------------------
 const RPC_ERROR_TYPE_MAP: Record<ApiErrorCode, string> = {
+  content_blocked: 'content_blocked',
   context_overflow: 'context',
   model_not_found: 'model',
   invalid_request: 'context',
@@ -238,6 +240,7 @@ const RPC_ERROR_TYPE_MAP: Record<ApiErrorCode, string> = {
 };
 
 const RPC_ERROR_CODE_MAP: Record<ApiErrorCode, number> = {
+  content_blocked: 400,
   context_overflow: 400,
   model_not_found: 404,
   invalid_request: 400,
@@ -253,6 +256,7 @@ const RPC_ERROR_CODE_MAP: Record<ApiErrorCode, number> = {
 };
 
 const RPC_ERROR_ICON_MAP: Record<ApiErrorCode, string> = {
+  content_blocked: '\u26A0\uFE0F',
   context_overflow: '\uD83D\uDCE6',  // 📦
   model_not_found: '\uD83E\uDD16',   // 🤖
   invalid_request: '\uD83D\uDCE6',   // 📦
@@ -1871,6 +1875,24 @@ export class RPCAdapter {
         } satisfies HookSubagentActivityNotificationParams);
         break;
       }
+      case 'computer-use-start':
+      case 'computer-use-progress':
+      case 'computer-use-error':
+      case 'computer-use-stop': {
+        const notifications = {
+          'computer-use-start': RPC_NOTIFICATIONS.HOOK_COMPUTER_USE_START,
+          'computer-use-progress': RPC_NOTIFICATIONS.HOOK_COMPUTER_USE_PROGRESS,
+          'computer-use-error': RPC_NOTIFICATIONS.HOOK_COMPUTER_USE_ERROR,
+          'computer-use-stop': RPC_NOTIFICATIONS.HOOK_COMPUTER_USE_STOP,
+        };
+        if (!this.notificationsSealed) writeNotification(notifications[context.event], {
+          runId: context.computerUseId ?? '', status: context.computerUseStatus,
+          action: context.computerUseAction, tool: context.tool, toolCallId: context.toolCallId,
+          success: context.success, error: context.error, duration: context.duration, toolCallsCount: context.toolCallsCount,
+          timestamp: createTimestamp(),
+        } satisfies HookComputerUseNotificationParams);
+        break;
+      }
       case 'subagent-stop':
         this.emitHookSubagentStop(
           context.subagentId ?? '',
@@ -3299,6 +3321,11 @@ export class RPCAdapter {
         });
         break;
       }
+      case 'message_delta':
+      case 'thought_delta':
+        // RPC clients receive the whole reply in one message update; the
+        // streamed fragments are intentionally not forwarded here.
+        break;
       case 'thinking':
         if (event.thought
           && prompt
@@ -3337,6 +3364,7 @@ export class RPCAdapter {
           }
           writeNotification(RPC_NOTIFICATIONS.TOOL_START, {
             toolId: event.toolId ?? generateId('tool'),
+            ...(event.parentToolId === undefined ? {} : { parentToolId: event.parentToolId }),
             toolName: event.toolName,
             args: redactBrowserToolArguments(event.toolName, event.toolArgs ?? {}),
             timestamp: createTimestamp(),
@@ -3348,6 +3376,7 @@ export class RPCAdapter {
         if (event.toolName) {
           writeNotification(RPC_NOTIFICATIONS.TOOL_END, {
             toolId: event.toolId ?? 'unknown',
+            ...(event.parentToolId === undefined ? {} : { parentToolId: event.parentToolId }),
             toolName: event.toolName,
             success: event.toolSuccess === true,
             output: event.toolOutput,

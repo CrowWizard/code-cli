@@ -13,12 +13,13 @@ import type {
   MultimodalMessage,
 } from "../types.js";
 import { joinReasoning, splitInlineThinking } from "./inlineThinking.js";
-import { ApiError, classifyApiError } from "./errors.js";
+import { ApiError, classifyApiError, readContentBlockedError } from "./errors.js";
 import { normalizeOutboundMessages, toTextOnlyContent } from "./messagePayload.js";
 import { normalizeLLMUsage } from "./usage.js";
 import { readOpenAIEventStream } from "./openAIEventStream.js";
 import { buildChatTemplateKwargs, coerceErrorDetail } from "./openAICompatibleShared.js";
 import { normalizeProviderFinishReason } from "./finishReason.js";
+import { recordRateLimitHeaders } from './rateLimitHeaders.js';
 
 /**
  * Sanitize messages for API consumption.
@@ -484,10 +485,22 @@ export class LLMGatewayClient {
       throw await this.buildFriendlyError(response);
     }
 
+    recordRateLimitHeaders(this.baseUrl, response.headers);
+
     // Inspection gateways can explicitly return buffered JSON even for stream:true.
     // Preserve that response without inventing incremental deltas or retrying billed work.
     if (isStreaming && !response.headers?.get('content-type')?.includes('application/json')) {
-      return readOpenAIEventStream(response, onDelta, signal, this.timeout);
+      try {
+        return await readOpenAIEventStream(response, onDelta, signal, this.timeout);
+      } catch (error) {
+        if (error instanceof ApiError && error.code !== 'cancelled' && error.code !== 'content_blocked' && this.errorLabels.serviceName === 'Autohand AI') {
+          throw new ApiError(
+            `${error.message}\nThe accepted request was not replayed. Check /usage before retrying. Request ID: ${headers['x-autohand-client-request-id']}.`,
+            error.code, error.httpStatus, false, error.retryAfterMs, error.rawDetail,
+          );
+        }
+        throw error;
+      }
     }
 
     const json = (await response.json()) as any;
@@ -538,6 +551,8 @@ export class LLMGatewayClient {
       const bodyRecord = body && typeof body === "object" && !Array.isArray(body)
         ? body as Record<string, unknown>
         : undefined;
+      const blocked = readContentBlockedError(bodyRecord?.error, status, response.headers?.get('x-autohand-request-id'));
+      if (blocked) return blocked;
       const arrayDetail = Array.isArray(body) ? coerceErrorDetail(body) : "";
       errorDetail = structuredError?.message
         ?? (coerceErrorDetail(bodyRecord?.error) || coerceErrorDetail(bodyRecord?.message) || arrayDetail);

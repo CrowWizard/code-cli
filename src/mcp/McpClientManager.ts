@@ -15,6 +15,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { buildAutohandChildProcessEnv } from '../utils/childProcessEnv.js';
 import { EventEmitter } from 'node:events';
+import { boundComputerUseObservation } from '../computer/computerUseOutput.js';
+import { computerUseCursorMotion, DEFAULT_COMPUTER_USE_CURSOR, installComputerUseCursor } from '../computer/computerUseCursor.js';
+import { setBounded } from '../utils/bounded.js';
 import {
   type McpServerConfig,
   type McpToolDefinition,
@@ -89,6 +92,25 @@ const MCP_STOP_FORCE_WAIT_MS = 1_000;
  */
 const MCP_REQUEST_TIMEOUT_MS = 30_000;
 const MCP_OAUTH_INITIALIZE_TIMEOUT_MS = 240_000;
+
+function isMcpToolError(result: unknown): boolean {
+  return result !== null && typeof result === 'object' && 'isError' in result && result.isError === true;
+}
+
+async function waitForCursorSession(ready: Promise<void> | undefined, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!ready) return;
+  if (!signal) return ready;
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([ready, new Promise<never>((_, reject) => {
+      onAbort = () => reject(new McpRequestAbortedError());
+      signal.addEventListener('abort', onAbort, { once: true });
+    })]);
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
+}
 
 function isOAuthBridge(config: McpServerConfig): boolean {
   return config.transport === 'stdio' && Boolean(config.command && isNpxCommand(config.command))
@@ -188,6 +210,16 @@ export class McpStdioConnection extends EventEmitter {
           // Server-specific env still wins; the base follows the shell.env policy.
           env: buildAutohandChildProcessEnv(this.config.env),
         });
+
+        const stdin = this.process.stdin;
+        if (stdin) {
+          const onStdinError = (error: Error): void => {
+            this.rejectPendingRequests(error);
+            if (this.listenerCount('error') > 0) this.emit('error', error);
+          };
+          stdin.on('error', onStdinError);
+          stdin.once('close', () => stdin.off('error', onStdinError));
+        }
 
         this.process.stdout?.on('data', (data: Buffer) => {
           this.handleStdoutData(data);
@@ -784,6 +816,7 @@ class McpHttpConnection extends EventEmitter {
  * ```
  */
 export class McpClientManager {
+  private cursorSessions = new WeakMap<McpStdioConnection | McpHttpConnection, Map<string | undefined, Promise<void>>>();
   private servers = new Map<string, McpServerState>();
   private connections = new Map<string, McpStdioConnection | McpHttpConnection>();
   private inFlightConnections = new Set<McpStdioConnection | McpHttpConnection>();
@@ -965,6 +998,7 @@ export class McpClientManager {
 
     if (connection) {
       await connection.stop();
+      this.cursorSessions.delete(connection);
       this.connections.delete(serverName);
     }
 
@@ -1069,13 +1103,94 @@ export class McpClientManager {
     }
 
     // Strip internal agent metadata fields that are not part of MCP tool schemas.
-    const toolArgs = { ...args };
+    const toolArgs = serverName === 'autohand-computer-use'
+      ? boundComputerUseObservation(toolName, args, state.tools.find(tool => tool.name === `mcp__${serverName}__${toolName}`)?.parameters.properties ?? {})
+      : { ...args };
     delete (toolArgs as { type?: unknown }).type;
 
-    const result = await connection.request('tools/call', {
+    const themeDirectory = state.config.env?.CUA_DRIVER_CURSOR_THEME_DIR;
+    const startSession = state.tools.find(tool => tool.name === `mcp__${serverName}__start_session`);
+    const managesCursor = serverName === 'autohand-computer-use' && state.config.transport === 'stdio'
+      && themeDirectory && startSession?.parameters.properties?.cursor_theme;
+    const session = typeof toolArgs.session === 'string' ? toolArgs.session : undefined;
+    let explicitStart: Promise<unknown> | undefined;
+    let cursorSessions: Map<string | undefined, Promise<void>> | undefined;
+    if (managesCursor) {
+      options.signal?.throwIfAborted();
+      cursorSessions = this.cursorSessions.get(connection);
+      if (!cursorSessions) {
+        cursorSessions = new Map();
+        this.cursorSessions.set(connection, cursorSessions);
+      }
+      const supportsStartMotion = Boolean(startSession?.parameters.properties?.cursor_motion);
+      const supportsLegacyMotion = state.tools.some(tool => tool.name === `mcp__${serverName}__set_agent_cursor_motion`
+        && tool.parameters.properties?.glide_duration_ms);
+      const startCursorSession = async (args: Record<string, unknown>): Promise<unknown> => {
+        const startArgs = { ...args };
+        const motion = (supportsStartMotion && startArgs.cursor_motion === undefined) || (!supportsStartMotion && supportsLegacyMotion)
+          ? computerUseCursorMotion(state.config.env?.AUTOHAND_COMPUTER_USE_GLIDE_MS ?? process.env.AUTOHAND_COMPUTER_USE_GLIDE_MS)
+          : undefined;
+        if (startArgs.cursor_theme === undefined) {
+          await installComputerUseCursor(themeDirectory);
+          startArgs.cursor_theme = DEFAULT_COMPUTER_USE_CURSOR;
+        }
+        if (supportsStartMotion && startArgs.cursor_motion === undefined) startArgs.cursor_motion = motion;
+        const deadline = AbortSignal.timeout(5_000);
+        const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+        const initialized = await connection.request('tools/call', { name: 'start_session', arguments: startArgs }, { signal });
+        if (isMcpToolError(initialized)) return initialized;
+        if (!supportsStartMotion && supportsLegacyMotion) {
+          const configured = await connection.request('tools/call', {
+            name: 'set_agent_cursor_motion', arguments: { ...motion, ...(session === undefined ? {} : { session }) },
+          }, { signal });
+          if (isMcpToolError(configured)) throw new Error('Could not configure the Computer Use cursor motion');
+        }
+        return initialized;
+      };
+      const sessions = cursorSessions;
+      const track = (ready: Promise<void>) => {
+        setBounded(sessions, session, ready, 64);
+        const forget = () => {
+          if (sessions.get(session) === ready) sessions.delete(session);
+        };
+        // A cancelled initializer must not poison an immediate retry. Other
+        // callers only cancel their own wait, leaving this initializer intact.
+        options.signal?.addEventListener('abort', forget, { once: true });
+        if (options.signal?.aborted) forget();
+        const settled = () => options.signal?.removeEventListener('abort', forget);
+        void ready.then(settled, () => { forget(); settled(); });
+      };
+      if (toolName === 'start_session') {
+        await waitForCursorSession(cursorSessions.get(session), options.signal);
+        explicitStart = startCursorSession(toolArgs);
+        track(explicitStart.then(result => {
+          if (isMcpToolError(result)) throw new Error('Could not initialize the Computer Use light-gray cursor session');
+        }));
+      } else if (toolName !== 'end_session' && (toolArgs.session === undefined || typeof toolArgs.session === 'string')) {
+        let ready = cursorSessions.get(session);
+        if (!ready) {
+          ready = (async () => {
+            const initialized = await startCursorSession(session === undefined ? {} : { session });
+            if (isMcpToolError(initialized)) {
+              throw new Error('Could not initialize the Computer Use light-gray cursor session');
+            }
+          })();
+          track(ready);
+        }
+        await waitForCursorSession(ready, options.signal);
+      } else if (toolName === 'end_session') {
+        await waitForCursorSession(cursorSessions.get(session), options.signal);
+      }
+    }
+
+    const result = explicitStart ? await explicitStart : await connection.request('tools/call', {
       name: toolName,
       arguments: toolArgs,
     }, options);
+
+    if (managesCursor && !isMcpToolError(result)) {
+      if (toolName === 'end_session') cursorSessions?.delete(session);
+    }
 
     return result;
   }
@@ -1274,6 +1389,8 @@ export class McpClientManager {
         errMsg = typeof closeCode === 'number'
           ? `MCP connection closed (server exited with code ${closeCode})`
           : 'MCP connection closed before initialization completed';
+      } else if (error instanceof Error && 'code' in error && error.code === 'EPIPE' && typeof closeCode === 'number') {
+        errMsg = `${errMsg} (server exited with code ${closeCode})`;
       }
 
       // Enrich error with stderr output for diagnostics

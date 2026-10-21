@@ -138,6 +138,19 @@ function runVersionStep(manualVersion: string): string {
 }
 
 describe('release workflow', () => {
+  it('builds and bundles both musl architectures alongside glibc Linux', () => {
+    const workflow = loadReleaseWorkflow();
+    const targets = workflow.jobs.build.strategy?.matrix?.include ?? [];
+    const bundle = workflow.jobs.release.steps.find(step => step.name === 'Create bundled archives for installers and ACP registry')?.run ?? '';
+    for (const arch of ['x64', 'arm64']) {
+      expect(targets).toContainEqual(expect.objectContaining({
+        target: `linux-${arch}-musl`, artifact: `autohand-linux-${arch}-musl`, tracesArtifact: `ahtraces-linux-${arch}-musl`,
+      }));
+      expect(bundle).toContain(`bundle_unix "autohand-linux-${arch}-musl" "ahtraces-linux-${arch}-musl"`);
+      expect(targets).toContainEqual(expect.objectContaining({ target: `linux-${arch}` }));
+    }
+  });
+
   it('installs native dependencies for cross-compiled architectures before compiling', () => {
     const steps = loadReleaseWorkflow().jobs.build.steps;
     const compileIndex = steps.findIndex(step => step.name === 'Compile binaries');
@@ -296,6 +309,19 @@ describe('release workflow', () => {
     expect(revision).toMatch(/^[0-9a-f]{40}$/u);
   });
 
+  it('smoke tests fresh alpha installation before uploading release artifacts', () => {
+    const steps = loadReleaseWorkflow().jobs.build.steps;
+    const smoke = steps.find(step => step.name === 'Verify fresh alpha installation');
+    expect(smoke?.run).toContain('src/testing/scenarios/fresh-alpha-install.sh');
+    expect(smoke?.run).toContain('${{ needs.prepare.outputs.version }}');
+    expect(smoke?.run).toContain('${{ matrix.tracesArtifact }}');
+    expect(smoke?.env?.AUTOHAND_SKIP_COMPUTER_CONTROL_INSTALL).not.toBe('1');
+    expect(steps.indexOf(smoke!)).toBeLessThan(steps.findIndex(step => step.name === 'Upload artifact'));
+    const ci = parseYaml(readFileSync(CI_WORKFLOW_PATH, 'utf8')) as { jobs: { 'build-test': WorkflowJob } };
+    expect(ci.jobs['build-test'].steps.find(step => step.name === 'Verify fresh alpha installation')?.run)
+      .toContain('src/testing/scenarios/fresh-alpha-install.sh');
+  });
+
   it('pins the separate computer-use source to an immutable commit', () => {
     const revision = readFileSync(
       path.join(REPOSITORY_ROOT, '.github/computer-use-ref'),
@@ -341,6 +367,16 @@ describe('release workflow', () => {
 
     expect(compile?.run).toContain('AUTOHAND_BUILD_VERSION="${{ needs.prepare.outputs.version }}"');
     expect(compile?.run).toContain('AUTOHAND_BUILD_GIT_COMMIT="${GITHUB_SHA}"');
+    expect(compile?.run).toContain("'--env=AUTOHAND_BUILD_*'");
+  });
+
+  it('preserves the CI binary identity when it is installed outside the checkout', () => {
+    const ci = parseYaml(readFileSync(CI_WORKFLOW_PATH, 'utf8')) as {
+      jobs: { 'build-test': WorkflowJob };
+    };
+    const compile = ci.jobs['build-test'].steps.find(step => step.name === 'Test compilation');
+
+    expect(compile?.env?.AUTOHAND_BUILD_GIT_COMMIT).toBe('${{ github.sha }}');
     expect(compile?.run).toContain("'--env=AUTOHAND_BUILD_*'");
   });
 

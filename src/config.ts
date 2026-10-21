@@ -33,9 +33,11 @@ import type {
 } from "./types.js";
 import { AUTOHAND_FILES, AUTOHAND_HOME, PROJECT_DIR_NAME } from "./constants.js";
 import { KEYBINDING_PROFILE_IDS, isKeybindingProfileId } from "./keybindings/profiles.js";
+import { INTERACTION_MODE_SEQUENCE } from "./core/agent/InteractionModeController.js";
 import { hookIdentifier } from "./core/hookEvents.js";
 import { normalizeHooksSettings } from "./core/legacyHookEvents.js";
 import { isAutohandInferenceEnabled } from "./featureFlags.js";
+import { validateStatusBarConfig } from "./core/agent/StatusBarConfig.js";
 import { autoInitTheme, configureThemeSources, getDefaultThemeName, themeExists } from "./ui/theme/index.js";
 import { loadLocalProjectSettings, type LocalProjectSettings } from "./permissions/localProjectPermissions.js";
 import {
@@ -47,7 +49,7 @@ import {
 import { isAwsBedrockProviderEnabled } from "./features/featureRegistry.js";
 import { getCustomProviderConfig, isCustomProviderName } from "./providers/customProviders.js";
 import { getProviderDefaultModel, getProviderModelOptions, getProviderRuntimeDefaultModel, normalizeOpenRouterModelId } from "./providers/modelCatalog.js";
-import { DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION, MAX_CONCURRENT_THREADS_PER_SESSION, isValidSessionThreadLimit } from "./core/agents/SessionThreadBudget.js";
+import { MAX_CONCURRENT_THREADS_PER_SESSION, isValidSessionThreadLimit } from "./core/agents/SessionThreadBudget.js";
 
 const DEFAULT_CONFIG_PATH = AUTOHAND_FILES.configJson;
 const TOML_CONFIG_PATH = AUTOHAND_FILES.configToml;
@@ -151,6 +153,27 @@ export function applyCliProviderOverride<T extends AutohandConfig>(config: T, va
   };
 }
 
+export function applyCliModelOverride(config: LoadedConfig, model: string, explicitProvider?: unknown): LoadedConfig {
+  const hostedId = model.trim().replace(/^autohand(?:ai)?\//i, '').toLowerCase();
+  const hosted = getProviderModelOptions('autohandai').some(entry => entry.id === hostedId);
+  const requestedProvider = explicitProvider ?? (hosted ? 'autohandai' : config.provider ?? 'openrouter');
+  const provider = normalizeProviderName(requestedProvider);
+  if (!provider) throw new Error(`Unknown provider: ${String(requestedProvider)}`);
+  const selected = provider === config.provider ? config : applyCliProviderOverride(config, provider);
+  const settingsPath = isCustomProviderName(provider)
+    ? `customProviders.${getCustomProviderConfig(selected, provider)?.id ?? provider.slice('custom:'.length)}`
+    : provider;
+  const selectedModel = provider === 'autohandai' && hosted ? hostedId : model;
+  const { config: layered, snapshot } = applyRunConfigOverlay(selected, {
+    sets: [`${settingsPath}.model=${JSON.stringify(selectedModel)}`],
+  });
+  return {
+    ...selected,
+    ...layered,
+    runOverlay: { ...selected.runOverlay, entries: [...(selected.runOverlay?.entries ?? []), ...(snapshot?.entries ?? [])] },
+  };
+}
+
 export interface LoadConfigOptions {
   /**
    * Persist the safe default config when no file exists. Answer-only
@@ -201,11 +224,7 @@ function createDefaultConfig(): AutohandConfig {
     agent: {
       toolSelectionCache: true,
     },
-    features: {
-      multi_agent_v2: {
-        max_concurrent_threads_per_session: DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION,
-      },
-    },
+    features: {},
   };
 }
 
@@ -1580,6 +1599,19 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
     ) {
       throw new Error(`ui.taskListPosition must be up or above-composer in ${configPath}`);
     }
+    const toolOutput: unknown = config.ui.toolOutput;
+    if (toolOutput !== undefined && toolOutput !== "compact" && toolOutput !== "full") {
+      throw new Error(`ui.toolOutput must be compact or full in ${configPath}`);
+    }
+    const defaultInteractionMode: unknown = config.ui.defaultInteractionMode;
+    if (
+      defaultInteractionMode !== undefined &&
+      !(INTERACTION_MODE_SEQUENCE as readonly unknown[]).includes(defaultInteractionMode)
+    ) {
+      throw new Error(
+        `ui.defaultInteractionMode must be one of ${INTERACTION_MODE_SEQUENCE.join(", ")} in ${configPath}`,
+      );
+    }
     if (
       config.ui.keybindingProfile !== undefined &&
       !isKeybindingProfileId(config.ui.keybindingProfile)
@@ -1599,6 +1631,10 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
       typeof config.ui.activityVerbsEnabled !== "boolean"
     ) {
       throw new Error(`ui.activityVerbsEnabled must be boolean in ${configPath}`);
+    }
+
+    if (config.ui.statusBar !== undefined) {
+      validateStatusBarConfig(config.ui.statusBar, configPath);
     }
   }
 

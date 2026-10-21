@@ -5,11 +5,12 @@
  * Provides text and screenshot tools.
  */
 
+import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const rl = createInterface({ input: process.stdin });
 const initializeDelayMs = Number(process.env.MCP_TEST_INITIALIZE_DELAY_MS ?? 0);
-const screenshotData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const screenshotData = process.env.MCP_TEST_SCREENSHOT_PATH ? readFileSync(process.env.MCP_TEST_SCREENSHOT_PATH).toString('base64') : 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -57,6 +58,16 @@ rl.on('line', (line) => {
         result: {
           tools: [
             {
+              name: 'list_windows',
+              description: 'List the Spotify fixture window',
+              inputSchema: { type: 'object', properties: { pid: { type: 'number' } }, required: ['pid'] },
+            },
+            {
+              name: 'get_window_state',
+              description: 'Inspect the exact Spotify fixture window',
+              inputSchema: { type: 'object', properties: { pid: { type: 'number' }, window_id: { type: 'number' } }, required: ['pid', 'window_id'] },
+            },
+            {
               name: 'echo_test',
               description: 'Echoes back the input message',
               inputSchema: {
@@ -69,10 +80,10 @@ rl.on('line', (line) => {
             },
             {
               name: 'screenshot_test',
-              description: 'Returns a tiny desktop screenshot fixture',
+              description: 'Returns a desktop screenshot fixture',
               inputSchema: {
                 type: 'object',
-                properties: {},
+                properties: { frame: { type: 'integer' } },
               },
             },
           ],
@@ -81,7 +92,18 @@ rl.on('line', (line) => {
       break;
 
     case 'tools/call':
-      if (msg.params?.name === 'echo_test') {
+      if (msg.params?.name === 'list_windows') {
+        send({ jsonrpc: '2.0', id: msg.id, result: {
+          content: [{ type: 'text', text: 'Found 1 window(s).' }],
+          structuredContent: { windows: [{ pid: 6844, window_id: 280, title: 'Spotify Free' }] },
+        } });
+      } else if (msg.params?.name === 'get_window_state') {
+        const valid = msg.params.arguments?.pid === 6844 && msg.params.arguments?.window_id === 280;
+        send({ jsonrpc: '2.0', id: msg.id, result: {
+          isError: !valid,
+          content: [{ type: 'text', text: valid ? 'Spotify window 280 inspected' : 'window_id is not a live window' }],
+        } });
+      } else if (msg.params?.name === 'echo_test') {
         send({
           jsonrpc: '2.0',
           id: msg.id,

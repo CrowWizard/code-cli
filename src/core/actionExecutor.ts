@@ -104,7 +104,8 @@ import type { MemoryManager } from '../memory/MemoryManager.js';
 import { SecurityScanner } from './SecurityScanner.js';
 import { execSync } from 'node:child_process';
 import { PlanFileStorage } from '../modes/planMode/PlanFileStorage.js';
-import type { Plan, PlanStep } from '../modes/planMode/types.js';
+import { parsePlanNotes } from '../modes/planMode/PlanParser.js';
+import type { Plan } from '../modes/planMode/types.js';
 import { getPlanModeManager } from '../commands/plan.js';
 import { randomUUID } from 'node:crypto';
 import { withCommandCoordination, type CommandCoordinationContext } from '../session/peers/CommandCoordinationGate.js';
@@ -135,6 +136,7 @@ import {
   type ReadStateStore,
 } from './agent/ReadSessionLedger.js';
 import { buildLocalWorkMap, parseWorkMapHarnesses } from '../integrations/ahtraces/workMap.js';
+import { zitFileResource } from '../utils/sessionZit.js';
 
 interface ActivityTodo {
   id?: string;
@@ -296,6 +298,29 @@ const PEER_GIT_COMMAND_BY_ACTION: Readonly<Record<string, string>> = {
   git_push: 'git push',
 };
 
+/** Tools whose writes reach FileActionManager's write guard with their content. */
+const ZIT_CONTENT_CLAIMED_ACTIONS = new Set<string>([
+  'write_file',
+  'append_file',
+  'apply_patch',
+  'search_replace',
+  'multi_file_edit',
+  'notebook_edit',
+  'format_file',
+]);
+
+/** Files a unified diff touches, from its `--- a/x` and `+++ b/x` headers. */
+function pathsInUnifiedDiff(diff: string): string[] {
+  const paths = new Set<string>();
+  for (const line of diff.split('\n')) {
+    const match = /^(?:---|\+\+\+) (?:[ab]\/)?(.+?)\s*$/.exec(line);
+    if (match && match[1] !== '/dev/null') {
+      paths.add(match[1]);
+    }
+  }
+  return [...paths];
+}
+
 const PEER_DIRECT_WRITE_ACTIONS = new Set<string>([
   'write_file',
   'append_file',
@@ -328,6 +353,7 @@ export class ActionExecutor {
   private readonly onFileModified?: AgentExecutorDeps['onFileModified'];
   private readonly onAskFollowup?: AgentExecutorDeps['onAskFollowup'];
   private readonly onPlanCreated?: AgentExecutorDeps['onPlanCreated'];
+  private readonly plansCreatedThisSession = new Set<string>();
   private readonly onPermissionRequest?: AgentExecutorDeps['onPermissionRequest'];
   private readonly onReviewHook?: AgentExecutorDeps['onReviewHook'];
   private readonly onAutoresearchHook?: AgentExecutorDeps['onAutoresearchHook'];
@@ -361,6 +387,15 @@ export class ActionExecutor {
   constructor(private readonly deps: AgentExecutorDeps) {
     this.runtime = deps.runtime;
     this.files = deps.files;
+    const zitClaims = deps.runtime.zitClaims;
+    if (zitClaims) {
+      this.files.setWriteGuard((relativePath, previous, next) => {
+        const result = zitClaims.claimEdit(relativePath, previous, next);
+        if (!result.ok) {
+          throw new Error(result.message);
+        }
+      });
+    }
     this.resolveWorkspacePath = deps.resolveWorkspacePath;
     this.confirmDangerousAction = deps.confirmDangerousAction;
     this.projectManager = deps.projectManager;
@@ -1032,6 +1067,38 @@ export class ActionExecutor {
     return [];
   }
 
+  /**
+   * In a --zit session, claim every file a tool is about to write. A refused
+   * or failed claim blocks the tool before it touches the file.
+   */
+  private claimZitWritePaths(action: AgentAction): string | undefined {
+    const zitClaims = this.runtime.zitClaims;
+    if (!zitClaims) {
+      return undefined;
+    }
+    const paths = this.writePathsForZitClaim(action)
+      .map((candidate) => this.toWorkspaceRelative(candidate))
+      .filter((candidate): candidate is string => Boolean(candidate));
+    if (paths.length === 0) {
+      return undefined;
+    }
+    const result = zitClaims.claim(paths.map(zitFileResource));
+    return result.ok ? undefined : result.message;
+  }
+
+  private writePathsForZitClaim(action: AgentAction): string[] {
+    // Directories and Autohand's own task list are not source files to claim.
+    // Text edits are claimed by the file write guard, which sees the content
+    // and so claims only the sections or symbols that change.
+    if (action.type === 'create_directory' || action.type === 'todo_write' || ZIT_CONTENT_CLAIMED_ACTIONS.has(action.type)) {
+      return [];
+    }
+    if (action.type === 'git_apply_patch') {
+      return pathsInUnifiedDiff(this.pickText(action.patch, action.diff) ?? '');
+    }
+    return this.writePathsForPeerGuard(action);
+  }
+
   private async executeLegacy(
     action: AgentAction,
     context?: ToolExecutionContext,
@@ -1104,6 +1171,11 @@ export class ActionExecutor {
       );
     }
 
+    const zitClaimFailure = this.claimZitWritePaths(action);
+    if (zitClaimFailure) {
+      return this.recordToolFailure(capture, 'authorization', zitClaimFailure, zitClaimFailure);
+    }
+
     if (executionState) {
       executionState.started = true;
     }
@@ -1148,116 +1220,47 @@ export class ActionExecutor {
           console.log(chalk.gray(`\n🧹 Cleaned up ${cleanedCount} plan(s) older than 30 days`));
         }
 
-        // Only offer resume of incomplete plans when user explicitly entered plan mode
-        // (via /plan or Shift+Tab). When the LLM calls the plan tool on its own during
-        // normal conversation, always create a fresh plan - don't interrupt with stale plans.
-        const planModeManager = getPlanModeManager();
-        if (planModeManager.isEnabled() && this.onAskFollowup) {
-          const refreshedPlanIds = await storage.listPlans();
-          const incompletePlans: Array<{ plan: Plan; pendingCount: number; inProgressCount: number }> = [];
-
-          for (const planId of refreshedPlanIds) {
-            const existingPlan = await storage.loadPlan(planId);
-            if (existingPlan) {
-              const pendingCount = existingPlan.steps.filter(s => s.status === 'pending').length;
-              const inProgressCount = existingPlan.steps.filter(s => s.status === 'in_progress').length;
-
-              if (pendingCount > 0 || inProgressCount > 0) {
-                incompletePlans.push({ plan: existingPlan, pendingCount, inProgressCount });
-              }
+        // In plan mode, offer to pick up a plan from an earlier session that was
+        // started and left unfinished. A plan nobody began is not work to resume,
+        // and a plan written in this session is the draft being refined right now.
+        if (getPlanModeManager().isEnabled() && this.onAskFollowup) {
+          const unfinished: Plan[] = [];
+          for (const planId of await storage.listPlans()) {
+            const existingPlan = this.plansCreatedThisSession.has(planId) ? null : await storage.loadPlan(planId);
+            const started = existingPlan?.steps.some(s => s.status === 'completed' || s.status === 'in_progress');
+            const remaining = existingPlan?.steps.some(s => s.status === 'pending' || s.status === 'in_progress');
+            if (existingPlan && started && remaining) {
+              unfinished.push(existingPlan);
             }
           }
 
-          if (incompletePlans.length > 0) {
-            console.log(chalk.yellow(`\n📋 Found ${incompletePlans.length} incomplete plan(s):`));
-
-            for (const { plan, pendingCount, inProgressCount } of incompletePlans) {
-              const age = Math.floor((now - plan.createdAt) / (1000 * 60 * 60 * 24));
-              const ageStr = age === 0 ? 'today' : age === 1 ? '1 day ago' : `${age} days ago`;
-              const statusStr = inProgressCount > 0
-                ? `${inProgressCount} in progress, ${pendingCount} pending`
-                : `${pendingCount} pending`;
-              console.log(chalk.gray(`   • ${plan.id} (${ageStr}) - ${plan.steps.length} steps, ${statusStr}`));
-            }
-            console.log();
-
-            const suggestedAnswers = [
-              'Create new plan',
-              ...incompletePlans.slice(0, 3).map(({ plan }) => `Resume: ${plan.id}`)
-            ];
-
+          if (unfinished.length > 0) {
             const answer = await this.onAskFollowup(
               'Would you like to resume an incomplete plan or create a new one?',
-              suggestedAnswers
+              ['Create new plan', ...unfinished.slice(0, 3).map(plan => `Resume: ${plan.id}`)],
             );
+            const requestedId = answer.replace(/<\/?answer>/g, '').trim().match(/^resume[:\s]+(\S+)/i)?.[1];
+            const planToResume = unfinished.find(plan => plan.id === requestedId);
 
-            const answerText = answer.replace(/<\/?answer>/g, '').trim();
-
-            if (answerText.toLowerCase().includes('resume:') || answerText.toLowerCase().startsWith('resume')) {
-              const resumeMatch = answerText.match(/resume[:\s]+(\S+)/i);
-              if (resumeMatch) {
-                const planIdToResume = resumeMatch[1];
-                const planToResume = incompletePlans.find(p => p.plan.id === planIdToResume);
-
-                if (planToResume) {
-                  const filePath = `${storage.getPlansDirectory()}/${planToResume.plan.id}.md`;
-                  console.log(chalk.cyan(`\n📋 Resuming plan: ${planToResume.plan.id}`));
-                  console.log(chalk.gray(`   File: ${filePath}\n`));
-
-                  if (this.onPlanCreated) {
-                    return this.onPlanCreated(planToResume.plan, filePath);
-                  }
-
-                  return `Resumed plan ${planToResume.plan.id}\n\nSteps:\n${planToResume.plan.steps.map(s => {
-                    const status = s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '>' : '○';
-                    return `${status} ${s.number}. ${s.description}`;
-                  }).join('\n')}`;
-                }
+            if (planToResume) {
+              const filePath = path.join(storage.getPlansDirectory(), `${planToResume.id}.md`);
+              if (this.onPlanCreated) {
+                return this.onPlanCreated(planToResume, filePath);
               }
+              return `Resumed plan ${planToResume.id}\n\nSteps:\n${planToResume.steps.map(s => {
+                const status = s.status === 'completed' ? '✓' : s.status === 'in_progress' ? '>' : '○';
+                return `${status} ${s.number}. ${s.description}`;
+              }).join('\n')}`;
             }
-
-            console.log(chalk.cyan('\n📋 Creating new plan...'));
           }
         }
 
-        // Parse notes into PlanStep[] - look for numbered lines
-        const lines = notes.split('\n');
-        const steps: PlanStep[] = [];
-        let stepNumber = 0;
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          // Match patterns like "1. Do something" or "- Step one" or "* Task"
-          const numberedMatch = trimmed.match(/^(\d+)[.)]\s*(.+)$/);
-          const bulletMatch = trimmed.match(/^[-*]\s+(.+)$/);
-
-          if (numberedMatch) {
-            stepNumber = parseInt(numberedMatch[1], 10);
-            steps.push({
-              number: stepNumber,
-              description: numberedMatch[2].trim(),
-              status: 'pending'
-            });
-          } else if (bulletMatch) {
-            stepNumber++;
-            steps.push({
-              number: stepNumber,
-              description: bulletMatch[1].trim(),
-              status: 'pending'
-            });
-          }
-        }
-
-        // If no steps were parsed, treat the whole text as a single step
+        const steps = parsePlanNotes(notes);
         if (steps.length === 0) {
-          steps.push({
-            number: 1,
-            description: notes.substring(0, 200),
-            status: 'pending'
-          });
+          const error = 'The plan has no steps. Write the plan as a numbered list, one concrete action per line.';
+          return this.recordToolFailure(capture, 'validation', error, error);
         }
 
-        // Create Plan object
         const plan: Plan = {
           id: `plan-${randomUUID().split('-')[0]}`,
           steps,
@@ -1267,14 +1270,15 @@ export class ActionExecutor {
 
         // Save plan to file
         const filePath = await storage.savePlan(plan);
+        this.plansCreatedThisSession.add(plan.id);
 
-        console.log(chalk.cyan(`\n📋 Plan created with ${steps.length} step(s)`));
-        console.log(chalk.gray(`   Saved to: ${filePath}\n`));
-
-        // If callback is provided, notify agent for acceptance flow
+        // The callback presents the plan and drives the acceptance flow
         if (this.onPlanCreated) {
           return this.onPlanCreated(plan, filePath);
         }
+
+        console.log(chalk.cyan(`\n📋 Plan created with ${steps.length} step(s)`));
+        console.log(chalk.gray(`   Saved to: ${filePath}\n`));
 
         // Fallback: just return the file path and steps summary
         return `Plan saved to ${filePath}\n\nSteps:\n${steps.map(s => `${s.number}. ${s.description}`).join('\n')}`;
@@ -1287,7 +1291,11 @@ export class ActionExecutor {
         const offset = typeof action.offset === 'number' ? action.offset : 0;
         const limit = typeof action.limit === 'number' ? action.limit : 0;
         const effectiveLimit = Math.min(limit > 0 ? limit : READ_FILE_MAX_LINES, READ_FILE_MAX_LINES);
-        const statefulReadMode = resolveStatefulReadMode(this.runtime.config);
+        // A read whose result goes to a script, not into the model's context, is
+        // neither deduplicated nor counted as something the model has seen.
+        const statefulReadMode = context?.modelVisible === false
+          ? 'off'
+          : resolveStatefulReadMode(this.runtime.config);
         const viewKey = this.readViewKey(action.path, offset, effectiveLimit);
 
         if (typeof this.files.readFileWindow === 'function') {
@@ -3038,9 +3046,7 @@ export class ActionExecutor {
           browserToolInvoker: hasBrowserBridgeOutput() ? invokeBrowserTool : undefined,
           signal: context?.signal,
         });
-        // Show preview
-        const preview = content.slice(0, 500);
-        console.log(chalk.gray(preview + (content.length > 500 ? '\n   ... (truncated)' : '')));
+        // The page is shown once, as the tool result; a console preview here printed it twice.
         return content;
       }
       case 'package_info': {

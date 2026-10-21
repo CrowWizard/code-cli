@@ -48,7 +48,7 @@ export interface PermissionDecision {
   allowed: boolean;
   reason:
     | 'allow_list' | 'deny_list' | 'blacklisted' | 'rule_match' | 'user_approved' | 'user_denied'
-    | 'mode_unrestricted' | 'mode_restricted' | 'default'
+    | 'mode_unrestricted' | 'mode_restricted' | 'read_only_review' | 'default'
     | 'external_approved' | 'external_denied' | 'external_error'
     | 'pattern_denied' | 'pattern_allowed' | 'not_in_available' | 'excluded'
     | 'run_scope_denied' | 'run_scope_not_allowed'
@@ -66,6 +66,7 @@ const ALLOW_REASONS = new Set<PermissionDecision['reason']>([
   'rule_match',
   'user_approved',
   'mode_unrestricted',
+  'read_only_review',
   'external_approved',
   'pattern_allowed',
   'all_paths_allowed',

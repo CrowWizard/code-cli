@@ -237,6 +237,15 @@ checkbox list), or set `features.tokenUsageStatus: true` in
 `~/.autohand/config.json`. It updates in real time as the model works and takes
 effect immediately — no restart required.
 
+### Code mode (experimental)
+
+`run_tool_script` lets the agent write one sandboxed JavaScript script that calls
+its tools and returns only the answer, instead of many tool calls whose raw
+output fills the context. Every nested call goes through the normal permission
+checks, lifecycle hooks and RPC/ACP events. Enable it with
+`/experiments enable code_mode` or `features.codeMode: true`. See
+[codemode.md](./codemode.md).
+
 ## Memory System
 - [x] Project memory in `.autohand/memory/`
 - [x] User memory in `~/.autohand/memory/`
@@ -318,7 +327,7 @@ effect immediately — no restart required.
 ## Advanced Controls
 - [x] **Extended Thinking**: `--thinking [level]` (extended/normal/none)
 - [x] **Yolo Mode**: `--yolo [pattern]` for granular auto-approve
-- [x] **Auto-Approve Timeout**: `--timeout <seconds>`
+- [x] **Auto-Approve Timeout**: `--timeout <seconds>` ends `--yolo` auto-approval after the given time
 - [x] **Custom System Prompt**: Override or append system prompt
 
 ## MCP Support

@@ -8,6 +8,29 @@ const client = () => new LLMGatewayClient({ apiKey: 'fixture', model: 'moa' }, {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('cloud inference streaming', () => {
+  it.each([false, true])('preserves a safety rejection without retries or completed tool calls (stream=%s)', async (stream) => {
+    const error = { type: 'content_blocked', categories: ['S7'], requestId: 'server-request-123', message: "This message was blocked by Autohand's safety check. Rephrase it and try again." };
+    const tool = { index: 0, id: 'call-1', type: 'function', function: { name: 'mcp__autohand-computer-use__click', arguments: '{}' } };
+    const body = stream
+      ? event({ choices: [{ delta: { tool_calls: [tool] }, finish_reason: 'tool_calls' }] }) + event({ error })
+      : JSON.stringify({ error });
+    const fetch = vi.fn().mockResolvedValue(new Response(body, {
+      status: stream ? 200 : 400,
+      headers: { 'content-type': stream ? 'text/event-stream' : 'application/json', 'x-autohand-request-id': 'server-request-123' },
+    }));
+    vi.stubGlobal('fetch', fetch);
+    const cloud = new LLMGatewayClient({ apiKey: 'fixture', model: 'fantail' }, { maxRetries: 2, retryDelay: 1 }, {
+      serviceName: 'Autohand AI', credentialName: 'Autohand API key', accountName: 'Autohand account',
+    });
+    const result = cloud.complete({ messages: [{ role: 'user', content: 'Play Felix Rosch in Spotify' }], stream });
+    await expect(result).rejects.toMatchObject({
+      code: 'content_blocked', retryable: false,
+      message: expect.stringContaining('S7'),
+    });
+    await expect(result).rejects.toThrow('Request ID: server-request-123');
+    await expect(result).rejects.not.toThrow(/malformed|network|Check \/usage/);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
   it('targets inference directly by default', () => {
     expect(AUTOHAND_AI_DEFAULT_BASE_URL).toBe('https://inference.autohand.ai/v1');
   });
@@ -41,13 +64,33 @@ describe('cloud inference streaming', () => {
       toolCalls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.ts"}' } }],
       usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } });
   });
-  it('does not retry a stream after visible content or return a truncated answer as success', async () => {
+  it('preserves a stream that ends early for continuation without replaying the accepted request', async () => {
     const fetch = vi.fn().mockImplementation(() => new Response(new ReadableStream({
       start(c) { c.enqueue(encoder.encode(event({ choices: [{ delta: { content: 'partial' } }] }))); c.close(); },
     })));
     vi.stubGlobal('fetch', fetch);
-    await expect(client().complete({ messages: [], stream: true, onDelta: vi.fn() })).rejects.toThrow(/incomplete|ended/i);
+    expect(await client().complete({ messages: [], stream: true, onDelta: vi.fn() }))
+      .toMatchObject({ content: 'partial', finishReason: 'length' });
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('withholds unfinished tools when an accepted stream ends without a terminal event', async () => {
+    const fetch = vi.fn().mockImplementation(() => new Response(
+      event({ choices: [{ delta: { content: 'I inspected the result and will write the file next.', tool_calls: [
+        { index: 0, id: 'call-1', type: 'function', function: { name: 'write_file', arguments: '{"path":"a.ts","content":"part' } },
+      ] } }] }), { headers: { 'content-type': 'text/event-stream' } },
+    ));
+    vi.stubGlobal('fetch', fetch);
+    const result = await client().complete({ messages: [], stream: true });
+    expect(result.finishReason).toBe('length');
+    expect(result.toolCalls).toBeUndefined();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+  it('marks an empty accepted EOF as truncation for bounded agent recovery without transport replay', async () => {
+    const fetch = vi.fn().mockImplementation(() => new Response(''));
+    vi.stubGlobal('fetch', fetch);
+    expect(await client().complete({ messages: [], stream: true }))
+      .toMatchObject({ content: '', finishReason: 'length' });
+    expect(fetch).toHaveBeenCalledOnce();
   });
   it('normalizes upstream max-token termination to a truncated response', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(

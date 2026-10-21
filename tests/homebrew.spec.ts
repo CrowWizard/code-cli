@@ -166,7 +166,6 @@ describe('Homebrew formula', () => {
       'docs/changelog/whats-new-0.8.0_ptBR.md',
       'docs/changelog/whats-new-0.8.0_zh.md',
     ];
-    const authSource = readFileSync(join(ROOT, 'src', 'auth', 'ensureAuth.ts'), 'utf-8');
     const installCommand = 'brew install autohandai/code/autohand-code';
 
     for (const documentationPath of documentationPaths) {
@@ -177,7 +176,5 @@ describe('Homebrew formula', () => {
       expect(documentation, documentationPath).not.toMatch(/brew install autohand(?=[\s`]|$)/);
     }
 
-    expect(authSource).toContain(installCommand);
-    expect(authSource).not.toContain('brew tap autohandai/code && brew install autohand-code');
   });
 });

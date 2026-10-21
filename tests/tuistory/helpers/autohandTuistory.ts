@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Session } from 'tuistory';
-import { launchTuistorySession } from '../../../src/testing/drivers/tuistory-driver.js';
+import { launchPipedTuistorySession, launchTuistorySession } from '../../../src/testing/drivers/tuistory-driver.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -29,6 +29,8 @@ export interface TuistoryTempState {
 }
 
 export interface LaunchBuiltAutohandOptions {
+  inputCommand?: string[];
+  entrypoint?: string;
   autohandHome?: string;
   cwd?: string;
   env?: Record<string, string | undefined>;
@@ -127,12 +129,16 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
       checkForUpdates: false,
       // Rotating tips put random command text on idle screens; the tip scenario turns them on.
       showTips: false,
+      // Scenarios exercise approval prompts; the startup-mode scenario removes this pin.
+      defaultInteractionMode: 'default',
     },
   };
   const overrideConfig = options.config ?? {};
   const config = {
     ...baseConfig,
     ...overrideConfig,
+    // Scripted legacy scenarios cover their own flow; orchestration scenarios enable its additional requests explicitly.
+    ...(overrideConfig.autohandai ? { autohandai: { orchestration: false, ...recordOrEmpty(overrideConfig.autohandai) } } : {}),
     openrouter: {
       ...recordOrEmpty(baseConfig.openrouter),
       ...recordOrEmpty(overrideConfig.openrouter),
@@ -161,7 +167,8 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
     configPath,
     workspaceRoot,
     cleanup: async () => {
-      await rm(tempRoot, { recursive: true, force: true });
+      // Child shutdown can briefly recreate files while the fixture directory is removed.
+      await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     },
   };
 }
@@ -998,6 +1005,17 @@ export async function createMockAuthServer(
     'S'.repeat(43),
   ].join('.');
   const server = createServer((request, response) => {
+    if (request.url === '/v1/models' && request.method === 'GET') {
+      const authenticated = request.headers.authorization === 'Bearer tuistory-test-token';
+      response.writeHead(authenticated ? 200 : 401, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(authenticated ? {
+        object: 'list',
+        data: (options.paymentBlocked?.() ? ['fantail'] : ['fantail', 'moa', 'auto'])
+          .map(id => ({ id, object: 'model' })),
+      } : { error: 'invalid_credential' }));
+      return;
+    }
+
     if (request.url === '/api/auth/me' && request.method === 'GET') {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
@@ -1226,15 +1244,18 @@ export async function launchBuiltAutohand(
     ...options.env,
   };
 
-  return await launchTuistorySession({
+  const launch = options.inputCommand
+    ? (launchOptions: Parameters<typeof launchTuistorySession>[0]) => launchPipedTuistorySession(options.inputCommand!, launchOptions)
+    : launchTuistorySession;
+  return await launch({
     command: process.execPath,
-    args: [path.join(root, 'dist/index.js'), ...args],
+    args: [options.entrypoint ?? path.join(root, 'dist/index.js'), ...args],
     cwd: options.cwd ?? root,
     env,
     cols: options.cols ?? 120,
     rows: options.rows ?? 36,
     waitForData: options.waitForData,
-    waitForDataTimeout: options.waitForDataTimeout,
+    waitForDataTimeout: Math.max(options.waitForDataTimeout ?? 30_000, 30_000),
   });
 }
 

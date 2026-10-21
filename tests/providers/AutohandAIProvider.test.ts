@@ -38,6 +38,20 @@ describe("AutohandAIProvider", () => {
     expect(AUTOHAND_AI_CLOUD_MODELS).toEqual(expect.arrayContaining(["gpt-5.6-luna", "deepseek-v4-flash", "gpt-6-sol", "grok-4.7", "qwen3.8-27b"]));
   });
 
+  it("applies an ACP effort change to the next Moa completion without mutating the source settings", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      id:"response",choices:[{message:{content:"Done"},finish_reason:"stop"}],
+    }));
+    globalThis.fetch=fetchMock as typeof globalThis.fetch;
+    const settings={plan:"cloud" as const,authMode:"api-key" as const,apiKey:"test-key",model:"moa",reasoningEffort:"high" as const};
+    const provider=new AutohandAIProvider(settings);
+    provider.setReasoningEffort("xhigh");
+    await provider.complete({messages:[{role:"user",content:"Test"}]});
+    const body=JSON.parse(String(fetchMock.mock.calls[0]?.[1].body));
+    expect(body.extra_body.chat_template_kwargs.reasoning_effort).toBe("xhigh");
+    expect(settings.reasoningEffort).toBe("high");
+  });
+
   it("does not offer paid models when discovery fails or the account has no allowed models", async () => {
     globalThis.fetch = vi.fn().mockResolvedValueOnce(Response.json({ error: "unauthorized" }, { status: 401 }))
       .mockResolvedValueOnce(Response.json({ data: [] })) as typeof globalThis.fetch;
@@ -116,6 +130,15 @@ describe("AutohandAIProvider", () => {
     const provider = new AutohandAIProvider({ plan: 'cloud', authMode: 'api-key', apiKey: 'fixture', baseUrl, model: 'fantail' });
     await provider.complete({ messages: [] });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(`${expected}/chat/completions`);
+  });
+
+  it('updates the tool limit when switching between Grok and other hosted models', () => {
+    const provider = new AutohandAIProvider({ plan: 'cloud', authMode: 'api-key', apiKey: 'fixture', model: 'grok-4.7' });
+    expect(provider.getCapabilities().maxTools).toBe(128);
+    provider.setModel('moa');
+    expect(provider.getCapabilities().maxTools).toBeUndefined();
+    provider.setModel('grok-4.7');
+    expect(provider.getCapabilities().maxTools).toBe(128);
   });
 
   it("advertises native tool calling for Moa", () => {

@@ -9,11 +9,11 @@ Operate one exact local app or window, observe before input, perform the request
 
 ## Tool boundary
 
-Use the tools advertised by the `cua-driver` MCP server. Their Autohand names start with `mcp__cua-driver__`, including app and window discovery, launch, state capture, click, text, key, scroll, and verification tools. Follow each tool's current schema instead of guessing fields.
+Use the tools advertised by the `autohand-computer-use` MCP server. Their names start with `mcp__autohand-computer-use__`, including app and window discovery, launch, state capture, click, text, key, scroll, and verification tools. Follow each tool's current schema instead of guessing fields.
 
-`cua-driver` is an internal compatibility name. In user-facing responses, call the capability **Autohand Computer Use** and do not present the internal MCP server or tool prefix as a separate product the user must install.
+Older manually configured integrations may advertise the legacy `mcp__cua-driver__*` or `mcp__cua__*` prefixes. Use those only when the canonical Autohand tools are absent. In user-facing responses, call the capability **Autohand Computer Use** and do not present the underlying engine or an MCP tool prefix as a separate product the user must install.
 
-When this instruction is present in the request context, the skill is already active. Do not call `skill activate`, `skill info`, or read this file again. If `mcp__cua-driver__*` tools are advertised, call the relevant app-discovery tool immediately. Do not call `tool_search` or `tools_registry` to rediscover them.
+When this instruction is present in the request context, the skill is already active. Do not call `skill activate`, `skill info`, or read this file again. If canonical or legacy computer-control tools are advertised, call the relevant app-discovery tool immediately. Do not call `tool_search` or `tools_registry` to rediscover them.
 
 If those tools are absent, tell the user that native computer control is unavailable and give the exact repair command:
 
@@ -27,11 +27,13 @@ Do not inspect shell paths, home-directory configuration, running processes, or 
 
 ## Workflow
 
-1. Discover the requested application with `list_apps`; launch it only when it is not already running.
-2. Resolve the exact live target with `list_windows` and observe it with `get_window_state`. Use desktop state only when the request truly targets the desktop rather than one window.
+1. Discover the requested application with `list_apps`; launch it only when it is not already running. Reuse a known live process/window instead of repeating discovery.
+2. Resolve the exact live target with `list_windows` and observe it with `get_window_state`. Prefer a targeted element query and structured `elements`; do not request both a full AX tree and its structured duplicate. Keep default observation limits; increase them only when truncation hides the needed target. Use desktop state only for a desktop task.
 3. Act once using a fresh element token and the exact process and window target. Prefer semantic elements over coordinates. If coordinates are necessary, derive them from a fresh screenshot of that same target.
 4. Re-observe or call `verify_state` after each meaningful action. A successful tool return alone does not prove the user-visible outcome.
 5. Stop when the requested postcondition is visible. End only this run's session when the server offers session lifecycle tools; do not stop a shared driver daemon.
+
+The CLI renders native tool calls in one task lane. Do not narrate every tool call, print AX trees, repeat JSON, or copy tool arguments into the response. Summarize the verified outcome and any remaining blocker. Keep screenshots when needed to locate a visual target or verify an effect; a screenshot bound does not change window coordinate units.
 
 ## Authorization
 
@@ -47,3 +49,4 @@ System permission prompts belong to the user. Explain the required Accessibility
 - Honor the requested interaction route. If the user asks for the native UI, do not replace it with an API, DOM, shell mutation, or browser extension path.
 - For a browser page request without an explicit route, use native Cua control when the desired result depends on the user's local browser session or visible UI.
 - Never claim completion without current visual or accessibility-state evidence of the requested result.
+- Treat `unverifiable` delivery as pending verification, not failure or success. Inspect the current state before another input. For partial typing, retry only the undelivered suffix after checking the field; never blindly resend the full text or repeat a submission.

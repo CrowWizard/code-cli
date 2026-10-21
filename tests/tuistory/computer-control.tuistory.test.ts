@@ -3,8 +3,11 @@
  * Copyright 2026 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
-import { chmod, readFile, readdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
+import sharp from 'sharp';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Session } from 'tuistory';
 import {
@@ -29,14 +32,14 @@ afterEach(async () => {
   await Promise.all(states.splice(0).map((state) => state.cleanup()));
 });
 
-async function writeFakeCuaDriver(state: TuistoryTempState, initializeDelayMs = 0): Promise<string> {
+async function writeFakeCuaDriver(state: TuistoryTempState, initializeDelayMs = 0, screenshotPath = ''): Promise<string> {
   const executable = path.join(state.workspaceRoot, 'cua-driver');
   const mcpFixture = path.join(repoRoot(), 'tests/fixtures/mock-mcp-server.mjs');
   await writeFile(executable, [
     '#!/bin/sh',
     'case "${1:-}" in',
     '  --version) printf "cua-driver 0.28.2\\n" ;;',
-    `  mcp) MCP_TEST_INITIALIZE_DELAY_MS="${initializeDelayMs}" exec "${process.execPath}" "${mcpFixture}" ;;`,
+    `  mcp) MCP_TEST_SCREENSHOT_PATH="${screenshotPath}" MCP_TEST_INITIALIZE_DELAY_MS="${initializeDelayMs}" exec "${process.execPath}" "${mcpFixture}" ;;`,
     '  doctor) printf "Cua Driver doctor: ready\\n" ;;',
     '  *) exit 2 ;;',
     'esac',
@@ -58,7 +61,109 @@ async function writeFakeComputerUseHost(state: TuistoryTempState): Promise<strin
   return executable;
 }
 
+async function writePermissionFixture(state: TuistoryTempState): Promise<Record<string, string>> {
+  const driver = await writeFakeCuaDriver(state);
+  const app = path.join(await realpath(state.workspaceRoot), 'Autohand Computer Use.app');
+  const executable = path.join(app, 'Contents/MacOS/AutohandComputerUse');
+  await mkdir(path.dirname(executable), { recursive: true });
+  await writeFile(executable, await readFile(await writeFakeComputerUseHost(state)));
+  await chmod(executable, 0o755);
+  const preload = path.join(state.workspaceRoot, 'permission-fixture.mjs');
+  await writeFile(preload, `
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const spawn = childProcess.spawn;
+const app = ${JSON.stringify(app)};
+childProcess.spawn = function(command, args, options) {
+  if (args?.includes(app) && command.endsWith('/lsregister')) {
+    return spawn(process.execPath, ['-e', ''], options);
+  }
+  if (command === '/usr/bin/open' && args?.includes(app) && args.includes('--result-path')) {
+    const resultPath = args[args.indexOf('--result-path') + 1];
+    const script = 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({accessibility:false,screenRecording:true,bundleIdentifier:"ai.autohand.computer-use"}))';
+    return spawn(process.execPath, ['-e', script, resultPath], options);
+  }
+  return spawn(command, args, options);
+};
+syncBuiltinESMExports();
+`);
+  return {
+    AUTOHAND_DISABLE_COMPUTER_USE: '0',
+    AUTOHAND_CUA_DRIVER_PATH: driver,
+    AUTOHAND_COMPUTER_USE_APP_PATH: app,
+    NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+  };
+}
+
 describe('built native computer control', () => {
+  it.runIf(process.platform === 'darwin')('reports denied native permissions as JSON with recovery guidance', async () => {
+    const state = await createTempAutohandHome({ initializeGit: false });
+    states.push(state);
+    const session = await launchBuiltAutohand(['computer', 'doctor', '--json'], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: await writePermissionFixture(state),
+      cols: 1000,
+    });
+    sessions.push(session);
+    await waitForExit(session, 15_000);
+    expect(session.exitInfo?.exitCode).toBe(1);
+    const report = JSON.parse(session.readAll());
+    expect(report).toMatchObject({ mcpReady: false, permissions: { accessibility: false } });
+    expect(report.error).toContain('remove the old entry');
+    expect(report.error).toContain('Autohand Computer Use.app');
+  });
+
+  it.runIf(process.platform === 'darwin')('stops different app requests before inference and leaves the terminal usable', async () => {
+    const provider = await createMockAutohandAINativeSequenceServer([{ content: 'UNEXPECTED_MODEL_REQUEST' }]);
+    servers.push(provider);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'autohandai',
+        autohandai: { plan: 'cloud', authMode: 'api-key', apiKey: 'tuistory-key', model: 'moa', baseUrl: provider.baseUrl },
+        features: { autohand_inference: true },
+        agent: { autoMemory: false, sessionRetryLimit: 0 },
+        ui: { promptSuggestions: false, showCompletionNotification: false, terminalBell: false },
+      },
+    });
+    states.push(state);
+    const session = await launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath, '--yes'], {
+      autohandHome: state.autohandHome,
+      cwd: state.workspaceRoot,
+      env: await writePermissionFixture(state),
+      cols: 160,
+      rows: 50,
+      waitForDataTimeout: 15_000,
+    });
+    sessions.push(session);
+    await session.waitForText('❯', { timeout: 20_000 });
+    for (const [index, request] of ['open the Calculator app', 'type hello in the TextEdit window', 'open my browser'].entries()) {
+      await session.type(request);
+      await session.press('enter');
+      await session.text({ timeout: 15_000, waitFor: () =>
+        session.readAll().split('needs Accessibility permission').length > index + 1 });
+    }
+    expect(provider.requests).toHaveLength(0);
+    expect(session.readAll()).toContain('remove the old entry');
+    expect(session.readAll()).toContain('autohand computer doctor');
+    await exitInteractive(session);
+  }, 60_000);
+
+  it('exits unsuccessfully when the required postinstall component cannot be written', async () => {
+    const state = await createTempAutohandHome({ initializeGit: false });
+    states.push(state);
+    const occupiedPath = path.join(state.workspaceRoot, 'occupied');
+    await writeFile(occupiedPath, 'fixture');
+    const session = await launchBuiltAutohand([
+      'computer', 'install', '--postinstall', '--non-interactive', '--force', '--bin-dir', occupiedPath,
+    ], { autohandHome: state.autohandHome, cwd: state.workspaceRoot });
+    sessions.push(session);
+    await waitForExit(session, 15_000);
+    expect(session.exitInfo?.exitCode).toBe(1);
+    expect(session.readAll()).toContain('Could not install native computer control');
+    expect(session.readAll()).toContain('autohand computer install');
+  });
+
   it('uses the Autohand Computer Use product name in user-facing status', async () => {
     const state = await createTempAutohandHome();
     states.push(state);
@@ -112,15 +217,19 @@ describe('built native computer control', () => {
     });
   });
 
-  it('waits for native control and exposes its tools on the first direct app turn', async () => {
+  it('waits for native control and preserves window IDs for the next app inspection', async () => {
     const provider = await createMockAutohandAINativeSequenceServer([
       {
         content: 'Checking the native app connection.',
         toolCall: {
-          id: 'call_cua_echo',
-          name: 'mcp__cua-driver__echo_test',
-          args: { message: 'computer-control-mcp-ok' },
+          id: 'call_windows',
+          name: 'mcp__autohand-computer-use__list_windows',
+          args: { pid: 6844 },
         },
+      },
+      {
+        content: 'Inspecting the discovered window.',
+        toolCall: { id: 'call_window_state', name: 'mcp__autohand-computer-use__get_window_state', args: { pid: 6844, window_id: 280 } },
       },
       { content: 'COMPUTER_CONTROL_TURN_COMPLETE' },
     ]);
@@ -136,7 +245,7 @@ describe('built native computer control', () => {
           baseUrl: provider.baseUrl,
         },
         features: { autohand_inference: true },
-        agent: { autoMemory: false, sessionRetryLimit: 0, maxIterations: 3 },
+        agent: { autoMemory: false, sessionRetryLimit: 0, maxIterations: 4 },
         network: { maxRetries: 0 },
         ui: { promptSuggestions: false, showCompletionNotification: false, terminalBell: false },
       },
@@ -174,15 +283,24 @@ describe('built native computer control', () => {
       tools?: Array<{ function?: { name?: string } }>;
     };
     expect(firstRequest.tools?.map((tool) => tool.function?.name))
-      .toContain('mcp__cua-driver__echo_test');
+      .toContain('mcp__autohand-computer-use__list_windows');
     const userMessage = firstRequest.messages?.find((message) => message.role === 'user')?.content ?? '';
-    expect(userMessage).toContain('Computer control mode');
-    expect(userMessage).toContain('Operate one exact local app or window');
+    expect(userMessage).toBe('use my spotify and play Felix Rosch');
+    const turnContext = firstRequest.messages?.filter(message => message.role === 'system').map(message => message.content).join('\n') ?? '';
+    expect(turnContext).toContain('Computer control mode');
+    expect(turnContext).toContain('Operate one exact local app or window');
+    expect(turnContext).toContain('mcp__autohand-computer-use__');
 
     const secondRequest = provider.requests[1] as {
       messages?: Array<{ role?: string; content?: string }>;
     };
-    expect(JSON.stringify(secondRequest.messages)).toContain('Echo: computer-control-mcp-ok');
+    const windowResult = secondRequest.messages?.find(message => message.role === 'tool')?.content;
+    expect(windowResult).toContain('Found 1 window(s).');
+    expect(windowResult).toContain('"window_id":280');
+    expect(windowResult).toContain('"pid":6844');
+    expect(windowResult).toContain('Spotify Free');
+    expect(JSON.stringify(provider.requests[2])).toContain('Spotify window 280 inspected');
+    expect(session.readAll()).not.toContain('window_id is not a live window');
     expect(await readFile(state.configPath, 'utf8')).not.toContain('cua-driver');
     await exitInteractive(session);
   }, 45_000);
@@ -193,15 +311,20 @@ describe('built native computer control', () => {
         content: 'Inspecting the desktop.',
         toolCall: {
           id: 'call_cua_screenshot',
-          name: 'mcp__cua-driver__screenshot_test',
+          name: 'mcp__autohand-computer-use__screenshot_test',
           args: {},
         },
       },
+      { toolCall: { id: 'call_windows', name: 'mcp__autohand-computer-use__list_windows', args: { pid: 6844 } } },
+      { toolCall: { id: 'call_stale', name: 'mcp__autohand-computer-use__get_window_state', args: { pid: 6844, window_id: 1 } } },
+      { toolCall: { id: 'call_fresh', name: 'mcp__autohand-computer-use__get_window_state', args: { pid: 6844, window_id: 280 } } },
       { content: 'COMPUTER_CONTROL_SCREENSHOT_COMPLETE' },
     ]);
     servers.push(provider);
     const state = await createTempAutohandHome({
       config: {
+        hooks: { hooks: (['computer-use-start', 'computer-use-progress', 'computer-use-error', 'computer-use-stop'] as const)
+          .map(event => ({ event, command: 'node computer-use-hook.cjs' })) },
         provider: 'autohandai',
         autohandai: {
           plan: 'cloud',
@@ -211,12 +334,17 @@ describe('built native computer control', () => {
           baseUrl: provider.baseUrl,
         },
         features: { autohand_inference: true },
-        agent: { autoMemory: false, sessionRetryLimit: 0, maxIterations: 3 },
+        agent: { autoMemory: false, sessionRetryLimit: 0, maxIterations: 6 },
         network: { maxRetries: 0 },
         ui: { promptSuggestions: false, showCompletionNotification: false, terminalBell: false },
       },
     });
     states.push(state);
+    await writeFile(path.join(state.workspaceRoot, 'computer-use-hook.cjs'), `
+let input = '';
+process.stdin.on('data', chunk => input += chunk);
+process.stdin.on('end', () => require('node:fs').appendFileSync('computer-use-hooks.jsonl', input + '\\n'));
+`);
     const driver = await writeFakeCuaDriver(state);
     const computerUseHost = await writeFakeComputerUseHost(state);
     const session = await launchBuiltAutohand([
@@ -242,8 +370,15 @@ describe('built native computer control', () => {
     await session.waitForText('COMPUTER_CONTROL_SCREENSHOT_COMPLETE', { timeout: 30_000 });
 
     const screen = session.readAll();
-    expect(screen).toContain('desktop screenshot 1x1 px');
-    expect(screen).toContain('[1 image available for visual inspection.]');
+    expect(screen).toContain('Computer Use');
+    expect(screen).toContain('Screenshot test');
+    expect(screen).toContain('Finding the window');
+    expect(screen).toContain('Checking the window');
+    expect(screen).toContain('window_id is not a live window');
+    expect(screen).not.toContain('mcp__autohand-computer-use__get_window_state');
+    expect(screen).not.toContain('mcp__autohand-computer-use__screenshot_test');
+    expect(screen).not.toContain('desktop screenshot 1x1 px');
+    expect(screen).not.toContain('[1 image available for visual inspection.]');
     expect(screen).not.toContain('iVBORw0KGgo');
     const secondRequest = provider.requests[1] as {
       messages?: Array<{ role?: string; content?: unknown }>;
@@ -260,6 +395,19 @@ describe('built native computer control', () => {
 
     await exitInteractive(session);
     const storedSessions = path.join(state.autohandHome, 'sessions');
+    const nativeHooks = (await readFile(path.join(state.workspaceRoot, 'computer-use-hooks.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    expect(nativeHooks.map(hook => hook.hook_event_name)).toEqual([
+      'computer-use-start',
+      ...Array.from({ length: 6 }, () => 'computer-use-progress'),
+      'computer-use-error',
+      'computer-use-progress', 'computer-use-progress',
+      'computer-use-stop',
+    ]);
+    expect(new Set(nativeHooks.map(hook => hook.computer_use_id)).size).toBe(1);
+    expect(nativeHooks.at(-1)).toMatchObject({ computer_use_status: 'finished', tool_calls_count: 4 });
+    expect(nativeHooks.filter(hook => hook.hook_event_name === 'computer-use-error')).toEqual([
+      expect.objectContaining({ computer_use_status: 'failed', tool_use_id: 'call_stale', error: expect.stringContaining('window_id') }),
+    ]);
     for (const relative of await readdir(storedSessions, { recursive: true })) {
       if (!relative.endsWith('.json') && !relative.endsWith('.jsonl')) continue;
       const persisted = await readFile(path.join(storedSessions, relative), 'utf8');
@@ -267,6 +415,50 @@ describe('built native computer control', () => {
       expect(persisted).not.toContain('iVBORw0KGgo');
     }
   }, 45_000);
+
+  it('finishes repeated large screenshot observations without overflowing the model request', async () => {
+    const provider = await createMockAutohandAINativeSequenceServer([
+      ...Array.from({ length: 6 }, (_, index) => ({
+        toolCall: { id: `frame-${index}`, name: 'mcp__autohand-computer-use__screenshot_test', args: { frame: index } },
+      })),
+      { content: 'SCREENSHOT_PAYLOAD_BOUNDED' },
+    ]);
+    servers.push(provider);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'autohandai',
+        autohandai: { plan: 'cloud', authMode: 'api-key', apiKey: 'tuistory-key', model: 'moa', baseUrl: provider.baseUrl },
+        features: { autohand_inference: true },
+        agent: { autoMemory: false, sessionRetryLimit: 0, maxIterations: 8 },
+        network: { maxRetries: 0 },
+        ui: { promptSuggestions: false, showCompletionNotification: false, terminalBell: false },
+      },
+    });
+    states.push(state);
+    const screenshotPath = path.join(state.workspaceRoot, 'large-screenshot.png');
+    await sharp(randomBytes(1280 * 800 * 3), { raw: { width: 1280, height: 800, channels: 3 } }).png().toFile(screenshotPath);
+    const driver = await writeFakeCuaDriver(state, 0, screenshotPath);
+    const computerUseHost = await writeFakeComputerUseHost(state);
+    const session = await launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath, '--yes'], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot,
+      env: { AUTOHAND_DISABLE_COMPUTER_USE: '0', AUTOHAND_CUA_DRIVER_PATH: driver, AUTOHAND_COMPUTER_USE_APP_PATH: computerUseHost },
+    });
+    sessions.push(session);
+    await session.text({ timeout: 20_000, waitFor: text => text.includes('❯') });
+    await session.type('Observe my desktop six times and summarize the latest state.');
+    await session.press('enter');
+    await session.waitForText('SCREENSHOT_PAYLOAD_BOUNDED', { timeout: 40_000 });
+    expect(provider.requests).toHaveLength(7);
+    for (const request of provider.requests) expect(Buffer.byteLength(JSON.stringify(request))).toBeLessThan(5 * 1024 * 1024);
+    const latest = JSON.stringify(provider.requests.at(-1));
+    const latestMessages = provider.requests.at(-1)?.messages as Array<{ role?: string; content?: unknown }> | undefined;
+    const toolDiagnostics = latestMessages?.filter(message => message.role === 'tool').map(message => JSON.stringify(message.content).slice(0, 500));
+    expect(latest.match(/data:image\/(?:png|jpeg);base64,/g), JSON.stringify(toolDiagnostics)).toHaveLength(2);
+    expect(latest).toContain('unavailable under runtime retention limits');
+    expect(session.readAll()).not.toContain('auto-compacting');
+    expect(session.readAll()).not.toContain('Request payload too large');
+    await exitInteractive(session);
+  }, 60_000);
 
   it('keeps tool discovery compact until the user expands it', async () => {
     const provider = await createMockAutohandAINativeSequenceServer([
