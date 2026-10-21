@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Session } from 'tuistory';
 import { isTerminalMouseTrackingEnabled } from '../../src/testing/scenarios/mouseScrollbackScenario.js';
 import { composerCaretLine } from '../../src/testing/assertions/composerCaret.js';
-import { clickFullScreenComposer, seedFullScreenHistory, typeMultilineDraft } from '../../src/testing/scenarios/fullScreenScenario.js';
+import { clickFullScreenComposer, seedFullScreenHistory, startFullScreenHeaderProbe, typeMultilineDraft } from '../../src/testing/scenarios/fullScreenScenario.js';
 import { outputViewport, LONG_OUTPUT_COMMAND, runLongOutputTurn } from '../../src/testing/scenarios/compactOutputScenario.js';
 import { createMockAuthServer, type MockAuthServer, createMockAutohandAINativeSequenceServer, type MockNativeToolServer, createTempAutohandHome, launchBuiltAutohand, exitInteractive, type TuistoryTempState } from './helpers/autohandTuistory.js';
 let server: MockNativeToolServer | undefined;
@@ -15,6 +15,38 @@ let session: Session | undefined;
 afterEach(async () => { session?.close(); await server?.close(); await auth?.close(); auth = undefined; server = undefined; await state?.cleanup(); session = undefined; state = undefined; });
 
 describe('full-screen terminal', () => {
+  it('shows product identity at the top and navigation below the composer status', async () => {
+    server = await createMockAutohandAINativeSequenceServer([{ content: 'HEADER_WORK_DONE', delayMs: 1500 }]);
+    state = await createTempAutohandHome({ config: {
+      provider: 'autohandai',
+      autohandai: { plan: 'cloud', authMode: 'api-key', apiKey: 'fixture', model: 'moa', baseUrl: server.baseUrl },
+      features: { fullScreenMode: true, autohand_inference: true },
+      agent: { autoMemory: false, maxIterations: 4, sessionRetryLimit: 0 },
+      network: { maxRetries: 0 },
+      ui: { promptSuggestions: false, terminalBell: false, showCompletionNotification: false },
+    } });
+    session = await launchBuiltAutohand(['--config', state.configPath, '--path', state.workspaceRoot, '--yes'], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot, cols: 180, rows: 40,
+    });
+    await session.waitForText('❯'); await session.waitIdle();
+    const lines = outputViewport(session).split('\n');
+    expect(lines[0]).toMatch(/Autohand Code \(v\d+\.\d+\.\d+/);
+    expect(lines[1]).toContain(state.workspaceRoot);
+    const composerRow = lines.findLastIndex(line => line.includes('❯'));
+    const statusRow = lines.findIndex(line => line.includes('context left'));
+    const navigationRow = lines.findIndex(line => line.includes('Full screen · Latest'));
+    expect(statusRow).toBeGreaterThan(composerRow);
+    expect(navigationRow).toBeGreaterThan(statusRow);
+    expect(navigationRow).toBeGreaterThanOrEqual(37);
+    await startFullScreenHeaderProbe(session);
+    const workingLines = outputViewport(session).split('\n');
+    expect(workingLines[2]).toContain('esc to cancel');
+    expect(workingLines.filter(line => line.includes('esc to cancel'))).toHaveLength(1);
+    expect(workingLines.findLastIndex(line => line.includes('❯'))).toBe(composerRow);
+    await session.waitForText('HEADER_WORK_DONE', { timeout: 15_000 });
+    await exitInteractive(session);
+    expect(session.getRawOutput()).toContain('\x1b[?1049l');
+  });
   it('places the hardware caret inside the composer on a tall empty screen and after resize', async () => {
     state = await createTempAutohandHome({ config: { features: { fullScreenMode: undefined }, ui: { promptSuggestions: false } } });
     session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], {

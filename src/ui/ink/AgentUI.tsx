@@ -2888,6 +2888,13 @@ export function AgentUI({
     model={fullScreenTranscript} messages={fullScreenMessages} detailsId={expandedToolOutput?.id}
     rows={windowSize.rows ?? 24} columns={windowSize.columns ?? 80}
     footer={bottom}
+    workspaceRoot={workspaceRoot}
+    loading={<StatusLine
+      isWorking={state.isWorking} status={state.status} elapsed={state.elapsed} tokens={state.tokens}
+      queueCount={state.queuedInstructions.length} teamActivity={state.teamActivity}
+      lineExtension={mergeLineExtensions(effectiveConfiguredLineExtensions?.status, effectiveLineExtensions?.status, effectiveRuntimeLineExtensions?.status)}
+      onSpinnerFrame={onWorkingSpinnerFrame}
+    />}
   />;
 
   return (
@@ -3193,6 +3200,7 @@ const CompletionHistoryMessage = memo(function CompletionHistoryMessage({
  * Memoized to prevent re-renders when only input changes
  */
 interface StatusSectionProps {
+  fullScreen?: boolean;
   terminalRows?: number;
   onWorkingSpinnerFrame?: (frame: number) => void;
   isWorking: boolean;
@@ -3302,6 +3310,7 @@ const CommandResultPanel = memo(function CommandResultPanel({
 ));
 
 const StatusSection = memo(function StatusSection({
+  fullScreen = false,
   terminalRows,
   onWorkingSpinnerFrame,
   isWorking,
@@ -3343,7 +3352,7 @@ const StatusSection = memo(function StatusSection({
       ) : null}
 
       {/* Status line with spinner - always renders for stability */}
-      <StatusLine
+      {!fullScreen ? <StatusLine
         isWorking={isWorking}
         status={status}
         elapsed={elapsed}
@@ -3356,7 +3365,7 @@ const StatusSection = memo(function StatusSection({
         teamActivity={teamActivity}
         lineExtension={lineExtension}
         onSpinnerFrame={onWorkingSpinnerFrame}
-      />
+      /> : null}
       <TipLine tip={tip} columns={columns} />
 
       {/* Keep interactive panels adjacent to the status line, before the composer. */}
@@ -3369,6 +3378,7 @@ const StatusSection = memo(function StatusSection({
       )}
       {goalPanelVisible && goalActivity ? (
         <GoalPanel
+          compact={fullScreen}
           snapshot={goalActivity}
           selectedIndex={selectedGoalIndex}
           onRowLayoutChange={onGoalRowLayoutChange}
@@ -3393,7 +3403,8 @@ const StatusSection = memo(function StatusSection({
   );
 }, (prev, next) => {
   // Only re-render if status-related props change
-  return prev.isWorking === next.isWorking &&
+  return prev.fullScreen === next.fullScreen &&
+         prev.isWorking === next.isWorking &&
          prev.terminalRows === next.terminalRows &&
          prev.status === next.status &&
          prev.elapsed === next.elapsed &&
@@ -3894,6 +3905,7 @@ const FixedBottom = memo(function FixedBottom({
           <FeedbackSurveyLine survey={feedbackSurvey} columns={terminalColumns} />
         ) : null}
         <StatusSection
+          fullScreen={fullScreen}
           terminalRows={terminalRows}
           onWorkingSpinnerFrame={onWorkingSpinnerFrame}
           isWorking={isWorking}

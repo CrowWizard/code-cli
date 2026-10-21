@@ -10,6 +10,24 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 afterEach(cleanup);
 
 describe('full-screen composer integration', () => {
+  it('shows one working indicator below the project directory without moving the composer', async () => {
+    let state = { ...createInitialUIState(), currentInput: 'preserved draft', isWorking: true, status: 'READING_SOURCES' };
+    const model = new FullScreenTranscript();
+    const frame = () => <I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={model} workspaceRoot="/work/project" state={state} onInstruction={() => {}} onEscape={() => {}} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>;
+    const view = render(frame()); await flush();
+    const screen = () => stripAnsi(view.lastFrame() ?? '');
+    const rows = () => screen().split('\n');
+    expect(rows()[0]).toContain('Autohand Code');
+    expect(rows()[1]).toContain('/work/project');
+    expect(rows()[2]).toContain('READING_SOURCES');
+    expect(screen().split('READING_SOURCES')).toHaveLength(2);
+    const composerRow = rows().findIndex(line => line.includes('❯ preserved draft'));
+    expect(rows().findIndex(line => line.includes('Full screen'))).toBeGreaterThan(rows().findIndex(line => line.includes('context left')));
+    state = { ...state, isWorking: false, status: '' };
+    view.rerender(frame()); await flush();
+    expect(screen()).not.toContain('READING_SOURCES');
+    expect(rows().findIndex(line => line.includes('❯ preserved draft'))).toBe(composerRow);
+  });
   it.each([false, true])('renders a transcript reminder once in chronological order with fullScreen=%s', async fullScreen => {
     const state = { ...createInitialUIState(), chatMessages: [
       { role: 'assistant' as const, content: 'First response' },

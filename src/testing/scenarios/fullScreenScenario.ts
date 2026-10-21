@@ -4,6 +4,13 @@ import type { Session as TerminalSession } from 'tuistory';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { Session } from '../../session/SessionManager.js';
 
+export async function startFullScreenHeaderProbe(session: TerminalSession): Promise<void> {
+  await session.type('Say hello');
+  await session.waitForText('❯ Say hello');
+  await session.press('enter');
+  await session.waitForText('esc to cancel', { timeout: 10_000 });
+}
+
 export async function seedFullScreenHistory(home: string, project: string): Promise<void> {
   const date = new Date().toISOString();
   const metadata = { sessionId: 'full-screen-history', createdAt: date, lastActiveAt: date, projectPath: project,
