@@ -2138,6 +2138,24 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it("includes real tool arguments in the ACP step title", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      const args = { path: "src/session.ts", offset: 10, limit: 25 };
+
+      await outputListener({ type: "tool_start", toolId: "read-context", toolName: "read_file", toolArgs: args });
+
+      expect(connection.sessionUpdate).toHaveBeenCalledWith({
+        sessionId,
+        update: expect.objectContaining({
+          sessionUpdate: "tool_call",
+          toolCallId: "read-context",
+          title: "Read: src/session.ts (line 11, up to 25 lines)",
+          rawInput: args,
+          locations: [{ path: "src/session.ts" }],
+        }),
+      });
+    });
+
     it("marks a tool call made by a script with its parent call, and leaves direct calls unmarked", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
 

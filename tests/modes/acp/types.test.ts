@@ -248,6 +248,34 @@ describe("resolveToolKind()", () => {
 // ===========================================================================
 
 describe("resolveToolDisplayName()", () => {
+  it.each([
+    ["read_file", { path: "src/runtime.ts", offset: 20, limit: 30 }, "Read: src/runtime.ts (line 21, up to 30 lines)"],
+    ["read_file", { path: "src/runtime.ts", offset: 20 }, "Read: src/runtime.ts (from line 21)"],
+    ["read_file", { path: "src/runtime.ts" }, "Read: src/runtime.ts"],
+    ["read_file", { path: "src/runtime.ts", limit: 15 }, "Read: src/runtime.ts (line 1, up to 15 lines)"],
+    ["write_file", { path: "src/output.ts", content: "secret contents" }, "Write: src/output.ts"],
+    ["list_directory", { path: "src/" }, "List: src/"],
+    ["find_grep", { query: "sessionId", path: "src/" }, "Search: sessionId (in src/)"],
+    ["fff_find", { query: "*.test.ts" }, "Find files: *.test.ts"],
+    ["rename_path", { from: "old.ts", to: "new.ts" }, "Rename: old.ts -> new.ts"],
+    ["request_directory_access", { path: "../shared" }, "Request Directory Access: ../shared"],
+    ["run_command", { command: "git status --short", cwd: "src/" }, "Run: git (in src/)"],
+    ["run_command", { command: "curl --header 'Authorization: secret'" }, "Run: curl"],
+    ["shell", { command: "bun run typecheck", directory: "packages/api", description: "Check API types" }, "Shell: Check API types (in packages/api)"],
+    ["shell", { command: "TOKEN=secret bun run test" }, "Shell"],
+    ["read_file", { path: 42 }, "Read"],
+    ["read_file", { path: "src/\u001b[31mfile.ts\n" }, "Read: src/file.ts"],
+    ["unknown_tool", { token: "secret" }, "Unknown Tool"],
+  ])("describes %s using supported arguments", (toolName, args, expected) => {
+    expect(resolveToolDisplayName(toolName, args)).toBe(expected);
+  });
+
+  it("bounds long contextual titles", () => {
+    const title = resolveToolDisplayName("fff_find", { query: "x".repeat(1000) });
+    expect(title.length).toBeLessThanOrEqual(180);
+    expect(title.endsWith("...")).toBe(true);
+  });
+
   it("returns correct name for known tools", () => {
     expect(resolveToolDisplayName("read_file")).toBe("Read");
     expect(resolveToolDisplayName("write_file")).toBe("Write");

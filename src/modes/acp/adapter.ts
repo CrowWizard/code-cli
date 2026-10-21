@@ -1485,7 +1485,7 @@ export class AutohandAcpAdapter implements Agent {
           if (event.toolName) {
             const toolCallId = event.toolId ?? `tool_${Date.now()}`;
             const kind = resolveToolKind(event.toolName);
-            const title = resolveToolDisplayName(event.toolName);
+            const title = resolveToolDisplayName(event.toolName, event.toolArgs);
 
             // Build locations from tool args
             const locations: Array<{ path: string }> = [];

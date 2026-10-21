@@ -3,6 +3,7 @@
  * Constants, session state, and helpers for native ACP integration.
  */
 
+import { stripVTControlCharacters } from "node:util";
 import type { ToolKind, SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { BuiltInProviderName, LoadedConfig } from "../../types.js";
 import {
@@ -241,7 +242,120 @@ export function resolveToolKind(toolName: string): ToolKind {
 /**
  * Resolve the display name for a given tool name.
  */
-export function resolveToolDisplayName(toolName: string): string {
+export function resolveToolDisplayName(
+  toolName: string,
+  args?: Record<string, unknown>,
+): string {
+  const baseName = resolveToolBaseDisplayName(toolName);
+  if (!args) return baseName;
+
+  const value = (...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const candidate = args[key];
+      if (typeof candidate === "string" && candidate.trim()) {
+        return stripVTControlCharacters(candidate).replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+      }
+    }
+    return undefined;
+  };
+
+  let detail: string | undefined;
+  switch (toolName) {
+    case "read_file": {
+      const path = value("path", "file");
+      const offset = args.offset ?? 0;
+      const limit = args.limit;
+      const range = (args.offset !== undefined || args.limit !== undefined)
+        && typeof offset === "number" && Number.isFinite(offset)
+        ? typeof limit === "number" && Number.isFinite(limit) && limit > 0
+          ? ` (line ${Math.max(0, Math.trunc(offset)) + 1}, up to ${Math.trunc(limit)} lines)`
+          : ` (from line ${Math.max(0, Math.trunc(offset)) + 1})`
+        : "";
+      detail = path ? `${path}${range}` : undefined;
+      break;
+    }
+    case "write_file":
+    case "append_file":
+    case "apply_patch":
+    case "notebook_edit":
+    case "replace_in_file":
+    case "search_replace":
+    case "format_file":
+    case "file_stats":
+    case "file_info":
+    case "delete_path":
+    case "create_directory":
+      detail = value("path", "file");
+      break;
+    case "list_directory":
+    case "list_tree":
+      detail = value("path") ?? ".";
+      break;
+    case "find_grep":
+    case "find":
+    case "search":
+    case "search_files":
+    case "search_with_context":
+    case "semantic_search": {
+      const query = value("query", "pattern");
+      const path = value("path");
+      detail = query ? `${query}${path ? ` (in ${path})` : ""}` : path;
+      break;
+    }
+    case "fff_find":
+      detail = value("query", "pattern");
+      break;
+    case "glob":
+      detail = value("pattern", "patterns", "path");
+      break;
+    case "run_command":
+    case "shell": {
+      const command = value("command");
+      const executable = command?.match(/^[\w./-]+(?=\s|$)/)?.[0];
+      const directory = value("directory", "cwd");
+      const summary = value("description") ?? executable;
+      detail = summary ? `${summary}${directory ? ` (in ${directory})` : ""}` : directory;
+      break;
+    }
+    case "rename_path":
+    case "copy_path": {
+      const from = value("from");
+      const to = value("to");
+      detail = from && to ? `${from} -> ${to}` : from ?? to;
+      break;
+    }
+    case "request_directory_access":
+      detail = value("path", "directory");
+      break;
+    case "web_search":
+    case "tool_search":
+    case "recall_memory":
+      detail = value("query");
+      break;
+    case "dependency_add":
+    case "dependency_remove":
+    case "dependency_update":
+    case "add_dependency":
+    case "remove_dependency":
+      detail = value("name", "package");
+      break;
+    case "git_diff":
+    case "git_status":
+    case "git_log":
+    case "git_add":
+    case "git_commit":
+      detail = value("path", "message");
+      break;
+    default:
+      detail = value("path", "file", "query", "pattern", "name", "description", "objective");
+  }
+
+  if (!detail) return baseName;
+  const title = `${baseName}: ${detail}`.replace(/\s+/g, " ").trim();
+  return title.length > 180 ? `${title.slice(0, 177).trimEnd()}...` : title;
+}
+
+function resolveToolBaseDisplayName(toolName: string): string {
   if (toolName in TOOL_DISPLAY_NAMES) {
     return TOOL_DISPLAY_NAMES[toolName];
   }
