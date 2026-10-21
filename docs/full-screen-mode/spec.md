@@ -2,14 +2,14 @@
 
 ## Problem and outcome
 
-Long conversations and tool output currently share the terminal's scrollback with a dynamic composer. The experimental full-screen mode owns a bounded terminal viewport: history scrolls above a composer that remains visible and editable.
+Long conversations and tool output currently share the terminal's scrollback with a dynamic composer. The default full-screen mode owns a bounded terminal viewport: history scrolls above a composer that remains visible and editable.
 
 ## Activation
 
-- Off by default. Users opt in with `/experiments enable full_screen_mode` or `autohand experiments enable full_screen_mode`.
-- Stored as `features.fullScreenMode: true`; enabling or disabling requires restarting the interactive CLI.
+- Stable and on by default. Users opt out with `/experiments disable full_screen_mode` or `autohand experiments disable full_screen_mode`.
+- Opt-out is stored as `features.fullScreenMode: false`; enabling or disabling requires restarting the interactive CLI.
 - Only interactive TTY input/output with a usable terminal enables the mode. Piped output, RPC, ACP and `TERM=dumb` retain their existing behavior.
-- Existing inline mode remains the default and rollback path.
+- Inline mode remains available through explicit opt-out.
 
 ## Required behavior
 
@@ -25,7 +25,7 @@ Long conversations and tool output currently share the terminal's scrollback wit
 
 ## Acceptance evidence
 
-Tests cover default-off activation, persistence, TTY fallback, screen lifecycle and nested modals; transcript paging, streaming, resize anchoring and search; and built-CLI startup, long output, draft preservation, modal return and clean exit. Run focused tests, lint, build, Tuistory and `bun run proof`. Record aggregate failures separately from focused proof.
+Tests cover default-on activation and explicit opt-out, persistence, TTY fallback, screen lifecycle and nested modals; transcript paging, streaming, resize anchoring and search; and built-CLI startup, long output, draft preservation, modal return and clean exit. Run focused tests, lint, build, Tuistory and `bun run proof`. Record aggregate failures separately from focused proof.
 
 ## Interaction parity acceptance matrix
 
@@ -43,6 +43,6 @@ The target is the full-screen terminal experience shown in the reference screens
 | Extensions | Builder questions, file approvals, trusted views, keybindings, disable/enable | Extensions Tuistory with simulated provider responses |
 | Command diagnostics | Unsupported and unavailable command results survive transcript redraw | Slash dispatch and extension-disable Tuistory |
 | Queue and cancellation | Existing queue-first and selected-message steering behavior; interruption remains available | Existing queue suites and full-screen focus tests |
-| Opt-in and rollback | `/experiments` activation; restart required; inline fallback unchanged | Feature registry and persisted activation Tuistory |
+| Default and opt-out | Full screen by default; `/experiments disable full_screen_mode` opts out after restart | Feature registry and persisted activation Tuistory |
 
 Native Ghostty testing and the reported sustained extension freeze must be verified separately from simulated-provider terminal tests. This matrix does not claim an exhaustive port of undocumented Codex functionality. The reference for alternate-screen behavior and configurable Codex controls is the [official configuration documentation](https://developers.openai.com/codex/config-advanced/); the supplied screenshots define the requested layout.

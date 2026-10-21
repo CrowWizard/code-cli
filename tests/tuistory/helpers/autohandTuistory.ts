@@ -102,6 +102,9 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
 
   const baseConfig: JsonRecord = {
     provider: 'openrouter',
+    // Historical scenarios assert primary-screen scrollback. Full-screen scenarios
+    // override this; undefined exercises the application's unset/default behavior.
+    features: { fullScreenMode: false },
     autoReport: {
       enabled: false,
     },
@@ -137,6 +140,10 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
   const config = {
     ...baseConfig,
     ...overrideConfig,
+    features: {
+      ...recordOrEmpty(baseConfig.features),
+      ...recordOrEmpty(overrideConfig.features),
+    },
     // Scripted legacy scenarios cover their own flow; orchestration scenarios enable its additional requests explicitly.
     ...(overrideConfig.autohandai ? { autohandai: { orchestration: false, ...recordOrEmpty(overrideConfig.autohandai) } } : {}),
     openrouter: {

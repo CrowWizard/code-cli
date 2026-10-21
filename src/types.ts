@@ -484,7 +484,7 @@ export interface AutoReportSettings {
 }
 
 export interface FeatureFlagSettings {
-  /** Opt in to the full-screen interactive terminal; restart required. */
+  /** Full-screen interactive terminal (default: true); opt out with false and restart. */
   fullScreenMode?: boolean;
   multi_agent_v2?: {
     /** Total session threads including the main agent. Integer 1–64; default 9. */

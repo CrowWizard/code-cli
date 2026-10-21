@@ -4,7 +4,7 @@
 
 `InkRenderer` owns one alternate-screen lease for the interactive session. Modal renderers acquire nested leases instead of entering or leaving the terminal buffer independently. The last release restores the primary screen. Synchronous process-exit cleanup is a final safety net; listeners are removed during normal cleanup.
 
-`AgentUI` retains the existing composer and input routing. A full-screen frame allocates the terminal height between a transcript viewport and the measured composer area. The inline render branch stays intact. The experimental state is captured at renderer startup, so `/experiments` never switches terminal ownership halfway through a turn.
+`AgentUI` retains the existing composer and input routing. A full-screen frame allocates the terminal height between a transcript viewport and the measured composer area. The inline render branch stays intact. The full-screen setting is captured at renderer startup, so `/experiments` never switches terminal ownership halfway through a turn.
 
 ## Transcript model
 
@@ -20,4 +20,4 @@ Page keys and search are handled before composer editing only while the full-scr
 
 ## Compatibility and rollout
 
-The local `full_screen_mode` registry flag is experimental, false by default and restart-required. The setting is checked alongside TTY capability. There are no new dependencies or framework version changes. The experiment can be disabled through the same registry and documented JSON/TOML/YAML config paths. Keep inline tests running alongside the full-screen scenarios.
+The local `full_screen_mode` registry flag is stable, true by default and restart-required. The setting is checked alongside TTY capability. There are no new dependencies or framework version changes. Full-screen mode can be disabled through the same registry and documented JSON/TOML/YAML config paths. Keep inline tests running alongside the full-screen scenarios.

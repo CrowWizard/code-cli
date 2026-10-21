@@ -35,7 +35,7 @@ export function FullScreenFrame({ model, messages, footer, rows, columns, detail
     : `Full screen · ${view.following ? 'Latest' : 'Ctrl+End latest'} · PgUp/PgDn · Ctrl+F find`;
   return <Box flexDirection="column" width={width} height={height} overflow="hidden">
     <Text color={colors.muted} wrap="truncate">{hint}</Text>
-    <Box flexDirection="column" height={bodyHeight} flexShrink={0} overflow="hidden">
+    <Box flexDirection="column" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} overflow="hidden">
       {lines.map((line, index) => <Text key={index} wrap="truncate">{line || ' '}</Text>)}
     </Box>
     <Text color={colors.accent} wrap="truncate">{view.following ? ' ' : `${view.newActivity ? 'New activity · ' : ''}↓ Back to bottom · Ctrl+End${detailsId ? '' : ' / Esc'}`}</Text>

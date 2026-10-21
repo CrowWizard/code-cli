@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -123,7 +124,7 @@ describe('background repository readiness', () => {
     service.markTurnCompleted(); await service.flush(); expect(notify).toHaveBeenCalledTimes(1);
     service.stop();
   });
-  it('remembers shown findings across sessions and repeats only for materially new findings', async () => {
+  it('shows the automatic reminder only once per repository even when findings change', async () => {
     const root = await temporaryWorkspace(); const notify = vi.fn(); let current = report;
     const options = { workspaceRoot: root, cacheDir: path.join(root, 'cache'), collect: async () => inventoryFixture(root, current.fingerprint), analyze: async () => current, notify, isIdle: () => true };
     for (let i = 0; i < 3; i++) {
@@ -131,7 +132,26 @@ describe('background repository readiness', () => {
       if (i === 2) { await writeFile(path.join(root, 'other.ts'), 'changed'); current = { ...report, fingerprint: 'three', findings: [{ kind: 'tests', paths: ['other.ts'], title: 'Add coverage', detail: 'New source has no related tests.' }] }; }
       const service = createService(options); await service.start(); service.markTurnCompleted(); await service.flush(); service.stop();
     }
-    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0]?.[0]).not.toContain(report.findings[0]!.title);
+  });
+  it('persists dismissal while keeping new reports available for manual review', async () => {
+    const root = await temporaryWorkspace(); const notify = vi.fn();
+    const options = { workspaceRoot: root, cacheDir: path.join(root, 'cache'), analyze: async () => report, notify, isIdle: () => true };
+    const first = createService(options); await first.start(); await first.dismiss(); await first.stop();
+    const current: ReadinessReport = { ...report, fingerprint: 'new', findings: [{ kind: 'tests', paths: ['new.ts'], title: 'New coverage', detail: 'Review this manually.' }] };
+    const next = createService({ ...options, collect: async () => inventoryFixture(root, current.fingerprint), analyze: async () => current });
+    await next.start(); next.markTurnCompleted(); await next.flush();
+    expect(notify).not.toHaveBeenCalled(); expect(next.getReport()).toEqual(current);
+  });
+  it('honors previously shown reminders from caches written before the once-per-repository setting', async () => {
+    const root = await temporaryWorkspace(); const cacheDir = path.join(root, 'cache'); const notify = vi.fn();
+    await mkdir(cacheDir);
+    await writeFile(path.join(cacheDir, `${createHash('sha256').update(root).digest('hex')}.json`), JSON.stringify({ version: 1, report, seen: ['legacy-finding-key'] }));
+    const current = { ...report, fingerprint: 'new' };
+    const service = createService({ workspaceRoot: root, cacheDir, collect: async () => inventoryFixture(root, 'new'), analyze: async () => current, notify, isIdle: () => true });
+    await service.start(); service.markTurnCompleted(); await service.flush();
+    expect(notify).not.toHaveBeenCalled(); expect(service.getReport()).toEqual(current);
   });
   it('does not notify while a new turn is active, or after shutdown; releases cancellation listeners', async () => {
     const root = await temporaryWorkspace(); const notify = vi.fn(); let idle = false;

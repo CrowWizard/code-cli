@@ -903,9 +903,14 @@ export class InkRenderer {
     this.updateState({ commandResult });
   }
 
-  addNotification(message: string): void {
+  addNotification(message: string, options?: { placement: 'transcript' }): void {
     const content = message.trim();
     if (!content) {
+      return;
+    }
+
+    if (options?.placement === 'transcript') {
+      this.updateState({ chatMessages: [...this.state.chatMessages, { role: 'notification', content }] });
       return;
     }
 

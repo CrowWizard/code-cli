@@ -551,7 +551,10 @@ export function initializeAgentDependencies(
         workspaceRoot: runtime.repositorySourceRoot ?? runtime.workspaceRoot,
         signal: host.runtimeResourceShutdownController?.signal,
         getProvider: () => host.llm,
-        notify: message => host.notifyUser(message),
+        notify: message => {
+          if (host.inkRenderer?.isRunning()) host.inkRenderer.addNotification(message, { placement: 'transcript' });
+          else host.notifyUser(message);
+        },
         isIdle: () => !host.isInstructionActive && !host.modalActive,
       });
       void host.repositoryReadiness.start();

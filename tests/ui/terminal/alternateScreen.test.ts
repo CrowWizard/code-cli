@@ -16,8 +16,9 @@ describe('alternate screen ownership', () => {
     expect(process.listenerCount('exit')).toBe(before);
   });
 
-  it('requires an explicit opt-in and interactive streams', () => {
-    expect(shouldUseFullScreen(undefined, true, true, 'xterm')).toBe(false);
+  it('defaults to full screen on interactive streams and honors opt-out', () => {
+    expect(shouldUseFullScreen(undefined, true, true, 'xterm')).toBe(true);
+    expect(shouldUseFullScreen(false, true, true, 'xterm')).toBe(false);
     expect(shouldUseFullScreen(true, true, true, 'xterm')).toBe(true);
     expect(shouldUseFullScreen(true, false, true, 'xterm')).toBe(false);
     expect(shouldUseFullScreen(true, true, false, 'xterm')).toBe(false);

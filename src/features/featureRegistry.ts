@@ -47,9 +47,9 @@ export const FEATURE_REGISTRY: readonly FeatureDefinition[] = [
     id: 'full_screen_mode',
     label: 'Full-screen terminal',
     description: 'Keep the composer visible with a scrollable and searchable full-screen transcript.',
-    stage: 'experimental',
+    stage: 'stable',
     configPath: 'features.fullScreenMode',
-    defaultEnabled: false,
+    defaultEnabled: true,
     requiresRestart: true,
   },
   {

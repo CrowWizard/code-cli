@@ -25,11 +25,11 @@ function makeConfig(overrides: Partial<LoadedConfig> = {}): LoadedConfig {
 }
 
 describe('feature registry', () => {
-  it('requires opt-in and restart for full-screen terminal mode', () => {
+  it('defaults to stable full-screen mode and supports a restart-required opt-out', () => {
     const config = makeConfig({ features: {} });
-    expect(getFeatureState(config, 'full_screen_mode')).toEqual(expect.objectContaining({ enabled: false, stage: 'experimental', requiresRestart: true, configPath: 'features.fullScreenMode' }));
-    expect(setFeatureState(config, 'full_screen_mode', true).ok).toBe(true);
-    expect(getFeatureState(config, 'full_screen_mode')?.enabled).toBe(true);
+    expect(getFeatureState(config, 'full_screen_mode')).toEqual(expect.objectContaining({ enabled: true, stage: 'stable', requiresRestart: true, configPath: 'features.fullScreenMode' }));
+    expect(setFeatureState(config, 'full_screen_mode', false).ok).toBe(true);
+    expect(getFeatureState(config, 'full_screen_mode')?.enabled).toBe(false);
   });
 
   it('lists real config-backed features with stable ids', () => {

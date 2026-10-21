@@ -2721,9 +2721,7 @@ export function AgentUI({
       ? state.chatMessages
       : state.userMessages.map((content): ChatLogMessage => ({ role: 'user', content }));
 
-    return sourceMessages
-      .filter((message) => message.role !== 'notification')
-      .map((message, index) => ({
+    return sourceMessages.map((message, index) => ({
         index,
         key: `${state.chatHistoryEpoch}:${index}`,
         message,
@@ -3227,6 +3225,7 @@ interface QueuedInstructionsPanelProps {
   queuedInstructions: string[];
   queueSteeringEnabled?: boolean;
   selectedQueueIndex: number | null;
+  maxRows: number;
 }
 
 function formatQueuedInstructionRow(instruction: string, width: number): string {
@@ -3242,11 +3241,14 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
   queuedInstructions,
   queueSteeringEnabled,
   selectedQueueIndex,
+  maxRows,
 }: QueuedInstructionsPanelProps) {
   const { colors } = useTheme();
   const windowSize = useTerminalWindowSize();
   const width = getPromptBlockWidth(windowSize.columns);
   const focused = selectedQueueIndex !== null;
+  const start = Math.max(0, Math.min((selectedQueueIndex ?? 0) - maxRows + 1, queuedInstructions.length - maxRows));
+  const visibleInstructions = queuedInstructions.slice(start, start + maxRows);
 
   return (
     <Box flexDirection="column" marginTop={1}>
@@ -3254,7 +3256,8 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
         Queue · {queuedInstructions.length} pending
         {queueSteeringEnabled ? <Text bold={false}> · ctrl+enter steer {focused ? 'selected' : 'next'}</Text> : null}
       </Text>
-      {queuedInstructions.map((instruction, idx) => {
+      {visibleInstructions.map((instruction, visibleIndex) => {
+        const idx = start + visibleIndex;
         const selected = selectedQueueIndex === idx;
         const prefix = selected ? '›' : ' ';
         return (
@@ -3265,6 +3268,7 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
           </Box>
         );
       })}
+      {queuedInstructions.length > visibleInstructions.length && <Text color={colors.muted} wrap="truncate">{queuedInstructions.length - visibleInstructions.length} more · ↑↓ to select</Text>}
       {focused && (
         <Text color={colors.muted}>
           enter edit, then steer · shift+enter save · delete remove · esc clear selection
@@ -3275,7 +3279,8 @@ const QueuedInstructionsPanel = memo(function QueuedInstructionsPanel({
 }, (prev, next) => (
   prev.queuedInstructions === next.queuedInstructions &&
   prev.queueSteeringEnabled === next.queueSteeringEnabled &&
-  prev.selectedQueueIndex === next.selectedQueueIndex
+  prev.selectedQueueIndex === next.selectedQueueIndex &&
+  prev.maxRows === next.maxRows
 ));
 
 const CommandResultPanel = memo(function CommandResultPanel({
@@ -3373,6 +3378,7 @@ const StatusSection = memo(function StatusSection({
       {/* Info section - either queue or completion stats, stable position */}
       {showQueue && (
         <QueuedInstructionsPanel
+          maxRows={Math.max(1, Math.min(5, Math.floor((terminalRows ?? 24) / 4)))}
           queuedInstructions={queuedInstructions}
           queueSteeringEnabled={queueSteeringEnabled}
           selectedQueueIndex={selectedQueueIndex}
@@ -3875,63 +3881,65 @@ const FixedBottom = memo(function FixedBottom({
 
   return (
     <>
-      {announcement ? (
-        <AnnouncementLine
-          text={announcement.text}
-          hint={announcement.hint}
-          visible={announcement.visible}
-          columns={terminalColumns}
-        />
-      ) : null}
-      {feedbackSurvey ? (
-        <FeedbackSurveyLine survey={feedbackSurvey} columns={terminalColumns} />
-      ) : null}
-      <StatusSection
-        terminalRows={terminalRows}
-        onWorkingSpinnerFrame={onWorkingSpinnerFrame}
-        isWorking={isWorking}
-        status={status}
-        elapsed={elapsed}
-        tokens={tokens}
-        queuedInstructions={queuedInstructions}
-        queueSteeringEnabled={queueSteeringEnabled}
-        selectedQueueIndex={selectedQueueIndex}
-        completionStats={completionStats}
-        activityItems={activityItems}
-        teamActivity={teamActivity}
-        teamPanelVisible={teamPanelVisible}
-        goalActivity={goalActivity}
-        goalPanelVisible={goalPanelVisible}
-        selectedGoalIndex={selectedGoalIndex}
-        onGoalRowLayoutChange={onGoalRowLayoutChange}
-        commandResult={commandResult}
-        tip={tip}
-        columns={terminalColumns}
-        contextPercent={contextPercent}
-        contextTokens={contextTokens}
-        provider={provider}
-        model={model}
-        taskListPosition={taskListPosition}
-        lineExtension={mergeLineExtensions(
-          configuredLineExtensions?.status,
-          lineExtensions?.status,
-          runtimeLineExtensions?.status,
-        )}
-      />
-      {axo && onAxoGone && shouldShowAxo(axo.enabled, terminalColumns, terminalRows) ? (
-        <AxoBuddy
-          axo={axo}
+      <Box flexDirection="column" flexShrink={fullScreen ? 1 : 0} overflow={fullScreen ? 'hidden' : 'visible'}>
+        {announcement ? (
+          <AnnouncementLine
+            text={announcement.text}
+            hint={announcement.hint}
+            visible={announcement.visible}
+            columns={terminalColumns}
+          />
+        ) : null}
+        {feedbackSurvey ? (
+          <FeedbackSurveyLine survey={feedbackSurvey} columns={terminalColumns} />
+        ) : null}
+        <StatusSection
+          terminalRows={terminalRows}
+          onWorkingSpinnerFrame={onWorkingSpinnerFrame}
           isWorking={isWorking}
-          turnStatus={lastTurnOutcome}
-          input={input}
+          status={status}
+          elapsed={elapsed}
+          tokens={tokens}
+          queuedInstructions={queuedInstructions}
+          queueSteeringEnabled={queueSteeringEnabled}
+          selectedQueueIndex={selectedQueueIndex}
+          completionStats={completionStats}
+          activityItems={activityItems}
+          teamActivity={teamActivity}
+          teamPanelVisible={teamPanelVisible}
+          goalActivity={goalActivity}
+          goalPanelVisible={goalPanelVisible}
+          selectedGoalIndex={selectedGoalIndex}
+          onGoalRowLayoutChange={onGoalRowLayoutChange}
+          commandResult={commandResult}
+          tip={tip}
           columns={terminalColumns}
-          rows={terminalRows}
-          onGone={onAxoGone}
+          contextPercent={contextPercent}
+          contextTokens={contextTokens}
+          provider={provider}
+          model={model}
+          taskListPosition={taskListPosition}
+          lineExtension={mergeLineExtensions(
+            configuredLineExtensions?.status,
+            lineExtensions?.status,
+            runtimeLineExtensions?.status,
+          )}
         />
-      ) : null}
-      {fullScreen && menus}
-      <ShortcutsHelpPanel visible={showShortcuts && !isWorking} keybindings={keybindings} columns={terminalColumns} fullScreen={fullScreen} />
-      {goalEditUnavailable ? <Text color={colors.warning}>Goal is unavailable. Draft kept; Esc cancels.</Text> : null}
+        {axo && onAxoGone && shouldShowAxo(axo.enabled, terminalColumns, terminalRows) ? (
+          <AxoBuddy
+            axo={axo}
+            isWorking={isWorking}
+            turnStatus={lastTurnOutcome}
+            input={input}
+            columns={terminalColumns}
+            rows={terminalRows}
+            onGone={onAxoGone}
+          />
+        ) : null}
+        {fullScreen && menus}
+        <ShortcutsHelpPanel visible={showShortcuts && !isWorking} keybindings={keybindings} columns={terminalColumns} fullScreen={fullScreen} />
+        {goalEditUnavailable ? <Text color={colors.warning}>Goal is unavailable. Draft kept; Esc cancels.</Text> : null}
+      </Box>
       <InputLineWrapper
         maxRows={fullScreen ? Math.max(1, Math.min(4, Math.floor((terminalRows ?? 24) / 4))) : undefined}
         enableQueueInput={enableQueueInput}

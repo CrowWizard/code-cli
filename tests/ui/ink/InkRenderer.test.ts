@@ -594,6 +594,17 @@ describe('InkRenderer live command blocks', () => {
     expect(renderer.getState().chatMessages).toEqual([]);
   });
 
+  it('keeps a one-time transcript notice in order instead of pinning it below future turns', () => {
+    const renderer = new InkRenderer({ onInstruction: () => {}, onEscape: () => {}, onCtrlC: () => {} });
+    renderer.addNotification('Repository suggestions available.', { placement: 'transcript' });
+    renderer.addUserMessage('Continue working');
+    expect(renderer.getState().notifications).toEqual([]);
+    expect(renderer.getState().chatMessages).toEqual([
+      { role: 'notification', content: 'Repository suggestions available.' },
+      { role: 'user', content: 'Continue working' },
+    ]);
+  });
+
   it('tracks a running command and finalizes it into tool output', () => {
     const renderer = new InkRenderer({
       onInstruction: () => {},

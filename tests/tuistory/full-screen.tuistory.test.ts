@@ -7,15 +7,16 @@ import { isTerminalMouseTrackingEnabled } from '../../src/testing/scenarios/mous
 import { composerCaretLine } from '../../src/testing/assertions/composerCaret.js';
 import { clickFullScreenComposer, seedFullScreenHistory, typeMultilineDraft } from '../../src/testing/scenarios/fullScreenScenario.js';
 import { outputViewport, LONG_OUTPUT_COMMAND, runLongOutputTurn } from '../../src/testing/scenarios/compactOutputScenario.js';
-import { createMockAutohandAINativeSequenceServer, type MockNativeToolServer, createTempAutohandHome, launchBuiltAutohand, exitInteractive, type TuistoryTempState } from './helpers/autohandTuistory.js';
+import { createMockAuthServer, type MockAuthServer, createMockAutohandAINativeSequenceServer, type MockNativeToolServer, createTempAutohandHome, launchBuiltAutohand, exitInteractive, type TuistoryTempState } from './helpers/autohandTuistory.js';
 let server: MockNativeToolServer | undefined;
+let auth: MockAuthServer | undefined;
 let state: TuistoryTempState | undefined;
 let session: Session | undefined;
-afterEach(async () => { session?.close(); await server?.close(); server = undefined; await state?.cleanup(); session = undefined; state = undefined; });
+afterEach(async () => { session?.close(); await server?.close(); await auth?.close(); auth = undefined; server = undefined; await state?.cleanup(); session = undefined; state = undefined; });
 
-describe('experimental full-screen terminal', () => {
+describe('full-screen terminal', () => {
   it('places the hardware caret inside the composer on a tall empty screen and after resize', async () => {
-    state = await createTempAutohandHome({ config: { features: { fullScreenMode: true }, ui: { promptSuggestions: false } } });
+    state = await createTempAutohandHome({ config: { features: { fullScreenMode: undefined }, ui: { promptSuggestions: false } } });
     session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], {
       autohandHome: state.autohandHome, cwd: state.workspaceRoot, waitForDataTimeout: 15_000,
       cols: 180, rows: 58, env: { TERM_PROGRAM: 'ghostty' },
@@ -160,7 +161,7 @@ describe('experimental full-screen terminal', () => {
     expect(outputViewport(session)).toContain('preserved draft');
     await session.resize({ cols: 60, rows: 20 }); await session.text();
     expect(outputViewport(session)).toContain('preserved draft');
-    expect(outputViewport(session)).toContain('History item 20');
+    await expect.poll(() => outputViewport(session!)).toContain('History item 20');
     await session.write('\x1b[1;5F'); await session.waitForText('History item 79');
     for (let i = 0; i < 'preserved draft'.length; i++) await session.press('backspace');
     await session.type('/usage'); await session.press('enter'); await session.waitForText('Activity overview');
@@ -241,16 +242,25 @@ describe('experimental full-screen terminal', () => {
     await exitInteractive(session);
   });
 
-  it('persists explicit opt-in through experiments and leaves the current inline session unchanged', async () => {
-    state = await createTempAutohandHome({ config: { ui: { promptSuggestions: false } } });
-    session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], { autohandHome: state.autohandHome, cwd: state.workspaceRoot, waitForDataTimeout: 15_000 });
+  it('defaults to full screen and persists opt-out across restarts', async () => {
+    auth = await createMockAuthServer();
+    const env = { AUTOHAND_API_URL: auth.baseUrl, AUTOHAND_AUTH_URL: auth.baseUrl, AUTOHAND_AUTH_API_URL: `${auth.baseUrl}/api/auth` };
+    state = await createTempAutohandHome({ config: { features: { fullScreenMode: undefined }, ui: { promptSuggestions: false } } });
+    session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], { autohandHome: state.autohandHome, cwd: state.workspaceRoot, waitForDataTimeout: 15_000, env });
     await session.waitForText('❯');
-    expect(outputViewport(session)).not.toContain('Full screen');
-    await session.type('/experiments enable full_screen_mode'); await session.press('enter');
+    expect(outputViewport(session)).toContain('Full screen');
+    await session.type('/experiments disable full_screen_mode'); await session.press('enter');
     await session.waitForText('Restart');
     const config = JSON.parse(await readFile(state.configPath, 'utf8'));
-    expect(config.features.fullScreenMode).toBe(true);
+    expect(config.features.fullScreenMode).toBe(false);
+    expect(outputViewport(session)).toContain('Full screen ·');
+    await exitInteractive(session);
+    session.close();
+    session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], { autohandHome: state.autohandHome, cwd: state.workspaceRoot, env });
+    await session.waitForText('❯');
     expect(outputViewport(session)).not.toContain('Full screen ·');
+    expect(session.getRawOutput()).not.toContain('\x1b[?1049h');
+    await session.type('inline opt-out works'); await session.waitForText('❯ inline opt-out works');
     await exitInteractive(session);
   });
 });

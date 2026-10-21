@@ -1,9 +1,9 @@
 # Full-screen mode implementation
 
 - [x] Preserve committed main work and create an isolated full-screen integration checkout.
-- [x] Define the experimental scope, behavior and design.
+- [x] Define the full-screen scope, behavior and design.
 - [x] Add failing tests for the registry, terminal ownership, viewport model and rendered frame.
-- [x] Implement default-off feature wiring and shared alternate-screen lifecycle.
+- [x] Implement default-on feature wiring with explicit opt-out and shared alternate-screen lifecycle.
 - [x] Implement bounded transcript rendering, paging, resize anchoring and search.
 - [x] Integrate the existing composer, tool expansion and modal flows.
 - [x] Document activation, keyboard controls, fallback and limitations in the config reference.
@@ -18,7 +18,7 @@
 - **Full proof is not green.** Its unit stage finished with 11,726 passed, 15 failed and 49 skipped across 825 files, so its automatic build/Tuistory stage did not run. Build and the focused terminal scenarios above ran separately.
 - All nine failed files passed unchanged in a focused rerun (254 tests): `command.spec.ts`, `extensionsCliCommand.spec.ts`, `mcpClientManager.spec.ts`, `actions/command.coordination.test.ts`, `ui/discoveryProgressPty.test.ts`, `ui/inputPrompt.test.ts`, `core/agent/WorkspaceFileCollector.mobile-query.test.ts`, `modes/rpc/blueprintProcess.integration.test.ts`, and `ui/ink/peerComposer.pty.test.ts`. These reruns support intermittent execution failures; they do not replace a passing aggregate proof.
 
-The experiment remains disabled by default. No release or remote push is part of this implementation.
+Full-screen mode is stable and enabled by default; explicit opt-out requires a restart. No release or remote push is part of this implementation.
 
 ## Interaction repair — 2026-10-06
 

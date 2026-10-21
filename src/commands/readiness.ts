@@ -16,7 +16,7 @@ interface ReadinessContext {
 export async function readiness(ctx: ReadinessContext, args: string[] = []): Promise<string> {
   const service = ctx.repositoryReadiness;
   if (!service) return 'Repository readiness is unavailable. Enable ui.repositoryReadiness in an interactive session.';
-  if (args[0] === 'dismiss') { await service.dismiss(); return 'Repository suggestions dismissed. Materially new findings can be offered in a later session.'; }
+  if (args[0] === 'dismiss') { await service.dismiss(); return 'Repository suggestions dismissed. Use /readiness whenever you want to review them.'; }
   const report = service.getReport();
   if (!report) return 'Repository readiness is still being assessed, or the review could not finish. Your work can continue.';
   if (args[0] === 'apply') {

@@ -4,7 +4,7 @@ interface Ownership { count: number; restore: () => void }
 const owners = new WeakMap<ScreenOutput, Ownership>();
 
 export function shouldUseFullScreen(enabled: boolean | undefined, stdinTTY: boolean | undefined, stdoutTTY: boolean | undefined, term: string | undefined): boolean {
-  return enabled === true && stdinTTY === true && stdoutTTY === true && term !== 'dumb';
+  return enabled !== false && stdinTTY === true && stdoutTTY === true && term !== 'dumb';
 }
 
 export function ownsAlternateScreen(output: ScreenOutput): boolean {

@@ -19,7 +19,8 @@ describe('/readiness', () => {
   it('dismisses without model work and handles invalid selections or pending analysis', async () => {
     const dismiss = vi.fn(); const enqueueInstruction = vi.fn();
     const ctx = { repositoryReadiness: { getReport: () => report, dismiss }, enqueueInstruction };
-    await readiness(ctx, ['dismiss']); expect(dismiss).toHaveBeenCalledOnce(); expect(enqueueInstruction).not.toHaveBeenCalled();
+    expect(await readiness(ctx, ['dismiss'])).toBe('Repository suggestions dismissed. Use /readiness whenever you want to review them.');
+    expect(dismiss).toHaveBeenCalledOnce(); expect(enqueueInstruction).not.toHaveBeenCalled();
     expect(await readiness(ctx, ['apply', '9'])).toContain('Choose');
     expect(await readiness({})).toContain('unavailable');
   });

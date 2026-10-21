@@ -35,6 +35,7 @@ interface ReadinessCache {
   version: 1;
   report: ReadinessReport;
   seen: string[];
+  notificationShown?: boolean;
 }
 interface RepositoryReadinessOptions {
   workspaceRoot: string;
@@ -196,6 +197,7 @@ export class RepositoryReadiness {
   private cachePath?: string;
   private completedTurn = false;
   private shown = false;
+  private notificationShown = false;
   constructor(private readonly options: RepositoryReadinessOptions) {}
   private get stopped(): boolean { return this.controller.signal.aborted || this.options.signal?.aborted === true; }
 
@@ -213,7 +215,10 @@ export class RepositoryReadiness {
       const text = await readFile(this.cachePath, { encoding: 'utf8', signal });
       if (text.length < 128_000) cached = JSON.parse(text) as ReadinessCache;
     } catch { signal.throwIfAborted(); }
-    if (cached?.version === 1 && Array.isArray(cached.seen)) this.seen = cached.seen.filter(item => typeof item === 'string').slice(-128);
+    if (cached?.version === 1 && Array.isArray(cached.seen)) {
+      this.seen = cached.seen.filter(item => typeof item === 'string').slice(-128);
+      this.notificationShown ||= cached.notificationShown === true || this.seen.length > 0;
+    }
     this.report = cached?.report?.fingerprint === inventory.fingerprint && Array.isArray(cached.report.findings)
       ? cached.report
       : await cancellable(this.options.analyze
@@ -231,11 +236,15 @@ export class RepositoryReadiness {
       const text = await readFile(this.cachePath, 'utf8');
       if (text.length > 128_000) return;
       const cached = JSON.parse(text) as Partial<ReadinessCache>;
-      if (cached.version === 1 && Array.isArray(cached.seen)) this.seen = [...new Set([...cached.seen.filter(item => typeof item === 'string'), ...this.seen])].slice(-128);
+      if (cached.version === 1 && Array.isArray(cached.seen)) {
+        const seen = cached.seen.filter(item => typeof item === 'string');
+        this.seen = [...new Set([...seen, ...this.seen])].slice(-128);
+        this.notificationShown ||= cached.notificationShown === true || seen.length > 0;
+      }
     } catch { /* A missing or invalid cache is rebuilt from the current review. */ }
   }
   private async writeCache(): Promise<void> {
-    if (this.cachePath && this.report && !this.stopped) await atomicWriteJson(this.cachePath, { version: 1, report: this.report, seen: this.seen });
+    if (this.cachePath && this.report && !this.stopped) await atomicWriteJson(this.cachePath, { version: 1, report: this.report, seen: this.seen, notificationShown: this.notificationShown });
   }
   private async save(): Promise<void> {
     if (!this.cachePath || !this.report || this.stopped) return;
@@ -245,19 +254,21 @@ export class RepositoryReadiness {
     if (this.stopped || !this.completedTurn || this.shown || this.notification || !this.report || !this.cachePath || !this.options.isIdle()) return;
     this.notification = withFileLock(`${this.cachePath}.lock`, async () => {
       await this.mergeSeen();
-      if (this.stopped || this.shown || !this.report || !this.options.isIdle()) return;
+      if (this.stopped || this.shown || this.notificationShown || !this.report || !this.options.isIdle()) return;
       const findings = this.report.findings.filter(finding => !this.seen.includes(this.findingKey(finding)));
       if (!findings.length) return;
       this.shown = true;
+      this.notificationShown = true;
       this.seen = [...new Set([...this.seen, ...findings.map(finding => this.findingKey(finding))])].slice(-128);
       await this.writeCache();
-      if (!this.stopped) this.options.notify(`Hey, I found ${findings.length === 1 ? 'a repository improvement' : `${findings.length} repository improvements`} that could help: ${findings.map(finding => finding.title).join('; ')}. Use /readiness to review and choose, or /readiness dismiss to skip.`);
+      if (!this.stopped) this.options.notify('Repository suggestions available. Use /readiness to review or /readiness dismiss to hide.');
     }, { waitTimeoutMs: 1_000 }).catch(() => {}).finally(() => { this.notification = undefined; });
   }
   markTurnCompleted(): void { this.completedTurn = true; this.maybeNotify(); }
   getReport(): ReadinessReport | undefined { return this.report; }
   async dismiss(): Promise<void> {
     this.shown = true;
+    this.notificationShown = true;
     if (this.report) this.seen = [...new Set([...this.seen, ...this.report.findings.map(finding => this.findingKey(finding))])].slice(-128);
     await this.save();
   }

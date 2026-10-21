@@ -2307,7 +2307,7 @@ describe('agent startup and active input UI', () => {
       (agent as any).initializeUIManager();
 
       const options = (agent.ui as any).options;
-      expect(options.fullScreenMode).toBe(fullScreenMode === true);
+      expect(options.fullScreenMode).toBe(fullScreenMode !== false);
       expect(options.skillsProvider).toBeTypeOf('function');
       expect(options.skillsProvider()).toEqual([
         {

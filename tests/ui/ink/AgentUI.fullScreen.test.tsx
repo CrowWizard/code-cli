@@ -10,6 +10,38 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 afterEach(cleanup);
 
 describe('full-screen composer integration', () => {
+  it.each([false, true])('renders a transcript reminder once in chronological order with fullScreen=%s', async fullScreen => {
+    const state = { ...createInitialUIState(), chatMessages: [
+      { role: 'assistant' as const, content: 'First response' },
+      { role: 'notification' as const, content: 'Repository suggestions available.' },
+      { role: 'assistant' as const, content: 'Later response' },
+    ] };
+    const view = render(<I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={fullScreen ? new FullScreenTranscript() : undefined} state={state} onInstruction={() => {}} onEscape={() => {}} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>);
+    await flush();
+    const screen = stripAnsi(view.lastFrame() ?? '');
+    expect(screen.split('Repository suggestions available.')).toHaveLength(2);
+    expect(screen.indexOf('Repository suggestions available.')).toBeGreaterThan(screen.indexOf('First response'));
+    expect(screen.indexOf('Repository suggestions available.')).toBeLessThan(screen.indexOf('Later response'));
+  });
+  it('anchors every rendered frame as slash menus and queued rows appear and disappear', async () => {
+    const model = new FullScreenTranscript();
+    let state = createInitialUIState();
+    const frame = () => <I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={model} state={state} enableQueueInput slashCommands={[{ command: '/about', description: 'About', implemented: true }]} onInstruction={() => {}} onEscape={() => {}} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>;
+    const view = render(frame()); await flush();
+    const row = (frame: string) => stripAnsi(frame).split('\n').findIndex(line => line.includes('❯'));
+    const baseline = row(view.lastFrame() ?? '');
+    const start = view.frames.length;
+    view.stdin.write('/'); await flush();
+    expect(stripAnsi(view.lastFrame() ?? '')).toContain('/about');
+    view.stdin.write('\x1b'); await flush();
+    state = { ...state, isWorking: true, queuedInstructions: ['queued message'] };
+    view.rerender(frame()); await flush();
+    state = { ...state, queuedInstructions: Array.from({ length: 40 }, (_, i) => `queued ${i}`) };
+    view.rerender(frame()); await flush();
+    state = { ...state, isWorking: false, queuedInstructions: [] };
+    view.rerender(frame()); await flush();
+    expect([...new Set(view.frames.slice(start).map(row))]).toEqual([baseline]);
+  });
   it('dismisses shortcuts before leaving history and leaves interruption available at the tail', async () => {
     const model = new FullScreenTranscript();
     const state = { ...createInitialUIState(), chatMessages: Array.from({ length: 100 }, (_, i) => ({ role: 'assistant' as const, content: `Message ${i}` })) };
@@ -56,6 +88,20 @@ describe('full-screen composer integration', () => {
     expect(screen).toContain('editable during work');
     expect(screen.split('\n').length).toBeLessThanOrEqual(24);
     view.unmount();
+  });
+
+  it('keeps the selected end of a long queue visible without moving the composer', async () => {
+    const state = { ...createInitialUIState(), isWorking: true, queuedInstructions: Array.from({ length: 40 }, (_, i) => `queued message ${i}`) };
+    const view = render(<I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={new FullScreenTranscript()} state={state} enableQueueInput onInstruction={() => {}} onEscape={() => {}} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>);
+    await flush();
+    const row = () => stripAnsi(view.lastFrame() ?? '').split('\n').findIndex(line => line.includes('❯'));
+    const baseline = row();
+    for (let i = 0; i < 40; i++) { view.stdin.write('\x1b[B'); await flush(); }
+    const screen = stripAnsi(view.lastFrame() ?? '');
+    expect(screen).toContain('› 40. queued message 39');
+    expect(screen).toContain('35 more');
+    expect(row()).toBe(baseline);
+    expect(screen).not.toContain('1. queued message 0');
   });
 
   it('keeps the active end of a multiline draft visible', async () => {

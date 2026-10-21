@@ -25,34 +25,54 @@ describe('repository readiness in the running CLI', () => {
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('Readiness fixture unavailable');
     const auth = await createMockAuthServer();
+    const env = { AUTOHAND_API_URL: auth.baseUrl, AUTOHAND_AUTH_URL: auth.baseUrl, AUTOHAND_AUTH_API_URL: `${auth.baseUrl}/api/auth` };
     const state = await createTempAutohandHome({ config: {
       openrouter: { baseUrl: `http://127.0.0.1:${address.port}` },
       agent: { autoMemory: false, maxIterations: 2, sessionRetryLimit: 0 },
-      features: { automaticSpecialists: false },
+      features: { automaticSpecialists: false, fullScreenMode: true },
       ui: { repositoryReadiness: enabled, promptSuggestions: false, terminalBell: false, showCompletionNotification: false },
     } });
     await writeFile(path.join(state.workspaceRoot, 'AGENTS.md'), 'Use bun to test the CLI.');
     let session: Session | undefined;
     try {
       session = await launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
-        autohandHome: state.autohandHome, cwd: state.workspaceRoot, env: { AUTOHAND_AUTH_API_URL: `${auth.baseUrl}/api/auth` },
+        autohandHome: state.autohandHome, cwd: state.workspaceRoot, env,
       });
       await session.text({ timeout: 20_000, waitFor: text => text.includes('❯') });
-      expect(await session.text({ immediate: true })).not.toContain('Hey, I found');
+      expect(await session.text({ immediate: true })).not.toContain('Repository suggestions available.');
       await session.type('Explain this repository'); await session.press('enter');
       await session.waitForText('FIRST_TURN_COMPLETE', { timeout: 15_000 });
       if (enabled) {
-        await session.waitForText('Hey, I found', { timeout: 15_000 });
+        await session.waitForText('Repository suggestions available.', { timeout: 15_000 });
         expect(readinessRequests).toBe(1); expect(turns).toBe(1);
+        const reminderScreen = await session.text({ immediate: true });
+        expect(reminderScreen.indexOf('FIRST_TURN_COMPLETE')).toBeGreaterThanOrEqual(0);
+        expect(reminderScreen.indexOf('Repository suggestions available.')).toBeGreaterThan(reminderScreen.indexOf('FIRST_TURN_COMPLETE'));
         const snapshot = await reviewRepositoryReadinessScenario(session);
         expect(snapshot).toBe((await readFile(path.join(import.meta.dirname, '../../src/testing/snapshots/repository-readiness.txt'), 'utf8')).trimEnd());
         expect(turns).toBe(2);
-        const transcript = session.readAll();
-        expect(transcript.indexOf('FIRST_TURN_COMPLETE')).toBeLessThan(transcript.indexOf('Hey, I found'));
       } else expect(readinessRequests).toBe(0);
       await exitInteractive(session);
       expect(session.exitInfo?.exitCode).toBe(0);
+      if (enabled) {
+        session.close();
+        await writeFile(path.join(state.workspaceRoot, 'new.ts'), 'export const changed = true;');
+        session = await launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath], {
+          autohandHome: state.autohandHome, cwd: state.workspaceRoot, env,
+        });
+        await session.waitForText('❯');
+        await session.type('Review the changed repository'); await session.press('enter');
+        await session.waitForText('READINESS_OPT_IN_COMPLETE', { timeout: 15_000 });
+        await session.waitIdle();
+        expect(await session.text({ immediate: true })).not.toContain('Repository suggestions available.');
+        expect(session.getRawOutput()).not.toContain('Repository suggestions available.');
+        expect(readinessRequests).toBe(2);
+        await session.type('/readiness'); await session.press('tab'); await session.press('enter');
+        await session.waitForText('Evidence: AGENTS.md');
+        await exitInteractive(session);
+      }
     } finally {
+      if (session && !session.exitInfo) await exitInteractive(session).catch(() => {});
       session?.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
       await auth.close(); await state.cleanup();
     }
