@@ -43,6 +43,27 @@ import { ReactionParser } from '../../../src/core/agent/ReactionParser.js';
 import { PromptCacheToolSet } from '../../../src/core/agent/PromptCache.js';
 
 describe('ReactLoopRunner composer status', () => {
+  it('emits streamed final response text without duplicating the terminal response', async () => {
+    const parser = new ReactionParser();
+    const llmComplete = vi.fn(async (request) => {
+      request.onTextDelta?.('{"finalResponse":"Hello ');
+      request.onTextDelta?.('world."}');
+      return {
+        id: 'final-response',
+        created: 1,
+        content: '{"finalResponse":"Hello world."}',
+        raw: {},
+      };
+    });
+    const host = createReactLoopTestHost(llmComplete, parser);
+
+    await runAgentReactLoop(host, new AbortController());
+
+    expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'Hello ' });
+    expect(host.emitOutput).toHaveBeenCalledWith({ type: 'message', content: 'world.' });
+    expect(host.emitOutput).not.toHaveBeenCalledWith({ type: 'message', content: 'Hello world.' });
+  });
+
   it('stops before the model request that would exceed the run budget and records usage', async () => {
     const { RunBudget, RunBudgetExceededError } = await import('../../../src/core/agent/RunBudget.js');
     const llmComplete = vi.fn()

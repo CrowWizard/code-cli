@@ -8,6 +8,14 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 describe('index SDK mode startup ordering', () => {
+  it('allows a configured BYOK provider to bypass account authentication', () => {
+    const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
+
+    expect(source).toContain('function canUseProviderWithoutAccountAuth(config: LoadedConfig): boolean');
+    expect(source).toContain("(config.provider ?? 'openrouter') !== 'autohandai'");
+    expect(source).toContain('if (!canUseProviderWithoutAccountAuth(authConfig)) {');
+  });
+
   it('refreshes the model catalog in background startup instead of before the banner', () => {
     const source = readFileSync(path.resolve(process.cwd(), 'src/index.ts'), 'utf8');
     const runCliStart = source.indexOf('async function runCLI(');

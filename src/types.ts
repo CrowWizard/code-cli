@@ -1522,6 +1522,8 @@ export interface LLMRequest {
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
+  /** Receives provider text increments before the final response is available. */
+  onTextDelta?: (delta: string) => void;
   /** Live provider deltas; completion still returns the assembled answer and tool calls. */
   onDelta?: (delta: { type: 'content' | 'reasoning'; text: string }) => void;
   /** Receives provider text increments before the final response is available. */
