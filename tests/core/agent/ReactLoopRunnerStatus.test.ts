@@ -238,6 +238,8 @@ describe('ReactLoopRunner composer status', () => {
       vi.useRealTimers();
     }
 
+  });
+
   it('emits streamed final response text without duplicating the terminal response', async () => {
     const parser = new ReactionParser();
     const llmComplete = vi.fn(async (request) => {

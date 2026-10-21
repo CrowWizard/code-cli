@@ -486,31 +486,6 @@ export class AutohandAcpAdapter implements Agent {
     return { config, state, agent };
   }
 
-  private rekeyManagedSession(
-    provisionalSessionId: string,
-    sessionId: string,
-    state: AcpSessionState,
-    agent: AutohandAgent,
-  ): void {
-    this.sessions.delete(provisionalSessionId);
-    this.agents.delete(provisionalSessionId);
-    this.permissionBridges.delete(provisionalSessionId);
-    const configOptions = this.sessionConfigOptions.get(provisionalSessionId);
-    this.sessionConfigOptions.delete(provisionalSessionId);
-
-    state.sessionId = sessionId;
-    this.sessions.set(sessionId, state);
-    this.agents.set(sessionId, agent);
-    if (configOptions) this.sessionConfigOptions.set(sessionId, configOptions);
-
-    const permBridge = createPermissionBridge({
-      connection: this.connection,
-      sessionId,
-      modeId: state.modeId,
-    });
-    this.permissionBridges.set(sessionId, permBridge);
-  }
-
   private restoreConversation(messages: SessionMessage[]): void {
     const conversation = ConversationManager.getInstance();
     if (!conversation.isInitialized()) {
@@ -711,12 +686,9 @@ export class AutohandAcpAdapter implements Agent {
   // ==========================================================================
 
   async newSession(params: NewSessionRequest): Promise<ResponseWithLegacyModels<NewSessionResponse>> {
-    const provisionalSessionId = crypto.randomUUID();
     const workspaceRoot = this.resolveWorkspaceRoot(params.cwd);
-    const { config, state, agent } = await this.createManagedSession(provisionalSessionId, workspaceRoot);
-    const persistedSession = await agent.getSessionManager().createSession(workspaceRoot, state.modelId);
-    const sessionId = persistedSession.metadata.sessionId;
-    this.rekeyManagedSession(provisionalSessionId, sessionId, state, agent);
+    const { config, state, agent } = await this.createManagedSession(workspaceRoot);
+    const { sessionId } = state;
     await this.connectSessionMcpServers(agent, params.mcpServers);
     this.emitHookSessionStart(sessionId, 'startup');
 

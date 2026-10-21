@@ -29,7 +29,6 @@ const {
 } = vi.hoisted(() => {
   const mockSessionManager = {
     getCurrentSession: vi.fn(),
-    createSession: vi.fn(),
     loadSession: vi.fn(),
     listSessions: vi.fn(),
   };
@@ -297,9 +296,6 @@ describe("AutohandAcpAdapter", () => {
       },
       getMessages: () => [],
       save: mockPersistedSessionSave,
-    });
-    mockSessionManager.createSession.mockResolvedValue({
-      metadata: { sessionId: "persisted-acp-session" },
     });
     mockPersistentSessionManager.initialize.mockResolvedValue(undefined);
     mockPersistentSessionManager.listSessions.mockResolvedValue([]);
@@ -605,17 +601,14 @@ describe("AutohandAcpAdapter", () => {
     it("returns the persisted agent session ID", async () => {
       const result = await adapter.newSession(makeNewSessionRequest());
 
-      expect(result.sessionId).toBe("persisted-acp-session");
+      expect(result.sessionId).toBe("persisted-session-123");
     });
 
     it("returns the durable session identifier created by SessionManager", async () => {
       const result = await adapter.newSession(makeNewSessionRequest());
 
-      expect(mockSessionManager.createSession).toHaveBeenCalledWith(
-        "/workspace",
-        "your-modelcard-id-here",
-      );
-      expect(result.sessionId).toBe("persisted-acp-session");
+      expect(mockAgent.initializeForRPC).toHaveBeenCalledWith(undefined, undefined);
+      expect(result.sessionId).toBe(mockSessionManager.getCurrentSession().metadata.sessionId);
     });
 
     it("returns available modes matching DEFAULT_ACP_MODES", async () => {
