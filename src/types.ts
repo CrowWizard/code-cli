@@ -1249,6 +1249,8 @@ export interface CLIOptions {
   config?: string;
   temperature?: number;
   resumeSessionId?: string;
+  continue?: boolean;
+  resume?: string | boolean;
   /** Keep this run out of session history: nothing saved, no auto-memory, no session sync. */
   ephemeral?: boolean;
   /** --output-schema <file>: the command-mode final answer must be JSON validating against this schema. */

@@ -1253,10 +1253,16 @@ export async function runAgentCommandMode(
         throw createLifecycleAbortError();
       }
       await awaitLifecycleStep(
-        Promise.resolve(host.initializeForRPC(signal)),
+        Promise.resolve(host.runtime.options.resumeSessionId
+          ? host.initializeForRPC(signal, host.runtime.options.resumeSessionId)
+          : host.initializeForRPC(signal)),
         signal,
       );
       initialized = true;
+
+      if (host.runtime.options.resumeSessionId) {
+        await awaitLifecycleStep(host.restoreSessionState(host.runtime.options.resumeSessionId), signal);
+      }
 
       if (options.review) {
         await host.telemetryManager.trackCommand({
