@@ -387,7 +387,7 @@ export interface UISettings {
   promptSuggestions?: boolean;
   /** Background, read-only repository review offered after the first completed turn (default: true). */
   repositoryReadiness?: boolean;
-  /** Rotate tips about slash commands, composer triggers and shortcuts beside the idle composer (default: true) */
+  /** Rotate capability tips below the working status or completion summary, above the composer (default: true) */
   showTips?: boolean;
   /**
    * While a turn runs, `select` queues drafts with Enter and steers only a

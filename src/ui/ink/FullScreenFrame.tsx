@@ -14,14 +14,13 @@ interface FullScreenFrameProps {
   model: FullScreenTranscript;
   messages: readonly ChatLogMessage[];
   footer: React.ReactNode;
-  loading?: React.ReactNode;
   workspaceRoot?: string;
   detailsId?: string;
   rows: number;
   columns: number;
 }
 
-export function FullScreenFrame({ model, messages, footer, loading, workspaceRoot, rows, columns, detailsId }: FullScreenFrameProps) {
+export function FullScreenFrame({ model, messages, footer, workspaceRoot, rows, columns, detailsId }: FullScreenFrameProps) {
   const { colors } = useTheme();
   const footerRef = useRef<DOMElement>(null);
   const metrics = useBoxMetrics(footerRef);
@@ -45,7 +44,7 @@ export function FullScreenFrame({ model, messages, footer, loading, workspaceRoo
     <Box flexDirection="column" height={3} flexShrink={0} overflow="hidden">
       <Text wrap="truncate"><Text color={colors.accent}>{'>_ '}</Text><Text bold>Autohand Code</Text><Text color={colors.muted}>{` (v${runtimeVersion})`}</Text></Text>
       <Text color={colors.muted} wrap="truncate">{`   ${displayDirectory}`}</Text>
-      <Box height={1} overflow="hidden">{loading ?? <Text> </Text>}</Box>
+      <Text> </Text>
     </Box>
     <Box flexDirection="column" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} overflow="hidden">
       {lines.map((line, index) => <Text key={index} wrap="truncate">{line || ' '}</Text>)}

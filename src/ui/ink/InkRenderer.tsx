@@ -479,8 +479,7 @@ export class InkRenderer {
   /** Debounce timer for drag-resize events */
   private resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Rotates tips beside the composer while no turn runs. */
-  private idleTipTimer: ReturnType<typeof setInterval> | null = null;
+  private tipTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Debounce time for resize events (ms) - longer to batch drag-resize */
   private static readonly RESIZE_DEBOUNCE_MS = 150;
@@ -559,8 +558,7 @@ export class InkRenderer {
         process.stdout.on('resize', this.resizeHandler);
       }
 
-      // Seed the idle tip before the first frame so it does not pop in a render later.
-      this.syncIdleTips();
+      this.syncTips();
 
       this.instance = this.mountAgentUI();
     } catch (error) {
@@ -679,7 +677,7 @@ export class InkRenderer {
         this.resizeDebounceTimer = null;
       }
 
-      this.stopIdleTips();
+      this.stopTips();
       if (this.liveOutputFlushTimer) {
         clearTimeout(this.liveOutputFlushTimer);
         this.liveOutputFlushTimer = null;
@@ -823,13 +821,12 @@ export class InkRenderer {
       updates.commandResult = undefined;
     }
 
-    // Tips rotate only while idle; an upgrade hint stays until the next turn starts.
-    if (isWorking && this.state.tip) {
+    if (isWorking && this.state.tip?.kind === 'upgrade') {
       updates.tip = undefined;
     }
 
     this.updateState(updates);
-    this.syncIdleTips();
+    this.syncTips();
   }
 
   /**
@@ -1371,33 +1368,32 @@ export class InkRenderer {
     this.updateState({ tip });
   }
 
-  private syncIdleTips(): void {
-    if (this.state.isWorking) {
-      this.stopIdleTips();
+  private syncTips(): void {
+    if (!this.options.tipProvider) {
       return;
     }
-    if (this.idleTipTimer || !this.options.tipProvider) {
+    if (!this.state.tip) {
+      this.showNextTip();
+    }
+    if (this.tipTimer) {
       return;
     }
-    this.showNextIdleTip();
-    this.idleTipTimer = setInterval(() => this.showNextIdleTip(), TIP_ROTATION_MS);
-    this.idleTipTimer.unref?.();
+    this.tipTimer = setInterval(() => this.showNextTip(), TIP_ROTATION_MS);
+    this.tipTimer.unref?.();
   }
 
-  private stopIdleTips(): void {
-    if (this.idleTipTimer) {
-      clearInterval(this.idleTipTimer);
-      this.idleTipTimer = null;
+  private stopTips(): void {
+    if (this.tipTimer) {
+      clearInterval(this.tipTimer);
+      this.tipTimer = null;
     }
   }
 
-  /** Draws a tip that fits the room left beside the completion summary; a pinned upgrade hint wins. */
-  private showNextIdleTip(): void {
-    if (this.state.isWorking || this.state.tip?.kind === 'upgrade') {
+  private showNextTip(): void {
+    if (this.state.tip?.kind === 'upgrade') {
       return;
     }
-    const stats = this.state.completionStats;
-    const width = idleTipWidth(process.stdout.columns ?? 80, stats ? formatCompletionSummary(stats) : undefined);
+    const width = idleTipWidth(process.stdout.columns ?? 80);
     const text = this.options.tipProvider?.((tip) => fitsIdleTip(tip, width));
     this.updateState({ tip: text ? { kind: 'tip', text } : undefined });
   }

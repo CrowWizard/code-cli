@@ -10,8 +10,8 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 afterEach(cleanup);
 
 describe('full-screen composer integration', () => {
-  it('shows one working indicator below the project directory without moving the composer', async () => {
-    let state = { ...createInitialUIState(), currentInput: 'preserved draft', isWorking: true, status: 'READING_SOURCES' };
+  it('keeps one working indicator above the tip and composer across turn completion', async () => {
+    let state = { ...createInitialUIState(), currentInput: 'preserved draft', isWorking: true, status: 'READING_SOURCES', elapsed: '0m 11s', tokens: '↑0 ↓0', tip: { kind: 'tip' as const, text: 'Type /review security to check auth flows' } };
     const model = new FullScreenTranscript();
     const frame = () => <I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={model} workspaceRoot="/work/project" state={state} onInstruction={() => {}} onEscape={() => {}} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>;
     const view = render(frame()); await flush();
@@ -19,13 +19,20 @@ describe('full-screen composer integration', () => {
     const rows = () => screen().split('\n');
     expect(rows()[0]).toContain('Autohand Code');
     expect(rows()[1]).toContain('/work/project');
-    expect(rows()[2]).toContain('READING_SOURCES');
+    expect(rows()[2]).not.toContain('READING_SOURCES');
     expect(screen().split('READING_SOURCES')).toHaveLength(2);
+    const tipRow = rows().findIndex(line => line.startsWith('Tip:'));
+    expect(tipRow).toBeGreaterThan(2);
+    expect(rows()[tipRow - 1]).toContain('READING_SOURCES');
+    expect(rows()[tipRow - 1]).toContain('0m 11s · ↑0 ↓0');
+    expect(rows()[tipRow - 1]).toContain('esc to cancel');
     const composerRow = rows().findIndex(line => line.includes('❯ preserved draft'));
+    expect(rows().slice(tipRow + 1, composerRow).every(line => /^[▔▁─\s]*$/u.test(line))).toBe(true);
     expect(rows().findIndex(line => line.includes('Full screen'))).toBeGreaterThan(rows().findIndex(line => line.includes('context left')));
     state = { ...state, isWorking: false, status: '' };
     view.rerender(frame()); await flush();
     expect(screen()).not.toContain('READING_SOURCES');
+    expect(rows().findIndex(line => line.startsWith('Tip:'))).toBe(tipRow);
     expect(rows().findIndex(line => line.includes('❯ preserved draft'))).toBe(composerRow);
   });
   it.each([false, true])('renders a transcript reminder once in chronological order with fullScreen=%s', async fullScreen => {

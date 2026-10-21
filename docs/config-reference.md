@@ -783,7 +783,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `activityVerbs`              | string or string[] | built-in pool | Custom activity verb or verb pool for the working indicator, rendered as `Verb...` |
 | `activityVerbsEnabled`       | boolean | `true`  | Show rotating activity verbs like `Compiling...` while the agent is working |
 | `activitySymbol`             | string | `"✳"`   | Symbol shown before the activity verb in activity indicator output |
-| `showTips`                   | boolean | `true`  | Rotate tips about slash commands, the `/ @ $ ! : ?` triggers and shortcuts beside the idle composer |
+| `showTips`                   | boolean | `true`  | Rotate built-in capability tips below the working status or completion summary and above the composer |
 | `repositoryReadiness`        | boolean | `true`  | Review repository readiness in the background; show one reminder per repository after a successful interactive turn. Set false to disable background reviews |
 | `enterWhileWorking`          | string  | `select` | While a turn runs, Enter queues a draft; select a queued message with the arrow keys, press Enter to edit it, then Enter to steer or Shift+Enter to save it in the queue. `steer` and `queue` retain the earlier direct steering shortcuts for configured sessions |
 | `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"automode"` | Mode an interactive terminal session starts in. Auto mode runs without approval prompts; set `"default"` to be asked before risky actions. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
@@ -951,7 +951,7 @@ Customize the verbs in the config file when you want a fixed status label or a s
 }
 ```
 
-`activityVerbs` accepts either a single string or a non-empty string array. When `activityVerbsEnabled` is `false`, Autohand falls back to `Working...` instead of rotating through custom or built-in verbs. While no turn is running, a tip rotates every 30 seconds at the right end of the row above the composer, beside the `Completed in …` summary. Tips cover slash commands, the `/ @ $ ! : ?` composer triggers, keyboard shortcuts and your installed skills; only tips that fit the remaining width are drawn, and they hide while the agent works. Set `showTips` to `false`, or toggle Idle tips in `/settings`, to turn them off.
+`activityVerbs` accepts either a single string or a non-empty string array. When `activityVerbsEnabled` is `false`, Autohand falls back to `Working...` instead of rotating through custom or built-in verbs. A tip rotates every 30 seconds on its own left-aligned row above the composer, below the working status or the `Completed in …` summary. Tips remain visible across turns, and starting or finishing work does not reset their rotation. Tips include practical prompts for debugging, tests, codebase exploration and git worktrees, along with reviews, browser checks, recurring tasks, slash commands, the `/ @ $ ! : ?` composer triggers, keyboard shortcuts and your installed skills. Tips use the full composer width; only tips that fit are selected. Set `showTips` to `false`, or toggle Capability tips in `/settings`, to turn them off.
 
 You can toggle completion reports, including the structured `SITREP` prompt, without editing the file:
 
