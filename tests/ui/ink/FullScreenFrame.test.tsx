@@ -5,13 +5,47 @@ import { Box, Text } from 'ink';
 import os from 'node:os';
 import path from 'node:path';
 import stripAnsi from 'strip-ansi';
+import stringWidth from 'string-width';
 import { FullScreenFrame } from '../../../src/ui/ink/FullScreenFrame.js';
 import { FullScreenTranscript } from '../../../src/ui/ink/fullScreenTranscript.js';
 import { ThemeProvider } from '../../../src/ui/theme/ThemeContext.js';
+import { Theme } from '../../../src/ui/theme/Theme.js';
+import { loadTheme } from '../../../src/ui/theme/loader.js';
 const flush = () => new Promise(resolve => setTimeout(resolve, 30));
 afterEach(cleanup);
 
 describe('full-screen frame', () => {
+  it('preserves the themed user-message background across the transcript row', async () => {
+    const theme = new Theme('user-background-test', { ...loadTheme('dark').colors, userMessageBg: '#654321' }, 'truecolor');
+    const model = new FullScreenTranscript();
+    const view = render(<ThemeProvider theme={theme}><FullScreenFrame model={model} messages={[
+      { role: 'user', content: 'thanks' },
+      { role: 'assistant', content: 'You are welcome.' },
+    ]} rows={24} columns={60} footer={<Text>❯ draft</Text>} /></ThemeProvider>);
+    await flush();
+    const rows = (view.lastFrame() ?? '').split('\n');
+    const userRow = rows.find(row => row.includes('thanks')) ?? '';
+    expect(userRow).toContain('\x1b[48;2;101;67;33m');
+    expect(stripAnsi(userRow)).toHaveLength(59);
+    expect(rows.find(row => row.includes('You are welcome.'))).not.toContain('\x1b[48;2;101;67;33m');
+  });
+
+  it.each([24, 40])('fills wrapped Unicode user messages with their background at %i columns', async columns => {
+    const theme = new Theme('user-background-test', { ...loadTheme('dark').colors, userMessageBg: '#654321' }, 'truecolor');
+    const model = new FullScreenTranscript();
+    const view = render(<ThemeProvider theme={theme}><FullScreenFrame model={model} messages={[
+      { role: 'user', content: 'thanks for the careful review of this change 界🙂' },
+      { role: 'assistant', content: 'You are welcome.' },
+    ]} rows={30} columns={columns} footer={<Text>❯ draft</Text>} /></ThemeProvider>);
+    await flush();
+    const rows = (view.lastFrame() ?? '').split('\n');
+    const highlighted = rows.filter(row => row.includes('\x1b[48;2;101;67;33m'));
+    expect(highlighted.length).toBeGreaterThanOrEqual(4);
+    expect(highlighted.every(row => stringWidth(row) === columns - 1)).toBe(true);
+    expect(highlighted.map(row => stripAnsi(row)).join('\n')).toContain('界🙂');
+    expect(rows.find(row => row.includes('You are welcome.'))).not.toContain('\x1b[48;2;101;67;33m');
+  });
+
   it('shows product identity above history and navigation below the status line', async () => {
     const model = new FullScreenTranscript();
     const directory = path.join(os.homedir(), 'Documents', 'autohand', 'cli-3');

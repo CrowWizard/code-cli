@@ -1,11 +1,13 @@
 /** @license Apache-2.0 */
 import { renderAutohandLogo } from '../../src/utils/asciiArt.js';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Session } from 'tuistory';
 import { isTerminalMouseTrackingEnabled } from '../../src/testing/scenarios/mouseScrollbackScenario.js';
 import { composerCaretLine } from '../../src/testing/assertions/composerCaret.js';
-import { clickFullScreenComposer, seedFullScreenHistory, startFullScreenHeaderProbe, typeMultilineDraft } from '../../src/testing/scenarios/fullScreenScenario.js';
+import { clickFullScreenComposer, seedFullScreenHistory, startFullScreenHeaderProbe, typeMultilineDraft, runFullScreenLiveOutputScenario } from '../../src/testing/scenarios/fullScreenScenario.js';
+import { launchTuistorySession } from '../../src/testing/drivers/tuistory-driver.js';
 import { outputViewport, LONG_OUTPUT_COMMAND, runLongOutputTurn } from '../../src/testing/scenarios/compactOutputScenario.js';
 import { createMockAuthServer, type MockAuthServer, createMockAutohandAINativeSequenceServer, type MockNativeToolServer, createTempAutohandHome, launchBuiltAutohand, exitInteractive, type TuistoryTempState } from './helpers/autohandTuistory.js';
 let server: MockNativeToolServer | undefined;
@@ -15,6 +17,29 @@ let session: Session | undefined;
 afterEach(async () => { session?.close(); await server?.close(); await auth?.close(); auth = undefined; server = undefined; await state?.cleanup(); session = undefined; state = undefined; });
 
 describe('full-screen terminal', () => {
+  it('expands live output from history and retains user-message highlighting through resize', async () => {
+    state = await createTempAutohandHome();
+    session = await launchTuistorySession({
+      command: process.execPath,
+      args: ['--import', 'tsx', path.resolve('src/testing/scenarios/fullScreenLiveOutputPtyScenario.tsx')],
+      cwd: process.cwd(),
+      cols: 80, rows: 30, waitForDataTimeout: 15_000,
+      env: { ...process.env, AUTOHAND_HOME: state.autohandHome, CI: 'false', TERM: 'xterm-256color', FORCE_COLOR: '3', NO_COLOR: undefined },
+    });
+    const screens = await runFullScreenLiveOutputScenario(session);
+    expect(screens.highlightedBefore).toContain('❯ thanks');
+    expect(screens.highlightedBefore).not.toContain('fixture-history-50');
+    expect(screens.expanded).toContain('live-row-1\n');
+    expect(screens.expanded).toContain('Ctrl+O collapse');
+    expect(screens.paged).not.toContain('live-row-1\n');
+    expect(screens.resized).toContain('preserved draft');
+    expect(screens.collapsed).toContain('Ctrl+O expand');
+    expect(screens.collapsed).toContain('live-row-60');
+    expect(screens.highlightedAfter).toContain('❯ thanks');
+    await exitInteractive(session);
+    expect(session.getRawOutput()).toContain('FULL_SCREEN_PTY_EXIT');
+  });
+
   it('shows product identity at the top and navigation below the composer status', async () => {
     server = await createMockAutohandAINativeSequenceServer([{ content: 'HEADER_WORK_DONE', delayMs: 1500 }]);
     state = await createTempAutohandHome({ config: {
@@ -40,7 +65,8 @@ describe('full-screen terminal', () => {
     expect(navigationRow).toBeGreaterThanOrEqual(37);
     await startFullScreenHeaderProbe(session);
     const workingLines = outputViewport(session).split('\n');
-    expect(workingLines[2]).toContain('esc to cancel');
+    expect(workingLines[2]).not.toContain('esc to cancel');
+    expect(workingLines.findIndex(line => line.includes('esc to cancel'))).toBeGreaterThan(2);
     expect(workingLines.filter(line => line.includes('esc to cancel'))).toHaveLength(1);
     expect(workingLines.findLastIndex(line => line.includes('❯'))).toBe(composerRow);
     await session.waitForText('HEADER_WORK_DONE', { timeout: 15_000 });

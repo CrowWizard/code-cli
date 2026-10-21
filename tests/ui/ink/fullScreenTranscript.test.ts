@@ -5,6 +5,14 @@ import type { ChatLogMessage } from '../../../src/session/chatLog.js';
 const messages: ChatLogMessage[] = Array.from({ length: 100 }, (_, i) => ({ role: 'assistant', content: `Message ${i} with enough words to wrap on narrow terminals.` }));
 
 describe('full-screen transcript viewport', () => {
+  it('opens the selected live details even when later messages follow them', () => {
+    const model = new FullScreenTranscript();
+    const details = { role: 'tool_call' as const, tool: 'live command', detailsId: 'live-output', content: Array.from({ length: 30 }, (_, i) => `live-detail-${i}`).join('\n') };
+    model.update([...messages, details, { role: 'notification', content: 'Later notification' }], 60);
+    model.focusDetails('live-output');
+    expect(model.view(8).lines.join('\n')).toContain('live-detail-0\n');
+  });
+
   it('preserves terminal rows using the current chat-log formatting flag', () => {
     const model = new FullScreenTranscript();
     const content = 'first row  \n    second row\ncolumn A    column B';

@@ -6,14 +6,24 @@ import wrapAnsi from 'wrap-ansi';
 import type { ChatLogMessage } from '../../session/chatLog.js';
 import { formatAssistantMarkdown } from '../terminalMarkdown.js';
 
+export interface FullScreenMessage extends ChatLogMessage {
+  detailsId?: string;
+}
+
+export interface TranscriptRow {
+  text: string;
+  role?: ChatLogMessage['role'];
+}
+
 interface Entry {
-  message: ChatLogMessage;
+  message: FullScreenMessage;
   lines: string[];
   end: number;
 }
 
 export interface TranscriptView {
   lines: string[];
+  rows: TranscriptRow[];
   following: boolean;
   newActivity: boolean;
   start: number;
@@ -34,7 +44,8 @@ function formatMessage(message: ChatLogMessage, width: number): string[] {
   else if (message.role === 'tool_call') text = `… ${message.tool ?? 'Tool'} ${text}`;
   else if (message.role === 'tool_batch') text = (message.groups ?? []).flatMap(group => group.items.map(item => `${item.success ? '✓' : '×'} ${item.label}${item.detail ? ` · ${item.detail}` : ''}`)).join('\n');
   else if (message.role === 'thinking') text = `Thinking · ${text}`;
-  return [...wrapAnsi(text, width, { hard: true, trim: false }).split('\n'), ''];
+  const lines = [...wrapAnsi(text, width, { hard: true, trim: false }).split('\n'), ''];
+  return message.role === 'user' ? ['', ...lines] : lines;
 }
 
 export class FullScreenTranscript {
@@ -59,7 +70,10 @@ export class FullScreenTranscript {
       return;
     }
     this.following = false;
-    this.offset = this.entries.at(-2)?.end ?? 0;
+    const index = this.entries.findIndex(entry => entry.message.detailsId === id);
+    this.offset = index >= 0
+      ? (this.entries[index - 1]?.end ?? 0)
+      : (this.entries.at(-2)?.end ?? 0);
   }
 
   invalidate(): void {
@@ -99,7 +113,7 @@ export class FullScreenTranscript {
     return false;
   }
 
-  update(messages: readonly ChatLogMessage[], width: number): void {
+  update(messages: readonly FullScreenMessage[], width: number): void {
     width = Math.max(1, width);
     const oldIndex = this.entries.findIndex(entry => entry.end > this.offset);
     const previousEnd = oldIndex > 0 ? this.entries[oldIndex - 1].end : 0;
@@ -139,7 +153,7 @@ export class FullScreenTranscript {
     const total = this.entries.at(-1)?.end ?? 0;
     const start = this.following ? Math.max(0, total - this.height) : Math.min(this.offset, Math.max(0, total - this.height));
     this.offset = start;
-    const lines: string[] = [];
+    const rows: TranscriptRow[] = [];
     let low = 0;
     let high = this.entries.length;
     while (low < high) {
@@ -147,13 +161,13 @@ export class FullScreenTranscript {
       if (this.entries[mid].end <= start) low = mid + 1;
       else high = mid;
     }
-    for (let index = low; index < this.entries.length && lines.length < this.height; index++) {
+    for (let index = low; index < this.entries.length && rows.length < this.height; index++) {
       const entry = this.entries[index];
       const before = index > 0 ? this.entries[index - 1].end : 0;
       const from = Math.max(0, start - before);
-      lines.push(...entry.lines.slice(from, from + this.height - lines.length));
+      rows.push(...entry.lines.slice(from, from + this.height - rows.length).map(text => ({ text, role: entry.message.role })));
     }
-    return { lines, following: this.following, newActivity: this.newActivity, start, total };
+    return { lines: rows.map(row => row.text), rows, following: this.following, newActivity: this.newActivity, start, total };
   }
 
   scroll(delta: number, height = this.height): void {

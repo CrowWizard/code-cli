@@ -10,6 +10,41 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 afterEach(cleanup);
 
 describe('full-screen composer integration', () => {
+  it('expands a running command with Ctrl+O while reading history and keeps the draft', async () => {
+    const model = new FullScreenTranscript();
+    let state = createInitialUIState();
+    state = { ...state, isWorking: true, status: 'Running command', currentInput: 'preserved draft',
+      chatMessages: Array.from({ length: 30 }, (_, i) => ({ role: 'assistant', content: `History ${i}` })),
+      liveCommands: [{ id: 'live-output', command: 'long command', stdout: Array.from({ length: 60 }, (_, i) => `live-row-${i + 1}`).join('\n'), stderr: '', startedAt: Date.now(), isExpanded: false }],
+    };
+    const toggle = vi.fn(() => {
+      state = { ...state, liveCommands: state.liveCommands.map(entry => ({ ...entry, isExpanded: !entry.isExpanded })) };
+      view.rerender(frame());
+    });
+    const frame = () => <I18nProvider><ThemeProvider><AgentUI fullScreenTranscript={model} state={state} onToggleLiveCommandExpanded={toggle} onInstruction={() => {}} onEscape={() => {}} onCtrlC={() => {}} /></ThemeProvider></I18nProvider>;
+    const view = render(frame()); await flush();
+    view.stdin.write('\x1b[5~'); await flush();
+    expect(model.view(8).following).toBe(false);
+    view.stdin.write('\x0f'); await flush();
+    expect(toggle).toHaveBeenCalledOnce();
+    const expanded = stripAnsi(view.lastFrame() ?? '');
+    expect(expanded).toContain('Ctrl+O collapse');
+    expect(expanded).toContain('live-row-1\n');
+    expect(expanded).toContain('preserved draft');
+    view.stdin.write('\x1b[6~'); await flush();
+    const reading = model.view(8).lines;
+    state = { ...state, notifications: ['Later notification'], liveCommands: state.liveCommands.map(entry => ({ ...entry, stdout: `${entry.stdout}\nlive-row-61` })) };
+    view.rerender(frame()); await flush();
+    expect(model.view(8).lines).toEqual(reading);
+    view.stdin.write('\x0f'); await flush();
+    const collapsed = stripAnsi(view.lastFrame() ?? '');
+    expect(collapsed).toContain('Ctrl+O expand');
+    expect(collapsed).toContain('live-row-61');
+    expect(collapsed.match(/^live-row-\d+$/gmu)).toHaveLength(5);
+    expect(collapsed).not.toContain('live-row-1\n');
+    expect(model.view(8).following).toBe(true);
+  });
+
   it('keeps one working indicator above the tip and composer across turn completion', async () => {
     let state = { ...createInitialUIState(), currentInput: 'preserved draft', isWorking: true, status: 'READING_SOURCES', elapsed: '0m 11s', tokens: '↑0 ↓0', tip: { kind: 'tip' as const, text: 'Type /review security to check auth flows' } };
     const model = new FullScreenTranscript();

@@ -5,11 +5,11 @@ export class PtyDriver {
   private terminal?: IPty;
   private output = '';
 
-  launch(command: string, args: string[], options: { cwd?: string; cols?: number; rows?: number } = {}): void {
+  launch(command: string, args: string[], options: { cwd?: string; cols?: number; rows?: number; env?: NodeJS.ProcessEnv } = {}): void {
     this.terminal = spawn(command, args, {
       name: 'xterm-256color', cwd: options.cwd ?? process.cwd(),
       cols: options.cols ?? 120, rows: options.rows ?? 32,
-      env: { ...process.env, CI: 'false', FORCE_COLOR: '0', TERM: 'xterm-256color' },
+      env: { ...process.env, CI: 'false', FORCE_COLOR: '0', TERM: 'xterm-256color', ...options.env },
     });
     this.terminal.onData(data => { this.output += data; });
   }

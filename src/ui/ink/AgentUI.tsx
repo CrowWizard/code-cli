@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { FullScreenFrame } from './FullScreenFrame.js';
-import type { FullScreenTranscript } from './fullScreenTranscript.js';
+import type { FullScreenMessage, FullScreenTranscript } from './fullScreenTranscript.js';
 import React, { useState, useEffect, memo, useMemo, useRef, useCallback } from 'react';
 import { Box, Static, Text, useInput, usePaste, useStdout, type Key as InkKey } from 'ink';
 import {
@@ -15,7 +15,7 @@ import {
   type LineExtension,
   type LineSegment,
 } from './StatusLine.js';
-import { ExpandedToolOutput, LiveCommandBlock, ToolOutputStatic, ToolOutputBatchStatic, ThemedDiffOutput, type LiveCommandEntry, type ToolOutputEntry, type ToolOutputBatchEntry, type ToolOutputItem } from './ToolOutput.js';
+import { ExpandedToolOutput, LiveCommandBlock, getLiveCommandViews, ToolOutputStatic, ToolOutputBatchStatic, ThemedDiffOutput, type LiveCommandEntry, type ToolOutputEntry, type ToolOutputBatchEntry, type ToolOutputItem } from './ToolOutput.js';
 import { InputLine } from './InputLine.js';
 import { ThinkingOutput } from './ThinkingOutput.js';
 import { FileMentionDropdown, parseFileSuggestions, matchFileMention, type FileMentionSuggestion } from './FileMentionDropdown.js';
@@ -2765,19 +2765,25 @@ export function AgentUI({
 
   const fullScreenMessages = useMemo(() => {
     if (!fullScreenTranscript) return [];
-    const messages: ChatLogMessage[] = chatHistoryItems.map(item => item.message);
+    const messages: FullScreenMessage[] = chatHistoryItems.map(item => item.message);
     if (!chatIncludesToolOutput) for (const item of toolOutputItems) {
       messages.push(item.type === 'batch'
         ? { role: 'tool_batch', content: '', groups: item.groups, success: item.allSuccess }
         : { role: 'tool', tool: item.tool, content: item.output, success: item.success });
     }
-    for (const item of liveCommandItems) messages.push({ role: 'tool_call', tool: item.command, content: [item.stdout, item.stderr].filter(Boolean).join('\n') });
+    for (const item of liveCommandItems) {
+      const { stdoutView, stderrView } = getLiveCommandViews(item);
+      const output = [...stdoutView.lines, ...(stderrView.lines.length > 0 ? ['stderr', ...stderrView.lines] : [])];
+      const hint = item.isExpanded ? 'Ctrl+O collapse' : 'Ctrl+O expand';
+      messages.push({ role: 'tool_call', tool: `Running ${item.command}`, detailsId: item.id,
+        content: [hint, ...(output.length > 0 ? output : ['No output yet'])].join('\n') });
+    }
     if (state.thinking) messages.push({ role: 'thinking', content: state.thinking });
     if (state.isWorking && state.streamingResponse) messages.push({ role: 'assistant', content: state.streamingResponse });
     if (!chatIncludesFinalResponse && !state.isWorking && state.finalResponse) messages.push({ role: 'assistant', content: state.finalResponse });
     if (state.computerUseSteps?.length) messages.push({ role: 'tool', tool: 'computer_use', content: JSON.stringify(state.computerUseSteps) });
     for (const notification of state.notifications) messages.push({ role: 'notification', content: notification });
-    if (expandedToolOutput) messages.push({ role: 'tool', tool: expandedToolOutput.tool, success: expandedToolOutput.success, content: `Ctrl+O collapse\n${expandedToolOutput.expandedOutput}` });
+    if (expandedToolOutput) messages.push({ role: 'tool', tool: expandedToolOutput.tool, success: expandedToolOutput.success, detailsId: expandedToolOutput.id, content: `Ctrl+O collapse\n${expandedToolOutput.expandedOutput}` });
     return messages;
   }, [fullScreenTranscript, chatHistoryItems, chatIncludesToolOutput, toolOutputItems, liveCommandItems, state.thinking, state.isWorking, state.streamingResponse, chatIncludesFinalResponse, state.finalResponse, state.computerUseSteps, state.notifications, expandedToolOutput]);
 
@@ -2885,7 +2891,7 @@ export function AgentUI({
       />;
 
   if (fullScreenTranscript) return state.agentRunsPanelVisible ? <Box height={Math.max(1, (windowSize.rows ?? 24) - 1)} overflow="hidden">{bottom}</Box> : <FullScreenFrame
-    model={fullScreenTranscript} messages={fullScreenMessages} detailsId={expandedToolOutput?.id}
+    model={fullScreenTranscript} messages={fullScreenMessages} detailsId={liveCommandItems.slice().reverse().find(entry => entry.isExpanded)?.id ?? expandedToolOutput?.id}
     rows={windowSize.rows ?? 24} columns={windowSize.columns ?? 80}
     footer={bottom}
     workspaceRoot={workspaceRoot}
