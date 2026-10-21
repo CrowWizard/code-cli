@@ -34,6 +34,7 @@ function createAgent(): AgentInternals {
     getModel: vi.fn().mockReturnValue('test-model'),
   } as unknown as LLMProvider;
   const files = {
+    setTurnProvider: vi.fn(),
     root: '/test/workspace',
     readFile: vi.fn().mockResolvedValue(''),
     writeFile: vi.fn(),

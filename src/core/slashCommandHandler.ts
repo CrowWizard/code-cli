@@ -238,8 +238,9 @@ export class SlashCommandHandler {
         case '/undo': {
           const { undo } = await import('../commands/undo.js');
           return undo({
-            undoFileMutation: this.ctx.undoFileMutation ?? (async () => {}),
-            removeLastTurn: this.ctx.removeLastTurn ?? (() => {})
+            getLastTurn: this.ctx.getLastTurn ?? (() => undefined),
+            undoTurnMutations: this.ctx.undoTurnMutations ?? (async () => { throw new Error('File undo is unavailable in this session'); }),
+            removeLastTurn: this.ctx.removeLastTurn ?? (() => false)
           });
         }
         case '/ps': {

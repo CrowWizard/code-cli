@@ -3,6 +3,7 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { AutoCommitSnapshot } from './actions/gitSessionSnapshot.js';
 import type { Ora } from 'ora';
 import type { ThemeDefinition } from './ui/theme/types.js';
 import type { KeybindingProfileId } from './keybindings/profiles.js';
@@ -2135,6 +2136,11 @@ export interface ToolOutputChunk {
 }
 
 export interface AgentRuntime {
+  sessionGitSnapshot?: AutoCommitSnapshot | null;
+  sessionGitSnapshotError?: string;
+  sessionGitSnapshotFinalized?: boolean;
+  /** Exact paths approved for the nested automatic-commit instruction. */
+  autoCommitPaths?: readonly string[];
   config: LoadedConfig;
   workspaceRoot: string;
   /** Additional directories with same access as workspaceRoot */

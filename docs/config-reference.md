@@ -3076,14 +3076,20 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | `/sessions`   | List past sessions                                    |
 | `/resume`     | Resume a previous session                             |
 | `/history`    | Browse session history with pagination                |
-| `/undo`       | Revert the last recorded agent file mutation and turn |
+| `/undo`       | Restore agent file changes from the last turn and remove it |
 | `/export`     | Export session to markdown/JSON/HTML                  |
 | `/share`      | Share current session                                 |
 | `/status`     | Show session status and the signed-in Autohand plan   |
 | `/usage`      | Explore usage, sessions, skills, extensions, and trace insights |
 | `/upgrade`    | Open the console to upgrade your Autohand plan        |
 
-`/undo` never resets or cleans the Git worktree. It preserves unrelated tracked and untracked work, and refuses to overwrite a file that changed after the recorded agent mutation.
+`/undo` restores every recorded agent file mutation from the last turn, newest first, then removes that turn. It stops on the first unsafe restore and keeps the turn. It never resets or cleans the Git worktree. Shell command changes are not undone. A restored conversation without an in-memory file journal is kept.
+
+`/export` redacts credentials in messages, tool arguments and tool output before producing Markdown, JSON or HTML. It prints `Secrets redacted: N` and the saved path. Bare filenames are stored in `~/.autohand/exports/` (or `$AUTOHAND_HOME/exports/`); absolute and `./`-prefixed paths choose an explicit destination.
+
+`--auto-commit` captures repository status and content hashes before agent editing. Pre-existing staged, unstaged and untracked changes are listed as `left uncommitted (yours)` and excluded, including an initially dirty file edited again by the agent. Commits preserve unrelated staging. A missing baseline disables automatic commits; `-c` remains the same option.
+
+Node builds install an environment proxy dispatcher at startup when `HTTPS_PROXY` or `HTTP_PROXY` is set. `NO_PROXY` bypasses matching hosts; lowercase variables take precedence. Bun binaries use their native proxy support. Use `NODE_EXTRA_CA_CERTS` for a corporate CA bundle.
 
 ### Model & Provider
 

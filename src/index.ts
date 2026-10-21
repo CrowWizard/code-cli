@@ -22,6 +22,7 @@ if (process.stdout.isTTY && !requestsStructuredCommandOutput && !requestsProtoco
 // Set environment variable for detection by Expect and other tools
 process.env.AUTOHAND_CODE = '1';
 import 'dotenv/config';
+import './startup/installEnvironmentProxy.js';
 import { collectToolPatternOption } from './permissions/cliPolicyMutation.js';
 import { configureRunConfigOverlay } from './runConfigOverlay.js';
 import { loadOutputSchema } from './modes/outputSchema.js';

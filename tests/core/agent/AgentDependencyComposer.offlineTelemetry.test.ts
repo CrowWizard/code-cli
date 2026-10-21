@@ -30,6 +30,7 @@ async function createAgent(options: AgentRuntime['options']): Promise<void> {
     getModel: vi.fn().mockReturnValue('test-model'),
   } as unknown as LLMProvider;
   const files = {
+    setTurnProvider: vi.fn(),
     root: '/test/workspace',
     readFile: vi.fn().mockResolvedValue('original contents'),
     writeFile: vi.fn(),

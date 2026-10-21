@@ -8,6 +8,8 @@
  */
 import fs from 'fs-extra';
 import path from 'node:path';
+import { AUTOHAND_PATHS } from '../constants.js';
+import { redactSensitiveText, redactSensitiveTextWithCount } from '../feedback/sessionTranscript.js';
 import type { SessionMetadata, SessionMessage } from './types.js';
 
 export interface ExportOptions {
@@ -201,7 +203,7 @@ function formatMessage(
 /**
  * Export a session to markdown format
  */
-export function exportToMarkdown(
+function formatMarkdown(
   metadata: SessionMetadata,
   messages: SessionMessage[],
   options: ExportOptions = {}
@@ -286,7 +288,7 @@ export function exportToMarkdown(
 /**
  * Export a session to JSON format
  */
-export function exportToJson(
+function formatJson(
   metadata: SessionMetadata,
   messages: SessionMessage[],
   pretty = true
@@ -304,12 +306,12 @@ export function exportToJson(
 /**
  * Export a session to HTML format
  */
-export function exportToHtml(
+function formatHtml(
   metadata: SessionMetadata,
   messages: SessionMessage[],
   options: ExportOptions = {}
 ): string {
-  const markdown = exportToMarkdown(metadata, messages, options);
+  const markdown = formatMarkdown(metadata, messages, options);
 
   // Simple markdown to HTML conversion
   const html = markdown
@@ -361,6 +363,56 @@ export function exportToHtml(
 </html>`;
 }
 
+export interface SessionExportResult {
+  content: string;
+  secretsRedacted: number;
+}
+
+export function buildSessionExport(
+  metadata: SessionMetadata,
+  messages: SessionMessage[],
+  format: 'md' | 'json' | 'html',
+  options: ExportOptions = {},
+  pretty = true,
+): SessionExportResult {
+  let secretsRedacted = 0;
+  const serialized = JSON.stringify({ metadata, messages }, (key, value: unknown) => {
+    if (typeof value !== 'string') return value;
+    const result = redactSensitiveTextWithCount(value, { fieldName: key });
+    secretsRedacted += result.redactions;
+    return result.text;
+  });
+  const safe = JSON.parse(serialized) as { metadata: SessionMetadata; messages: SessionMessage[] };
+  const content = format === 'json' ? formatJson(safe.metadata, safe.messages, pretty)
+    : format === 'html' ? formatHtml(safe.metadata, safe.messages, options)
+      : formatMarkdown(safe.metadata, safe.messages, options);
+  return { content, secretsRedacted };
+}
+
+export function exportToMarkdown(metadata: SessionMetadata, messages: SessionMessage[], options: ExportOptions = {}): string {
+  return buildSessionExport(metadata, messages, 'md', options).content;
+}
+
+export function exportToJson(metadata: SessionMetadata, messages: SessionMessage[], pretty = true): string {
+  return buildSessionExport(metadata, messages, 'json', {}, pretty).content;
+}
+
+export function exportToHtml(metadata: SessionMetadata, messages: SessionMessage[], options: ExportOptions = {}): string {
+  return buildSessionExport(metadata, messages, 'html', options).content;
+}
+
+export function resolveExportPath(filename: string, workspaceRoot: string): string {
+  if (path.isAbsolute(filename)) return filename;
+  if (filename.startsWith('./') || filename.startsWith('.' + path.sep)) return path.resolve(workspaceRoot, filename);
+  const base = path.resolve(AUTOHAND_PATHS.exports);
+  const destination = path.resolve(base, filename);
+  const relative = path.relative(base, destination);
+  if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+    throw new Error('Use an absolute or ./-prefixed path to save outside the exports directory.');
+  }
+  return destination;
+}
+
 /**
  * Save exported session to file
  */
@@ -381,7 +433,7 @@ export function getSuggestedFilename(
 ): string {
   const date = new Date(metadata.createdAt);
   const dateStr = date.toISOString().split('T')[0];
-  const projectSlug = metadata.projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const projectSlug = redactSensitiveText(metadata.projectName).toLowerCase().replace(/[^a-z0-9]+/g, '-');
   const sessionShort = metadata.sessionId.slice(0, 8);
 
   return `${projectSlug}-${dateStr}-${sessionShort}.${format}`;

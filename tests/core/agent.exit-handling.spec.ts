@@ -22,6 +22,7 @@ describe('Agent Exit Handling', () => {
     } as unknown as LLMProvider;
 
     mockFiles = {
+      setTurnProvider: vi.fn(),
       readFile: vi.fn(),
       writeFile: vi.fn(),
     } as unknown as FileActionManager;

@@ -71,4 +71,29 @@ describe('performAgentAutoCommit cancellation', () => {
     expect(getAutoCommitInfo).not.toHaveBeenCalled();
     expect(runInstruction).not.toHaveBeenCalled();
   });
+  it('limits nested commit tools to session paths and clears the scope after failure', async () => {
+    vi.mocked(getAutoCommitInfo).mockReturnValue({
+      canCommit: true, filesChanged: ['feature.ts'], filesLeftUncommitted: ['README.md', 'notes.txt'],
+      suggestedMessage: 'Add feature', diffSummary: 'feature only',
+    });
+    let observedScope: readonly string[] | undefined;
+    let observedPrompt = '';
+    const host = {
+      runtime: { workspaceRoot: '/workspace', sessionGitSnapshot: null },
+      runInstruction: vi.fn(async (prompt: string) => {
+        observedScope = host.runtime.autoCommitPaths;
+        observedPrompt = prompt;
+        throw new Error('cancelled');
+      }),
+    } as unknown as AgentProjectOperationsHost;
+    await performAgentAutoCommit(host);
+    expect(observedScope).toEqual(['feature.ts']);
+    expect(observedPrompt).toContain('git_add');
+    expect(observedPrompt).toContain('exact');
+    expect(observedPrompt).toContain('left uncommitted (yours)');
+    expect(getAutoCommitInfo).toHaveBeenCalledWith('/workspace', null);
+    expect(host.runtime.autoCommitPaths).toBeUndefined();
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('left uncommitted (yours)'));
+  });
+
 });

@@ -4,47 +4,44 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
-import { UndoStackEmptyError } from '../actions/filesystem.js';
-import { t } from '../i18n/index.js';
+import type { FileMutationTurn } from '../actions/filesystem.js';
 
 export interface UndoCommandContext {
-    undoFileMutation: () => Promise<void>;
-    removeLastTurn: () => void;
+    getLastTurn: () => FileMutationTurn | undefined;
+    undoTurnMutations: (turn: FileMutationTurn) => Promise<string[]>;
+    removeLastTurn: (turnId: string) => boolean;
 }
 
-/**
- * Undo command - reverts the last agent-owned file mutation and conversation turn
- */
 export async function undo(ctx: UndoCommandContext): Promise<string | null> {
+    const turn = ctx.getLastTurn();
+    if (!turn) {
+        console.log(chalk.gray('No conversation turn to undo.'));
+        return null;
+    }
     console.log();
     console.log(chalk.bold.yellow('Undoing changes...'));
-
-    // Revert only mutations recorded by the agent. Repository-wide Git cleanup
-    // would also destroy unrelated work that existed before the agent turn.
+    if (turn.ranShellCommand) console.log(chalk.yellow('Shell command changes are not undone.'));
     try {
-        await ctx.undoFileMutation();
-        console.log(chalk.green('  ' + t('commands.undo.success', { file: 'last mutation' })));
-    } catch (error) {
-        if (error instanceof UndoStackEmptyError) {
-            console.log(chalk.gray('  ' + t('commands.undo.noChanges')));
-        } else {
-            const message = error instanceof Error ? error.message : String(error);
-            console.log(chalk.yellow(`  Undo stopped: ${message}`));
+        const files = await ctx.undoTurnMutations(turn);
+        if (!ctx.removeLastTurn(turn.id)) {
+            console.log(chalk.yellow('The conversation changed during undo; kept its turns.'));
             return null;
         }
+        console.log(chalk.green(files.length > 0
+            ? 'Restored ' + files.length + ' files: ' + files.join(', ')
+            : 'No file changes in the last turn; removed it from the conversation.'));
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(chalk.yellow('Undo stopped: ' + message + '. Kept the last conversation turn.'));
+        return null;
     }
-
-    ctx.removeLastTurn();
-    console.log(chalk.green('  Removed last conversation turn'));
-
     console.log();
     console.log(chalk.cyan('Undo complete. Ready for new instructions.'));
-
     return null;
 }
 
 export const metadata = {
     command: '/undo',
-    description: 'revert the last agent file mutation and conversation turn',
+    description: 'revert agent file edits from the last turn and remove that turn',
     implemented: true
 };

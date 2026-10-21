@@ -23,9 +23,9 @@ export function withCommandCoordination<T>(context: CommandCoordinationContext, 
 
 export function getCommandCoordination(): CommandCoordinationContext | undefined { return contexts.getStore(); }
 
-export async function executeCoordinatedFile(command: ResourceCommand, options: { input?: string; timeoutMs?: number; maxBuffer?: number; signal?: AbortSignal } = {}): Promise<SpawnSyncReturns<string>> {
+export async function executeCoordinatedFile(command: ResourceCommand, options: { env?: NodeJS.ProcessEnv; input?: string; timeoutMs?: number; maxBuffer?: number; signal?: AbortSignal } = {}): Promise<SpawnSyncReturns<string>> {
   options = { ...options, signal: options.signal ?? contexts.getStore()?.signal };
-  const child = await spawnCoordinatedProcess(command, { stdio: 'pipe', windowsHide: true }, options.signal);
+  const child = await spawnCoordinatedProcess(command, { stdio: 'pipe', windowsHide: true, env: options.env }, options.signal);
   return new Promise((resolve, reject) => {
     let stdout = '';
     let stderr = '';

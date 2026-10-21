@@ -12,7 +12,7 @@ import { syncAgentTerminalTitleName } from './AgentSessionTitle.js';
 import type { PeerComposerDraft } from '../../ui/peerMention.js';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { FileActionManager } from '../../actions/filesystem.js';
+import { FileActionManager, type FileMutationTurn } from '../../actions/filesystem.js';
 import { saveConfig, getProviderConfig } from '../../config.js';
 import type { LLMProvider } from '../../providers/LLMProvider.js';
 import { getOpenRouterModelContextWindow } from '../../providers/modelCapabilities.js';
@@ -505,6 +505,7 @@ export function initializeAgentDependencies(
       logWarning: (message) => console.log(message),
     });
     host.conversation = ConversationManager.getInstance();
+    host.files.setTurnProvider(() => host.conversation.getLastTurn());
     host.shellSuggestionProvider = new ShellSuggestionProvider({
       runtime: host.runtime,
       conversation: host.conversation,
@@ -2139,8 +2140,9 @@ export function initializeAgentDependencies(
       restoreLoadedSession: async (session: Session) => {
         await host.restoreSessionState(session);
       },
-      undoFileMutation: () => host.files.undoLast(),
-      removeLastTurn: () => host.conversation.removeLastTurn(),
+      getLastTurn: () => host.conversation.getLastTurn(),
+      undoTurnMutations: (turn: FileMutationTurn) => host.files.undoTurn(turn),
+      removeLastTurn: (turnId: string) => host.conversation.removeLastTurn(turnId),
       // Status command context
       get provider() {
         return host.activeProvider;

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import chalk from 'chalk';
+import { initializeSessionGitSnapshot, type SessionGitState } from '../../actions/gitSessionSnapshot.js';
 import { isAxoInput } from '../../ui/axo/axoCommand.js';
 import { isStartupTimingEnabled, startupTimeline } from '../../startup/startupTimeline.js';
 import { buildOutputSchemaInstruction, buildOutputSchemaRepairInstruction, checkOutputAgainstSchema, type OutputSchemaSpec } from '../../modes/outputSchema.js';
@@ -269,7 +270,7 @@ export interface FreshAgentSessionRecord {
 }
 
 export interface FreshAgentSessionHost {
-  runtime: {
+  runtime: SessionGitState & {
     workspaceRoot: string;
     options: Pick<AgentRuntime['options'], 'bare' | 'model'>;
     config: LoadedConfig;
@@ -341,6 +342,7 @@ export async function startFreshAgentSession(
     }
   }
 
+  initializeSessionGitSnapshot(host.runtime, true);
   const startedAt = Date.now();
   await host.resetConversationContext();
   host.resetAgentStateForFreshSession(startedAt);
@@ -803,6 +805,7 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
   }
 
 export async function initializeAgentManagers(host: AgentLifecycleHost): Promise<void> {
+    initializeSessionGitSnapshot(host.runtime);
     if (host.runtime?.options?.bare === true) {
       await runWithConcurrency([
         { label: 'session_manager', run: async () => host.sessionManager.initialize() },
@@ -1370,6 +1373,7 @@ export async function runAgentCommandMode(
   }
 
 export async function restoreAgentSessionState(host: AgentLifecycleHost, sessionOrId: string | Session) {
+    initializeSessionGitSnapshot(host.runtime, true);
     const session = typeof sessionOrId === 'string'
       ? await host.sessionManager.loadSession(sessionOrId)
       : sessionOrId;
@@ -1404,6 +1408,10 @@ export async function restoreAgentSessionState(host: AgentLifecycleHost, session
           tool_calls: convertedToolCalls,
           tool_call_id: (msg as any).tool_call_id
         });
+        if (msg.role === 'user') {
+          const restoredTurn = host.conversation.getLastTurn?.();
+          if (restoredTurn) restoredTurn.undoUnavailable = 'File undo history is unavailable for this restored conversation turn';
+        }
       }
     }
 
