@@ -2113,12 +2113,14 @@ export class AutohandAgent {
     filePath?: string,
     changeType?: 'create' | 'modify' | 'delete',
     toolCallId?: string,
+    fileDiff?: { oldText: string | null; newText: string },
   ): void {
     return markAgentFilesModified(
       this as unknown as AgentSessionAccountingHost,
       filePath,
       changeType,
       toolCallId,
+      fileDiff,
     );
   }
 

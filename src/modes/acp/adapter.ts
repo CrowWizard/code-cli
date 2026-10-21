@@ -35,6 +35,7 @@ import type {
   ToolCallStatus,
 } from '@agentclientprotocol/sdk';
 import { PROTOCOL_VERSION, RequestError } from '@agentclientprotocol/sdk';
+import { resolve } from 'node:path';
 
 import { AutohandAgent } from '../../core/agent.js';
 import { isLikelyFilePathSlashInput } from '../../core/slashInputDetection.js';
@@ -1597,6 +1598,25 @@ export class AutohandAcpAdapter implements Agent {
 
         case 'file_modified':
           if (event.filePath) {
+            if (event.toolId) {
+              const filePath = resolve(this.sessions.get(sessionId)?.workspaceRoot ?? process.cwd(), event.filePath);
+              await this.connection.sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: event.toolId,
+                  locations: [{ path: filePath }],
+                  ...(event.fileDiff === undefined ? {} : {
+                    content: [{
+                      type: 'diff',
+                      path: filePath,
+                      oldText: event.fileDiff.oldText,
+                      newText: event.fileDiff.newText,
+                    }],
+                  }),
+                },
+              });
+            }
             this.emitHookFileModified(
               sessionId,
               event.filePath,

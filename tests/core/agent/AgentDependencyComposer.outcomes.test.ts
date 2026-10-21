@@ -986,6 +986,7 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
       filePath: 'created.ts',
       changeType: 'create',
       toolId: 'write-tool-id',
+      fileDiff: { oldText: null, newText: 'export {};' },
     });
   });
 

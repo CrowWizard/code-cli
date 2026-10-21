@@ -806,8 +806,8 @@ export function initializeAgentDependencies(
       getCurrentSessionId: () => host.sessionManager?.getCurrentSession?.()?.metadata?.sessionId,
       memoryManager: host.memoryManager,
       permissionManager: host.permissionManager,
-      onFileModified: (filePath, changeType, toolCallId) => {
-        host.markFilesModified(filePath, changeType, toolCallId);
+      onFileModified: (filePath, changeType, toolCallId, fileDiff) => {
+        host.markFilesModified(filePath, changeType, toolCallId, fileDiff);
       },
       backgroundProcessRegistry: host.backgroundProcessRegistry,
       peerAwareness: host.peerAwareness,

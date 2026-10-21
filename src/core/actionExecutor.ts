@@ -182,6 +182,7 @@ export interface ActionExecutorOptions {
     filePath?: string,
     changeType?: 'create' | 'modify' | 'delete',
     toolCallId?: string,
+    fileDiff?: { oldText: string | null; newText: string },
   ) => void;
   /** Callback to handle ask_followup_question tool - delegates to agent for TUI coordination */
   onAskFollowup?: (question: string, suggestedAnswers?: string[]) => Promise<string>;
@@ -934,13 +935,14 @@ export class ActionExecutor {
     filePath: string,
     changeType: 'create' | 'modify' | 'delete',
     toolCallId?: string,
+    fileDiff?: { oldText: string | null; newText: string },
   ): void {
     this.peerAwareness?.recordWrite(this.toWorkspaceRelative(filePath) ?? filePath);
     if (toolCallId === undefined) {
       this.onFileModified?.(filePath, changeType);
       return;
     }
-    this.onFileModified?.(filePath, changeType, toolCallId);
+    this.onFileModified?.(filePath, changeType, toolCallId, fileDiff);
   }
 
   private async withToolActivity<T>(action: AgentAction, operation: () => Promise<T>): Promise<T> {
@@ -1536,7 +1538,10 @@ export class ActionExecutor {
         }
 
         await this.files.writeFile(action.path, newContent);
-        this.notifyFileModified(action.path, exists ? 'modify' : 'create', context?.toolCallId);
+        this.notifyFileModified(action.path, exists ? 'modify' : 'create', context?.toolCallId, {
+          oldText: exists ? oldContent : null,
+          newText: newContent,
+        });
         return resultOutput ?? (exists ? `Updated ${action.path}` : `Created ${action.path}`);
       }
       case 'append_file': {
@@ -1555,7 +1560,7 @@ export class ActionExecutor {
         this.showDiff(oldContent, newContent, action.path);
 
         await this.files.appendFile(action.path, addition);
-        this.notifyFileModified(action.path, 'modify', context?.toolCallId);
+        this.notifyFileModified(action.path, 'modify', context?.toolCallId, { oldText: oldContent, newText: newContent });
         return this.formatDiffPreview(oldContent, newContent, action.path);
       }
       case 'apply_patch': {
@@ -1579,7 +1584,7 @@ export class ActionExecutor {
 
         const newContent = await this.files.readFile(action.path);
         this.showDiff(oldContent, newContent, action.path);
-        this.notifyFileModified(action.path, 'modify', context?.toolCallId);
+        this.notifyFileModified(action.path, 'modify', context?.toolCallId, { oldText: oldContent, newText: newContent });
 
         return this.formatDiffPreview(oldContent, newContent, action.path);
       }
@@ -1595,7 +1600,7 @@ export class ActionExecutor {
         const current = await this.files.readFile(action.path);
         const { updated, summary } = applyNotebookEdit(current, action);
         await this.files.writeFile(action.path, updated);
-        this.notifyFileModified(action.path, 'modify', context?.toolCallId);
+        this.notifyFileModified(action.path, 'modify', context?.toolCallId, { oldText: current, newText: updated });
         return summary;
       }
       case 'tools_registry': {
@@ -1781,7 +1786,7 @@ export class ActionExecutor {
         if (oldDeleteContent !== null) {
           console.log(chalk.cyan(`\n🗑️ ${action.path}:`));
           this.showDiff(oldDeleteContent, '', action.path);
-          this.notifyFileModified(action.path, 'delete', context?.toolCallId);
+          this.notifyFileModified(action.path, 'delete', context?.toolCallId, { oldText: oldDeleteContent, newText: '' });
           return this.formatDiffPreview(oldDeleteContent, '', action.path);
         }
         this.notifyFileModified(action.path, 'delete', context?.toolCallId);
@@ -1832,7 +1837,7 @@ export class ActionExecutor {
           console.log(chalk.cyan(`\n🔄 ${action.path}:`));
           this.showDiff(content, result, action.path);
           await this.files.writeFile(action.path, result);
-          this.notifyFileModified(action.path, 'modify', context?.toolCallId);
+          this.notifyFileModified(action.path, 'modify', context?.toolCallId, { oldText: content, newText: result });
           return this.formatDiffPreview(content, result, action.path);
         }
         return `No changes needed for ${action.path} (content identical)`;
@@ -1851,7 +1856,7 @@ export class ActionExecutor {
         if (oldFormatContent !== newFormatContent) {
           console.log(chalk.cyan(`\n🎨 ${action.path}:`));
           this.showDiff(oldFormatContent, newFormatContent, action.path);
-          this.notifyFileModified(action.path, 'modify', context?.toolCallId);
+          this.notifyFileModified(action.path, 'modify', context?.toolCallId, { oldText: oldFormatContent, newText: newFormatContent });
           return this.formatDiffPreview(oldFormatContent, newFormatContent, action.path);
         }
         return `No changes needed (already formatted): ${action.path}`;
@@ -2215,7 +2220,7 @@ export class ActionExecutor {
         if (oldPkgAdd !== newPkgAdd) {
           console.log(chalk.cyan(`\n📦 package.json:`));
           this.showDiff(oldPkgAdd, newPkgAdd, 'package.json');
-          this.notifyFileModified('package.json', 'modify', context?.toolCallId);
+          this.notifyFileModified('package.json', 'modify', context?.toolCallId, { oldText: oldPkgAdd, newText: newPkgAdd });
           return this.formatDiffPreview(oldPkgAdd, newPkgAdd, 'package.json');
         }
         return `Added dependency ${action.name}@${action.version}${action.dev ? ' (dev)' : ''}`;
@@ -2229,7 +2234,7 @@ export class ActionExecutor {
         if (oldPkgRm !== newPkgRm) {
           console.log(chalk.cyan(`\n📦 package.json:`));
           this.showDiff(oldPkgRm, newPkgRm, 'package.json');
-          this.notifyFileModified('package.json', 'modify', context?.toolCallId);
+          this.notifyFileModified('package.json', 'modify', context?.toolCallId, { oldText: oldPkgRm, newText: newPkgRm });
           return this.formatDiffPreview(oldPkgRm, newPkgRm, 'package.json');
         }
         return `Removed dependency ${action.name}${action.dev ? ' (dev)' : ''}`;
@@ -2277,7 +2282,7 @@ export class ActionExecutor {
         if (oldCheckoutContent !== newCheckoutContent) {
           console.log(chalk.cyan(`\n↩️ ${action.path}:`));
           this.showDiff(oldCheckoutContent, newCheckoutContent, action.path);
-          this.notifyFileModified(action.path, 'modify', context?.toolCallId);
+          this.notifyFileModified(action.path, 'modify', context?.toolCallId, { oldText: oldCheckoutContent, newText: newCheckoutContent });
           return this.formatDiffPreview(oldCheckoutContent, newCheckoutContent, action.path);
         }
         return `Restored ${action.path} from git (no changes).`;
@@ -2786,7 +2791,7 @@ export class ActionExecutor {
           }
           this.showDiff(oldContent, newContent, action.file_path);
           await this.files.writeFile(action.file_path, newContent);
-          this.notifyFileModified(action.file_path, 'modify', context?.toolCallId);
+          this.notifyFileModified(action.file_path, 'modify', context?.toolCallId, { oldText: oldContent, newText: newContent });
           return this.formatDiffPreview(oldContent, newContent, action.file_path);
         }
 

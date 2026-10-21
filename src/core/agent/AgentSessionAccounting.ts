@@ -457,6 +457,7 @@ export function markAgentFilesModified(
   filePath?: string,
   changeType?: 'create' | 'modify' | 'delete',
   toolCallId?: string,
+  fileDiff?: { oldText: string | null; newText: string },
 ): void {
   host.filesModifiedThisSession = true;
   host.fileModCount++;
@@ -478,6 +479,7 @@ export function markAgentFilesModified(
       filePath,
       changeType: changeType || 'modify',
       ...(toolCallId === undefined ? {} : { toolId: toolCallId }),
+      ...(fileDiff === undefined ? {} : { fileDiff }),
     });
   }
 }

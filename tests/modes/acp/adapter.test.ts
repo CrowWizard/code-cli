@@ -2156,6 +2156,30 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it("reports file changes as standard ACP diffs without completing the tool", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      await outputListener({
+        type: "file_modified",
+        toolId: "write-1",
+        filePath: "src/file.ts",
+        changeType: "modify",
+        fileDiff: { oldText: "before", newText: "after" },
+      });
+
+      expect(connection.sessionUpdate).toHaveBeenCalledWith({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "write-1",
+          locations: [{ path: "/workspace/src/file.ts" }],
+          content: [{ type: "diff", path: "/workspace/src/file.ts", oldText: "before", newText: "after" }],
+        },
+      });
+      expect(connection.extNotification).toHaveBeenCalledWith("autohand.hook.fileModified", expect.objectContaining({
+        sessionId, filePath: "src/file.ts", changeType: "modify", toolId: "write-1",
+      }));
+    });
+
     it("marks a tool call made by a script with its parent call, and leaves direct calls unmarked", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
 

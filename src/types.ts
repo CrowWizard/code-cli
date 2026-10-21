@@ -2195,6 +2195,8 @@ export interface AgentOutputEvent {
   filePath?: string;
   /** Change type for file_modified events */
   changeType?: 'create' | 'modify' | 'delete';
+  /** File contents for rendering a structured diff in protocol clients. */
+  fileDiff?: { oldText: string | null; newText: string };
   /** Complete live team state for TUI, RPC, and ACP consumers. */
   teamActivity?: TeamActivitySnapshot;
 }
