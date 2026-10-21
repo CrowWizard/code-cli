@@ -748,7 +748,10 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       callResourceCleanupSync(() => stopMobileRelay());
       host.persistentInputActiveTurn = false;
       callResourceCleanupSync(() => host.persistentInput?.dispose?.());
-      callResourceCleanupSync(() => process.stdin.pause());
+      // Protocol transports own stdin across replacement agent sessions.
+      if (!host.runtime?.isRpcMode) {
+        callResourceCleanupSync(() => process.stdin.pause());
+      }
 
       const cleanupTasks: Promise<unknown>[] = [];
       if (host.ui) {
