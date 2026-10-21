@@ -62,6 +62,7 @@ const {
     initializeForRPC: vi.fn().mockResolvedValue(undefined),
     setOutputListener: vi.fn(),
     setConfirmationCallback: vi.fn(),
+    setDirectoryAccessCallback: vi.fn<(callback: (path: string, reason?: string) => Promise<string | undefined>) => void>(),
     connectAcpMcpServers: vi.fn().mockResolvedValue(undefined),
     applyAcpMode: vi.fn(),
     applyAcpModel: vi.fn(),
@@ -801,6 +802,57 @@ describe("AutohandAcpAdapter", () => {
       expect(typeof mockAgent.setConfirmationCallback.mock.calls[0][0]).toBe(
         "function",
       );
+    });
+
+    it.each(["allow_once", "allow_session", "allow_always_project", "allow_always_user"])(
+      "requests directory permission through ACP and accepts %s",
+      async (optionId) => {
+        vi.mocked(connection.requestPermission).mockResolvedValue({
+          outcome: { outcome: "selected", optionId },
+        });
+        const { sessionId } = await adapter.newSession(makeNewSessionRequest());
+
+        expect(mockAgent.setDirectoryAccessCallback).toHaveBeenCalledTimes(1);
+        const callback = mockAgent.setDirectoryAccessCallback.mock.calls[0][0];
+        await expect(callback("/references/anatomy", "Read reference source")).resolves.toBe("/references/anatomy");
+        expect(connection.requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+          sessionId,
+          toolCall: expect.objectContaining({
+            locations: [{ path: "/references/anatomy" }],
+            rawInput: expect.objectContaining({
+              tool: "request_directory_access",
+              path: "/references/anatomy",
+              description: "Read reference source",
+            }),
+          }),
+        }));
+      },
+    );
+
+    it.each(["deny_once", "deny_session", "deny_always_project", "deny_always_user", "unknown"])(
+      "does not grant directory access for %s",
+      async (optionId) => {
+        vi.mocked(connection.requestPermission).mockResolvedValue({
+          outcome: { outcome: "selected", optionId },
+        });
+        await adapter.newSession(makeNewSessionRequest());
+
+        expect(mockAgent.setDirectoryAccessCallback).toHaveBeenCalledTimes(1);
+        const callback = mockAgent.setDirectoryAccessCallback.mock.calls[0][0];
+        await expect(callback("/references/anatomy")).resolves.toBeUndefined();
+      },
+    );
+
+    it("does not grant directory access when the client cancels or disconnects", async () => {
+      vi.mocked(connection.requestPermission)
+        .mockResolvedValueOnce({ outcome: { outcome: "cancelled" } })
+        .mockRejectedValueOnce(new Error("Client disconnected"));
+      await adapter.newSession(makeNewSessionRequest());
+
+      expect(mockAgent.setDirectoryAccessCallback).toHaveBeenCalledTimes(1);
+      const callback = mockAgent.setDirectoryAccessCallback.mock.calls[0][0];
+      await expect(callback("/references/anatomy")).resolves.toBeUndefined();
+      await expect(callback("/references/anatomy")).resolves.toBeUndefined();
     });
 
     it("uses original workspace when worktree option is not enabled", async () => {

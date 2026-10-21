@@ -485,6 +485,22 @@ export class AutohandAcpAdapter implements Agent {
       }
       return activePermBridge.confirmAction(message, context);
     });
+    agent.setDirectoryAccessCallback(async (directoryPath, reason) => {
+      const activePermBridge = this.permissionBridges.get(state.sessionId);
+      if (!activePermBridge) {
+        return undefined;
+      }
+      const result = await activePermBridge.confirmAction(reason ?? `Access directory: ${directoryPath}`, {
+        tool: 'request_directory_access',
+        path: directoryPath,
+      });
+      return result.decision === 'allow_once'
+        || result.decision === 'allow_session'
+        || result.decision === 'allow_always_project'
+        || result.decision === 'allow_always_user'
+        ? directoryPath
+        : undefined;
+    });
     this.permissionBridges.set(managedSessionId, permBridge);
     await this.publishSessionCommands(managedSessionId, config);
 
