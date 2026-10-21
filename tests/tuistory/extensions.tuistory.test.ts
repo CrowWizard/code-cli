@@ -23,9 +23,11 @@ import {
   createExtensionBuilderDemoResponses,
   driveExtensionBuilderAuthoring,
 } from '../../src/testing/scenarios/extensionBuilderAuthoringDemo.js';
+import { showDocumentFactoryInstruction } from '../../src/testing/scenarios/documentFactoryScenario.js';
 
 const EXAMPLE_IDS = [
   'autohand.code-health',
+  'autohand.document-factory',
   'autohand.git-insights',
   'autohand.release-assistant',
   'autohand.runtime-showcase',
@@ -320,7 +322,24 @@ describe('built extensions CLI Tuistory E2E', () => {
     await exitInteractive(session);
   }, 90_000);
 
-  it('runs all seven examples through fresh built CLI processes', async () => {
+  it.each([false, true])('shows the trusted document factory instruction and restores input (full screen: %s)', async (fullScreenMode) => {
+    const state = await createTempAutohandHome({ config: { features: { fullScreenMode } } });
+    tempStates.push(state);
+    const source = path.join(repoRoot(), 'examples', 'extensions', 'autohand.document-factory');
+    const installation = await runBuiltCommand(state, ['extensions', 'install', source, '--trust']);
+    expect(installation.exitCode, installation.output).toBe(0);
+    const session = await launchBuiltAutohand(['--config', state.configPath, '--offline'], {
+      autohandHome: state.autohandHome, cwd: state.workspaceRoot, cols: 160, rows: 50,
+    });
+    sessions.push(session);
+    await showDocumentFactoryInstruction(session);
+    const screen = session.readAll();
+    expect(screen).toContain('checkout');
+    expect(screen).toContain('delegate_task');
+    await exitInteractive(session);
+  });
+
+  it('runs all eight examples through fresh built CLI processes', async () => {
     const state = await createTempAutohandHome();
     tempStates.push(state);
     const examplesRoot = path.join(repoRoot(), 'examples', 'extensions');
@@ -341,7 +360,7 @@ describe('built extensions CLI Tuistory E2E', () => {
         'extensions',
         'install',
         source,
-        ...(id === 'autohand.runtime-showcase' ? ['--trust'] : []),
+        ...(['autohand.runtime-showcase', 'autohand.document-factory'].includes(id) ? ['--trust'] : []),
       ]);
       expect(installation.exitCode, installation.output).toBe(0);
       expect(installation.output).toContain(`Installed ${id}@1.0.0`);
@@ -396,7 +415,7 @@ describe('built extensions CLI Tuistory E2E', () => {
 
     const doctor = await runBuiltCommand(state, ['extensions', 'doctor']);
     expect(doctor.exitCode, doctor.output).toBe(0);
-    expect(doctor.output).toContain('Extension diagnostics: healthy (6 installed)');
+    expect(doctor.output).toContain(`Extension diagnostics: healthy (${EXAMPLE_IDS.length - 1} installed)`);
   }, 120_000);
 
   it('runs interactive list, show, doctor, disable, and enable with stable Ctrl+C exit', async () => {
