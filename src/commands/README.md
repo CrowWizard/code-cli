@@ -40,7 +40,7 @@ Each command is a separate TypeScript file that exports:
 | `/experiments` | `features.ts` | List and toggle experiments |
 | `/goal` | `goal.ts` | Manage session-attached persistent goals, budgets, templates, and queued work; bare `/goal` recovers a stranded queue only when no live peer owns it. Requires `slash_goal`. |
 | `/goals` | `goal.ts` | Open the live goal queue with keyboard and mouse editing. Accepts `/goal` subcommands and returns the queue as text without an interactive panel. Shares `slash_goal`; `/experiments enable slash_goals` enables the same local experiment. |
-| `/squad` | `squad.ts` | Open/manage the standalone Autohand Squad runtime. |
+| `/squad` | `squad.ts`, `squadDesktop.ts` | Open the Autohand Squad app, installing the latest release when missing; subcommands manage the standalone runtime. |
 | `/squad view` | `squad.ts` | Inspect recorded independent Squad sessions for the current workspace |
 | `/usage` | `usage.ts` | Show Autohand plan limits and project token activity |
 | `/statusline` | `statusline.ts` | Configure composer status-line fields |

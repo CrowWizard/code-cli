@@ -986,7 +986,7 @@ program
 
 program
   .command('squad [args...]')
-  .description('Start and manage the standalone Autohand Squad runtime')
+  .description('Open the Autohand Squad app (installs it if missing); subcommands manage the standalone runtime')
   .allowUnknownOption(true)
   .allowExcessArguments(true)
   .action(async (args: string[] = []) => {
@@ -994,7 +994,7 @@ program
     const config = await loadConfig(rootOptions.config, process.cwd());
     const workspaceRoot = resolveWorkspaceRoot(config, rootOptions.path);
     const { runSquadCommand } = await import('./commands/squad.js');
-    const result = await runSquadCommand({ workspaceRoot, config }, args);
+    const result = await runSquadCommand({ workspaceRoot, config, onProgress: (line) => console.log(line) }, args);
     if (result.output) {
       if (result.code === 0) {
         console.log(result.output);

@@ -3149,7 +3149,7 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | `/agents view` | Inspect direct and team runs                          |
 | `/agents provider [agent]` | Choose and confirm the provider/model default for new teammates, or an override for one sub-agent definition |
 | `/agents-new` | Create a new agent via wizard                         |
-| `/squad`      | Open/manage the standalone Autohand Squad runtime     |
+| `/squad`      | Open the Autohand Squad app (installs it if missing); subcommands manage the runtime |
 | `/team`       | Manage team for parallel work                         |
 | `/tasks`      | Manage tasks in team                                  |
 | `/message`    | Send message to teammate                              |
