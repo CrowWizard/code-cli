@@ -2201,6 +2201,9 @@ describe("AutohandAcpAdapter", () => {
         fileDiff: { oldText: "before", newText: "after" },
       });
 
+      const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update)
+        .filter(update => update.toolCallId === "write-1");
+      expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "write-1", kind: "edit", title: "Modified: src/file.ts" });
       expect(connection.sessionUpdate).toHaveBeenCalledWith({
         sessionId,
         update: {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getAutohandAIAvailableModelOptions } from "../../providers/AutohandAIProvider.js";
 /**
  * ACP Adapter
@@ -1613,15 +1614,32 @@ export class AutohandAcpAdapter implements Agent {
 
         case 'file_modified':
           if (event.filePath) {
-            if (event.toolId) {
+            {
+              const toolCallId = event.toolId ?? `file_${randomUUID()}`;
               const filePath = resolve(this.sessions.get(sessionId)?.workspaceRoot ?? process.cwd(), event.filePath);
+              if (!event.toolId || !this.toolStartTimes.has(event.toolId)) {
+                await this.connection.sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: 'tool_call',
+                    toolCallId,
+                    title: `${event.changeType === 'create' ? 'Created' : event.changeType === 'delete' ? 'Deleted' : 'Modified'}: ${event.filePath}`,
+                    kind: 'edit',
+                    status: 'completed',
+                    locations: [{ path: filePath }],
+                    rawInput: { path: filePath, changeType: event.changeType ?? 'modify' },
+                  },
+                });
+              }
               await this.connection.sessionUpdate({
                 sessionId,
                 update: {
                   sessionUpdate: 'tool_call_update',
-                  toolCallId: event.toolId,
+                  toolCallId,
                   locations: [{ path: filePath }],
-                  ...(event.fileDiff === undefined ? {} : {
+                  ...(event.fileDiff === undefined ? {
+                    content: [{ type: 'content', content: { type: 'text', text: `${event.changeType ?? 'modify'}: ${filePath}` } }],
+                  } : {
                     content: [{
                       type: 'diff',
                       path: filePath,
