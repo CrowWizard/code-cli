@@ -744,6 +744,16 @@ function Install-Zit {
     Write-Warning "Zit currently publishes macOS and Linux binaries, with no native Windows release. See https://getzit.org for supported installation options. Autohand installation continues; -NoZit opts out of this check."
 }
 
+function Test-ComputerControlSupport {
+    param([string]$BinaryPath)
+    # Old releases print root help even for unknown commands before --help.
+    try {
+        $helpText = (& $BinaryPath --help 2>$null | Out-String)
+        return ($LASTEXITCODE -eq 0 -and $helpText -match '(?m)^\s+computer(?:\s|$)')
+    }
+    catch { return $false }
+}
+
 function Install-ComputerControl {
     param(
         [Parameter(Mandatory = $true)][string]$BinaryPath
@@ -751,6 +761,11 @@ function Install-ComputerControl {
 
     if ($env:AUTOHAND_SKIP_COMPUTER_CONTROL_INSTALL -eq "1") {
         Write-Host "Skipping Computer control because AUTOHAND_SKIP_COMPUTER_CONTROL_INSTALL=1." -ForegroundColor Yellow
+        return
+    }
+
+    if (-not (Test-ComputerControlSupport $BinaryPath)) {
+        Write-Host "Computer control arrives in the next release" -ForegroundColor DarkGray
         return
     }
 
@@ -766,9 +781,8 @@ function Install-ComputerControl {
         Write-Success "Autohand Computer Use is ready."
     }
     catch {
-        Write-Host "Installation is incomplete: Computer control could not be installed." -ForegroundColor Yellow
+        Write-Host "Warning: Optional Computer control could not be installed. Autohand CLI is ready." -ForegroundColor Yellow
         Write-Host "Retry with: autohand computer install" -ForegroundColor Yellow
-        throw
     }
 }
 
@@ -982,7 +996,9 @@ function Install-Autohand {
     Write-Host "  autohand              # Start interactive mode"
     Write-Host "  autohand --help       # Show all options"
     Write-Host "  autohand login        # Sign in to your account"
-    Write-Host "  autohand computer doctor # Verify native app control permissions"
+    if (Test-ComputerControlSupport (Join-Path $InstallPath 'autohand.exe')) {
+        Write-Host "  autohand computer doctor # Verify native app control permissions"
+    }
     if ($extractedAhtraces) {
         Write-Host ""
         Write-Host "Agent traces stay off until you choose during onboarding."
