@@ -2156,6 +2156,41 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it("logs file updates without a matching tool start without exposing file contents", async () => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+        await outputListener({ type: "file_modified", toolId: "missing-write", filePath: "src/file.ts", fileDiff: { oldText: "private-before", newText: "private-after" } });
+        const diagnostic = stderr.mock.calls.map(([message]) => String(message)).find(message => message.includes("[ACP tool-event]"));
+        expect(diagnostic).toContain('"toolId":"missing-write"');
+        expect(diagnostic).toContain('"reason":"missing_tool_start"');
+        expect(diagnostic).toContain('"event":"file_modified"');
+        expect(diagnostic).toContain(sessionId);
+        expect(diagnostic).not.toContain("private-before");
+        expect(diagnostic).not.toContain("private-after");
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it("traces matched tool events when ACP debugging is enabled", async () => {
+      vi.stubEnv("AUTOHAND_DEBUG", "1");
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+        await outputListener({ type: "tool_start", toolId: "traced-read", toolName: "read_file" });
+        await outputListener({ type: "tool_end", toolId: "traced-read", toolName: "read_file", toolSuccess: true });
+        const diagnostics = stderr.mock.calls.map(([message]) => String(message)).filter(message => message.includes("[ACP tool-event]"));
+        expect(diagnostics).toHaveLength(2);
+        expect(diagnostics[0]).toContain('"event":"tool_start"');
+        expect(diagnostics[1]).toContain('"event":"tool_end"');
+        expect(diagnostics[1]).toContain('"reason":"trace"');
+      } finally {
+        stderr.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
+
     it("reports file changes as standard ACP diffs without completing the tool", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
       await outputListener({

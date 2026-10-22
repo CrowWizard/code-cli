@@ -1437,6 +1437,21 @@ export class AutohandAcpAdapter implements Agent {
    */
   private async handleAgentOutput(sessionId: string, event: AgentOutputEvent): Promise<void> {
     try {
+      if (event.type === 'tool_start' || event.type === 'tool_end' || event.type === 'file_modified') {
+        const hasToolStart = event.toolId !== undefined && this.toolStartTimes.has(event.toolId);
+        const reason = event.toolId === undefined ? 'missing_tool_id'
+          : event.type !== 'tool_start' && !hasToolStart ? 'missing_tool_start'
+          : event.type === 'tool_start' && hasToolStart ? 'duplicate_tool_start'
+          : 'trace';
+        if (reason !== 'trace' || process.env.AUTOHAND_DEBUG === '1' || process.env.AUTOHAND_DEBUG === 'true') {
+          process.stderr.write(`[ACP tool-event] ${JSON.stringify({
+            timestamp: new Date().toISOString(), sessionId, event: event.type,
+            toolId: event.toolId ?? null, parentToolId: event.parentToolId ?? null,
+            toolName: event.toolName ?? null, hasToolStart, reason,
+            hasDiff: event.fileDiff !== undefined,
+          })}\n`);
+        }
+      }
       switch (event.type) {
         case 'peer_update':
         case 'resource_update': {
@@ -1648,7 +1663,7 @@ export class AutohandAcpAdapter implements Agent {
     } catch (err) {
       // Don't let notification errors crash the agent
       process.stderr.write(
-        `[ACP] Failed to send session update: ${err instanceof Error ? err.message : String(err)}\n`
+        `[ACP] Failed to send session update: ${JSON.stringify({ sessionId, event: event.type, toolId: event.toolId ?? null })} ${err instanceof Error ? err.message : String(err)}\n`
       );
     }
   }
