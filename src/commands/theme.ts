@@ -6,7 +6,7 @@
 import chalk from 'chalk';
 import { t } from '../i18n/index.js';
 import { showModal, type ModalOption } from '../ui/ink/components/Modal.js';
-import { listAvailableThemes, initTheme, getTheme, isThemeInitialized, CUSTOM_THEMES_DIR } from '../ui/theme/index.js';
+import { listAvailableThemes, initTheme, getTheme, isThemeInitialized, themedFgIfSet, CUSTOM_THEMES_DIR } from '../ui/theme/index.js';
 import { builtInThemes, getDefaultThemeName } from '../ui/theme/themes.js';
 import type { LoadedConfig } from '../types.js';
 import { saveConfig } from '../config.js';
@@ -24,7 +24,7 @@ export async function theme(ctx: ThemeContext): Promise<string | null> {
   const themes = listAvailableThemes();
   const currentTheme = isThemeInitialized() ? getTheme().name : (ctx.config.ui?.theme || getDefaultThemeName());
 
-  console.log(chalk.cyan(`\n🎨 ${t('commands.theme.title')}\n`));
+  console.log(themedFgIfSet('commandAccent', `\n🎨 ${t('commands.theme.title')}\n`, chalk.cyan));
   console.log(chalk.gray(t('commands.theme.currentTheme', { theme: chalk.white(currentTheme) })));
   console.log(chalk.gray(`Custom themes location: ${CUSTOM_THEMES_DIR}\n`));
 
@@ -41,6 +41,7 @@ export async function theme(ctx: ThemeContext): Promise<string | null> {
     cappadocia: 'Cappadocia-inspired rose valleys, dawn sky, and balloon colors',
     rio: 'Rio-inspired blue macaw, rainforest, and beach-light palette',
     australia: 'Australian coast, wattle, and eucalyptus palette',
+    autohand: 'Autohand brand: black and white, with status colours for status only',
     // Curated Ghostty themes
     'Atom One Dark': 'Atom editor dark theme',
     'Ayu Mirage': 'Soft dark with warm accents',

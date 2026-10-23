@@ -6,6 +6,7 @@
 import chalk from 'chalk';
 import terminalLink from 'terminal-link';
 import { t } from '../i18n/index.js';
+import { themedFgIfSet } from '../ui/theme/index.js';
 
 /**
  * Help command - shows available commands and tips
@@ -19,7 +20,7 @@ import { t } from '../i18n/index.js';
 export async function help(): Promise<string> {
     const { SLASH_COMMANDS } = await import('../core/slashCommands.js');
 
-    const lines = [chalk.cyan(`\n  ${t('commands.help.title')}\n`)];
+    const lines = [themedFgIfSet('commandAccent', `\n  ${t('commands.help.title')}\n`, chalk.cyan)];
 
     const commands = SLASH_COMMANDS
         .filter(cmd => cmd.implemented && cmd.command !== '/?')
@@ -28,10 +29,10 @@ export async function help(): Promise<string> {
     const maxLen = Math.max(...commands.map(c => c.command.length)) + 2;
 
     for (const { command, description } of commands) {
-        lines.push(`  ${chalk.yellow(command.padEnd(maxLen))} ${chalk.gray(description)}`);
+        lines.push(`  ${themedFgIfSet('commandAccent', command.padEnd(maxLen), chalk.yellow)} ${chalk.gray(description)}`);
     }
 
-    lines.push(chalk.cyan(`\n  ${t('commands.help.tips.title')}\n`));
+    lines.push(themedFgIfSet('commandAccent', `\n  ${t('commands.help.tips.title')}\n`, chalk.cyan));
     lines.push(chalk.gray(`  • ${t('commands.help.tips.mention')}`));
     lines.push(chalk.gray(`  • ${t('commands.help.tips.arrows')}`));
     lines.push(chalk.gray(`  • ${t('commands.help.tips.tab')}`));

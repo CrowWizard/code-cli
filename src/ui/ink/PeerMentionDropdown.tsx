@@ -12,7 +12,7 @@ export function PeerMentionDropdown({ suggestions, activeIndex, status, open, sc
     {open && <Text>{theme.fg('muted', `Peers · ${scope}${canCycleScope ? ' · Shift+Tab to change scope' : ''}`)}</Text>}
     {open && !suggestions.length && <Text>{theme.fg('dim', 'No matching peers · Esc to close')}</Text>}
     {suggestions.map((peer, index) => <Box key={peer.peerId}>
-      <Text>{theme.fg(index === activeIndex ? 'accent' : 'text', `${index === activeIndex ? '▸' : ' '} :${safePeerLabel(peer.alias)}`)}</Text>
+      <Text>{index === activeIndex ? theme.selected(`▸ :${safePeerLabel(peer.alias)}`) : theme.fg('text', `  :${safePeerLabel(peer.alias)}`)}</Text>
       <Text>{theme.fg('muted', `  ${safePeerLabel(peer.project)} · ${peer.kind} · ${safePeerLabel(peer.activity)}${peer.availability === 'available' ? '' : ` · ${peer.availability}`}`)}</Text>
     </Box>)}
     {suggestions.length > 0 && <Text>{theme.fg('dim', '  Tab or Enter to select · ↑↓ to navigate · Esc to close')}</Text>}

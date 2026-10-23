@@ -742,6 +742,7 @@ function Modal(props: ModalProps) {
       label: `${isSelected ? '\u25b8 ' : '  '}${checkbox}${numberPrefix}${choice.label}${disabledSuffix}`,
       description: choice.description ? `     ${choice.description}` : undefined,
       color,
+      selected: isSelected && !choice.disabled,
     };
   });
 
@@ -820,7 +821,7 @@ function Modal(props: ModalProps) {
               <Box key={view.key} flexDirection="column">
                 {view.spacer && <Text> </Text>}
                 {view.heading && <Text>{theme.fg('muted', view.heading)}</Text>}
-                <Text>{theme.fg(view.color, view.label)}</Text>
+                <Text>{view.selected ? theme.selected(view.label) : theme.fg(view.color, view.label)}</Text>
                 {view.description && <Text>{theme.fg('muted', view.description)}</Text>}
               </Box>
             ))}

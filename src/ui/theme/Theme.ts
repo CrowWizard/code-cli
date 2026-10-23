@@ -5,6 +5,12 @@
  */
 
 import type { ColorToken, ResolvedColors, ColorMode } from './types.js';
+import { DERIVED_COLOR_TOKENS } from './types.js';
+
+export interface ThemeOptions {
+  /** Map near-neutral colours to the 256-colour grey ramp. */
+  neutralGreys256?: boolean;
+}
 
 /**
  * Theme class provides methods for applying colors to terminal output.
@@ -15,11 +21,13 @@ export class Theme {
   readonly colors: ResolvedColors;
   private readonly colorMode: ColorMode;
   private readonly ansiCache: Map<string, string> = new Map();
+  private readonly neutralGreys256: boolean;
 
-  constructor(name: string, colors: ResolvedColors, colorMode?: ColorMode) {
+  constructor(name: string, colors: ResolvedColors, colorMode?: ColorMode, options: ThemeOptions = {}) {
     this.name = name;
     this.colors = colors;
     this.colorMode = colorMode ?? detectColorMode();
+    this.neutralGreys256 = options.neutralGreys256 === true;
   }
 
   /**
@@ -27,7 +35,7 @@ export class Theme {
    */
   fg(token: ColorToken, text: string): string {
     if (this.colorMode === 'none') return text;
-    const color = this.colors[token];
+    const color = this.lookup(token);
     if (!color) return text;
     const ansi = this.getAnsiCode(color, 'fg');
     return `${ansi}${text}\x1b[39m`;
@@ -38,7 +46,7 @@ export class Theme {
    */
   bg(token: ColorToken, text: string): string {
     if (this.colorMode === 'none') return text;
-    const color = this.colors[token];
+    const color = this.lookup(token);
     if (!color) return text;
     const ansi = this.getAnsiCode(color, 'bg');
     return `${ansi}${text}\x1b[49m`;
@@ -49,11 +57,29 @@ export class Theme {
    */
   fgBg(fgToken: ColorToken, bgToken: ColorToken, text: string): string {
     if (this.colorMode === 'none') return text;
-    const fgColor = this.colors[fgToken];
-    const bgColor = this.colors[bgToken];
+    const fgColor = this.lookup(fgToken);
+    const bgColor = this.lookup(bgToken);
     const fgAnsi = fgColor ? this.getAnsiCode(fgColor, 'fg') : '';
     const bgAnsi = bgColor ? this.getAnsiCode(bgColor, 'bg') : '';
     return `${fgAnsi}${bgAnsi}${text}\x1b[0m`;
+  }
+
+  /**
+   * Whether the theme sets this token itself rather than inheriting it.
+   */
+  has(token: ColorToken): boolean {
+    return this.colors[token] !== undefined;
+  }
+
+  /**
+   * Style the selected row of a picker or dropdown.
+   * Themes that set selectionBg render it inverse (filled); others colour the text only.
+   */
+  selected(text: string): string {
+    if (this.colorMode !== 'none' && this.lookup('selectionBg')) {
+      return this.fgBg('selectionText', 'selectionBg', text);
+    }
+    return this.fg('selectionText', text);
   }
 
   /**
@@ -102,7 +128,17 @@ export class Theme {
    * Get raw color value for a token.
    */
   getColor(token: ColorToken): string {
-    return this.colors[token] || '';
+    return this.lookup(token);
+  }
+
+  /**
+   * Resolve a token, letting optional tokens a theme left out inherit their core token.
+   */
+  private lookup(token: ColorToken): string {
+    const color = this.colors[token];
+    if (color !== undefined) return color || '';
+    const source = (DERIVED_COLOR_TOKENS as Partial<Record<ColorToken, ColorToken | null>>)[token];
+    return source ? this.lookup(source) : '';
   }
 
   /**
@@ -161,7 +197,9 @@ export class Theme {
       return `\x1b[${base};2;${rgb.r};${rgb.g};${rgb.b}m`;
     } else if (this.colorMode === '256') {
       // Convert to nearest 256-color
-      const index = rgbTo256(rgb.r, rgb.g, rgb.b);
+      const index = this.neutralGreys256 && isNearNeutral(rgb.r, rgb.g, rgb.b)
+        ? greyTo256(rgb.r, rgb.g, rgb.b)
+        : rgbTo256(rgb.r, rgb.g, rgb.b);
       return `\x1b[${base};5;${index}m`;
     } else if (this.colorMode === '16') {
       // Convert to nearest basic color
@@ -285,6 +323,24 @@ export function rgbTo256(r: number, g: number, b: number): number {
 }
 
 /**
+ * Whether a colour is close enough to grey to use the grey ramp.
+ */
+export function isNearNeutral(r: number, g: number, b: number): boolean {
+  return Math.max(r, g, b) - Math.min(r, g, b) <= 20;
+}
+
+/**
+ * Map a near-neutral colour to the nearest step of the 256-colour grey ramp
+ * (232-255), or to cube black or white at the ends.
+ */
+export function greyTo256(r: number, g: number, b: number): number {
+  const level = (r + g + b) / 3;
+  if (level < 4) return 16;
+  if (level > 243) return 231;
+  return Math.min(255, Math.max(232, Math.round((level - 8) / 10) + 232));
+}
+
+/**
  * Convert RGB to nearest basic 16-color index.
  */
 export function rgbTo16(r: number, g: number, b: number): number {
@@ -365,6 +421,18 @@ export function setTheme(theme: Theme): void {
  */
 export function isThemeInitialized(): boolean {
   return globalTheme !== null;
+}
+
+/**
+ * Apply an optional token only when the current theme sets it, otherwise the
+ * caller's fixed colour. Lets a theme recolour output that other themes leave alone.
+ */
+export function themedFgIfSet(token: ColorToken, text: string, fallback: (value: string) => string): string {
+  if (!isThemeInitialized()) {
+    return fallback(text);
+  }
+  const theme = getTheme();
+  return theme.has(token) ? theme.fg(token, text) : fallback(text);
 }
 
 /**

@@ -7,8 +7,8 @@
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import type { ThemeDefinition, ThemeColors, ColorValue, ResolvedColors, ColorToken } from './types.js';
-import { COLOR_TOKENS, isHexColor, is256ColorIndex } from './types.js';
+import type { ThemeDefinition, ThemeColors, ColorValue, ResolvedColors, ColorToken, DerivedColorToken } from './types.js';
+import { ALL_COLOR_TOKENS, COLOR_TOKENS, DERIVED_COLOR_TOKENS, isHexColor, is256ColorIndex } from './types.js';
 import { Theme, setTheme, detectColorMode } from './Theme.js';
 import { builtInThemes, darkTheme, getBuiltInTheme, getDefaultThemeName, isBuiltInTheme } from './themes.js';
 import { loadGhosttyTheme, detectGhosttyTheme } from './ghosttyLoader.js';
@@ -66,7 +66,9 @@ export class ThemeLoadError extends Error {
 export function loadTheme(themeName: string): Theme {
   const definition = getThemeDefinition(themeName);
   const resolvedColors = resolveThemeColors(definition);
-  return new Theme(definition.name, resolvedColors, detectColorMode());
+  return new Theme(definition.name, resolvedColors, detectColorMode(), {
+    neutralGreys256: definition.neutralGreys256 === true,
+  });
 }
 
 /**
@@ -164,7 +166,7 @@ export function validateAndMergeTheme(partial: Partial<ThemeDefinition>, themeNa
   // Validate colors if present
   if (partial.colors) {
     for (const [key, value] of Object.entries(partial.colors)) {
-      if (!COLOR_TOKENS.includes(key as ColorToken)) {
+      if (!ALL_COLOR_TOKENS.includes(key as ColorToken)) {
         // Allow unknown keys (just ignore them)
         continue;
       }
@@ -211,6 +213,15 @@ export function resolveThemeColors(definition: ThemeDefinition): ResolvedColors 
       throw new ThemeLoadError(`Missing required color token: ${token}`, definition.name);
     }
     resolved[token] = resolveColorValue(value, vars, definition.name, new Set());
+  }
+
+  // Optional tokens resolve only when the theme sets them; Theme falls back to
+  // the core token they inherit, so other themes resolve exactly as before.
+  for (const token of Object.keys(DERIVED_COLOR_TOKENS) as DerivedColorToken[]) {
+    const value = colors[token];
+    if (value !== undefined) {
+      resolved[token] = resolveColorValue(value, vars, definition.name, new Set());
+    }
   }
 
   return resolved as ResolvedColors;

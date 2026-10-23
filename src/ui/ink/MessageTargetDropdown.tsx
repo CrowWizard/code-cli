@@ -55,7 +55,7 @@ function MessageTargetDropdownComponent({ suggestions, activeIndex, visible }: M
         return (
           <Box key={suggestion.alias}>
             <Text>
-              {theme.fg(isSelected ? 'accent' : 'text', `${pointer} ${alias}`)}
+              {isSelected ? theme.selected(`${pointer} ${alias}`) : theme.fg('text', `${pointer} ${alias}`)}
               {suggestion.messageable ? theme.fg('success', ' ●') : theme.fg('dim', ' ○')}
             </Text>
             {detail && <Text>{theme.fg('muted', `  ${detail}`)}</Text>}

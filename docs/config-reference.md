@@ -773,7 +773,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 
 | Field                        | Type   | Default | Description                                                                                    |
 | ---------------------------- | ------ | ------- | ---------------------------------------------------------------------------------------------- |
-| `theme`                      | string | `"aurora"` | Color theme for terminal output. Built-ins include `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, `rio`, and `australia`. Legacy `turkey` and `brazil` values still load as aliases. |
+| `theme`                      | string | `"aurora"` | Color theme for terminal output. Built-ins include `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, `rio`, `australia`, and `autohand`. Legacy `turkey` and `brazil` values still load as aliases. |
 | `customThemes`               | object | `{}`    | Inline custom theme definitions keyed by theme name. Set `theme` to the same key to use one.   |
 | `autoConfirm`                | boolean | `false` | Skip confirmation prompts for safe operations                                                  |
 | `readFileCharLimit`          | number | `300`   | Max characters to display from read/find tool output (full content is still sent to the model) |
@@ -870,6 +870,24 @@ Tuatara uses lichen green for focus, warm stone for text, mist blue for function
 | Warnings and numbers | `#d9bd7b` amber |
 
 Use a dark terminal background; `#171c17` is the reference background. Autohand styles its own input and tool surfaces but leaves the terminal's background setting to you. Tests check at least 4.5:1 contrast for text, syntax, and status colours against the reference background and these surfaces, and at least 7:1 for input text. These use the [W3C contrast calculation](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html); terminal palettes, transparency, and font rendering can affect the displayed result. Truecolor preserves the full palette; 256-colour and 16-colour terminals use the existing fallback conversion. Status labels and diff `+`/`-` markers remain readable when colour output is disabled.
+
+### Autohand theme
+
+The `autohand` theme follows the Autohand brand: black and white, with the accent in ink. Select it from `/theme` or `/settings`, set `"ui": { "theme": "autohand" }` in your config, or try it for one run with `--set ui.theme=autohand`. It is not the default.
+
+| Role | Colour |
+| --- | --- |
+| Main text, focus, headings, links and the startup logo | `#F4F7F5` ink |
+| Secondary text, tool output and code | `#C9CBCA` |
+| Hints, comments and link URLs | `#8E908F` |
+| Borders, rules and the composer border | `#2A2E36` hairline |
+| Composer and tool surfaces | `#171A1F` |
+| Selected rows | `#08090A` on `#F4F7F5` (inverse) |
+| Errors and removed lines | `#E05D5D` red |
+| Success and added lines | `#46A758` green |
+| Warnings and waiting | `#E2A336` amber |
+
+Red, green and amber appear only on status and diff colours; nothing else is coloured. Use a dark terminal background; `#08090A` is the reference. Each status colour has at least 4.5:1 contrast on the reference background and on `#171A1F`. Truecolor terminals show the exact palette. In 256-colour terminals the neutrals map to the grey ramp, so surfaces stay grey rather than picking up a blue tint; 16-colour terminals use black, white and the basic red, green and yellow.
 
 ### Custom themes
 

@@ -92,7 +92,7 @@ function InputLineComponent({
     ? 'warning'
     : borderStyle === 'shell'
       ? 'dim'
-      : 'borderAccent';
+      : 'composerBorder';
 
   const rules = useMemo(() => ({
     top: drawInkRule(width, 'top'),

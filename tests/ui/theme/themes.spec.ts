@@ -43,6 +43,7 @@ function contrastRatio(foreground: string, background: string): number {
 describe.each([
   { name: 'tuatara', accent: '#b7c98a', background: '#171c17' },
   { name: 'aurora', accent: '#9b9ef5', background: '#111216' },
+  { name: 'autohand', accent: '#F4F7F5', background: '#08090A' },
 ])('$name theme', ({ name, accent, background }) => {
   it('is available as a built-in theme alongside Tui', () => {
     expect(isBuiltInTheme(name)).toBe(true);
@@ -235,8 +236,8 @@ describe('builtInThemes', () => {
     expect(builtInThemes.australia).toBe(australiaTheme);
   });
 
-  it('has exactly 11 built-in themes', () => {
-    expect(Object.keys(builtInThemes)).toHaveLength(11);
+  it('has exactly 12 built-in themes', () => {
+    expect(Object.keys(builtInThemes)).toHaveLength(12);
   });
 
   it('all themes have unique names', () => {
