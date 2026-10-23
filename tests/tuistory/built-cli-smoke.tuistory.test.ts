@@ -13,6 +13,7 @@ import path from 'node:path';
 import stripAnsi from 'strip-ansi';
 import packageJson from '../../package.json' with { type: 'json' };
 import { createStalledGitVersionPreload } from '../../src/testing/scenarios/gitVersionScenario.js';
+import { startupWelcomeStatusLine } from '../../src/testing/scenarios/startupReturningBrandingScenario.js';
 import {
   createMockAutohandAINativeSequenceServer,
   createMockAutohandAINativeToolServer,
@@ -42,6 +43,41 @@ import {
 registerBuiltCliCleanup();
 
 describe('built CLI Tuistory smoke tests', () => {
+  it('shortens the home directory in the command-mode welcome banner', async () => {
+    const provider = await createMockAutohandAINativeSequenceServer([{ content: 'WELCOME_DIRECTORY_OK' }]);
+    mockServers.push(provider);
+    const state = await createTempAutohandHome({
+      config: {
+        provider: 'autohandai',
+        autohandai: {
+          plan: 'cloud', authMode: 'api-key', apiKey: 'tuistory-autohand-api-key',
+          model: 'moa', baseUrl: provider.baseUrl,
+        },
+        features: { autohand_inference: true },
+        agent: { maxIterations: 2, sessionRetryLimit: 0, autoMemory: false },
+        network: { maxRetries: 0, retryDelay: 0 },
+      },
+    });
+    tempStates.push(state);
+    const workspace = path.join(state.workspaceRoot, 'demo', 'kowhai-coffee');
+    await fs.ensureDir(workspace);
+    const session = await trackSession(launchBuiltAutohand([
+      '--path', workspace, '--config', state.configPath,
+      '--prompt', 'Say WELCOME_DIRECTORY_OK.', '--ephemeral', '--y',
+    ], {
+      autohandHome: state.autohandHome,
+      cwd: workspace,
+      cols: 180,
+      env: { HOME: state.workspaceRoot },
+    }));
+    await waitForExit(session, 30_000);
+    const welcome = startupWelcomeStatusLine(session.getRawOutput());
+    expect(welcome).toContain('| directory:  ~/demo/kowhai-coffee');
+    expect(welcome).not.toContain(state.workspaceRoot);
+    expect(session.readAll()).toContain('WELCOME_DIRECTORY_OK');
+    expectCleanExit(session);
+  }, 45_000);
+
   it('keeps a prior-session goal dormant when a fresh MOA session starts with an acknowledgement', async () => {
     const nativeToolServer = await createMockAutohandAINativeSequenceServer([
       {

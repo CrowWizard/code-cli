@@ -11,6 +11,7 @@ import { COLOR_TOKENS, type ResolvedColors } from '../../../src/ui/theme/types.j
 import {
   formatStartupBanner,
   formatPeerSessionsLine,
+  formatWelcomeDirectory,
   formatWelcomeStatusLine,
   formatWelcomeSuggestion,
   formatWelcomeHint,
@@ -72,5 +73,14 @@ describe('startup theme formatting', () => {
     const hint = stripAnsi(formatWelcomeHint());
     expect(hint).toBe('Describe a task, or use /help to see commands.');
     expect(hint.split('\n')).toHaveLength(1);
+  });
+
+  it('shows the home folder as ~ in the welcome directory, like the status line', () => {
+    expect(formatWelcomeDirectory('/Users/ana/demo/kowhai-coffee', '/Users/ana')).toBe('~/demo/kowhai-coffee');
+    expect(formatWelcomeDirectory('/Users/ana', '/Users/ana')).toBe('~');
+    expect(formatWelcomeDirectory('/Users/anabel/repo', '/Users/ana')).toBe('/Users/anabel/repo');
+    expect(formatWelcomeDirectory('/srv/repo', '/Users/ana')).toBe('/srv/repo');
+    expect(formatWelcomeDirectory('C:\\Users\\ana\\repo', 'C:\\Users\\ana')).toBe('~\\repo');
+    expect(formatWelcomeDirectory('/srv/repo', '')).toBe('/srv/repo');
   });
 });

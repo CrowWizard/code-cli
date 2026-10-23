@@ -21,3 +21,8 @@ export function returningStartupLogoRows(output: string): string[] {
   return stripAnsi(output).split('\n').map((line) => line.trimEnd())
     .filter(isStartupLogoRow);
 }
+
+export function startupWelcomeStatusLine(output: string): string | undefined {
+  return stripAnsi(output).split(/\r?\n/u)
+    .find((line) => line.startsWith('model:') && line.includes('| directory:'));
+}
