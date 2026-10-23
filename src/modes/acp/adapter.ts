@@ -208,6 +208,7 @@ export class AutohandAcpAdapter implements Agent {
   private config: LoadedConfig | null = null;
   private clientCapabilities?: InitializeRequest['clientCapabilities'];
   private toolStartTimes = new Map<string, number>();
+  private todoPlans = new Map<string, Array<{ content: string; priority: 'medium'; status: 'pending' | 'in_progress' | 'completed' }>>();
   private toolFileDiffs = new Map<string, Array<{ path: string; oldText: string | null; newText: string }>>();
   private static readonly LIST_SESSIONS_PAGE_SIZE = 50;
 
@@ -1533,6 +1534,24 @@ export class AutohandAcpAdapter implements Agent {
             // Hook: record start time and emit pre-tool notification
             this.toolStartTimes.set(toolCallId, Date.now());
             this.toolFileDiffs.delete(toolCallId);
+            if (event.toolName === 'todo_write' && Array.isArray(event.toolArgs?.tasks)) {
+              const entries = event.toolArgs.tasks.flatMap((task: unknown) => {
+                if (!task || typeof task !== 'object') return [];
+                const todo = task as Record<string, unknown>;
+                const content = todo.content || todo.title;
+                if (typeof content !== 'string' || !content) return [];
+                const status: 'pending' | 'in_progress' | 'completed' =
+                  todo.status === 'completed' || todo.status === 'in_progress' ? todo.status : 'pending';
+                return [{ content, priority: 'medium' as const, status }];
+              });
+              const key = JSON.stringify([sessionId, toolCallId]);
+              this.todoPlans.delete(key);
+              if (this.todoPlans.size >= 1000) {
+                const oldestKey = this.todoPlans.keys().next().value;
+                if (oldestKey !== undefined) this.todoPlans.delete(oldestKey);
+              }
+              this.todoPlans.set(key, entries);
+            }
             this.emitHookPreTool(sessionId, toolCallId, event.toolName, event.toolArgs ?? {});
           }
           break;
@@ -1540,6 +1559,9 @@ export class AutohandAcpAdapter implements Agent {
         case 'tool_end':
           if (event.toolName) {
             const toolCallId = event.toolId ?? 'unknown';
+            const todoKey = JSON.stringify([sessionId, toolCallId]);
+            const todoEntries = this.todoPlans.get(todoKey);
+            this.todoPlans.delete(todoKey);
             const status: ToolCallStatus = event.toolSuccess === true ? 'completed' : 'failed';
             const rawOutput = event.toolOutput !== undefined || event.toolError !== undefined
               ? {
@@ -1574,6 +1596,12 @@ export class AutohandAcpAdapter implements Agent {
             const duration = startTime ? Date.now() - startTime : 0;
             this.toolStartTimes.delete(toolCallId);
             this.toolFileDiffs.delete(toolCallId);
+            if (event.toolSuccess === true && todoEntries) {
+              await this.connection.sessionUpdate({
+                sessionId,
+                update: { sessionUpdate: 'plan', entries: todoEntries },
+              });
+            }
             this.emitHookPostTool(
               sessionId, toolCallId, event.toolName,
               event.toolSuccess === true, duration, event.toolOutput ?? event.toolError

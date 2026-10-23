@@ -1911,6 +1911,35 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it.each([false, true])("publishes successful todo plans including empty lists: %s", async (clear) => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      connection.sessionUpdate.mockClear();
+      const tasks = clear ? [] : [
+        { content: "Inspect code", status: "completed", activeForm: "Inspecting code" },
+        { content: "Implement change", status: "in_progress", activeForm: "Implementing change" },
+        { content: "Run tests", status: "pending", activeForm: "Running tests" },
+      ];
+      await outputListener({ type: "tool_start", toolId: "todo-1", toolName: "todo_write", toolArgs: { tasks } });
+      expect(connection.sessionUpdate.mock.calls.some(([call]) => call.update.sessionUpdate === "plan")).toBe(false);
+      await outputListener({ type: "tool_end", toolId: "todo-1", toolName: "todo_write", toolSuccess: true });
+      expect(connection.sessionUpdate).toHaveBeenCalledWith({
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: tasks.map((task) => ({ content: task.content, status: task.status, priority: "medium" })),
+        },
+      });
+    });
+
+    it("does not publish failed todo plans or reuse their input", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      connection.sessionUpdate.mockClear();
+      await outputListener({ type: "tool_start", toolId: "todo-1", toolName: "todo_write", toolArgs: { tasks: [{ content: "Run tests", status: "completed" }] } });
+      await outputListener({ type: "tool_end", toolId: "todo-1", toolName: "todo_write", toolSuccess: false });
+      await outputListener({ type: "tool_end", toolId: "todo-1", toolName: "todo_write", toolSuccess: true });
+      expect(connection.sessionUpdate.mock.calls.some(([call]) => call.update.sessionUpdate === "plan")).toBe(false);
+    });
+
     it("maps live team tasks to ACP plan updates", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
       connection.sessionUpdate.mockClear();
