@@ -503,6 +503,21 @@ describe("configParser – error handling (Issue #3)", () => {
     expect(providerConfig?.baseUrl).toBe("https://api.sakana.ai/v1");
   });
 
+  it("rejects non-boolean custom provider image capability", async () => {
+    const configPath = await writeTempConfig(testDir, "config.json", JSON.stringify({
+      provider: "custom:acme",
+      customProviders: {
+        acme: {
+          id: "acme", displayName: "Acme AI", apiFormat: "openai-responses",
+          baseUrl: "https://api.acme.example/v1", model: "vision-model",
+          supportsImageInput: "true",
+        },
+      },
+    }));
+    const { loadConfig } = await importConfigModule();
+    await expect(loadConfig(configPath)).rejects.toThrow("customProviders.acme.supportsImageInput must be boolean");
+  });
+
   it("loads custom OpenAI-compatible providers from config", async () => {
     const configPath = await writeTempConfig(
       testDir,
@@ -517,6 +532,7 @@ describe("configParser – error handling (Issue #3)", () => {
             baseUrl: "https://api.acme.example/v1",
             apiKey: "acme-api-key-12345",
             apiKeyRequired: true,
+            supportsImageInput: true,
             model: "acme-code-1",
             contextWindow: 256000,
             reasoningEffort: "medium",
@@ -532,6 +548,7 @@ describe("configParser – error handling (Issue #3)", () => {
     expect(result.provider).toBe("custom:acme");
     expect(providerConfig?.baseUrl).toBe("https://api.acme.example/v1");
     expect(providerConfig?.model).toBe("acme-code-1");
+    expect(providerConfig).toMatchObject({ supportsImageInput: true });
     expect(providerConfig?.contextWindow).toBe(256000);
     expect(providerConfig?.reasoningEffort).toBe("medium");
   });

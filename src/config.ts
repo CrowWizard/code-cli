@@ -1774,6 +1774,9 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
       ) {
         throw new Error(`customProviders.${key}.apiKeyRequired must be boolean in ${configPath}`);
       }
+      if (provider.supportsImageInput !== undefined && typeof provider.supportsImageInput !== "boolean") {
+        throw new Error(`customProviders.${key}.supportsImageInput must be boolean in ${configPath}`);
+      }
       if (provider.stream !== undefined && typeof provider.stream !== "boolean") {
         throw new Error(`customProviders.${key}.stream must be boolean in ${configPath}`);
       }

@@ -102,6 +102,7 @@ export interface CustomProviderSettings extends ProviderSettings {
   apiFormat: CustomProviderApiFormat;
   /** Whether this endpoint requires a bearer API key. Defaults to true. */
   apiKeyRequired?: boolean;
+  supportsImageInput?: boolean;
   /** Optional curated models for this provider. */
   models?: CustomProviderModel[];
   /** Hidden from provider selection without deleting saved credentials. */

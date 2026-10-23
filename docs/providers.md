@@ -807,6 +807,8 @@ The saved config uses `provider: "custom:<id>"` and stores provider details unde
 }
 ```
 
+Set `supportsImageInput: true` in the custom provider entry to enable image inputs for a vision-capable model. This option works with both `openai-compatible` and `openai-responses`. For `openai-responses`, user image parts are sent as `input_image` with their original URL or data URL. The default is `false`: images are replaced with a text placeholder while the surrounding text is preserved. The endpoint and selected model must support image inputs.
+
 For local gateways without bearer auth:
 
 ```json

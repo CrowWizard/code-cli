@@ -17,6 +17,46 @@ describe('CustomOpenAICompatibleProvider', () => {
     globalThis.fetch = originalFetch;
   });
 
+  it.each([true, false, undefined])('serializes Responses image input with supportsImageInput=%s', async (supportsImageInput) => {
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'vision', displayName: 'Vision', apiFormat: 'openai-responses',
+      baseUrl: 'https://example.com/v1', model: 'vision-model', apiKey: 'test-key',
+      supportsImageInput,
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ output_text: 'ok' })));
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    await provider.complete({ messages: [{ role: 'user', content: [
+      { type: 'text', text: 'Describe' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } },
+      { type: 'text', text: 'this image' },
+    ] }] });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.input[0].content).toEqual(supportsImageInput ? [
+      { type: 'input_text', text: 'Describe' },
+      { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+      { type: 'input_text', text: 'this image' },
+    ] : [{ type: 'input_text', text: 'Describe\n[Image input omitted because this provider does not support image inputs.]\nthis image' }]);
+  });
+
+  it('preserves image input for a custom Chat Completions provider when enabled', async () => {
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'vision', displayName: 'Vision', apiFormat: 'openai-compatible',
+      baseUrl: 'https://example.com/v1', model: 'vision-model', apiKey: 'test-key',
+      supportsImageInput: true,
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    })));
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const content = [
+      { type: 'text' as const, text: 'Describe' },
+      { type: 'image_url' as const, image_url: { url: 'https://example.com/image.png' } },
+    ];
+    await provider.complete({ messages: [{ role: 'user', content }] });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.messages).toEqual([{ role: 'user', content }]);
+  });
+
   it('uses the streamed Responses API when configured', async () => {
     const provider = new CustomOpenAICompatibleProvider({
       id: 'ailili',

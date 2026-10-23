@@ -17,6 +17,7 @@ import type {
 import { toCustomProviderName } from "./customProviders.js";
 import { ApiError, classifyApiError } from "./errors.js";
 import { normalizeLLMUsage } from "./usage.js";
+import { toTextOnlyContent } from "./messagePayload.js";
 import { writeAutohandDebugLine } from '../utils/debugLog.js';
 
 interface ResponsesFunctionCall {
@@ -43,6 +44,7 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
   private readonly apiKey?: string;
   private readonly apiFormat: CustomProviderSettings['apiFormat'];
   private readonly stream: boolean;
+  private readonly supportsImageInput: boolean;
   private readonly baseUrl: string;
   private model: string;
 
@@ -54,12 +56,14 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
     this.apiKey = config.apiKey;
     this.apiFormat = config.apiFormat;
     this.stream = config.stream === true;
+    this.supportsImageInput = config.supportsImageInput === true;
     this.baseUrl = config.baseUrl?.replace(/\/$/, '') ?? '';
     this.client = new LLMGatewayClient(
       {
         apiKey: config.apiKey ?? "",
         baseUrl: config.baseUrl,
         model: config.model,
+        supportsImageInput: this.supportsImageInput,
       },
       networkSettings,
       {
@@ -176,7 +180,13 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
         }));
       }
       const role = message.role === 'assistant' ? 'assistant' : 'user';
-      return [{ type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: message.content }] }];
+      const textType = role === 'assistant' ? 'output_text' : 'input_text';
+      const content = this.supportsImageInput && role === 'user' && Array.isArray(message.content)
+        ? message.content.map((part) => part.type === 'image_url'
+          ? { type: 'input_image', image_url: part.image_url.url }
+          : { type: textType, text: part.text })
+        : [{ type: textType, text: toTextOnlyContent(message.content) }];
+      return [{ type: 'message', role, content }];
     });
   }
 
