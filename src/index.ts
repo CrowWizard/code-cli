@@ -22,18 +22,19 @@ if (process.stdout.isTTY && !requestsStructuredCommandOutput && !requestsProtoco
 // Set environment variable for detection by Expect and other tools
 process.env.AUTOHAND_CODE = '1';
 import 'dotenv/config';
+import './startup/installEnvironmentProxy.js';
 import { collectToolPatternOption } from './permissions/cliPolicyMutation.js';
 import { configureRunConfigOverlay } from './runConfigOverlay.js';
 import { loadOutputSchema } from './modes/outputSchema.js';
 import { startupTimeline } from './startup/startupTimeline.js';
 import { countStartupWorkspacePeers, getStartupGitLabel, getStartupLogoRows, StartupBranding } from './startup/startupBranding.js';
-import { Command, Option } from 'commander';
+import { Command, InvalidArgumentError, Option } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
+import { applyCliModelOverride, applyCliProviderOverride, getProviderConfig, loadConfig, resolveRequestedWorkspaceRoot, resolveWorkspaceRoot, saveConfig } from './config.js';
 import { reportCliCommand } from './telemetry/commandUsage.js';
 import {
   reconcileAhTraces,
@@ -45,7 +46,7 @@ import { setTraceMonitoringEnabled } from './integrations/ahtraces/preferences.j
 import { runStartupChecks, printStartupCheckResults, validateWorkspacePath } from './startup/checks.js';
 import { checkWorkspaceSafety, printDangerousWorkspaceWarning } from './startup/workspaceSafety.js';
 import { ensureAuthenticated } from './auth/index.js';
-import type { AuthUser, BuiltInProviderName, LoadedConfig, SkillInstallScope } from './types.js';
+import type { AuthUser, LoadedConfig, SkillInstallScope } from './types.js';
 import { validateAuthOnStartup } from './auth/startupAuth.js';
 import { installProcessErrorHandlers } from './reporting/processErrorReporting.js';
 import { checkForUpdates, getInstallHint, type VersionCheckResult } from './utils/versionCheck.js';
@@ -77,7 +78,7 @@ import { registerBrowserCommand, registerBrowserOptions } from './browser/cliCom
 import { registerComputerCommand } from './computer/cliCommand.js';
 import { registerReviewCommand } from './review/reviewCliCommand.js';
 import { createTransferRunConfig, registerTransferCommand } from './startup/transferCommand.js';
-import { registerResumeCommand } from './startup/resumeCommand.js';
+import { registerResumeCommand, registerResumeOptions, resolveStartupSession, validateSessionOptions } from './startup/resumeCommand.js';
 import { registerCloudOptions, validateCloudOptions } from './startup/cloudOptions.js';
 import { attachHerdrIntegration, type HerdrIntegration } from './integrations/herdr/index.js';
 import { probeMcpServersWithManager, registerDoctorCommand } from './startup/doctorCommand.js';
@@ -128,7 +129,6 @@ import { ActiveAgentRegistry } from './session/ActiveAgentRegistry.js';
 import { AgentsGenerator } from './onboarding/agentsGenerator.js';
 import { buildAutomodeIterationPrompt } from './core/automodePrompt.js';
 import { looksLikeInlineAgents, parseInlineAgents } from './core/agents/AgentRegistry.js';
-import { getCustomProviderConfig, isCustomProviderName } from './providers/customProviders.js';
 import { GIT_VERSION_LOOKUP_TIMEOUT_MS, runtimeVersion } from './utils/runtimeVersion.js';
 import {
   getAnnouncementManager,
@@ -180,28 +180,6 @@ async function applyServedAutohandModel(config: LoadedConfig, opts: { model?: st
   const served = normalizeAutohandAIStartupModel(config);
   if (served && opts.model) {
     opts.model = served;
-  }
-}
-
-function applyCliModelOverride(config: LoadedConfig, model: string): void {
-  const providerName = config.provider ?? 'openrouter';
-  if (isCustomProviderName(providerName)) {
-    const customProvider = getCustomProviderConfig(config, providerName);
-    if (customProvider) {
-      config.customProviders = {
-        ...config.customProviders,
-        [customProvider.id]: {
-          ...customProvider,
-          model,
-        },
-      };
-    }
-    return;
-  }
-
-  const providerConfig = config[providerName as BuiltInProviderName];
-  if (providerConfig) {
-    providerConfig.model = model;
   }
 }
 
@@ -435,6 +413,7 @@ registerCloudOptions(program);
 registerComputerCommand(program);
 registerExtensionsCommand(program);
 registerDiscoveryCommand(program);
+registerResumeOptions(program);
 
 program
   .name('autohand')
@@ -458,7 +437,6 @@ program
   .option('--config <path>', 'Path to config file (default ~/.autohand/config.json)')
   .option('--temperature <value>', 'Sampling temperature', parseFloat)
   .option('--thinking [level]', 'Set thinking/reasoning depth (none, normal, extended)')
-  .option('-c, --auto-commit', 'Auto-commit with LLM-generated message (runs lint & test first)', false)
   .option('--unrestricted', 'Run without any approval prompts (use with caution)', false)
   .option('--restricted', 'Deny all dangerous operations automatically', false)
   .addOption(new Option('--plan', 'Start in read-only plan mode; require approval before execution')
@@ -502,7 +480,9 @@ program
   .option('--no-worktree', 'Disable git worktree isolation in auto-mode')
   .option('--checkpoint-interval <n>', 'Git commit every N iterations (default: 5)', parseInt)
   .option('--max-runtime <m>', 'Max runtime in minutes (default: 120)', parseInt)
-  .option('--max-cost <d>', 'Max API cost in dollars (default: 10)', parseFloat)
+  .addOption(new Option('--max-cost <d>').hideHelp().argParser(() => {
+    throw new InvalidArgumentError('--max-cost is not supported. Use --max-iterations or --max-runtime instead.');
+  }))
   .option('--max-requests <n>', 'Stop the run after this many model requests, sub-agents included', parseInt)
   .option('--max-tokens <n>', 'Stop the run once reported token usage reaches this total, sub-agents included', parseInt)
   .option('--max-duration <seconds>', 'Stop the run after this much wall time', parseInt)
@@ -533,6 +513,7 @@ program
   .option('--ephemeral', 'Keep this run out of session history: no session files, no auto-memory, no session sync', false)
   .option('--profile <name>', 'Layer profiles.<name> from the config onto this run without saving it')
   .option('--set <key=value>', 'Override one setting for this run, e.g. --set ui.theme=aurora (repeatable, never saved)', collectRepeatable)
+  .addHelpText('after', '\nExamples:\n  autohand -c                       Continue in this folder\n  autohand -c -p "Continue the fix"  Continue headlessly\n  autohand -r                       Pick a saved session\n  autohand -r <id>                  Resume a saved session\n  autohand --auto-commit -p "Fix lint"\n')
   .action(async (positionalPrompt: string | undefined, opts: RootCliOptions) => {
     // Clear screen immediately for Cursor-like behavior (before any output)
     if (
@@ -570,6 +551,12 @@ program
     normalizePromptAndProtocolOptions(positionalPrompt, opts);
     try { validateCloudOptions(opts); }
     catch (error) { program.error(error instanceof Error ? error.message : 'Invalid cloud options.'); }
+    const sessionOptionError = validateSessionOptions(opts);
+    if (sessionOptionError) {
+      console.error(chalk.red(sessionOptionError));
+      process.exitCode = 1;
+      return;
+    }
 
     const restrictedProtocolMode = resolveProtocolLaunchMode(opts);
     if (opts.answerOnly || opts.setupOnly || (
@@ -801,12 +788,6 @@ program
 
     if (opts.outputSchema && !opts.prompt) {
       console.error(chalk.red('--output-schema applies to command mode: pass the instruction with --prompt.'));
-      process.exit(1);
-    }
-
-    // An ephemeral run has no session to continue; refuse before asking anyone to sign in.
-    if (opts.ephemeral && (opts.resumeSessionId || opts.fork)) {
-      console.error(chalk.red('--ephemeral cannot be combined with --resume or --fork: an ephemeral run has no session to continue.'));
       process.exit(1);
     }
 
@@ -1640,7 +1621,9 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       commandLifecycleController.signal,
     );
     startupTimeline.mark('config loaded');
-    config = applyCliProviderOverride(config, options.provider);
+    config = options.model
+      ? applyCliModelOverride(config, options.model, options.provider)
+      : applyCliProviderOverride(config, options.provider);
     config = applyNoDaemonConfig(config, options);
     if (options.bare) {
       config = await awaitCliLifecycleStep(
@@ -1678,13 +1661,13 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       import('./permissions/yoloMode.js'),
       commandLifecycleController.signal,
     );
-    // `autohand resume` reaches runCLI directly, after its own sign-in, so the
-    // ephemeral conflict is checked here as well as on the root command.
-    if (options.ephemeral && (options.resumeSessionId || options.fork)) {
-      console.error(chalk.red('--ephemeral cannot be combined with --resume or --fork: an ephemeral run has no session to continue.'));
+    const sessionOptionError = validateSessionOptions(options);
+    if (sessionOptionError) {
+      console.error(chalk.red(sessionOptionError));
       process.exitCode = 1;
       return;
     }
+    if (!await awaitCliLifecycleStep(resolveStartupSession(options, originalWorkspaceRoot), commandLifecycleController.signal)) return;
 
     applyStartupInteractionMode(options, resolveStartupInteractionMode({
       options,
@@ -1782,6 +1765,14 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
       printDangerousWorkspaceWarning(originalWorkspaceRoot, safetyCheck);
       process.exitCode = 1;
       return;
+    }
+
+    if (!structuredOutput && resolveAgentLaunchMode(options) === 'interactive'
+      && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+      const { hasLegacyAutomodeState } = await import('./core/AutomodeState.js');
+      if (await awaitCliLifecycleStep(hasLegacyAutomodeState(originalWorkspaceRoot), commandLifecycleController.signal)) {
+        console.warn(chalk.gray('Ignored old auto-mode state in .autohand/automode.local.md. Auto mode now starts only when you choose it.'));
+      }
     }
 
     // loadConfig held back project hooks and MCP servers from an untrusted
@@ -2074,11 +2065,6 @@ async function runCLI(options: InternalCLIOptions): Promise<void> {
 
     // Note: Git repo check is passed to the agent via runtime.
     // The agent/LLM can suggest initializing git if needed for complex tasks.
-
-    // Override model from CLI if provided
-    if (options.model) {
-      applyCliModelOverride(config, options.model);
-    }
 
     // Override debug mode from CLI if provided
     if (options.debug) {
@@ -2723,7 +2709,7 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
   const fs = await import('fs-extra');
   const { generateUnifiedPatch, formatChangeSummary } = await import('./utils/patch.js');
 
-  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+  let config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
   let workspaceRoot = originalWorkspaceRoot;
 
@@ -2755,7 +2741,7 @@ async function runPatchMode(opts: CLIOptions): Promise<void> {
 
   // Override model from CLI if provided
   if (opts.model) {
-    applyCliModelOverride(config, opts.model);
+    config = applyCliModelOverride(config, opts.model, opts.provider);
   }
   await applyServedAutohandModel(config, opts);
 
@@ -2843,7 +2829,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
     process.exit(1);
   }
 
-  const config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
+  let config = await loadConfig(opts.config, resolveRequestedWorkspaceRoot(opts.path));
   const originalWorkspaceRoot = resolveWorkspaceRoot(config, opts.path);
 
   await exitUnlessWorkspaceIsSafe(originalWorkspaceRoot);
@@ -2858,7 +2844,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
 
   // Override model from CLI if provided
   if (opts.model) {
-    applyCliModelOverride(config, opts.model);
+    config = applyCliModelOverride(config, opts.model, opts.provider);
   }
   await applyServedAutohandModel(config, opts);
 
@@ -3030,6 +3016,7 @@ async function runAutoMode(opts: CLIOptions): Promise<void> {
         success,
         actions,
         error,
+        output: success ? activeAgent.getLastAssistantResponse() : undefined,
         filesModified: fileChanges.count,
         modifiedFiles: fileChanges.paths,
       };

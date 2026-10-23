@@ -78,6 +78,9 @@ describe("modelCatalog", () => {
       expect.objectContaining({ id: "gpt-6-sol", maxTokens: 16_000, toolCalls: true }),
       expect.objectContaining({ id: "grok-4.7", maxTokens: 16_000, toolCalls: true }),
       expect.objectContaining({ id: "qwen3.8-27b", maxTokens: 16_000, toolCalls: true }),
+      expect.objectContaining({ id: "muse-wonder-1.0", contextWindow: 262_144, maxTokens: 16_000, toolCalls: true }),
+      expect.objectContaining({ id: "qwen3.8-max", contextWindow: 262_144, maxTokens: 16_000, toolCalls: true }),
+      expect.objectContaining({ id: "gemini-4-argon", contextWindow: 1_048_576, maxTokens: 16_000, toolCalls: true }),
       expect.objectContaining({
         id: "weka",
         contextWindow: 32_000,
@@ -86,7 +89,7 @@ describe("modelCatalog", () => {
         description: expect.stringContaining("not runnable in the CLI"),
       }),
     ]);
-    expect(getProviderRunnableModelIds("autohandai")).toEqual(["fantail", "moa", "auto", "gpt-5.6-luna", "deepseek-v4-flash", "gpt-6-sol", "grok-4.7", "qwen3.8-27b"]);
+    expect(getProviderRunnableModelIds("autohandai")).toEqual(["fantail", "moa", "auto", "gpt-5.6-luna", "deepseek-v4-flash", "gpt-6-sol", "grok-4.7", "qwen3.8-27b", "muse-wonder-1.0", "qwen3.8-max", "gemini-4-argon"]);
     rmSync(dir, { recursive: true, force: true });
   });
 

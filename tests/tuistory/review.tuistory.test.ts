@@ -87,8 +87,9 @@ describe('/review built CLI', () => {
     expect(transcript).toContain('/review security src --audience forensic');
     expect(transcript).toContain('REVIEW_TUI_COMPLETE');
     expect(transcript).not.toContain('# Autohand Review invocation');
-    const modelMessages = server.requests[0]?.messages as Array<{ content?: string }>;
-    const modelInstruction = modelMessages.at(-1)?.content ?? '';
+    const modelMessages = server.requests[0]?.messages as Array<{ role: string; content?: string }>;
+    const modelInstruction = modelMessages.find(message =>
+      message.role === 'user' && message.content?.includes('# Autohand Review invocation'))?.content ?? '';
     expect(modelInstruction).toContain('# Autohand Review invocation');
     expect(modelInstruction).toContain('"kind": "security"');
     const lifecycleLogPath = path.join(state.workspaceRoot, 'review-events.log');
@@ -162,9 +163,9 @@ describe('/review built CLI', () => {
     expect(transcript).not.toContain('# Autohand Review invocation');
     expectCleanExit(session);
     const modelInstruction = server.requests
-      .map((request) => request.messages as Array<{ content?: string }>)
-      .map((messages) => messages.at(-1)?.content ?? '')
-      .find((content) => content.includes('"kind": "security"')) ?? '';
+      .flatMap((request) => request.messages as Array<{ role: string; content?: string }>)
+      .find(message => message.role === 'user'
+        && message.content?.includes('# Autohand Review invocation'))?.content ?? '';
     expect(modelInstruction).toContain('# Autohand Review invocation');
     expect(modelInstruction).toContain('"kind": "security"');
     const lifecycleLogPath = path.join(state.workspaceRoot, 'review-events.log');

@@ -53,7 +53,7 @@ export function resolveAgentLaunchMode(options: CLIOptions): AgentLaunchMode {
   return 'interactive';
 }
 
-export const DEFAULT_STARTUP_INTERACTION_MODE: InteractionMode = 'automode';
+export const DEFAULT_STARTUP_INTERACTION_MODE: InteractionMode = 'default';
 
 export interface StartupInteractionModeInput {
   options: Pick<
@@ -75,9 +75,8 @@ export interface StartupInteractionModeInput {
 }
 
 /**
- * Picks the interaction mode a session starts in. Auto mode is the default for
- * interactive terminals only: an explicit flag, a locked-down permission
- * config, or a launch nobody is watching always wins over it.
+ * Starts with normal approvals unless an explicit flag or user preference
+ * selects another mode. Non-interactive and locked-down launches stay scoped.
  */
 export function resolveStartupInteractionMode(input: StartupInteractionModeInput): InteractionMode {
   const { options } = input;

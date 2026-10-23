@@ -46,6 +46,7 @@ export interface ReviewPermissionManager {
   addRunToolScope?(scope: RunToolScope): () => void;
   getMode(): ReviewPermissionMode;
   setMode(mode: ReviewPermissionMode): void;
+  beginReadOnlyReview?(): () => void;
 }
 
 export interface ReviewLifecycleExecution {
@@ -79,6 +80,7 @@ export async function executeReviewWithLifecycle(
   let failure: string | undefined;
   let previousPermissionMode: ReviewPermissionMode | undefined;
   let releaseInspectionScope: (() => void) | undefined;
+  let restoreReadOnlyScope: (() => void) | undefined;
 
   const context = (includeOutcome: boolean): ReviewLifecycleContext => ({
     ...(execution.sessionId ? { sessionId: execution.sessionId } : {}),
@@ -119,6 +121,7 @@ export async function executeReviewWithLifecycle(
         execution.permissionManager.setMode('restricted');
       }
     }
+    restoreReadOnlyScope = execution.permissionManager?.beginReadOnlyReview?.();
 
     if (execution.signal?.aborted) {
       status = 'paused';
@@ -159,6 +162,7 @@ export async function executeReviewWithLifecycle(
       await notify('review:end', true);
     } finally {
       releaseInspectionScope?.();
+      restoreReadOnlyScope?.();
       if (execution.permissionManager && previousPermissionMode !== undefined
         && previousPermissionMode !== 'restricted') {
         execution.permissionManager.setMode(previousPermissionMode);

@@ -57,6 +57,9 @@ describe("model catalog distribution automation", () => {
         "gpt-6-sol": expect.objectContaining({ provider: "autohandai", maxTokens: 16_000 }),
         "grok-4.7": expect.objectContaining({ provider: "autohandai", maxTokens: 16_000 }),
         "qwen3.8-27b": expect.objectContaining({ provider: "autohandai", maxTokens: 16_000 }),
+        "muse-wonder-1.0": expect.objectContaining({ provider: "autohandai", contextWindow: 262_144, maxTokens: 16_000 }),
+        "qwen3.8-max": expect.objectContaining({ provider: "autohandai", contextWindow: 262_144, maxTokens: 16_000 }),
+        "gemini-4-argon": expect.objectContaining({ provider: "autohandai", contextWindow: 1_048_576, maxTokens: 16_000 }),
         weka: expect.objectContaining({
           api: "autohand-decisions",
           baseUrl: "https://api.autohand.ai/v1",

@@ -3,6 +3,7 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import { finalizeSessionGitSnapshot } from '../../actions/gitSessionSnapshot.js';
 import chalk from 'chalk';
 import type { HookManager, HookExecutionResult } from '../HookManager.js';
 import type { ComputerUseLifecycle } from '../../computer/ComputerUseLifecycle.js';
@@ -432,6 +433,8 @@ export class InstructionRunner {
         return false;
       }
     }
+
+    finalizeSessionGitSnapshot(host.runtime);
 
     const turnGoalManager = new GoalManager(host.runtime.workspaceRoot, {
       sessionId: host.sessionManager?.getCurrentSession()?.metadata?.sessionId,

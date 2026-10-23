@@ -6,12 +6,13 @@
 
 import fs from 'fs-extra';
 import path from 'path';
-import os from 'os';
+import { getUpdateCommand } from './installMethod.js';
+import { resolveAutohandHome } from '../constants.js';
 
 const GITHUB_REPO = 'autohandai/code-cli';
 const GITHUB_API_LATEST_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 const GITHUB_API_RELEASES_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100`;
-const CACHE_DIR = path.join(os.homedir(), '.autohand');
+const CACHE_DIR = resolveAutohandHome();
 const DEFAULT_CHECK_INTERVAL_HOURS = 24;
 const REQUEST_TIMEOUT_MS = 3000;
 
@@ -259,10 +260,7 @@ async function fetchLatestAlphaRelease(): Promise<{ version: string; url: string
  * Get the install command hint for a given channel
  */
 export function getInstallHint(channel: ReleaseChannel): string {
-  if (channel === 'alpha') {
-    return 'curl -fsSL https://autohand.ai/install.sh | sh -s -- --alpha';
-  }
-  return 'curl -fsSL https://autohand.ai/install.sh | sh';
+  return getUpdateCommand(channel).hint;
 }
 
 /**

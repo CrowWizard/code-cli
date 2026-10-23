@@ -32,6 +32,11 @@ import {
 } from './sessionProjectPermissions.js';
 import type { ExtensionPermissionPolicy } from '../extensions/ExtensionRuntimeHost.js';
 
+const READ_ONLY_REVIEW_TOOLS = new Set([
+  'read_file', 'find_grep', 'fff_find', 'find', 'list_tree', 'list_dir',
+  'git_status', 'git_list_untracked', 'git_diff', 'git_diff_range', 'git_log', 'checksum',
+]);
+
 /**
  * Default security blacklist - always blocked patterns for sensitive files and dangerous commands.
  * These are merged with user settings and cannot be overridden by allowLists.
@@ -196,6 +201,17 @@ export class PermissionManager {
   private workspaceRoot?: string;
   private localSettingsLoaded = false;
   private extensionPolicies: ExtensionPermissionPolicy[] = [];
+  private readOnlyReview = false;
+
+  beginReadOnlyReview(): () => void {
+    const previous = this.readOnlyReview;
+    this.readOnlyReview = true;
+    return () => { this.readOnlyReview = previous; };
+  }
+
+  isReadOnlyReview(): boolean {
+    return this.readOnlyReview;
+  }
 
   private normalizeSettings(settings: PermissionSettings | undefined): PermissionSettings {
     return {
@@ -310,7 +326,9 @@ export class PermissionManager {
   /** Tool schemas worth offering the model under the run scope and effective settings. */
   filterAdvertisedTools<T extends { name: string }>(definitions: readonly T[]): T[] {
     const scope = this.getRunToolScope();
-    const inScope = definitions.filter((definition) => isToolAdvertisedByScope(scope, definition.name));
+    const inScope = definitions.filter((definition) =>
+      (!this.readOnlyReview || READ_ONLY_REVIEW_TOOLS.has(definition.name))
+      && isToolAdvertisedByScope(scope, definition.name));
     return filterAdvertisedTools(inScope, this.getMergedSettings());
   }
 
@@ -368,9 +386,15 @@ export class PermissionManager {
       return { allowed: false, reason: 'blacklisted' };
     }
 
+    const reviewTool = context.tool === 'run_command' && context.requestedTool ? context.requestedTool : context.tool;
+    if (this.readOnlyReview && (!READ_ONLY_REVIEW_TOOLS.has(reviewTool)
+      || (context.requestedTool !== undefined && !READ_ONLY_REVIEW_TOOLS.has(context.requestedTool)))) {
+      return { allowed: false, reason: 'mode_restricted' };
+    }
+
     // Pattern-based checks (AFTER security blacklist, BEFORE session cache)
     const patternDecision = this.checkPatterns(context);
-    if (patternDecision) {
+    if (patternDecision && (!this.readOnlyReview || !patternDecision.allowed)) {
       return patternDecision;
     }
 
@@ -406,6 +430,8 @@ export class PermissionManager {
     if (ruleDenial) {
       return ruleDenial;
     }
+
+    if (this.readOnlyReview) return { allowed: true, reason: 'read_only_review' };
 
     if (cachedDecision === true) {
       return { allowed: true, reason: 'user_approved', cached: true };

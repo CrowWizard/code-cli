@@ -5,6 +5,7 @@
  */
 import { extensionRuntimeHost } from '../../extensions/ExtensionRuntimeHost.js';
 import chalk from 'chalk';
+import { initializeSessionGitSnapshot, type SessionGitState } from '../../actions/gitSessionSnapshot.js';
 import { isAxoInput } from '../../ui/axo/axoCommand.js';
 import { isStartupTimingEnabled, startupTimeline } from '../../startup/startupTimeline.js';
 import { buildOutputSchemaInstruction, buildOutputSchemaRepairInstruction, checkOutputAgainstSchema, type OutputSchemaSpec } from '../../modes/outputSchema.js';
@@ -270,7 +271,7 @@ export interface FreshAgentSessionRecord {
 }
 
 export interface FreshAgentSessionHost {
-  runtime: {
+  runtime: SessionGitState & {
     workspaceRoot: string;
     options: Pick<AgentRuntime['options'], 'bare' | 'model'>;
     config: LoadedConfig;
@@ -343,6 +344,7 @@ export async function startFreshAgentSession(
     }
   }
 
+  initializeSessionGitSnapshot(host.runtime, true);
   const startedAt = Date.now();
   await host.resetConversationContext();
   host.resetAgentStateForFreshSession(startedAt);
@@ -748,7 +750,10 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       callResourceCleanupSync(() => stopMobileRelay());
       host.persistentInputActiveTurn = false;
       callResourceCleanupSync(() => host.persistentInput?.dispose?.());
-      callResourceCleanupSync(() => process.stdin.pause());
+      // Protocol transports own stdin across replacement agent sessions.
+      if (!host.runtime?.isRpcMode) {
+        callResourceCleanupSync(() => process.stdin.pause());
+      }
 
       const cleanupTasks: Promise<unknown>[] = [];
       cleanupTasks.push(callResourceCleanup(async () => {
@@ -810,6 +815,7 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
   }
 
 export async function initializeAgentManagers(host: AgentLifecycleHost): Promise<void> {
+    initializeSessionGitSnapshot(host.runtime);
     if (host.runtime?.options?.bare === true) {
       await runWithConcurrency([
         { label: 'session_manager', run: async () => host.sessionManager.initialize() },
@@ -1256,10 +1262,16 @@ export async function runAgentCommandMode(
         throw createLifecycleAbortError();
       }
       await awaitLifecycleStep(
-        Promise.resolve(host.initializeForRPC(signal)),
+        Promise.resolve(host.runtime.options.resumeSessionId
+          ? host.initializeForRPC(signal, host.runtime.options.resumeSessionId)
+          : host.initializeForRPC(signal)),
         signal,
       );
       initialized = true;
+
+      if (host.runtime.options.resumeSessionId) {
+        await awaitLifecycleStep(host.restoreSessionState(host.runtime.options.resumeSessionId), signal);
+      }
 
       if (options.review) {
         await host.telemetryManager.trackCommand({
@@ -1308,6 +1320,7 @@ export async function runAgentCommandMode(
       if (succeeded) {
         if (
           host.runtime.config.ui?.terminalBell !== false
+          && process.stdout.isTTY
           && !options.review
           && (host.runtime.options.commandOutputFormat ?? 'text') === 'text'
         ) {
@@ -1378,6 +1391,7 @@ export async function runAgentCommandMode(
   }
 
 export async function restoreAgentSessionState(host: AgentLifecycleHost, sessionOrId: string | Session) {
+    initializeSessionGitSnapshot(host.runtime, true);
     const session = typeof sessionOrId === 'string'
       ? await host.sessionManager.loadSession(sessionOrId)
       : sessionOrId;
@@ -1420,6 +1434,10 @@ export async function restoreAgentSessionState(host: AgentLifecycleHost, session
           tool_calls: convertedToolCalls,
           tool_call_id: (msg as any).tool_call_id
         });
+        if (msg.role === 'user') {
+          const restoredTurn = host.conversation.getLastTurn?.();
+          if (restoredTurn) restoredTurn.undoUnavailable = 'File undo history is unavailable for this restored conversation turn';
+        }
       }
     }
 

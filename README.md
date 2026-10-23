@@ -144,7 +144,7 @@ autohand -p "add a dark mode toggle to the settings page"
 autohand -p "fix the TypeScript errors" -y
 
 # Auto-commit changes after task completion
-autohand -p "refactor the auth module" -c
+autohand -p "refactor the auth module" --auto-commit
 ```
 
 ## Editor Extensions
@@ -240,7 +240,9 @@ events and writes exactly one final `result` or `error` object to stdout.
 | `--output-format stream-json`   |       | Stream command lifecycle events as JSON Lines                                    |
 | `--json <stream\|local>`        |       | Stream JSON Lines or write only the final JSON result (`--json` defaults to stream) |
 | `--yes`                         | `-y`  | Auto-confirm risky actions                                                       |
-| `--auto-commit`                 | `-c`  | Auto-commit changes after completing tasks                                       |
+| `--continue`                    | `-c`  | Resume the latest session in this folder (also with `-p`)                        |
+| `--resume [id]`                 | `-r`  | Resume a saved session or open the folder picker                                 |
+| `--auto-commit`                 |       | Auto-commit changes after completing tasks                                       |
 | `--dry-run`                     |       | Preview actions without applying mutations                                       |
 | `--debug`                       | `-d`  | Enable debug output (verbose logging)                                            |
 | `--model <model>`               |       | Override the configured LLM model                                                |
@@ -347,7 +349,17 @@ Skills are discovered from:
 
 See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skills.
 
+## Automatic commits
+
+`--auto-commit` snapshots the repository before the agent starts editing. It commits only session changes and lists pre-existing edits and untracked files as `left uncommitted (yours)`. An initially dirty file stays uncommitted even if the agent edits it again. Your existing staging is preserved. Automatic commits are disabled if a safe baseline cannot be captured.
+
+## Proxy settings
+
+Node installs use `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` for requests, including provider SDK calls. Lowercase variables take precedence; Bun binaries use Bun's native proxy support. Corporate certificate bundles can be supplied with `NODE_EXTRA_CA_CERTS`.
+
 ## Slash Commands
+
+`/undo` restores every recorded agent file change from the last turn, newest first. It stops on the first unsafe restore and keeps the turn. Shell commands are not undone; restored sessions without a file journal are kept. `/export` redacts credentials and saves bare filenames under `~/.autohand/exports/` (or `$AUTOHAND_HOME/exports/`). Use an absolute or `./`-prefixed path to choose another location.
 
 | Command            | Description                                                                      |
 | ------------------ | -------------------------------------------------------------------------------- |
@@ -358,7 +370,7 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/model`           | Switch LLM models                                                                |
 | `/new`             | Start fresh conversation                                                         |
 | `/clear`           | Compact context, retaining requests, learnings, changes and final answer           |
-| `/undo`            | Revert the last recorded agent file mutation and conversation turn               |
+| `/undo`            | Restore agent file changes from the last turn and remove it                      |
 | `/session`         | Show current session details                                                     |
 | `/sessions`        | List past sessions                                                               |
 | `/resume`          | Resume a previous session                                                        |
@@ -379,7 +391,7 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/formatters`      | List code formatters                                                             |
 | `/lint`            | List code linters                                                                |
 | `/completion`      | Generate shell completion scripts                                                |
-| `/export`          | Export session to markdown/JSON/HTML                                             |
+| `/export`          | Export a redacted session to Markdown/JSON/HTML                                             |
 | `/status`          | Show workspace status                                                            |
 | `/usage`           | Show token activity by day, week, or month                                       |
 | `/login`           | Authenticate with Autohand Code API                                              |
@@ -614,7 +626,9 @@ autohand resume --path /path/to/project
 /resume
 ```
 
-The picker supports arrow keys, Enter, and page navigation for older sessions. Escape or Ctrl+C cancels without starting a session. `--last` uses the last activity time, falling back to creation time for older session metadata. Without a terminal, provide `--last` or an explicit reference. References cannot be combined with `--last` or `--all`; `-c` remains auto-commit.
+The picker supports arrow keys, Enter, and page navigation for older sessions. Escape or Ctrl+C cancels without starting a session. `--last` uses the last activity time, falling back to creation time for older session metadata. Without a terminal, provide `--last` or an explicit reference. References cannot be combined with `--last` or `--all`.
+
+`autohand -c` continues the most recently active session in this folder. If none exists, it starts a new one. Use `autohand -c -p "Continue the fix"` for a headless continuation, or `autohand -r <id>` to select a session directly. `autohand -r` opens the folder picker. `--ephemeral` cannot be combined with `--continue`, `--resume`, or `--fork`.
 
 ## Entire Integration
 

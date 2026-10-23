@@ -51,14 +51,14 @@ async function startApi(): Promise<MockFeedbackApiServer> {
 const QUIET_UI = { promptSuggestions: false, showCompletionNotification: false, terminalBell: false };
 
 describe('startup interaction mode', () => {
-  it('starts an interactive session in auto mode without a banner above the composer', async () => {
+  it('starts an interactive session in normal approval mode without a banner above the composer', async () => {
     // `undefined` removes the pin the shared temp home applies for approval-prompt scenarios.
     const session = await launchInteractive({ config: { ui: { defaultInteractionMode: undefined } } });
 
     await waitForComposer(session);
-    const screen = await session.text({ timeout: 10_000, waitFor: (text) => text.includes('● AUTO'), trimEnd: true });
+    const screen = await session.text({ timeout: 10_000, waitFor: (text) => text.includes('❯'), trimEnd: true });
 
-    expect(screen).toContain('● AUTO');
+    expect(screen).not.toContain('● AUTO');
     expect(screen).not.toContain('[AUTO]');
     expect(screen).not.toContain('auto mode active');
 

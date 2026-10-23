@@ -806,10 +806,10 @@ describe('ActionExecutor', () => {
         suggestedMessage: 'chore: automated commit',
         filesChanged: ['src/index.ts']
       } as any);
-      const executeSpy = vi.spyOn(gitActions, 'executeAutoCommit').mockReturnValue({
-        success: true,
+      const executeSpy = vi.spyOn(gitActions, 'commitSessionChanges').mockResolvedValue({
+        success: true, filesChanged: 1,
         message: 'Committed 1 file'
-      } as any);
+      });
       const modalSpy = vi.spyOn(modalComponents, 'showModal');
       const inputSpy = vi.spyOn(modalComponents, 'showInput');
 
@@ -822,7 +822,7 @@ describe('ActionExecutor', () => {
 
       expect(modalSpy).not.toHaveBeenCalled();
       expect(inputSpy).not.toHaveBeenCalled();
-      expect(executeSpy).toHaveBeenCalledWith('/repo', 'chore: automated commit', true);
+      expect(executeSpy).toHaveBeenCalledWith('/repo', 'chore: automated commit', true, null, undefined);
       expect(result).toBe('Committed 1 file');
 
       infoSpy.mockRestore();
@@ -840,10 +840,10 @@ describe('ActionExecutor', () => {
         suggestedMessage: 'chore: suggested message',
         filesChanged: ['src/index.ts']
       } as any);
-      const executeSpy = vi.spyOn(gitActions, 'executeAutoCommit').mockReturnValue({
-        success: true,
+      const executeSpy = vi.spyOn(gitActions, 'commitSessionChanges').mockResolvedValue({
+        success: true, filesChanged: 1,
         message: 'Committed 1 file'
-      } as any);
+      });
       const modalSpy = vi.spyOn(modalComponents, 'showModal').mockResolvedValue({ value: 'n' } as any);
 
       const executor = createExecutor();

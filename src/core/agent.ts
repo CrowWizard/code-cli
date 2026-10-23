@@ -1523,6 +1523,7 @@ export class AutohandAgent {
     if (!this.specialistOrchestrator) {
       return undefined;
     }
+    if (this.permissionManager.isReadOnlyReview()) return undefined;
 
     this.specialistOrchestrator.beginTurn();
     const request = detectSpecialistRequest(instruction);

@@ -1,3 +1,4 @@
+import type { UndoCommandContext } from '../commands/undo.js';
 /**
  * @license
  * Copyright 2025 Autohand AI LLC
@@ -40,8 +41,9 @@ import type { GoalEventData } from '../telemetry/types.js';
 export interface SlashCommandContext {
     listWorkspaceFiles?: () => Promise<void>;
     printGitDiff?: () => void;
-    undoFileMutation?: () => Promise<void>;
-    removeLastTurn?: () => void;
+    getLastTurn?: UndoCommandContext['getLastTurn'];
+    undoTurnMutations?: UndoCommandContext['undoTurnMutations'];
+    removeLastTurn?: UndoCommandContext['removeLastTurn'];
     promptModelSelection: () => Promise<void>;
     promptApprovalMode?: () => Promise<void>;
     createAgentsFile: () => Promise<void>;

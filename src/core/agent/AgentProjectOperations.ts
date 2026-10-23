@@ -29,7 +29,11 @@ export async function performAgentAutoCommit(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) return;
-  const info = getAutoCommitInfo(host.runtime.workspaceRoot);
+  const info = getAutoCommitInfo(host.runtime.workspaceRoot, host.runtime.sessionGitSnapshot ?? null);
+
+  for (const file of info.filesLeftUncommitted ?? []) {
+    console.log(chalk.gray(`   ${file}: left uncommitted (yours)`));
+  }
 
   if (!info.canCommit) {
     if (info.error !== 'No changes to commit') {
@@ -52,12 +56,13 @@ export async function performAgentAutoCommit(
 
 2. **Test**: Run the project's tests (try: bun run test, npm test, or pnpm test). If tests fail, do NOT proceed with commit.
 
-3. **Review Changes**: Use git diff to understand what changed.
+3. **Review Changes**: Use git_diff to understand the listed session changes. Pre-existing changes are left uncommitted (yours).
 
 4. **Commit**: If lint passes and tests pass (or no test script exists), create a commit with a meaningful message that:
    - Uses conventional commit format (feat:, fix:, docs:, refactor:, test:, chore:)
    - Describes WHAT changed and WHY (not just "update files")
    - Is concise but informative
+   - Use git_add with exactly the literal session paths listed below, then git_commit (or auto_commit). Never stage the whole repository. Use the Git tools instead of shell Git commands.
 
 Changed files:
 ${info.filesChanged.map((file) => `- ${file}`).join('\n')}
@@ -69,11 +74,15 @@ If lint or tests fail, report the issues but do NOT commit.`;
 
   console.log(chalk.cyan('\n\ud83d\udd04 Running lint, test, and generating commit message...\n'));
 
+  const previousScope = host.runtime.autoCommitPaths;
+  host.runtime.autoCommitPaths = info.filesChanged;
   try {
     if (signal?.aborted) return;
     await host.runInstruction(autoCommitPrompt, { signal });
   } catch (error) {
     console.log(chalk.red(`\n\u2717 Auto-commit failed: ${(error as Error).message}`));
+  } finally {
+    host.runtime.autoCommitPaths = previousScope;
   }
 }
 

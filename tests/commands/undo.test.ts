@@ -8,11 +8,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { UndoStackEmptyError } from '../../src/actions/filesystem.js';
 import { undo, type UndoCommandContext } from '../../src/commands/undo.js';
 
 describe('/undo command', () => {
   let workspaceRoot: string;
+  const turn = { id: 'test-turn', ranShellCommand: false };
 
   beforeEach(async () => {
     workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'autohand-undo-'));
@@ -36,12 +36,14 @@ describe('/undo command', () => {
     await fs.writeFile(path.join(workspaceRoot, 'untracked-user-notes.txt'), 'keep me\n');
     await fs.writeFile(path.join(workspaceRoot, 'agent-owned.txt'), 'changed by agent\n');
 
-    const undoFileMutation = vi.fn(async () => {
+    const undoTurnMutations = vi.fn(async () => {
       await fs.writeFile(path.join(workspaceRoot, 'agent-owned.txt'), 'before agent\n');
+      return ['agent-owned.txt'];
     });
-    const removeLastTurn = vi.fn();
+    const removeLastTurn = vi.fn().mockReturnValue(true);
     const context: UndoCommandContext = {
-      undoFileMutation,
+      getLastTurn: () => turn,
+      undoTurnMutations,
       removeLastTurn,
     };
 
@@ -53,15 +55,16 @@ describe('/undo command', () => {
       .resolves.toBe('keep me\n');
     await expect(fs.readFile(path.join(workspaceRoot, 'agent-owned.txt'), 'utf8'))
       .resolves.toBe('before agent\n');
-    expect(undoFileMutation).toHaveBeenCalledOnce();
+    expect(undoTurnMutations).toHaveBeenCalledOnce();
     expect(removeLastTurn).toHaveBeenCalledOnce();
   });
 
   it('keeps the conversation turn when the mutation cannot be safely reverted', async () => {
     const conflictMessage = 'Cannot undo because the file changed after the agent mutation';
-    const removeLastTurn = vi.fn();
+    const removeLastTurn = vi.fn().mockReturnValue(true);
     const context: UndoCommandContext = {
-      undoFileMutation: vi.fn().mockRejectedValue(new Error(conflictMessage)),
+      getLastTurn: () => turn,
+      undoTurnMutations: vi.fn().mockRejectedValue(new Error(conflictMessage)),
       removeLastTurn,
     };
 
@@ -72,9 +75,10 @@ describe('/undo command', () => {
   });
 
   it('removes the conversation turn when there is no file mutation to revert', async () => {
-    const removeLastTurn = vi.fn();
+    const removeLastTurn = vi.fn().mockReturnValue(true);
     const context: UndoCommandContext = {
-      undoFileMutation: vi.fn().mockRejectedValue(new UndoStackEmptyError()),
+      getLastTurn: () => turn,
+      undoTurnMutations: vi.fn().mockResolvedValue([]),
       removeLastTurn,
     };
 

@@ -277,13 +277,13 @@ describe('interactive built CLI Tuistory tests: composer, tips, announcements, a
 
     await session.type('/upgrade');
     await session.press('enter');
-    // The mock account is on Pro, so the next plan is Max. AUTOHAND_NO_BROWSER
+    // The mock account is on Pro, so the next plan is Pro+. AUTOHAND_NO_BROWSER
     // makes the opener print the link instead of launching a browser.
     const output = stripAnsi(await session.text({
       timeout: 10_000,
-      waitFor: (text) => text.includes('upgrade=max'),
+      waitFor: (text) => text.includes('upgrade=pro_plus'),
     }));
-    expect(output).toContain('https://console.autohand.ai/?upgrade=max&source=cli');
+    expect(output).toContain('https://console.autohand.ai/?upgrade=pro_plus&source=cli');
 
     await exitInteractive(session);
   });

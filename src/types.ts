@@ -3,6 +3,7 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { AutoCommitSnapshot } from './actions/gitSessionSnapshot.js';
 import type { Ora } from 'ora';
 import type { ThemeDefinition } from './ui/theme/types.js';
 import type { KeybindingProfileId } from './keybindings/profiles.js';
@@ -724,7 +725,7 @@ export type AutomodeCancelReason =
   | 'completion'       // Completion promise detected
   | 'error';           // Error occurred
 
-/** Auto-mode session state (stored in .autohand/automode.local.md) */
+/** Auto-mode progress stored in a private run directory under AUTOHAND_HOME. */
 export interface AutomodeSessionState {
   /** Session ID */
   sessionId: string;
@@ -1232,7 +1233,6 @@ export interface InlineAgentDefinition {
 
 export interface CLIOptions {
   cloud?: boolean;
-  resume?: string | boolean;
   cloudAccount?: string;
   cloudRepository?: string;
   cloudConnector?: string;
@@ -1262,6 +1262,8 @@ export interface CLIOptions {
   config?: string;
   temperature?: number;
   resumeSessionId?: string;
+  continue?: boolean;
+  resume?: string | boolean;
   /** Keep this run out of session history: nothing saved, no auto-memory, no session sync. */
   ephemeral?: boolean;
   /** --output-schema <file>: the command-mode final answer must be JSON validating against this schema. */
@@ -2153,6 +2155,11 @@ export interface ToolOutputChunk {
 }
 
 export interface AgentRuntime {
+  sessionGitSnapshot?: AutoCommitSnapshot | null;
+  sessionGitSnapshotError?: string;
+  sessionGitSnapshotFinalized?: boolean;
+  /** Exact paths approved for the nested automatic-commit instruction. */
+  autoCommitPaths?: readonly string[];
   config: LoadedConfig;
   workspaceRoot: string;
   /** Original repository when --zit runs the agent in an isolated workspace. */

@@ -786,7 +786,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `showTips`                   | boolean | `true`  | Rotate built-in capability tips below the working status or completion summary and above the composer |
 | `repositoryReadiness`        | boolean | `true`  | Review repository readiness in the background; show one reminder per repository after a successful interactive turn. Set false to disable background reviews |
 | `enterWhileWorking`          | string  | `select` | While a turn runs, Enter queues a draft; select a queued message with the arrow keys, press Enter to edit it, then Enter to steer or Shift+Enter to save it in the queue. `steer` and `queue` retain the earlier direct steering shortcuts for configured sessions |
-| `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"automode"` | Mode an interactive terminal session starts in. Auto mode runs without approval prompts; set `"default"` to be asked before risky actions. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
+| `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"default"` | Mode an interactive terminal session starts in. The default asks before risky actions. Auto mode requires an explicit flag, mode selection, or `defaultInteractionMode` set to `"automode"`, and runs without approval prompts. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
 | `statusLine.showProviderModel` | boolean | `true`  | Show the active provider and model in the composer status line |
 | `statusLine.showContext`       | boolean | `true`  | Show the context percentage in the composer status line |
 | `statusLine.showCommandHint`   | boolean | `true`  | Show command, mention, skill, and terminal-entry hints in the composer status line |
@@ -2927,7 +2927,9 @@ These flags override config file settings:
 | `--tmux`                      | Launch in a dedicated tmux session (implies `--worktree`; cannot be used with `--no-worktree`) |
 | `--zit [intent]`              | Run session in a disposable Zit workspace, recorded as a Zit change on exit (optional intent)  |
 | `--no-worktree`               | Disable git worktree isolation in auto-mode                                                    |
-| `-c, --auto-commit`           | Auto-commit changes after completing tasks                                                     |
+| `-c, --continue` | Resume the latest session in this folder, including with `-p`; start fresh when none exists |
+| `-r, --resume [id]` | Resume by reference, or open the folder picker without an id |
+| `--auto-commit`           | Auto-commit changes after completing tasks                                                     |
 | `--patch`                     | Generate git patch without applying changes                                                    |
 | `--output <file>`             | Output file for patch (used with --patch)                                                      |
 
@@ -2965,7 +2967,6 @@ Inspect the result with `zit status` and `zit show <change>`; accepting the chan
 | `--completion-promise <text>` | Completion marker text (default: "DONE")                                                       |
 | `--checkpoint-interval <n>`   | Git commit every N iterations (default: 5)                                                     |
 | `--max-runtime <m>`           | Max runtime in minutes (default: 120)                                                          |
-| `--max-cost <d>`              | Max API cost in dollars (default: 10)                                                          |
 | `--interactive-on-complete`   | After auto-mode ends, hand off directly to interactive mode (TTY only)                         |
 
 ### Skills & Learning
@@ -3116,14 +3117,20 @@ The picker loads twenty sessions per page and provides **More sessions** and **P
 | `/sessions`   | List past sessions                                    |
 | `/resume`     | Resume a previous session                             |
 | `/history`    | Browse session history with pagination                |
-| `/undo`       | Revert the last recorded agent file mutation and turn |
+| `/undo`       | Restore agent file changes from the last turn and remove it |
 | `/export`     | Export session to markdown/JSON/HTML                  |
 | `/share`      | Share current session                                 |
 | `/status`     | Show session status and the signed-in Autohand plan   |
 | `/usage`      | Explore usage, sessions, skills, extensions, and trace insights |
 | `/upgrade`    | Open the console to upgrade your Autohand plan        |
 
-`/undo` never resets or cleans the Git worktree. It preserves unrelated tracked and untracked work, and refuses to overwrite a file that changed after the recorded agent mutation.
+`/undo` restores every recorded agent file mutation from the last turn, newest first, then removes that turn. It stops on the first unsafe restore and keeps the turn. It never resets or cleans the Git worktree. Shell command changes are not undone. A restored conversation without an in-memory file journal is kept.
+
+`/export` redacts credentials in messages, tool arguments and tool output before producing Markdown, JSON or HTML. It prints `Secrets redacted: N` and the saved path. Bare filenames are stored in `~/.autohand/exports/` (or `$AUTOHAND_HOME/exports/`); absolute and `./`-prefixed paths choose an explicit destination.
+
+`--auto-commit` captures repository status and content hashes before agent editing. Pre-existing staged, unstaged and untracked changes are listed as `left uncommitted (yours)` and excluded, including an initially dirty file edited again by the agent. Commits preserve unrelated staging. A missing baseline disables automatic commits; `-c` remains the same option.
+
+Node builds install an environment proxy dispatcher at startup when `HTTPS_PROXY` or `HTTP_PROXY` is set. `NO_PROXY` bypasses matching hosts; lowercase variables take precedence. Bun binaries use their native proxy support. Use `NODE_EXTRA_CA_CERTS` for a corporate CA bundle.
 
 ### Model & Provider
 

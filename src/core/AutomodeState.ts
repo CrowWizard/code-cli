@@ -1,13 +1,14 @@
 /**
  * Auto-Mode State Management
  *
- * Handles reading/writing the .autohand/automode.local.md state file
- * that tracks auto-mode session progress.
+ * Stores each auto-mode run in a private directory outside the project.
  *
  * @license Apache-2.0
  */
 import fs from 'fs-extra';
 import path from 'path';
+import { createHash, randomUUID } from 'node:crypto';
+import { resolveAutohandHome } from '../constants.js';
 import type {
   AutomodeSessionState,
   AutomodeIterationLog,
@@ -16,8 +17,11 @@ import type {
   AutomodeCancelReason,
 } from '../types.js';
 
-/** Default state file path relative to workspace */
-const STATE_FILE_PATH = '.autohand/automode.local.md';
+const LEGACY_STATE_FILE_PATH = '.autohand/automode.local.md';
+
+export async function hasLegacyAutomodeState(workspaceRoot: string): Promise<boolean> {
+  return fs.pathExists(path.join(workspaceRoot, LEGACY_STATE_FILE_PATH));
+}
 
 /** Default circuit breaker thresholds */
 const DEFAULT_THRESHOLDS = {
@@ -31,7 +35,8 @@ const DEFAULT_THRESHOLDS = {
  * AutomodeState manages the state file for auto-mode sessions
  */
 export class AutomodeState {
-  private workspaceRoot: string;
+  private readonly stateDirectory: string;
+  private runDirectory: string;
   private state: AutomodeSessionState | null = null;
   private iterations: AutomodeIterationLog[] = [];
   private circuitBreaker: AutomodeCircuitBreaker = {
@@ -41,15 +46,17 @@ export class AutomodeState {
     sameFileRepeatCount: 0,
   };
 
-  constructor(workspaceRoot: string) {
-    this.workspaceRoot = workspaceRoot;
+  constructor(workspaceRoot: string, stateDirectory?: string) {
+    const workspaceId = createHash('sha256').update(path.resolve(workspaceRoot)).digest('hex').slice(0, 16);
+    this.stateDirectory = stateDirectory ?? path.join(resolveAutohandHome(), 'automode', workspaceId);
+    this.runDirectory = path.join(this.stateDirectory, randomUUID());
   }
 
   /**
    * Get the state file path
    */
   getStatePath(): string {
-    return path.join(this.workspaceRoot, STATE_FILE_PATH);
+    return path.join(this.runDirectory, 'automode.local.md');
   }
 
   /**
@@ -78,6 +85,7 @@ export class AutomodeState {
     branch?: string;
     worktreePath?: string;
   }): Promise<AutomodeSessionState> {
+    this.runDirectory = path.join(this.stateDirectory, randomUUID());
     this.state = {
       sessionId: options.sessionId,
       prompt: options.prompt,
@@ -132,10 +140,10 @@ export class AutomodeState {
 
     try {
       const filePath = this.getStatePath();
-      await fs.ensureDir(path.dirname(filePath));
+      await fs.ensureDir(path.dirname(filePath), { mode: 0o700 });
 
       const content = this.formatStateMarkdown(this.state);
-      await fs.writeFile(filePath, content, 'utf-8');
+      await fs.writeFile(filePath, content, { encoding: 'utf-8', mode: 0o600 });
     } catch (error) {
       console.error('[automode] Failed to save state:', error);
     }

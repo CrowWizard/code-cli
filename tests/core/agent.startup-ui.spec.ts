@@ -75,6 +75,7 @@ function createInteractionModeAgent(options: AgentRuntime['options'] = {}): {
   } as unknown as LLMProvider;
   const files = {
     root: '/test/workspace',
+    setTurnProvider: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
   } as unknown as FileActionManager;

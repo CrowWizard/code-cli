@@ -22,6 +22,21 @@ describe('CLI option normalization', () => {
     expect(options.bare).toBeUndefined();
     expect(normalizeTmuxWorktreeOption({ daemon: false, tmux: true })).toBe('--tmux cannot be used with --no-daemon');
   });
+
+  it('uses an optional --json value as the prompt when it is not an output mode', () => {
+    const options: RootCliOptions = { json: 'list todos' };
+    normalizeInitialCliOptions(options, {});
+    expect(options.prompt).toBe('list todos');
+    expect(options.json).toBe(true);
+  });
+
+  it.each(['stream', 'local'])('preserves the explicit JSON mode %s', json => {
+    const options: RootCliOptions = { json };
+    normalizeInitialCliOptions(options, {});
+    expect(options.json).toBe(json);
+    expect(options.prompt).toBeUndefined();
+  });
+
   it('normalizes Commander boolean option values and yes aliases', () => {
     const options: RootCliOptions = { y: true };
     Reflect.set(options, 'prompt', true);

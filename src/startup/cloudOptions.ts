@@ -12,7 +12,6 @@ export interface CloudOptions {
 }
 export function registerCloudOptions(program: Command): Command {
   return program.option('--cloud', 'Run with a durable hosted Autohand agent (Pro, Pro+, Max)', false)
-    .option('--resume [reference]', 'With --cloud, resume an owned cloud session by ID or Web URL; omit to choose')
     .option('--cloud-account <id>', 'Select the Autohand account for the cloud session')
     .option('--cloud-repository <owner/repo>', 'Attach an authorized repository to a new cloud session')
     .option('--cloud-connector <id>', 'Repository connector or GitHub App connection to use')
@@ -21,7 +20,6 @@ export function registerCloudOptions(program: Command): Command {
 }
 export function validateCloudOptions(options: CLIOptions & CloudOptions & { mode?: string }): void {
   if (!options.cloud) {
-    if (options.resume !== undefined) throw new Error('Use autohand resume for local sessions, or --cloud --resume for cloud sessions.');
     if (options.cloudAccount || options.cloudRepository || options.cloudConnector || options.cloudBranch || options.cloudProvider) throw new Error('Cloud workspace options require --cloud.');
     return;
   }

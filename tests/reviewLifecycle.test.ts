@@ -22,6 +22,48 @@ function hooks() {
 }
 
 describe('review lifecycle', () => {
+  it.each([true, false])('permits only inspection during a restricted review and restores scope after success=%s', async success => {
+    const manager = new PermissionManager({ settings: { mode: 'restricted' } });
+    const execute = async () => {
+      expect(manager.checkPermission({ tool: 'read_file', path: 'src/example.ts' }).allowed).toBe(true);
+      expect(manager.checkPermission({ tool: 'git_diff' }).allowed).toBe(true);
+      expect(manager.checkPermission({ tool: 'write_file', path: 'src/example.ts' }).allowed).toBe(false);
+      expect(manager.checkPermission({ tool: 'run_command', command: 'node', args: ['app.js'] }).allowed).toBe(false);
+      expect(manager.checkPermission({ tool: 'read_file', path: '.env' }).allowed).toBe(false);
+      if (!success) throw new Error('Review interrupted');
+      return true;
+    };
+    const result = executeReviewWithLifecycle({ request, surface: 'cli', permissionManager: manager, execute });
+    if (success) await expect(result).resolves.toBe(true);
+    else await expect(result).rejects.toThrow('Review interrupted');
+    expect(manager.getMode()).toBe('restricted');
+    expect(manager.checkPermission({ tool: 'read_file', path: 'src/example.ts' }).allowed).toBe(false);
+  });
+
+  it('advertises only inspection tools during the review and restores the original tool list', async () => {
+    const manager = new PermissionManager({ settings: { mode: 'unrestricted' } });
+    const definitions = ['read_file', 'git_diff', 'orchestrate_specialists', 'delegate_task', 'write_file', 'run_command']
+      .map(name => ({ name }));
+    await executeReviewWithLifecycle({ request, surface: 'interactive', permissionManager: manager, execute: async () => {
+      expect(manager.filterAdvertisedTools(definitions).map(tool => tool.name)).toEqual(['read_file', 'git_diff']);
+      return true;
+    } });
+    expect(manager.filterAdvertisedTools(definitions)).toEqual(definitions);
+  });
+
+  it('preserves explicit read denials and blocks permissively allowed writes during review', async () => {
+    const manager = new PermissionManager({ settings: {
+      mode: 'unrestricted', denyList: ['read_file:private.txt'], allPathsAllowed: true,
+    } });
+    await executeReviewWithLifecycle({ request, surface: 'interactive', permissionManager: manager, execute: async () => {
+      expect(manager.checkPermission({ tool: 'read_file', path: 'private.txt' }).allowed).toBe(false);
+      expect(manager.checkPermission({ tool: 'write_file', path: 'public.txt' }).allowed).toBe(false);
+      expect(manager.checkPermission({ tool: 'write_file', requestedTool: 'git_diff', path: 'public.txt' }).allowed).toBe(false);
+      return true;
+    } });
+    expect(manager.getMode()).toBe('unrestricted');
+  });
+
   it('brackets a successful review with typed context', async () => {
     const hookManager = hooks();
     const execute = vi.fn().mockResolvedValue(true);
@@ -165,11 +207,12 @@ describe('review lifecycle', () => {
   it('releases the review scope after failure and preserves a prior restricted mode', async () => {
     const manager = new PermissionManager({ mode: 'restricted' });
     await expect(executeReviewWithLifecycle({ request, surface: 'acp', permissionManager: manager, execute: async () => {
-      expect(manager.checkPermission({ tool: 'read_file', path: 'README.md' }).allowed).toBe(false);
+      expect(manager.checkPermission({ tool: 'read_file', path: 'README.md' }).allowed).toBe(true);
       throw new Error('Review failed');
     } })).rejects.toThrow('Review failed');
     expect(manager.getRunToolScope()).toBeUndefined();
     expect(manager.getMode()).toBe('restricted');
+    expect(manager.checkPermission({ tool: 'read_file', path: 'README.md' }).allowed).toBe(false);
   });
 
   it('enforces restricted permissions for the review and restores the session mode', async () => {

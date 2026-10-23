@@ -5,12 +5,10 @@
  */
 import chalk from 'chalk';
 import { t } from '../i18n/index.js';
-import path from 'node:path';
 import { showModal, showInput, showConfirm, type ModalOption } from '../ui/ink/components/Modal.js';
 import {
-  exportToMarkdown,
-  exportToJson,
-  exportToHtml,
+  buildSessionExport,
+  resolveExportPath,
   saveExport,
   getSuggestedFilename,
   type ExportOptions,
@@ -124,27 +122,14 @@ export async function execute(args?: string, context?: ExportContext): Promise<v
     return;
   }
 
-  // Generate export
-  let content: string;
-  switch (format) {
-    case 'md':
-      content = exportToMarkdown(metadata, messages, options);
-      break;
-    case 'json':
-      content = exportToJson(metadata, messages);
-      break;
-    case 'html':
-      content = exportToHtml(metadata, messages, options);
-      break;
-  }
-
-  // Save file
-  const filePath = path.isAbsolute(filename) ? filename : path.join(workspaceRoot, filename);
+  const { content, secretsRedacted } = buildSessionExport(metadata, messages, format, options);
 
   try {
+    const filePath = resolveExportPath(filename, workspaceRoot);
     await saveExport(content, filePath);
     console.log();
     console.log(chalk.green(t('commands.export.success', { path: filePath })));
+    console.log(chalk.gray('Secrets redacted: ' + secretsRedacted));
     console.log(chalk.gray(`  ${messages.length} messages, ${(Buffer.byteLength(content, 'utf8') / 1024).toFixed(1)} KB`));
     console.log();
   } catch (error) {

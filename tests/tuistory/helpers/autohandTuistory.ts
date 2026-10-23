@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Session } from 'tuistory';
-import { launchTuistorySession } from '../../../src/testing/drivers/tuistory-driver.js';
+import { launchPipedTuistorySession, launchTuistorySession } from '../../../src/testing/drivers/tuistory-driver.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -29,6 +29,8 @@ export interface TuistoryTempState {
 }
 
 export interface LaunchBuiltAutohandOptions {
+  inputCommand?: string[];
+  entrypoint?: string;
   autohandHome?: string;
   cwd?: string;
   env?: Record<string, string | undefined>;
@@ -174,7 +176,8 @@ export async function createTempAutohandHome(options: CreateTempAutohandHomeOpti
     configPath,
     workspaceRoot,
     cleanup: async () => {
-      await rm(tempRoot, { recursive: true, force: true });
+      // Child shutdown can briefly recreate files while the fixture directory is removed.
+      await rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     },
   };
 }
@@ -1268,9 +1271,12 @@ export async function launchBuiltAutohand(
     ...options.env,
   };
 
-  return await launchTuistorySession({
+  const launch = options.inputCommand
+    ? (launchOptions: Parameters<typeof launchTuistorySession>[0]) => launchPipedTuistorySession(options.inputCommand!, launchOptions)
+    : launchTuistorySession;
+  return await launch({
     command: process.execPath,
-    args: [path.join(root, 'dist/index.js'), ...args],
+    args: [options.entrypoint ?? path.join(root, 'dist/index.js'), ...args],
     cwd: options.cwd ?? root,
     env,
     cols: options.cols ?? 120,

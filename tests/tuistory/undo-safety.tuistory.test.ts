@@ -35,20 +35,13 @@ afterEach(async () => {
 });
 
 describe('/undo Tuistory', () => {
-  it('reverts an agent-created file while preserving unrelated work', async () => {
+  it('reverts all three agent-created files while preserving unrelated work', async () => {
     const completionMarker = 'AGENT_FILE_CREATED';
     const server = await createMockAutohandAINativeSequenceServer([
-      {
-        content: 'Creating the requested file.',
-        toolCall: {
-          id: 'call_create_undo_fixture',
-          name: 'write_file',
-          args: {
-            path: 'agent-created.txt',
-            contents: 'agent output\n',
-          },
-        },
-      },
+      ...['a.txt', 'b.txt', 'c.txt'].map((name, index) => ({
+        content: 'Creating ' + name,
+        toolCall: { id: 'call_undo_' + index, name: 'write_file', args: { path: name, contents: 'agent output\n' } },
+      })),
       { content: completionMarker },
     ]);
     servers.push(server);
@@ -95,13 +88,14 @@ describe('/undo Tuistory', () => {
     sessions.push(session);
 
     const output = await runUndoSafetyScenario(session, {
-      instruction: 'Create agent-created.txt with the requested fixture content.',
+      instruction: 'Create a.txt, b.txt and c.txt with the requested fixture content.',
       completionMarker,
     });
 
-    await expect(fs.stat(path.join(state.workspaceRoot, 'agent-created.txt'))).rejects.toMatchObject({
-      code: 'ENOENT',
-    });
+    for (const file of ['a.txt', 'b.txt', 'c.txt']) {
+      await expect(fs.stat(path.join(state.workspaceRoot, file))).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    expect(output).toContain('Restored 3 files: c.txt, b.txt, a.txt');
     await expect(fs.readFile(path.join(state.workspaceRoot, 'user-notes.txt'), 'utf8'))
       .resolves.toBe('uncommitted user edit\n');
     await expect(fs.readFile(path.join(state.workspaceRoot, 'untracked-user-notes.txt'), 'utf8'))
