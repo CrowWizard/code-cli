@@ -21,10 +21,10 @@ afterEach(async () => {
 });
 
 describe('goals summary Tuistory', () => {
-  it.each([false, true])('keeps queued-goal editing usable with fullScreen=%s', async fullScreen => {
+  it.each([false, true])('keeps queued-goal editing usable by default with fullScreen=%s', async fullScreen => {
     const state = await createTempAutohandHome({
       config: {
-        features: { slashGoal: true, fullScreenMode: fullScreen },
+        features: { fullScreenMode: fullScreen },
         agent: { autoMemory: false, goalAutoMode: false },
         ui: { promptSuggestions: false, showCompletionNotification: false, terminalBell: false },
       },
