@@ -69,6 +69,7 @@ const {
     applyAcpConfigOption: vi.fn(),
     cancelCurrentInstruction: vi.fn(),
     getSessionManager: vi.fn().mockReturnValue(mockSessionManager),
+    getConversationManager: vi.fn().mockReturnValue(mockConversation),
     getImageManager: vi.fn().mockReturnValue(mockImageManager),
     getHookManager: vi.fn(),
     getPermissionManager: vi.fn().mockReturnValue(mockPermissionManager),
@@ -2191,8 +2192,14 @@ describe("AutohandAcpAdapter", () => {
       }
     });
 
-    it("reports file changes as standard ACP diffs without completing the tool", async () => {
+    it("reports file changes as diffs on the completed tool update", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      await outputListener({
+        type: "tool_start",
+        toolId: "write-1",
+        toolName: "write_file",
+        toolArgs: { path: "src/file.ts" },
+      });
       await outputListener({
         type: "file_modified",
         toolId: "write-1",
@@ -2200,22 +2207,47 @@ describe("AutohandAcpAdapter", () => {
         changeType: "modify",
         fileDiff: { oldText: "before", newText: "after" },
       });
+      await outputListener({
+        type: "tool_end",
+        toolId: "write-1",
+        toolName: "write_file",
+        toolSuccess: true,
+      });
 
       const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update)
         .filter(update => update.toolCallId === "write-1");
       expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "write-1", kind: "edit", title: "Modified: src/file.ts" });
-      expect(connection.sessionUpdate).toHaveBeenCalledWith({
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: "write-1",
-          locations: [{ path: "/workspace/src/file.ts" }],
-          content: [{ type: "diff", path: "/workspace/src/file.ts", oldText: "before", newText: "after" }],
-        },
+      expect(updates).toHaveLength(2);
+      expect(updates[1]).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "write-1",
+        status: "completed",
+        locations: [{ path: "/workspace/src/file.ts" }],
+        content: [{ type: "diff", path: "/workspace/src/file.ts", oldText: "before", newText: "after" }],
       });
       expect(connection.extNotification).toHaveBeenCalledWith("autohand.hook.fileModified", expect.objectContaining({
         sessionId, filePath: "src/file.ts", changeType: "modify", toolId: "write-1",
       }));
+    });
+
+    it("aggregates multiple file changes on the completed tool update", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      await outputListener({ type: "tool_start", toolId: "write-many", toolName: "write_file" });
+      await outputListener({ type: "file_modified", toolId: "write-many", filePath: "src/a.ts", fileDiff: { oldText: null, newText: "a" } });
+      await outputListener({ type: "file_modified", toolId: "write-many", filePath: "src/b.ts", fileDiff: { oldText: "b", newText: "updated-b" } });
+      await outputListener({ type: "tool_end", toolId: "write-many", toolName: "write_file", toolSuccess: true });
+
+      const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update)
+        .filter(update => update.toolCallId === "write-many");
+      expect(updates).toHaveLength(2);
+      expect(updates[1]).toMatchObject({
+        status: "completed",
+        locations: [{ path: "/workspace/src/a.ts" }, { path: "/workspace/src/b.ts" }],
+        content: [
+          { type: "diff", path: "/workspace/src/a.ts", oldText: null, newText: "a" },
+          { type: "diff", path: "/workspace/src/b.ts", oldText: "b", newText: "updated-b" },
+        ],
+      });
     });
 
     it("marks a tool call made by a script with its parent call, and leaves direct calls unmarked", async () => {

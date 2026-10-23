@@ -208,6 +208,7 @@ export class AutohandAcpAdapter implements Agent {
   private config: LoadedConfig | null = null;
   private clientCapabilities?: InitializeRequest['clientCapabilities'];
   private toolStartTimes = new Map<string, number>();
+  private toolFileDiffs = new Map<string, Array<{ path: string; oldText: string | null; newText: string }>>();
   private static readonly LIST_SESSIONS_PAGE_SIZE = 50;
 
   constructor(
@@ -509,8 +510,10 @@ export class AutohandAcpAdapter implements Agent {
     return { config, state, agent };
   }
 
-  private restoreConversation(messages: SessionMessage[]): void {
-    const conversation = ConversationManager.getInstance();
+  private restoreConversation(
+    conversation: ConversationManager,
+    messages: SessionMessage[],
+  ): void {
     if (!conversation.isInitialized()) {
       throw new Error('Conversation manager is not initialized');
     }
@@ -627,7 +630,7 @@ export class AutohandAcpAdapter implements Agent {
         throw new Error(`Session not found after initialization: ${sessionId}`);
       }
       const messages = loadedSession.getMessages();
-      this.restoreConversation(messages);
+      this.restoreConversation(agent.getConversationManager(), messages);
 
       if (loadedSession.metadata.model) {
         state.modelId = loadedSession.metadata.model;
@@ -1529,6 +1532,7 @@ export class AutohandAcpAdapter implements Agent {
 
             // Hook: record start time and emit pre-tool notification
             this.toolStartTimes.set(toolCallId, Date.now());
+            this.toolFileDiffs.delete(toolCallId);
             this.emitHookPreTool(sessionId, toolCallId, event.toolName, event.toolArgs ?? {});
           }
           break;
@@ -1543,6 +1547,14 @@ export class AutohandAcpAdapter implements Agent {
                   ...(event.toolError === undefined ? {} : { error: event.toolError }),
                 }
               : undefined;
+            const fileDiffs = this.toolFileDiffs.get(toolCallId);
+            const content = fileDiffs?.map((fileDiff) => ({
+              type: 'diff' as const,
+              path: fileDiff.path,
+              oldText: fileDiff.oldText,
+              newText: fileDiff.newText,
+            }));
+            const locations = fileDiffs?.map((fileDiff) => ({ path: fileDiff.path }));
 
             await this.connection.sessionUpdate({
               sessionId,
@@ -1550,6 +1562,8 @@ export class AutohandAcpAdapter implements Agent {
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
                 status,
+                ...(content && content.length > 0 ? { content } : {}),
+                ...(locations && locations.length > 0 ? { locations } : {}),
                 rawOutput,
                 ...parentToolCallMeta(event.parentToolId),
               },
@@ -1559,6 +1573,7 @@ export class AutohandAcpAdapter implements Agent {
             const startTime = this.toolStartTimes.get(toolCallId);
             const duration = startTime ? Date.now() - startTime : 0;
             this.toolStartTimes.delete(toolCallId);
+            this.toolFileDiffs.delete(toolCallId);
             this.emitHookPostTool(
               sessionId, toolCallId, event.toolName,
               event.toolSuccess === true, duration, event.toolOutput ?? event.toolError
@@ -1628,27 +1643,21 @@ export class AutohandAcpAdapter implements Agent {
                     status: 'completed',
                     locations: [{ path: filePath }],
                     rawInput: { path: filePath, changeType: event.changeType ?? 'modify' },
+                    ...(event.fileDiff === undefined ? {} : {
+                      content: [{
+                        type: 'diff' as const,
+                        path: filePath,
+                        oldText: event.fileDiff.oldText,
+                        newText: event.fileDiff.newText,
+                      }],
+                    }),
                   },
                 });
+              } else if (event.fileDiff !== undefined) {
+                const diffs = this.toolFileDiffs.get(toolCallId) ?? [];
+                diffs.push({ path: filePath, ...event.fileDiff });
+                this.toolFileDiffs.set(toolCallId, diffs);
               }
-              await this.connection.sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: 'tool_call_update',
-                  toolCallId,
-                  locations: [{ path: filePath }],
-                  ...(event.fileDiff === undefined ? {
-                    content: [{ type: 'content', content: { type: 'text', text: `${event.changeType ?? 'modify'}: ${filePath}` } }],
-                  } : {
-                    content: [{
-                      type: 'diff',
-                      path: filePath,
-                      oldText: event.fileDiff.oldText,
-                      newText: event.fileDiff.newText,
-                    }],
-                  }),
-                },
-              });
             }
             this.emitHookFileModified(
               sessionId,

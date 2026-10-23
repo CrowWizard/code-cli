@@ -504,7 +504,7 @@ export function initializeAgentDependencies(
       getStatusLine: () => host.formatStatusLine().left,
       logWarning: (message) => console.log(message),
     });
-    host.conversation = ConversationManager.getInstance();
+    host.conversation = new ConversationManager();
     host.shellSuggestionProvider = new ShellSuggestionProvider({
       runtime: host.runtime,
       conversation: host.conversation,

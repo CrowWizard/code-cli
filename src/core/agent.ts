@@ -2192,6 +2192,13 @@ export class AutohandAgent {
   }
 
   /**
+   * Get the conversation history manager for this agent session.
+   */
+  getConversationManager(): ConversationManager {
+    return this.conversation;
+  }
+
+  /**
    * The most recent final assistant response, e.g. to summarise a session.
    */
   getLastAssistantResponse(): string {
