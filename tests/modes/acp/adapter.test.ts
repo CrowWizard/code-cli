@@ -1539,6 +1539,22 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it("keeps ordinary JSON assistant messages visible when loading a session", async () => {
+      await adapter.initialize(makeInitRequest());
+      const jsonMessage = JSON.stringify({ items: [{ name: "example", value: 'a"b' }] });
+      mockSessionManager.loadSession.mockResolvedValue({
+        metadata: { model: "your-modelcard-id-here", projectPath: "/workspace" },
+        getMessages: () => [{ role: "assistant", content: jsonMessage, timestamp: "2025-01-01T00:00:02Z" }],
+      });
+
+      await adapter.loadSession({ sessionId: "session-json", cwd: "/workspace", mcpServers: [] } as any);
+
+      expect(connection.sessionUpdate).toHaveBeenCalledWith({
+        sessionId: "session-json",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: jsonMessage } },
+      });
+    });
+
     it("connects ACP-provided MCP servers when loading a session", async () => {
       await adapter.initialize(makeInitRequest());
 
@@ -2245,7 +2261,7 @@ describe("AutohandAcpAdapter", () => {
 
       const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update)
         .filter(update => update.toolCallId === "write-1");
-      expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "write-1", kind: "edit", title: "Modified: src/file.ts" });
+      expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "write-1", kind: "edit", title: "Write: src/file.ts" });
       expect(updates).toHaveLength(2);
       expect(updates[1]).toMatchObject({
         sessionUpdate: "tool_call_update",
@@ -2257,6 +2273,24 @@ describe("AutohandAcpAdapter", () => {
       expect(connection.extNotification).toHaveBeenCalledWith("autohand.hook.fileModified", expect.objectContaining({
         sessionId, filePath: "src/file.ts", changeType: "modify", toolId: "write-1",
       }));
+    });
+
+    it("ignores duplicate tool completion events and preserves JSON output as text", async () => {
+      const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      const jsonOutput = '{"thought":"keep \\"quoted\\" JSON","items":[1,2]}';
+
+      await outputListener({ type: "tool_start", toolId: "json-1", toolName: "run_command" });
+      await outputListener({ type: "tool_end", toolId: "json-1", toolName: "run_command", toolSuccess: true, toolOutput: jsonOutput });
+      await outputListener({ type: "tool_end", toolId: "json-1", toolName: "run_command", toolSuccess: true, toolOutput: jsonOutput });
+
+      const updates = connection.sessionUpdate.mock.calls
+        .map(([params]: [{ update: Record<string, unknown> }]) => params.update)
+        .filter((update) => update.toolCallId === "json-1");
+      expect(updates).toHaveLength(2);
+      expect(updates[1]).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        rawOutput: { output: jsonOutput },
+      });
     });
 
     it("aggregates multiple file changes on the completed tool update", async () => {

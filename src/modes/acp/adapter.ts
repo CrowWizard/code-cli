@@ -186,7 +186,7 @@ function parseAssistantReplayParts(content: string): AssistantReplayParts {
     }
 
     if (trimmed.startsWith('{') || trimmed.includes('"thought"')) {
-      return {};
+      return { text: trimmed };
     }
   }
 
@@ -208,6 +208,7 @@ export class AutohandAcpAdapter implements Agent {
   private config: LoadedConfig | null = null;
   private clientCapabilities?: InitializeRequest['clientCapabilities'];
   private toolStartTimes = new Map<string, number>();
+  private completedToolCalls = new Map<string, number>();
   private todoPlans = new Map<string, Array<{ content: string; priority: 'medium'; status: 'pending' | 'in_progress' | 'completed' }>>();
   private toolFileDiffs = new Map<string, Array<{ path: string; oldText: string | null; newText: string }>>();
   private static readonly LIST_SESSIONS_PAGE_SIZE = 50;
@@ -1533,6 +1534,7 @@ export class AutohandAcpAdapter implements Agent {
 
             // Hook: record start time and emit pre-tool notification
             this.toolStartTimes.set(toolCallId, Date.now());
+            this.completedToolCalls.delete(`${sessionId}\0${toolCallId}`);
             this.toolFileDiffs.delete(toolCallId);
             if (event.toolName === 'todo_write' && Array.isArray(event.toolArgs?.tasks)) {
               const entries = event.toolArgs.tasks.flatMap((task: unknown) => {
@@ -1559,6 +1561,15 @@ export class AutohandAcpAdapter implements Agent {
         case 'tool_end':
           if (event.toolName) {
             const toolCallId = event.toolId ?? 'unknown';
+            const completedToolKey = `${sessionId}\0${toolCallId}`;
+            if (this.completedToolCalls.has(completedToolKey)) {
+              break;
+            }
+            if (this.completedToolCalls.size >= 1000) {
+              const oldestKey = this.completedToolCalls.keys().next().value;
+              if (oldestKey !== undefined) this.completedToolCalls.delete(oldestKey);
+            }
+            this.completedToolCalls.set(completedToolKey, Date.now());
             const todoKey = JSON.stringify([sessionId, toolCallId]);
             const todoEntries = this.todoPlans.get(todoKey);
             this.todoPlans.delete(todoKey);
