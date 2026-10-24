@@ -3,6 +3,8 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import { randomUUID } from 'node:crypto';
+import type { FileMutationTurn } from '../actions/filesystem.js';
 import type { LLMMessage } from '../types.js';
 import { findCoherentRemovalIndices } from './context/priority.js';
 
@@ -10,6 +12,7 @@ export class ConversationManager {
   private static instance: ConversationManager | null = null;
   private messages: LLMMessage[] = [];
   private initialized = false;
+  private turns = new WeakMap<LLMMessage, FileMutationTurn>();
 
   public constructor() { }
 
@@ -21,6 +24,7 @@ export class ConversationManager {
   }
 
   reset(systemPrompt: string): void {
+    this.turns = new WeakMap();
     this.messages = [
       {
         role: 'system',
@@ -38,6 +42,7 @@ export class ConversationManager {
     if (!this.initialized) {
       throw new Error('ConversationManager must be initialized with a system prompt before adding messages.');
     }
+    if (message.role === 'user') this.turns.set(message, { id: randomUUID(), ranShellCommand: false });
     this.messages.push(message);
   }
 
@@ -119,6 +124,8 @@ export class ConversationManager {
       throw new Error('ConversationManager must be initialized before replacing messages.');
     }
     if (index >= 0 && index < this.messages.length) {
+      const turn = this.turns.get(this.messages[index]);
+      if (message.role === 'user') this.turns.set(message, turn ?? { id: randomUUID(), ranShellCommand: false });
       this.messages[index] = message;
     }
   }
@@ -149,18 +156,20 @@ export class ConversationManager {
    * Removes the last user message and all subsequent messages (assistant responses, tool results)
    * This effectively undoes the last conversation turn.
    */
-  removeLastTurn(): void {
-    if (!this.initialized || this.messages.length <= 1) {
-      return;
-    }
+  getLastTurn(): FileMutationTurn | undefined {
+    const index = this.findLastUserIndex();
+    return index > 0 ? this.turns.get(this.messages[index]) : undefined;
+  }
 
+  removeLastTurn(expectedTurnId?: string): boolean {
+    if (!this.initialized || this.messages.length <= 1) return false;
     const lastUserIndex = this.findLastUserIndex();
-    if (lastUserIndex <= 0) {
-      return;
-    }
+    if (lastUserIndex <= 0) return false;
+    if (expectedTurnId !== undefined && this.getLastTurn()?.id !== expectedTurnId) return false;
 
     // Remove all messages from the last user message onwards
     this.messages = this.messages.slice(0, lastUserIndex);
+    return true;
   }
 
   private findLastUserIndex(): number {

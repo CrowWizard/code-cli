@@ -54,7 +54,7 @@ function SlashCommandDropdownComponent({ suggestions, activeIndex, visible }: Sl
         return (
           <Box key={suggestion.command}>
             <Text>
-              {theme.fg(isSelected ? 'accent' : 'text', `${pointer} ${cmd}`)}
+              {isSelected ? theme.selected(`${pointer} ${cmd}`) : theme.fg('text', `${pointer} ${cmd}`)}
             </Text>
             {desc && (
               <Text>{theme.fg('muted', `  ${desc}`)}</Text>

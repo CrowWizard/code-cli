@@ -3,6 +3,7 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { AutoCommitSnapshot } from './actions/gitSessionSnapshot.js';
 import type { Ora } from 'ora';
 import type { ThemeDefinition } from './ui/theme/types.js';
 import type { KeybindingProfileId } from './keybindings/profiles.js';
@@ -388,7 +389,9 @@ export interface UISettings {
   notifications?: boolean | NotificationConfig;
   /** Show LLM-generated next-step suggestions in prompt placeholder (default: true) */
   promptSuggestions?: boolean;
-  /** Rotate tips about slash commands, composer triggers and shortcuts beside the idle composer (default: true) */
+  /** Background, read-only repository review offered after the first completed turn (default: true). */
+  repositoryReadiness?: boolean;
+  /** Rotate capability tips below the working status or completion summary, above the composer (default: true) */
   showTips?: boolean;
   /**
    * While a turn runs, `select` queues drafts with Enter and steers only a
@@ -485,6 +488,8 @@ export interface AutoReportSettings {
 }
 
 export interface FeatureFlagSettings {
+  /** Full-screen interactive terminal (default: true); opt out with false and restart. */
+  fullScreenMode?: boolean;
   multi_agent_v2?: {
     /** Total session threads including the main agent. Integer 1–64; default 9. */
     max_concurrent_threads_per_session?: number;
@@ -501,7 +506,7 @@ export interface FeatureFlagSettings {
   usageV2?: boolean;
   /** Enable AWS Bedrock provider support. */
   awsBedrockProvider?: boolean;
-  /** Enable the experimental persistent /goal surface across CLI, tools, RPC, and ACP. */
+  /** Enable persistent goals across CLI, tools, RPC, and ACP. Defaults to true. */
   slashGoal?: boolean;
   /** Expose `run_tool_script`: one sandboxed script that calls tools and returns only its result (default: false). */
   codeMode?: boolean;
@@ -836,6 +841,7 @@ export interface AutomodeSettings {
 
 /** Hook events that can be subscribed to */
 export type HookEvent =
+  | 'program-status'
   | 'pre-tool'
   | 'post-tool'
   | 'file-modified'
@@ -1109,7 +1115,7 @@ export interface AutohandConfig {
 }
 
 /** Supported web search providers */
-export type SearchProvider = 'brave' | 'duckduckgo' | 'parallel' | 'google' | 'browser-profile' | 'exa';
+export type SearchProvider = 'autohand' | 'brave' | 'duckduckgo' | 'parallel' | 'google' | 'browser-profile' | 'exa';
 
 /** Web search provider settings */
 export interface SearchSettings {
@@ -1229,6 +1235,12 @@ export interface InlineAgentDefinition {
 }
 
 export interface CLIOptions {
+  cloud?: boolean;
+  cloudAccount?: string;
+  cloudRepository?: string;
+  cloudConnector?: string;
+  cloudBranch?: string;
+  cloudProvider?: string;
   /** Select a provider for this process without updating saved configuration. */
   provider?: ProviderName;
   prompt?: string;
@@ -1240,6 +1252,8 @@ export interface CLIOptions {
   json?: string | boolean;
   /** Minimal mode: disable featureful startup and require explicit context/auth. */
   bare?: boolean;
+  /** Disable background services and background child processes for this run. */
+  daemon?: boolean;
   /** Disable startup network operations while retaining local cached state. */
   offline?: boolean;
   path?: string;
@@ -1251,6 +1265,8 @@ export interface CLIOptions {
   config?: string;
   temperature?: number;
   resumeSessionId?: string;
+  continue?: boolean;
+  resume?: string | boolean;
   /** Keep this run out of session history: nothing saved, no auto-memory, no session sync. */
   ephemeral?: boolean;
   /** --output-schema <file>: the command-mode final answer must be JSON validating against this schema. */
@@ -2109,6 +2125,10 @@ export type ToolExecutionResult = {
 } & ToolActionOutcome;
 
 export interface ToolExecutionContext {
+  deferGoalCompletion?: (
+    prepared: import('./goals/types.js').GoalMutationResult,
+    commit: () => Promise<import('./goals/types.js').GoalMutationResult>,
+  ) => import('./goals/types.js').GoalMutationResult;
   peerMessaging?: import('./session/peers/PeerMessaging.js').PeerClient;
   resourceCoordinator?: import('./session/peers/ResourceCoordinator.js').ResourceCoordinatorClient;
   peerAutomatic?: boolean;
@@ -2140,8 +2160,15 @@ export interface ToolOutputChunk {
 }
 
 export interface AgentRuntime {
+  sessionGitSnapshot?: AutoCommitSnapshot | null;
+  sessionGitSnapshotError?: string;
+  sessionGitSnapshotFinalized?: boolean;
+  /** Exact paths approved for the nested automatic-commit instruction. */
+  autoCommitPaths?: readonly string[];
   config: LoadedConfig;
   workspaceRoot: string;
+  /** Original repository when --zit runs the agent in an isolated workspace. */
+  repositorySourceRoot?: string;
   /** Additional directories with same access as workspaceRoot */
   additionalDirs?: string[];
   options: CLIOptions;
@@ -2173,7 +2200,8 @@ export interface AgentOutputEvent {
    * model's reply in `content` / `thought` while the completion is still in
    * flight; the whole reply still follows as `message` / `thinking`.
    */
-  type: 'message' | 'message_delta' | 'thinking' | 'thought_delta' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update';
+  type: 'message' | 'message_delta' | 'thinking' | 'thought_delta' | 'tool_start' | 'tool_end' | 'error' | 'schedule_triggered' | 'file_modified' | 'team_update' | 'peer_update' | 'resource_update' | 'program_status';
+  programStatus?: import('./core/agent/AgentProgramStatus.js').ProgramStatusReport;
   peerEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   resourceEvent?: import('./session/peers/PeerProtocol.js').PeerEvent;
   content?: string;

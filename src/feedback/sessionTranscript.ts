@@ -38,18 +38,38 @@ const SECRET_ASSIGNMENT =
   /\b([A-Za-z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Za-z0-9_]*)("?\s*[:=]\s*"?)([^\s"'&,;]{6,})/giu;
 const SECRET_QUERY_PARAMETER = /([?&](?:token|key|secret|password|code|signature)=)[^&#\s]+/giu;
 
-/** Removes credentials and user-identifying paths before text leaves the machine. */
-export function redactSensitiveText(text: string): string {
+export interface TextRedactionResult {
+  text: string;
+  redactions: number;
+}
+
+export function redactSensitiveTextWithCount(
+  text: string,
+  options: { fieldName?: string } = {},
+): TextRedactionResult {
+  const field = options.fieldName?.replace(/([a-z0-9])([A-Z])/gu, '$1_$2').toLowerCase();
+  if (field && /(?:^|_)(?:api_key|apikey|secret|secret_key|private_key|token|password|passwd|authorization)$/u.test(field)
+    && text && text !== '[REDACTED]' && text !== '[REDACTED PRIVATE KEY]') {
+    return { text: '[REDACTED]', redactions: 1 };
+  }
+  let redactions = 0;
+  const redact = () => { redactions++; return '[REDACTED]'; };
   const home = os.homedir();
-  return (home.length > 1 ? text.replaceAll(home, '~') : text)
-    .replace(PRIVATE_KEY_BLOCK, '[REDACTED PRIVATE KEY]')
-    .replace(SECRET_QUERY_PARAMETER, '$1[REDACTED]')
-    .replace(SECRET_TOKEN, '[REDACTED]')
-    .replace(BEARER_TOKEN, '$1[REDACTED]')
+  const safe = (home.length > 1 ? text.replaceAll(home, '~') : text)
+    .replace(PRIVATE_KEY_BLOCK, () => { redactions++; return '[REDACTED PRIVATE KEY]'; })
+    .replace(SECRET_QUERY_PARAMETER, (_match, prefix: string) => prefix + redact())
+    .replace(SECRET_TOKEN, redact)
+    .replace(BEARER_TOKEN, (_match, prefix: string) => prefix + redact())
     .replace(SECRET_ASSIGNMENT, (match, name: string, separator: string, value: string) =>
-      value.startsWith('[REDACTED') ? match : `${name}${separator}[REDACTED]`)
+      value.startsWith('[REDACTED') ? match : name + separator + redact())
     .replace(/(?:\/Users|\/home)\/[^/\s:]+/gu, '~')
     .replace(/[A-Za-z]:\\Users\\[^\\\s:]+/gu, '~');
+  return { text: safe, redactions };
+}
+
+/** Removes credentials and user-identifying paths before text leaves the machine. */
+export function redactSensitiveText(text: string): string {
+  return redactSensitiveTextWithCount(text).text;
 }
 
 function toolCallNames(toolCalls: unknown): string[] {

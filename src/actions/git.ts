@@ -3,6 +3,10 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import { sessionAutoCommitInfo, commitSessionChanges } from './gitSessionCommit.js';
+import type { AutoCommitSnapshot } from './gitSessionSnapshot.js';
+export { captureAutoCommitSnapshot } from './gitSessionSnapshot.js';
+export { commitSessionChanges, stageSessionPaths } from './gitSessionCommit.js';
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { executeCoordinatedFile, getCommandCoordination } from '../session/peers/CommandCoordinationGate.js';
 
@@ -479,6 +483,7 @@ export interface AutoCommitInfo {
   canCommit: boolean;
   error?: string;
   filesChanged: string[];
+  filesLeftUncommitted?: string[];
   suggestedMessage: string;
   diffSummary: string;
 }
@@ -512,7 +517,8 @@ export function gitInit(cwd: string): { success: boolean; message: string } {
 /**
  * Get information about pending changes and generate a suggested commit message
  */
-export function getAutoCommitInfo(cwd: string): AutoCommitInfo {
+export function getAutoCommitInfo(cwd: string, snapshot?: AutoCommitSnapshot | null): AutoCommitInfo {
+  if (snapshot !== undefined) return sessionAutoCommitInfo(cwd, snapshot);
   // Check if this is a git repository
   if (!isGitRepository(cwd)) {
     return {
@@ -644,7 +650,8 @@ function generateCommitMessage(added: string[], modified: string[], deleted: str
 /**
  * Execute the actual commit with the given message
  */
-export async function executeAutoCommit(cwd: string, message: string, stageAll = true): Promise<AutoCommitResult> {
+export async function executeAutoCommit(cwd: string, message: string, stageAll = true, snapshot?: AutoCommitSnapshot | null): Promise<AutoCommitResult> {
+  if (snapshot !== undefined) return commitSessionChanges(cwd, message, stageAll, snapshot);
   // Get current changes count
   const statusResult = await runGit('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' });
   const changes = statusResult.stdout?.trim().split('\n').filter(Boolean) || [];

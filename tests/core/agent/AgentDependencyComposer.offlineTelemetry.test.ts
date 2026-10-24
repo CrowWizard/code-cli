@@ -30,6 +30,7 @@ async function createAgent(options: AgentRuntime['options']): Promise<void> {
     getModel: vi.fn().mockReturnValue('test-model'),
   } as unknown as LLMProvider;
   const files = {
+    setTurnProvider: vi.fn(),
     root: '/test/workspace',
     readFile: vi.fn().mockResolvedValue('original contents'),
     writeFile: vi.fn(),
@@ -56,6 +57,7 @@ describe('AgentDependencyComposer offline telemetry wiring', () => {
   it.each([
     { label: '--offline', options: { offline: true } },
     { label: '--bare', options: { bare: true } },
+    { label: '--no-daemon', options: { daemon: false } },
   ])('keeps session sync off the network for $label runs', async ({ options }) => {
     await createAgent(options);
     expect(telemetryManagerConstructor).toHaveBeenCalledWith(expect.objectContaining({ offline: true }));

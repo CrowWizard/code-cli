@@ -54,7 +54,7 @@ function resolveBorderToken(style: InputBorderStyle): ColorToken {
   if (style === 'shell') {
     return 'dim';
   }
-  return 'borderAccent';
+  return 'composerBorder';
 }
 
 function resolveBorderFallback(style: InputBorderStyle): string {

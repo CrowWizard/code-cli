@@ -536,7 +536,7 @@ cd ~/projects/my-app && autohand
 ```
 |領域 |類型 |預設 |描述 |
 | ---------------------------- | ------ | -------- |---------------------------------------------------------------------------------------------------------------- |
-| `theme` |字串| `"aurora"` |終端輸出的顏色主題。內建函數包括 `dark`、`light`、`dracula`、`sandy`、`tui`、`tuatara`、`github-dark`、`cappadocia`、`rio` 和 `australia`。舊版 `turkey` 和 `brazil` 值仍會作為別名載入。 |
+| `theme` |字串| `"aurora"` |終端輸出的顏色主題。內建函數包括 `dark`、`light`、`dracula`、`sandy`、`tui`、`tuatara`、`github-dark`、`cappadocia`、`rio`、`australia` 和 `autohand`。舊版 `turkey` 和 `brazil` 值仍會作為別名載入。 |
 | `customThemes` |物件| `{}` |按主題名稱鍵入的內聯自訂主題定義。將 `theme` 設定為同一鍵以使用一個。   |
 | `autoConfirm` |布林 | `false` |跳過確認提示以確保安全操作 |
 | `readFileCharLimit` |數量 | `300` |從讀取/查找工具輸出中顯示的最大字元數（完整內容仍發送到模型）|
@@ -1915,7 +1915,7 @@ Autohand 將資料儲存在 `~/.autohand/` （或 `$AUTOHAND_HOME`）：
 | `--worktree [name]` |在隔離的 git 工作樹中執行會話（可選工作樹/分支名稱）|
 | `--tmux` |在專用 tmux 會話中啟動（意味著 `--worktree`；不能與 `--no-worktree` 一起使用）|
 | `--no-worktree` |在自動模式下停用 git worktree 隔離 |
-| `-c, --auto-commit` |完成任務後自動提交變更 |
+| `--auto-commit` |完成任務後自動提交變更 |
 | `--patch` |產生 git 補丁而不套用變更 |
 | `--output <file>` |補丁的輸出檔案（與--patch一起使用）|
 

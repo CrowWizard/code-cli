@@ -3,7 +3,9 @@
  * Copyright 2025 Autohand AI LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+import { extensionRuntimeHost } from '../../extensions/ExtensionRuntimeHost.js';
 import chalk from 'chalk';
+import { initializeSessionGitSnapshot, type SessionGitState } from '../../actions/gitSessionSnapshot.js';
 import { isAxoInput } from '../../ui/axo/axoCommand.js';
 import { isStartupTimingEnabled, startupTimeline } from '../../startup/startupTimeline.js';
 import { buildOutputSchemaInstruction, buildOutputSchemaRepairInstruction, checkOutputAgainstSchema, type OutputSchemaSpec } from '../../modes/outputSchema.js';
@@ -45,7 +47,7 @@ import { shouldForceAgentIdleLogout } from './AgentSessionAccounting.js';
 import {
   consumeAgentInkSubmittedInstructionEcho,
 } from './AgentUIRuntime.js';
-import { renderAgentSlashCommandResult } from './AgentCommandRuntime.js';
+import { renderAgentSlashCommandResult, shouldPreserveComposerDraftAfterCommand } from './AgentCommandRuntime.js';
 import {
   createQueuedAgentInstruction,
   resolveActiveGoalContinuation,
@@ -269,7 +271,7 @@ export interface FreshAgentSessionRecord {
 }
 
 export interface FreshAgentSessionHost {
-  runtime: {
+  runtime: SessionGitState & {
     workspaceRoot: string;
     options: Pick<AgentRuntime['options'], 'bare' | 'model'>;
     config: LoadedConfig;
@@ -318,6 +320,7 @@ export interface FreshAgentSessionHost {
 
 export async function startFreshAgentSession(
   host: FreshAgentSessionHost,
+  closeReason = 'Session ended - new mobile task started',
 ): Promise<AgentSessionIdentity> {
   const previousSession = host.sessionManager.getCurrentSession();
 
@@ -326,7 +329,7 @@ export async function startFreshAgentSession(
   await host.flushScheduledSessionSnapshot?.();
 
   if (previousSession) {
-    await host.sessionManager.closeSession('Session ended - new mobile task started');
+    await host.sessionManager.closeSession(closeReason);
     const endedAt = Date.now();
     if (host.runtime?.options?.bare !== true) {
       await Promise.allSettled([
@@ -341,6 +344,7 @@ export async function startFreshAgentSession(
     }
   }
 
+  initializeSessionGitSnapshot(host.runtime, true);
   const startedAt = Date.now();
   await host.resetConversationContext();
   host.resetAgentStateForFreshSession(startedAt);
@@ -746,9 +750,17 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
       callResourceCleanupSync(() => stopMobileRelay());
       host.persistentInputActiveTurn = false;
       callResourceCleanupSync(() => host.persistentInput?.dispose?.());
-      callResourceCleanupSync(() => process.stdin.pause());
+      // Protocol transports own stdin across replacement agent sessions.
+      if (!host.runtime?.isRpcMode) {
+        callResourceCleanupSync(() => process.stdin.pause());
+      }
 
       const cleanupTasks: Promise<unknown>[] = [];
+      cleanupTasks.push(callResourceCleanup(async () => {
+        await host.extensionReloadController?.stop();
+        await extensionRuntimeHost.deactivateAll();
+      }));
+      if (host.repositoryReadiness) cleanupTasks.push(callResourceCleanup(() => host.repositoryReadiness.stop()));
       if (host.ui) {
         const ui = host.ui;
         host.ui = null;
@@ -803,6 +815,7 @@ export async function shutdownAgentRuntimeResources(host: AgentLifecycleHost): P
   }
 
 export async function initializeAgentManagers(host: AgentLifecycleHost): Promise<void> {
+    initializeSessionGitSnapshot(host.runtime);
     if (host.runtime?.options?.bare === true) {
       await runWithConcurrency([
         { label: 'session_manager', run: async () => host.sessionManager.initialize() },
@@ -839,6 +852,8 @@ export async function performAgentBackgroundInit(
     try {
       // Phase 1: Parallel manager initialization
       await awaitLifecycleStep(Promise.resolve(host.initializeManagers()), signal);
+      if (isRuntimeResourceShutdownStarted(host)) return;
+      await host.extensionReloadController?.start();
       if (isRuntimeResourceShutdownStarted(host)) return;
       startupTimeline.mark('managers ready (sessions, memory, skills, hooks, workspace files)');
 
@@ -1247,10 +1262,16 @@ export async function runAgentCommandMode(
         throw createLifecycleAbortError();
       }
       await awaitLifecycleStep(
-        Promise.resolve(host.initializeForRPC(signal)),
+        Promise.resolve(host.runtime.options.resumeSessionId
+          ? host.initializeForRPC(signal, host.runtime.options.resumeSessionId)
+          : host.initializeForRPC(signal)),
         signal,
       );
       initialized = true;
+
+      if (host.runtime.options.resumeSessionId) {
+        await awaitLifecycleStep(host.restoreSessionState(host.runtime.options.resumeSessionId), signal);
+      }
 
       if (options.review) {
         await host.telemetryManager.trackCommand({
@@ -1370,15 +1391,24 @@ export async function runAgentCommandMode(
   }
 
 export async function restoreAgentSessionState(host: AgentLifecycleHost, sessionOrId: string | Session) {
+    initializeSessionGitSnapshot(host.runtime, true);
     const session = typeof sessionOrId === 'string'
       ? await host.sessionManager.loadSession(sessionOrId)
       : sessionOrId;
 
     await host.resetConversationContext();
     await host.injectSessionBootstrap();
-    const messages = session.getMessages();
-    host.restoredChatMessages = buildSessionChatLog(messages);
-    for (const msg of messages) {
+    const messages: import('../../session/types.js').SessionMessage[] = session.getMessages();
+    let checkpoint = -1;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index].role === 'system' && messages[index]._meta?.contextCompaction === true) {
+        checkpoint = index;
+        break;
+      }
+    }
+    const activeMessages = checkpoint >= 0 ? messages.slice(checkpoint) : messages;
+    host.restoredChatMessages = buildSessionChatLog(activeMessages);
+    for (const msg of activeMessages) {
       if (msg.role === 'system') {
         if (!msg.content.startsWith('You are Autohand')) {
           host.conversation.addSystemNote(msg.content);
@@ -1404,6 +1434,10 @@ export async function restoreAgentSessionState(host: AgentLifecycleHost, session
           tool_calls: convertedToolCalls,
           tool_call_id: (msg as any).tool_call_id
         });
+        if (msg.role === 'user') {
+          const restoredTurn = host.conversation.getLastTurn?.();
+          if (restoredTurn) restoredTurn.undoUnavailable = 'File undo history is unavailable for this restored conversation turn';
+        }
       }
     }
 
@@ -1855,7 +1889,7 @@ export async function runAgentInteractiveLoop(host: AgentLifecycleHost): Promise
               );
               if (host.ui || host.inkRenderer) {
                 host.setComposerIdle();
-                if (command !== '/whatityped' && command !== '/peers' && command !== '/feedback') {
+                if (!shouldPreserveComposerDraftAfterCommand(command)) {
                   host.clearComposerInput();
                 }
                 // Return to the top of the loop so the idle-wait path can await

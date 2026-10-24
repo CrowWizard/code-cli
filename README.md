@@ -19,6 +19,12 @@ Install it, run `autohand`, and describe the outcome you want in natural languag
 
 ## Features
 
+Interactive sessions assess repository readiness in the background while you work. A bounded, read-only scan compares `AGENTS.md` and `CLAUDE.md` history with committed and uncommitted changes, then asks your configured model for a repository map and concrete improvement candidates. It runs no project scripts and makes no edits. After your first successful turn, new findings appear once per repository; materially new findings can be offered in a later session. Use `/readiness` to review the evidence, `/readiness apply 1` to choose a finding, or `/readiness dismiss` to skip. Set `ui.repositoryReadiness` to `false` to disable this background model request. Bare, ephemeral, offline, command, RPC and ACP sessions skip it.
+
+The shell installer includes [Zit](https://getzit.org) v0.1.2 by default on supported macOS and Linux platforms, preserving an existing installation and verifying release checksums. Use `--no-zit` or `AUTOHAND_SKIP_ZIT_INSTALL=1` to opt out. The Windows installer supports `-NoZit` and the same environment variable; it preserves an existing Zit installation and reports that native Windows binaries are currently unavailable. `autohand --zit` requires Git 2.38 or newer. Installing Zit does not initialize repositories.
+
+The npm package includes checksum-verified Zit binaries for macOS and Linux on ARM64 and x64. `npm install -g autohand-cli` and `bun install -g autohand-cli` download them with the package, including when lifecycle scripts are disabled. Autohand uses `ZIT_BIN`, an existing `zit` on `PATH`, or its packaged binary, in that order. Rust and a separate Zit installation are not required. Native Windows Zit binaries are currently unavailable.
+
 - **Terminal-Native Agent**: Understands your codebase and executes approved changes from the CLI
 - **Planning + Tools**: Combines reasoning, file edits, shell commands, and web context in one loop
 - **Interactive REPL**: Smooth terminal experience with file mentions, slash commands, and keyboard shortcuts
@@ -138,7 +144,7 @@ autohand -p "add a dark mode toggle to the settings page"
 autohand -p "fix the TypeScript errors" -y
 
 # Auto-commit changes after task completion
-autohand -p "refactor the auth module" -c
+autohand -p "refactor the auth module" --auto-commit
 ```
 
 ## Editor Extensions
@@ -234,7 +240,9 @@ events and writes exactly one final `result` or `error` object to stdout.
 | `--output-format stream-json`   |       | Stream command lifecycle events as JSON Lines                                    |
 | `--json <stream\|local>`        |       | Stream JSON Lines or write only the final JSON result (`--json` defaults to stream) |
 | `--yes`                         | `-y`  | Auto-confirm risky actions                                                       |
-| `--auto-commit`                 | `-c`  | Auto-commit changes after completing tasks                                       |
+| `--continue`                    | `-c`  | Resume the latest session in this folder (also with `-p`)                        |
+| `--resume [id]`                 | `-r`  | Resume a saved session or open the folder picker                                 |
+| `--auto-commit`                 |       | Auto-commit changes after completing tasks                                       |
 | `--dry-run`                     |       | Preview actions without applying mutations                                       |
 | `--debug`                       | `-d`  | Enable debug output (verbose logging)                                            |
 | `--model <model>`               |       | Override the configured LLM model                                                |
@@ -341,7 +349,17 @@ Skills are discovered from:
 
 See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skills.
 
+## Automatic commits
+
+`--auto-commit` snapshots the repository before the agent starts editing. It commits only session changes and lists pre-existing edits and untracked files as `left uncommitted (yours)`. An initially dirty file stays uncommitted even if the agent edits it again. Your existing staging is preserved. Automatic commits are disabled if a safe baseline cannot be captured.
+
+## Proxy settings
+
+Node installs use `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` for requests, including provider SDK calls. Lowercase variables take precedence; Bun binaries use Bun's native proxy support. Corporate certificate bundles can be supplied with `NODE_EXTRA_CA_CERTS`.
+
 ## Slash Commands
+
+`/undo` restores every recorded agent file change from the last turn, newest first. It stops on the first unsafe restore and keeps the turn. Shell commands are not undone; restored sessions without a file journal are kept. `/export` redacts credentials and saves bare filenames under `~/.autohand/exports/` (or `$AUTOHAND_HOME/exports/`). Use an absolute or `./`-prefixed path to choose another location.
 
 | Command            | Description                                                                      |
 | ------------------ | -------------------------------------------------------------------------------- |
@@ -351,8 +369,8 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/exit`            | Exit the session                                                                 |
 | `/model`           | Switch LLM models                                                                |
 | `/new`             | Start fresh conversation                                                         |
-| `/clear`           | Clear conversation history                                                       |
-| `/undo`            | Revert the last recorded agent file mutation and conversation turn               |
+| `/clear`           | Compact context, retaining requests, learnings, changes and final answer           |
+| `/undo`            | Restore agent file changes from the last turn and remove it                      |
 | `/session`         | Show current session details                                                     |
 | `/sessions`        | List past sessions                                                               |
 | `/resume`          | Resume a previous session                                                        |
@@ -373,7 +391,7 @@ See [Agent Skills Documentation](docs/agent-skills.md) for creating custom skill
 | `/formatters`      | List code formatters                                                             |
 | `/lint`            | List code linters                                                                |
 | `/completion`      | Generate shell completion scripts                                                |
-| `/export`          | Export session to markdown/JSON/HTML                                             |
+| `/export`          | Export a redacted session to Markdown/JSON/HTML                                             |
 | `/status`          | Show workspace status                                                            |
 | `/usage`           | Show token activity by day, week, or month                                       |
 | `/login`           | Authenticate with Autohand Code API                                              |
@@ -527,7 +545,7 @@ autohand extensions install ./examples/extensions/autohand.code-health
 autohand extensions list
 ```
 
-Declarative extensions contribute tools, focused agents, and portable Agent Skills without package-code execution. Reviewed runtime extensions installed with `--trust` can also register slash commands, Ink UI, status/help segments, keybindings, CLI flags, hooks, providers, and permission policy. Mention `$extension-builder` to create, extend, or adapt an extension from a description or Pi package. See the [extension-builder guide and terminal demo](docs/guides/building-autohand-extensions.md), [Using extensions](docs/extensions.md), [Extension authoring](docs/extension-authoring.md), and the [seven working examples](examples/extensions).
+Declarative extensions contribute tools, focused agents, and portable Agent Skills without package-code execution. Reviewed runtime extensions installed with `--trust` can also register slash commands, Ink UI, status/help segments, keybindings, CLI flags, hooks, providers, and permission policy. Mention `$extension-builder` to create, extend, or adapt an extension from a description or Pi package. See the [extension-builder guide and terminal demo](docs/guides/building-autohand-extensions.md), [Using extensions](docs/extensions.md), [Extension authoring](docs/extension-authoring.md), and the [eight working examples](examples/extensions).
 
 ### Notebooks
 
@@ -608,7 +626,9 @@ autohand resume --path /path/to/project
 /resume
 ```
 
-The picker supports arrow keys, Enter, and page navigation for older sessions. Escape or Ctrl+C cancels without starting a session. `--last` uses the last activity time, falling back to creation time for older session metadata. Without a terminal, provide `--last` or an explicit reference. References cannot be combined with `--last` or `--all`; `-c` remains auto-commit.
+The picker supports arrow keys, Enter, and page navigation for older sessions. Escape or Ctrl+C cancels without starting a session. `--last` uses the last activity time, falling back to creation time for older session metadata. Without a terminal, provide `--last` or an explicit reference. References cannot be combined with `--last` or `--all`.
+
+`autohand -c` continues the most recently active session in this folder. If none exists, it starts a new one. Use `autohand -c -p "Continue the fix"` for a headless continuation, or `autohand -r <id>` to select a session directly. `autohand -r` opens the folder picker. `--ephemeral` cannot be combined with `--continue`, `--resume`, or `--fork`.
 
 ## Entire Integration
 
@@ -716,6 +736,12 @@ bun run typecheck
 
 # Run tests
 bun run test
+
+# Full proof (unit tests, build, and Tuistory)
+bun run proof
+
+# Limit local test workers on resource-constrained hosts
+AUTOHAND_TEST_WORKERS=1 bun run proof
 ```
 
 ## Docker

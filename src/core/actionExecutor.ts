@@ -53,7 +53,8 @@ import {
   gitAdd,
   gitReset,
   getAutoCommitInfo,
-  executeAutoCommit,
+  commitSessionChanges,
+  stageSessionPaths,
   // Log operations
   gitLog,
   // Remote operations
@@ -98,6 +99,7 @@ import {
   type ToolParameter,
 } from './toolManager.js';
 import type { FFFSearchProvider } from '../search/fffSearchProvider.js';
+import { NO_DAEMON_MESSAGE } from '../runtime/noDaemon.js';
 import { ToolsRegistry, createToolsRegistry, type MetaToolDefinition } from './toolsRegistry.js';
 import { MetaToolService } from './metaTools/MetaToolService.js';
 import type { MemoryManager } from '../memory/MemoryManager.js';
@@ -472,12 +474,21 @@ export class ActionExecutor {
 
     const { FFFSearchProvider } = await import('../search/fffSearchProvider.js');
     this.fffSearchWorkspaceRoot = workspaceRoot;
-    this.fffSearchProviderPromise = FFFSearchProvider.create(workspaceRoot);
+    this.fffSearchProviderPromise = this.runtime.options.daemon === false
+      ? FFFSearchProvider.create(workspaceRoot, { background: false })
+      : FFFSearchProvider.create(workspaceRoot);
     return this.fffSearchProviderPromise;
   }
 
   private scheduleFFFSearchProviderCleanup(): void {
     if (!this.fffSearchProviderPromise) {
+      return;
+    }
+    if (this.runtime.options.daemon === false) {
+      const provider = this.fffSearchProviderPromise;
+      this.fffSearchProviderPromise = null;
+      this.fffSearchWorkspaceRoot = null;
+      void provider.then(value => value.destroy()).catch(() => {});
       return;
     }
 
@@ -1106,6 +1117,10 @@ export class ActionExecutor {
     context?: ToolExecutionContext,
     capture?: ToolOutcomeCapture,
   ): Promise<string | undefined> {
+    if (this.runtime.options.daemon === false && (
+      ((action.type === 'run_command' || action.type === 'shell') && action.background === true)
+      || action.type === 'add_teammate' || action.type === 'compose_team'
+    )) return this.recordToolFailure(capture, 'authorization', NO_DAEMON_MESSAGE, NO_DAEMON_MESSAGE);
     const command = this.commandForPeerGuard(action);
     const executionState: ActionExecutionState = { started: false };
     try {
@@ -1180,6 +1195,11 @@ export class ActionExecutor {
 
     if (executionState) {
       executionState.started = true;
+    }
+
+    if (this.runtime.autoCommitPaths && action.type.startsWith('git_')
+      && !['git_add', 'git_commit', 'git_status', 'git_diff', 'git_diff_range', 'git_log', 'git_list_untracked', 'git_show', 'git_blame'].includes(action.type)) {
+      return this.recordToolFailure(capture, 'authorization', 'Automatic commit allows only scoped staging, committing and Git reads', 'Automatic commit allows only scoped staging, committing and Git reads');
     }
 
     switch (action.type) {
@@ -1663,7 +1683,7 @@ export class ActionExecutor {
       }
       case 'update_goal': {
         const manager = this.createGoalManager();
-        const updated = await manager.updateGoal({
+        const input = {
           objective: action.objective,
           status: parseGoalStatus(action.status),
           completionEvidence: action.completion_evidence,
@@ -1674,7 +1694,19 @@ export class ActionExecutor {
           timeBudgetSeconds: action.time_budget_seconds,
           minTokensBeforeWrapUp: action.min_tokens_before_wrap_up,
           minTimeSecondsBeforeWrapUp: action.min_time_seconds_before_wrap_up,
-        });
+        };
+        if (input.status === 'complete' && context?.deferGoalCompletion) {
+          const prepared = await manager.prepareGoalCompletion(input);
+          if (!prepared.ok || !prepared.goal) return formatGoalToolResult(prepared);
+          const expectedGoalId = prepared.goal.goalId;
+          return formatGoalToolResult(context.deferGoalCompletion(prepared, async () => {
+            context.signal?.throwIfAborted();
+            const completed = await manager.updateGoal({ ...input, expectedGoalId });
+            if (completed.started) await this.activateGoal(completed);
+            return completed;
+          }));
+        }
+        const updated = await manager.updateGoal(input);
         if (action.status === 'active' || updated.started) await this.activateGoal(updated);
         return formatGoalToolResult(updated);
       }
@@ -1862,6 +1894,7 @@ export class ActionExecutor {
         return `No changes needed (already formatted): ${action.path}`;
       }
       case 'run_command': {
+        if (this.runtime.autoCommitPaths && /\bgit\b/i.test(action.command ?? '')) return 'Use the scoped Git tools during automatic commit; shell Git commands are disabled.';
         if (!action.command || typeof action.command !== 'string') {
           return 'Error: run_command requires a "command" argument (string)';
         }
@@ -1884,6 +1917,7 @@ export class ActionExecutor {
           });
         };
 
+        this.files.markShellCommand?.();
         const cmdStr = `${action.command} ${(action.args ?? []).join(' ')}`.trim();
 
         // For interactive commands, pause Ink renderer and use inherited stdio
@@ -2060,10 +2094,12 @@ export class ActionExecutor {
         return output;
       }
       case 'shell': {
+        if (this.runtime.autoCommitPaths && /\bgit\b/i.test([action.command, ...(action.args ?? [])].join(' '))) return 'Use the scoped Git tools during automatic commit; shell Git commands are disabled.';
         if (!action.command || typeof action.command !== 'string') {
           return 'Error: shell requires a "command" argument (string)';
         }
 
+        this.files.markShellCommand?.();
         const cmdStr = `${action.command} ${(action.args ?? []).join(' ')}`.trim();
         const commandId = this.shouldDisplayToolOutput()
           && (!action.background || Boolean(this.onLiveCommandFinish && this.onLiveCommandRemove))
@@ -2537,6 +2573,13 @@ export class ActionExecutor {
         return gitMergeAbort(this.runtime.workspaceRoot);
       // Git Commit Operations
       case 'git_commit': {
+        if (this.runtime.autoCommitPaths) {
+          if (action.amend || action.allow_empty) return this.recordToolFailure(capture, 'authorization', 'Automatic commit cannot amend or create an empty commit', 'Automatic commit cannot amend or create an empty commit');
+          const scan = await this.scanBeforeCommit();
+          if (scan) return this.recordToolFailure(capture, 'authorization', scan, scan);
+          const result = await commitSessionChanges(this.runtime.workspaceRoot, action.message ?? 'Update session files', false, this.runtime.sessionGitSnapshot ?? null, this.runtime.autoCommitPaths);
+          return result.success ? result.message : this.recordToolFailure(capture, 'command', result.message, result.message);
+        }
         // Security scan before commit
         const scanResult = await this.scanBeforeCommit();
         if (scanResult) {
@@ -2549,6 +2592,7 @@ export class ActionExecutor {
         });
       }
       case 'git_add':
+        if (this.runtime.autoCommitPaths) return stageSessionPaths(this.runtime.workspaceRoot, action.paths, this.runtime.sessionGitSnapshot ?? null, this.runtime.autoCommitPaths);
         return gitAdd(this.runtime.workspaceRoot, action.paths);
       case 'git_reset':
         return gitReset(this.runtime.workspaceRoot, action.mode, action.ref);
@@ -2564,8 +2608,9 @@ export class ActionExecutor {
           );
         }
 
-        // Get commit info and auto-generate message
-        const info = getAutoCommitInfo(this.runtime.workspaceRoot);
+        // Get commit info and auto-generate message.
+        const info = getAutoCommitInfo(this.runtime.workspaceRoot, this.runtime.sessionGitSnapshot ?? null);
+        for (const file of info.filesLeftUncommitted ?? []) console.log(chalk.gray(`${file}: left uncommitted (yours)`));
 
         if (!info.canCommit) {
           console.log(chalk.yellow(`\n⚠ ${info.error}`));
@@ -2603,7 +2648,7 @@ export class ActionExecutor {
 
         if (autoApproveCommit) {
           console.log(chalk.gray('Auto-commit approval enabled; committing without prompt.'));
-          const result = await executeAutoCommit(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false);
+          const result = await commitSessionChanges(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false, this.runtime.sessionGitSnapshot ?? null, this.runtime.autoCommitPaths);
           if (result.success) {
             console.log(chalk.green(`\n✓ ${result.message}`));
             return result.message;
@@ -2660,7 +2705,7 @@ export class ActionExecutor {
         }
 
         // Execute the commit
-        const result = await executeAutoCommit(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false);
+        const result = await commitSessionChanges(this.runtime.workspaceRoot, commitMessage, action.stage_all !== false, this.runtime.sessionGitSnapshot ?? null, this.runtime.autoCommitPaths);
 
         if (result.success) {
           console.log(chalk.green(`\n✓ ${result.message}`));
@@ -4719,6 +4764,7 @@ export class ActionExecutor {
 
 function formatGoalToolResult(result: {
   ok: boolean;
+  completionPending?: boolean;
   storageWarning?: string;
   message?: string;
   goal: unknown;
@@ -4735,6 +4781,7 @@ function formatGoalToolResult(result: {
 }): string {
   return JSON.stringify({
     ok: result.ok,
+    completionPending: result.completionPending,
     storageWarning: result.storageWarning,
     message: result.message,
     goal: result.goal,

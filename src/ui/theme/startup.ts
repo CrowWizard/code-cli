@@ -4,15 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import os from 'node:os';
 import chalk from 'chalk';
 import { themedFg } from './Theme.js';
 import { t } from '../../i18n/index.js';
+import { formatBrandLogo } from '../brand.js';
 
 export function formatStartupBanner(logo: string): string {
-  return logo
-    .split('\n')
-    .map((line, index) => themedFg(index % 2 === 0 ? 'accent' : 'borderAccent', line, chalk.cyan))
-    .join('\n');
+  return formatBrandLogo(logo);
 }
 
 export function formatWelcomeVersionPrefix(version: string): string {
@@ -35,6 +34,17 @@ export function formatWelcomeGreeting(nameOrEmail: string): string {
   return themedFg('success', `Welcome back, ${nameOrEmail}!`, chalk.green);
 }
 
+/** Shows the home folder as `~`, so the banner matches the status line and doesn't print a username. */
+export function formatWelcomeDirectory(dir: string, home: string = os.homedir()): string {
+  if (!home) return dir;
+  if (dir === home) return '~';
+  for (const sep of ['/', '\\']) {
+    const prefix = home.endsWith(sep) ? home : home + sep;
+    if (dir.startsWith(prefix)) return `~${sep}${dir.slice(prefix.length)}`;
+  }
+  return dir;
+}
+
 export function formatWelcomeStatusLine(model: string, ccEnabled: boolean, dir: string): string {
   const ccStatus = ccEnabled
     ? themedFg('success', '[CC: ON]', chalk.green)
@@ -45,12 +55,18 @@ export function formatWelcomeStatusLine(model: string, ccEnabled: boolean, dir: 
     themedFg('accent', model, chalk.cyan),
     ccStatus,
     themedFg('muted', '| directory:', chalk.gray),
-    themedFg('accent', dir, chalk.cyan),
+    themedFg('accent', formatWelcomeDirectory(dir), chalk.cyan),
   ].join('  ');
 }
 
 export function formatWelcomeTitle(): string {
   return themedFg('muted', 'To get started, describe a task or try one of these commands:', chalk.gray);
+}
+
+export function formatWelcomeHint(): string {
+  return themedFg('muted', 'Describe a task, or use ', chalk.gray)
+    + themedFg('accent', '/help', chalk.cyan)
+    + themedFg('muted', ' to see commands.', chalk.gray);
 }
 
 export function formatWelcomeSuggestion(command: string, description: string): string {

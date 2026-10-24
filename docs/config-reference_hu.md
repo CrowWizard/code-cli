@@ -536,7 +536,7 @@ A részletekért lásd a [Workspace Safety](./workspace-safety.md) részt.
 ```
 | Mező | Típus | Alapértelmezett | Leírás |
 | ----------------------------- | ------ | ------- | ---------------------------------------------------------------------------------------------- |
-| `theme` | húr | `"aurora"` | Színes téma a terminál kimenetéhez. A beépítettek a következők: `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, CODE és ___8__ `australia`. A régi `turkey` és `brazil` értékek továbbra is betöltődnek álnévként. |
+| `theme` | húr | `"aurora"` | Színes téma a terminál kimenetéhez. A beépítettek a következők: `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, CODE és ___8__ `australia`, `autohand`. A régi `turkey` és `brazil` értékek továbbra is betöltődnek álnévként. |
 | `customThemes` | tárgy | `{}` | Soron belüli egyéni témadefiníciók a téma nevével. A használatához állítsa be a `theme` kulcsot ugyanarra a kulcsra.   |
 | `autoConfirm` | logikai | `false` | A biztonságos működés érdekében hagyja ki a megerősítő felszólításokat |
 | `readFileCharLimit` | szám | `300` | Maximum megjeleníthető karakter az olvasási/kereső eszköz kimenetéből (a teljes tartalom továbbra is elküldésre kerül a modellnek) |
@@ -1915,7 +1915,7 @@ Ezek a jelzők felülírják a konfigurációs fájl beállításait:
 | `--worktree [name]` | Munkamenet futtatása elszigetelt git-munkafán (opcionális munkafa/ág neve) |
 | `--tmux` | Indítás egy dedikált tmux munkamenetben (az `--worktree`-t jelenti; nem használható a `--no-worktree` kóddal) |
 | `--no-worktree` | A git munkafa elkülönítésének letiltása automatikus módban |
-| `-c, --auto-commit` | Változások automatikus véglegesítése a feladatok elvégzése után |
+| `--auto-commit` | Változások automatikus véglegesítése a feladatok elvégzése után |
 | `--patch` | Git javítás generálása változtatások alkalmazása nélkül |
 | `--output <file>` | A javítás kimeneti fájlja (a --patch-el együtt használatos) |
 

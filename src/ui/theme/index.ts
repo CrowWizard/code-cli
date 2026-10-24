@@ -52,6 +52,7 @@ export {
   setTheme,
   isThemeInitialized,
   themedFg,
+  themedFgIfSet,
   hexToRgb,
 } from './Theme.js';
 

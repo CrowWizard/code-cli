@@ -536,7 +536,7 @@ Tüm ayrıntılar için [Çalışma Alanı Güvenliği](./workspace-safety.md) k
 ```
 | Alan | Tür | Varsayılan | Açıklama |
 | ---------------------------- | ------ | ------- | ---------------------------------------------------------------------------------------------- |
-| `theme` | dize | `"aurora"` | Terminal çıkışı için renk teması. Yerleşikler arasında `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, `rio` ve `australia` bulunur. Eski `turkey` ve `brazil` değerleri hâlâ takma ad olarak yükleniyor. |
+| `theme` | dize | `"aurora"` | Terminal çıkışı için renk teması. Yerleşikler arasında `aurora`, `dark`, `light`, `dracula`, `sandy`, `tui`, `tuatara`, `github-dark`, `cappadocia`, `rio`, `australia` ve `autohand` bulunur. Eski `turkey` ve `brazil` değerleri hâlâ takma ad olarak yükleniyor. |
 | `customThemes` | nesne | `{}` | Tema adına göre anahtarlanan satır içi özel tema tanımları. Birini kullanmak için `theme` değerini aynı tuşa ayarlayın.   |
 | `autoConfirm` | boole | `false` | Güvenli işlemler için onay istemlerini atlayın |
 | `readFileCharLimit` | sayı | `300` | Okuma/bulma aracı çıktısından görüntülenecek maksimum karakter (tam içerik hâlâ modele gönderilmektedir) |
@@ -1915,7 +1915,7 @@ Bu bayraklar yapılandırma dosyası ayarlarını geçersiz kılar:
 | `--worktree [name]` | Oturumu yalıtılmış git çalışma ağacında çalıştırın (isteğe bağlı çalışma ağacı/dal adı) |
 | `--tmux` | Özel bir tmux oturumunda başlat (`--worktree` anlamına gelir; `--no-worktree` ile kullanılamaz) |
 | `--no-worktree` | Otomatik modda git çalışma ağacı izolasyonunu devre dışı bırakın |
-| `-c, --auto-commit` | Görevleri tamamladıktan sonra değişiklikleri otomatik olarak uygula |
+| `--auto-commit` | Görevleri tamamladıktan sonra değişiklikleri otomatik olarak uygula |
 | `--patch` | Değişiklikleri uygulamadan git yamasını oluşturun |
 | `--output <file>` | Yama için çıktı dosyası (--patch ile kullanılır) |
 

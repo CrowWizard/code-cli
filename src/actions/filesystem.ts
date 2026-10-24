@@ -35,6 +35,8 @@ export const FILE_LIMITS = {
   MAX_SEARCH_RESULTS: 1000,
   /** Maximum undo stack size */
   MAX_UNDO_STACK: 100,
+  /** Combined retained before/after contents across the undo journal (64MB). */
+  MAX_UNDO_BYTES: 64 * 1024 * 1024,
 };
 
 export class UndoStackEmptyError extends Error {
@@ -51,22 +53,36 @@ export class UnsafeUndoError extends Error {
   }
 }
 
-type UndoEntry =
+export interface FileMutationTurn {
+  id: string;
+  ranShellCommand: boolean;
+  undoUnavailable?: string;
+}
+
+type UndoEntry = { turn?: FileMutationTurn; turnId?: string; expectedMode?: number } & (
   | {
       kind: 'restore-file';
       absolutePath: string;
-      previousContents: string;
-      expectedContents: string | null;
+      previousContents: string | Buffer;
+      previousMode?: number;
+      expectedContents: string | Buffer | null;
     }
   | {
       kind: 'remove-file';
       absolutePath: string;
-      expectedContents: string;
+      expectedContents: string | Buffer;
     }
   | {
       kind: 'unavailable';
       reason: string;
-    };
+    });
+
+function undoEntryBytes(entry: UndoEntry): number {
+  if (entry.kind === 'unavailable') return 0;
+  const size = (value: string | Buffer | null) => value === null ? 0 : Buffer.byteLength(value);
+  return size(entry.expectedContents) + (entry.kind === 'restore-file' ? size(entry.previousContents) : 0);
+}
+
 
 /**
  * Represents a batched change in preview mode
@@ -150,6 +166,8 @@ export type FileWriteGuard = (relativePath: string, previous: string | null, nex
 
 export class FileActionManager {
   private undoStack: UndoEntry[] = [];
+  private undoStackBytes = 0;
+  private turnProvider: () => FileMutationTurn | undefined = () => undefined;
   private workspaceRoot: string;
   private readonly additionalDirs: string[];
   private readonly resolveSearchCommand: () => string;
@@ -157,6 +175,7 @@ export class FileActionManager {
   // Preview mode state
   private previewMode = false;
   private pendingChanges: BatchedChange[] = [];
+  private pendingTurns = new WeakMap<BatchedChange, FileMutationTurn>();
   private batchId: string | null = null;
   private changeCounter = 0;
   private onBatchChange: BatchChangeCallback | null = null;
@@ -337,11 +356,20 @@ export class FileActionManager {
           }
         }
 
+        const exists = await fs.pathExists(fullPath);
+        const stats = exists ? await fs.lstat(fullPath) : null;
+        const previous = stats?.isFile() ? await fs.readFile(fullPath) : null;
         if (change.changeType === 'delete') {
           await fs.remove(fullPath);
+          if (previous !== null) this.recordUndo({ kind: 'restore-file', absolutePath: fullPath, previousContents: previous, previousMode: stats?.mode, expectedContents: null }, this.pendingTurns.get(change));
+          else if (stats) this.recordUndo({ kind: 'unavailable', reason: 'Cannot undo directory deletion: ' + change.filePath }, this.pendingTurns.get(change));
         } else {
+          this.guardWrite(fullPath, previous?.toString('utf8') ?? null, change.proposedContent);
           await fs.ensureDir(path.dirname(fullPath));
           await fs.writeFile(fullPath, change.proposedContent, 'utf8');
+          this.recordUndo(previous === null
+            ? { kind: 'remove-file', absolutePath: fullPath, expectedContents: change.proposedContent }
+            : { kind: 'restore-file', absolutePath: fullPath, previousContents: previous, expectedContents: change.proposedContent }, this.pendingTurns.get(change));
         }
 
         applied.push(change.id);
@@ -383,6 +411,8 @@ export class FileActionManager {
       toolId: this.currentToolId,
       toolName: this.currentToolName,
     };
+    const turn = this.turnProvider();
+    if (turn) this.pendingTurns.set(change, turn);
     this.pendingChanges.push(change);
 
     // Emit to RPC if callback is set
@@ -391,10 +421,51 @@ export class FileActionManager {
     }
   }
 
-  /**
-   * Called before any text write lands, with the content before (null for a
-   * new file) and after. Throwing blocks the write.
-   */
+  setTurnProvider(provider: () => FileMutationTurn | undefined): void {
+    this.turnProvider = provider;
+  }
+
+  markShellCommand(): void {
+    const turn = this.turnProvider();
+    if (turn) turn.ranShellCommand = true;
+  }
+
+  private recordUndo(entry: UndoEntry, turn: FileMutationTurn | undefined): void {
+    if (entry.kind !== 'unavailable' && entry.expectedContents !== null) {
+      try { entry = { ...entry, expectedMode: fs.lstatSync(entry.absolutePath).mode & 0o777 }; }
+      catch { /* Content and existence are still checked before any restore. */ }
+    }
+    if (undoEntryBytes(entry) > FILE_LIMITS.MAX_UNDO_BYTES) {
+      const reason = 'The file mutation exceeds the undo memory budget.';
+      if (turn) turn.undoUnavailable = reason;
+      entry = { kind: 'unavailable', reason };
+    }
+    while (this.undoStack.length && (this.undoStack.length >= FILE_LIMITS.MAX_UNDO_STACK
+      || this.undoStackBytes + undoEntryBytes(entry) > FILE_LIMITS.MAX_UNDO_BYTES)) {
+      const discarded = this.undoStack.shift()!;
+      this.undoStackBytes -= undoEntryBytes(discarded);
+      if (discarded.turn) discarded.turn.undoUnavailable = 'The undo history for this turn is no longer complete.';
+    }
+    this.undoStack.push({ ...entry, turn, turnId: turn?.id });
+    this.undoStackBytes += undoEntryBytes(entry);
+  }
+
+  async undoTurn(turn: FileMutationTurn): Promise<string[]> {
+    if (turn.undoUnavailable) throw new UnsafeUndoError(turn.undoUnavailable);
+    const restored = new Set<string>();
+    for (let index = this.undoStack.length - 1; index >= 0; index--) {
+      const entry = this.undoStack[index];
+      if (entry.turnId !== turn.id) continue;
+      if (entry.kind === 'unavailable') throw new UnsafeUndoError(entry.reason);
+      await this.revertEntry(entry);
+      this.undoStack.splice(index, 1);
+      this.undoStackBytes -= undoEntryBytes(entry);
+      restored.add(path.relative(this.workspaceRoot, entry.absolutePath));
+    }
+    return [...restored];
+  }
+
+  /** Inspects a text write before it lands; throwing blocks the write. */
   setWriteGuard(guard: FileWriteGuard | null): void {
     this.writeGuard = guard;
   }
@@ -794,9 +865,12 @@ export class FileActionManager {
       throw new Error(`Content too large to write (${sizeMB}MB). Maximum allowed: ${limitMB}MB`);
     }
 
+    const turn = this.turnProvider();
     const filePath = this.resolvePath(target);
     const exists = await fs.pathExists(filePath);
-    const previous = exists ? await fs.readFile(filePath, 'utf8') : '';
+    const previousBytes = exists ? await fs.readFile(filePath) : null;
+    const previousMode = exists ? (await fs.stat(filePath)).mode : undefined;
+    const previous = previousBytes?.toString('utf8') ?? '';
     const changeType = exists ? 'modify' : 'create';
 
     // In preview mode, batch the change instead of writing
@@ -814,20 +888,16 @@ export class FileActionManager {
     this.guardWrite(filePath, exists ? previous : null, contents);
     await fs.ensureDir(path.dirname(filePath));
 
-    // Limit undo stack size to prevent memory exhaustion
-    if (this.undoStack.length >= FILE_LIMITS.MAX_UNDO_STACK) {
-      this.undoStack.shift(); // Remove oldest entry
-    }
-    this.undoStack.push(exists
+    await fs.writeFile(filePath, contents, 'utf8');
+    this.recordUndo(exists
       ? {
           kind: 'restore-file',
           absolutePath: filePath,
-          previousContents: previous,
+          previousContents: previousBytes ?? '',
+          previousMode,
           expectedContents: contents,
         }
-      : { kind: 'remove-file', absolutePath: filePath, expectedContents: contents });
-
-    await fs.writeFile(filePath, contents, 'utf8');
+      : { kind: 'remove-file', absolutePath: filePath, expectedContents: contents }, turn);
   }
 
   async appendFile(target: string, contents: string): Promise<void> {
@@ -836,7 +906,11 @@ export class FileActionManager {
   }
 
   async applyPatch(target: string, patch: string, description?: string): Promise<void> {
+    const turn = this.turnProvider();
     const filePath = this.resolvePath(target);
+    const existed = await fs.pathExists(filePath);
+    const previousBytes = existed ? await fs.readFile(filePath) : null;
+    const previousMode = existed ? (await fs.stat(filePath)).mode : undefined;
     const current = await this.readFileSafe(target);
     // Validate and fix the patch to correct any mismatched line counts in hunk headers
     const fixedPatch = validateAndFixPatch(patch);
@@ -858,48 +932,58 @@ export class FileActionManager {
     }
 
     this.guardWrite(filePath, await fs.pathExists(filePath) ? current : null, updated);
-    this.undoStack.push({
+    await fs.writeFile(filePath, updated, 'utf8');
+    this.recordUndo(existed ? {
       kind: 'restore-file',
       absolutePath: filePath,
-      previousContents: current,
+      previousContents: previousBytes ?? current,
+      previousMode,
       expectedContents: updated,
-    });
-    await fs.writeFile(filePath, updated, 'utf8');
+    } : { kind: 'remove-file', absolutePath: filePath, expectedContents: updated }, turn);
   }
 
   async undoLast(): Promise<void> {
     const entry = this.undoStack.at(-1);
-    if (!entry) {
-      throw new UndoStackEmptyError();
-    }
-    if (entry.kind === 'unavailable') {
-      throw new UnsafeUndoError(entry.reason);
-    }
-    if (entry.kind === 'remove-file') {
-      if (await fs.pathExists(entry.absolutePath)) {
-        const currentContents = await fs.readFile(entry.absolutePath, 'utf8');
-        if (currentContents !== entry.expectedContents) {
-          throw new UnsafeUndoError('Cannot undo because the file changed after the agent mutation');
-        }
-      }
-      await fs.remove(entry.absolutePath);
-      this.undoStack.pop();
-      return;
-    }
-    if (entry.expectedContents !== null) {
-      if (!await fs.pathExists(entry.absolutePath)) {
-        throw new UnsafeUndoError('Cannot undo because the file changed after the agent mutation');
-      }
-      const currentContents = await fs.readFile(entry.absolutePath, 'utf8');
-      if (currentContents !== entry.expectedContents) {
-        throw new UnsafeUndoError('Cannot undo because the file changed after the agent mutation');
-      }
-    } else if (await fs.pathExists(entry.absolutePath)) {
-      throw new UnsafeUndoError('Cannot undo because the path changed after the agent mutation');
-    }
-    await fs.ensureDir(path.dirname(entry.absolutePath));
-    await fs.writeFile(entry.absolutePath, entry.previousContents, 'utf8');
+    if (!entry) throw new UndoStackEmptyError();
+    await this.revertEntry(entry);
     this.undoStack.pop();
+    this.undoStackBytes -= undoEntryBytes(entry);
+  }
+
+  private async revertEntry(entry: UndoEntry): Promise<void> {
+    if (entry.kind === 'unavailable') throw new UnsafeUndoError(entry.reason);
+    const displayPath = path.relative(this.workspaceRoot, entry.absolutePath);
+    const fail = (reason: string): never => { throw new UnsafeUndoError(displayPath + ': ' + reason); };
+    try {
+      this.resolvePath(entry.absolutePath);
+      const stats = await fs.lstat(entry.absolutePath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (stats && !stats.isFile()) fail('the path changed after the agent mutation');
+      if (stats && entry.expectedMode !== undefined && (stats.mode & 0o777) !== entry.expectedMode) fail('the file permissions changed after the agent mutation');
+      if (entry.expectedContents !== null) {
+        if (!stats) {
+          if (entry.kind === 'remove-file') return;
+          fail('the file changed after the agent mutation');
+        }
+        const current = await fs.readFile(entry.absolutePath);
+        const expected = Buffer.isBuffer(entry.expectedContents) ? entry.expectedContents : Buffer.from(entry.expectedContents);
+        if (!current.equals(expected)) fail('the file changed after the agent mutation');
+      } else if (stats) {
+        fail('the path changed after the agent mutation');
+      }
+      if (entry.kind === 'remove-file') {
+        await fs.remove(entry.absolutePath);
+      } else {
+        await fs.ensureDir(path.dirname(entry.absolutePath));
+        await fs.writeFile(entry.absolutePath, entry.previousContents);
+        if (entry.previousMode !== undefined) await fs.chmod(entry.absolutePath, entry.previousMode & 0o777);
+      }
+    } catch (error) {
+      if (error instanceof UnsafeUndoError) throw error;
+      fail(error instanceof Error ? error.message : String(error));
+    }
   }
 
   search(query: string, relativePath?: string): SearchHit[] {
@@ -1303,51 +1387,89 @@ export class FileActionManager {
   }
 
   async deletePath(relativePath: string, description?: string): Promise<void> {
+    const turn = this.turnProvider();
     const fullPath = this.resolvePath(relativePath);
     const exists = await fs.pathExists(fullPath);
     if (!exists) {
       throw new Error(`${relativePath} does not exist.`);
     }
     const stats = await fs.stat(fullPath);
-    const previousContents = stats.isFile() ? await fs.readFile(fullPath, 'utf8') : '';
+    const snapshotAvailable = stats.isFile() && stats.size <= FILE_LIMITS.MAX_WRITE_SIZE;
+    const previousContents = snapshotAvailable ? await fs.readFile(fullPath) : Buffer.alloc(0);
 
     // In preview mode, batch the change instead of deleting
     if (this.previewMode) {
       this.addBatchedChange(
         relativePath,
         'delete',
-        previousContents,
+        previousContents.toString('utf8'),
         '',
         description ?? `Delete ${relativePath}`
       );
       return;
     }
 
-    this.undoStack.push(stats.isFile()
+    await fs.remove(fullPath);
+    this.recordUndo(snapshotAvailable
       ? {
           kind: 'restore-file',
           absolutePath: fullPath,
           previousContents,
+          previousMode: stats.mode,
           expectedContents: null,
         }
       : {
           kind: 'unavailable',
-          reason: `Cannot undo directory deletion: ${relativePath}`,
-        });
-    await fs.remove(fullPath);
+          reason: stats.isFile()
+            ? `Cannot undo deletion without a bounded file snapshot: ${relativePath}`
+            : `Cannot undo directory deletion: ${relativePath}`,
+        }, turn);
   }
 
   async renamePath(from: string, to: string): Promise<void> {
+    const turn = this.turnProvider();
     const fromPath = this.resolvePath(from);
     const toPath = this.resolvePath(to);
+    if (fromPath === toPath) return;
+    const source = await fs.lstat(fromPath);
+    const destination = await fs.lstat(toPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    const sourceContents = source.isFile() && source.size <= FILE_LIMITS.MAX_WRITE_SIZE ? await fs.readFile(fromPath) : null;
+    const destinationContents = destination?.isFile() && destination.size <= FILE_LIMITS.MAX_WRITE_SIZE ? await fs.readFile(toPath) : null;
     await fs.ensureDir(path.dirname(toPath));
     await fs.move(fromPath, toPath, { overwrite: true });
+    if (sourceContents === null || (destination && destinationContents === null)) {
+      this.recordUndo({ kind: 'unavailable', reason: 'Cannot undo rename without bounded file snapshots: ' + from + ' -> ' + to }, turn);
+      return;
+    }
+    this.recordUndo({ kind: 'restore-file', absolutePath: fromPath, previousContents: sourceContents, previousMode: source.mode, expectedContents: null }, turn);
+    this.recordUndo(destinationContents === null
+      ? { kind: 'remove-file', absolutePath: toPath, expectedContents: sourceContents }
+      : { kind: 'restore-file', absolutePath: toPath, previousContents: destinationContents, previousMode: destination?.mode, expectedContents: sourceContents }, turn);
   }
 
   async copyPath(from: string, to: string): Promise<void> {
+    const turn = this.turnProvider();
     const fromPath = this.resolvePath(from);
     const toPath = this.resolvePath(to);
+    if (fromPath === toPath) return;
+    const source = await fs.lstat(fromPath);
+    const destination = await fs.lstat(toPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    const sourceContents = source.isFile() && source.size <= FILE_LIMITS.MAX_WRITE_SIZE ? await fs.readFile(fromPath) : null;
+    const destinationContents = destination?.isFile() && destination.size <= FILE_LIMITS.MAX_WRITE_SIZE ? await fs.readFile(toPath) : null;
     await fs.copy(fromPath, toPath, { overwrite: true });
+    if (sourceContents === null || (destination && destinationContents === null)) {
+      this.recordUndo({ kind: 'unavailable', reason: 'Cannot undo copy without bounded file snapshots: ' + to }, turn);
+      return;
+    }
+    this.recordUndo(destinationContents === null
+      ? { kind: 'remove-file', absolutePath: toPath, expectedContents: sourceContents }
+      : { kind: 'restore-file', absolutePath: toPath, previousContents: destinationContents, previousMode: destination?.mode, expectedContents: sourceContents }, turn);
   }
 
   async replaceInFile(relativePath: string, searchValue: string | RegExp, replaceValue: string): Promise<void> {

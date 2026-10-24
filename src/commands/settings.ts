@@ -1,3 +1,5 @@
+import { configureSearchFromAccount } from '../actions/web.js';
+import { SEARCH_PROVIDERS } from '../search/providers.js';
 /**
  * @license
  * Copyright 2025 Autohand AI LLC
@@ -10,7 +12,7 @@ import { DEFAULT_TOOL_OUTPUT_MODE, TOOL_OUTPUT_MODES } from '../ui/toolOutput.js
 import { INTERACTION_MODE_SEQUENCE } from '../core/agent/InteractionModeController.js';
 import { DEFAULT_STARTUP_INTERACTION_MODE } from '../startup/modeRouter.js';
 import { getCurrentLocale, t } from '../i18n/index.js';
-import { getTheme, initTheme, isThemeInitialized, listAvailableThemes } from '../ui/theme/index.js';
+import { getTheme, initTheme, isThemeInitialized, listAvailableThemes, themedFgIfSet } from '../ui/theme/index.js';
 import { getDefaultThemeName } from '../ui/theme/themes.js';
 import { showModal, showInput, showConfirm, showPassword, type ModalOption } from '../ui/ink/components/Modal.js';
 import { saveConfig } from '../config.js';
@@ -228,9 +230,10 @@ export const SETTINGS_REGISTRY: SettingDef[] = [
   { key: 'teams.maxTeammates', labelKey: 'commands.settings.teams.maxTeammates', descriptionKey: 'commands.settings.teams.maxTeammatesDesc', category: 'teams', type: 'number', defaultValue: 5 },
 
   // Search
-  { key: 'search.provider', labelKey: 'commands.settings.search.provider', descriptionKey: 'commands.settings.search.providerDesc', category: 'search', type: 'enum', enumValues: ['google', 'brave', 'duckduckgo', 'parallel'], defaultValue: 'google' },
+  { key: 'search.provider', labelKey: 'commands.settings.search.provider', descriptionKey: 'commands.settings.search.providerDesc', category: 'search', type: 'enum', enumValues: [...SEARCH_PROVIDERS], defaultValue: 'browser-profile' },
   { key: 'search.braveApiKey', labelKey: 'commands.settings.search.braveApiKey', descriptionKey: 'commands.settings.search.braveApiKeyDesc', category: 'search', type: 'password' },
   { key: 'search.parallelApiKey', labelKey: 'commands.settings.search.parallelApiKey', descriptionKey: 'commands.settings.search.parallelApiKeyDesc', category: 'search', type: 'password' },
+  { key: 'search.exaApiKey', labelKey: 'commands.settings.search.exaApiKey', descriptionKey: 'commands.settings.search.exaApiKeyDesc', category: 'search', type: 'password' },
 ];
 
 // ── Utility Functions ──────────────────────────────────────────────────
@@ -420,10 +423,10 @@ export function formatSettingValue(value: unknown, type: SettingType, fallback?:
     case 'password':
       return typeof value === 'string' && value.length > 0 ? chalk.gray('****') : chalk.gray('(not set)');
     case 'number':
-      return chalk.cyan(String(value));
+      return themedFgIfSet('commandAccent', String(value), chalk.cyan);
     case 'enum':
     case 'string':
-      return chalk.cyan(String(value));
+      return themedFgIfSet('commandAccent', String(value), chalk.cyan);
     default:
       return String(value);
   }
@@ -524,6 +527,7 @@ async function applyPersistedSettingChange(
   change: SettingsChange,
 ): Promise<string | undefined> {
   try {
+    if (change.key.startsWith('search.')) await configureSearchFromAccount(ctx.config);
     SETTINGS_REGISTRY.find((setting) => setting.key === change.key)?.apply?.(change.value);
     await ctx.onSettingChanged?.(change);
     return undefined;
@@ -564,7 +568,7 @@ async function showCategorySettings(category: SettingCategory, ctx: SettingsComm
     if (!setting) return;
 
     if (setting.redirect) {
-      console.log(chalk.gray(`\n${t('commands.settings.redirect', { command: chalk.cyan(setting.redirect) })}\n`));
+      console.log(chalk.gray(`\n${t('commands.settings.redirect', { command: themedFgIfSet('commandAccent', setting.redirect, chalk.cyan) })}\n`));
       continue;
     }
 
@@ -658,7 +662,7 @@ export async function settings(ctx: SettingsCommandContext, args: string[] = [])
     }
   }
 
-  console.log(chalk.cyan(`\n${t('commands.settings.title')}\n`));
+  console.log(themedFgIfSet('commandAccent', `\n${t('commands.settings.title')}\n`, chalk.cyan));
 
   while (true) {
     const options: ModalOption[] = SETTING_CATEGORIES.map(cat => ({

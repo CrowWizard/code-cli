@@ -5,7 +5,7 @@ export async function selectTheme(session: Session, name: string): Promise<void>
   await session.type('/theme');
   await session.press('enter');
   await session.waitForText('Select a theme:');
-  for (let step = 0; step < 30; step += 1) {
+  for (let step = 0; step < 60; step += 1) {
     const screen = await session.text({ trimEnd: true });
     const selected = screen.split('\n').find(line => line.includes('▸'));
     const label = selected?.replace(/^\s*▸\s+\d+\.\s*/, '').replace(/ \(current\)$/, '').trim();
@@ -29,7 +29,7 @@ export async function selectThemeFromSettings(session: Session, name: string): P
   await session.waitForText('Select a setting to change:');
   await session.press('1');
   await session.text({ timeout: 5_000, waitFor: (text) => /▸\s+\d+\.\s*aurora \(current\)/.test(text) });
-  for (let step = 0; step < 40; step += 1) {
+  for (let step = 0; step < 60; step += 1) {
     const screen = await session.text({ trimEnd: true });
     const selected = screen.split('\n').find(line => line.includes('▸'));
     const label = selected?.replace(/^\s*▸\s+\d+\.\s*/, '').replace(/ \(current\)$/, '').trim();
