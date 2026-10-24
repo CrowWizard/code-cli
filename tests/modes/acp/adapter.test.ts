@@ -2237,7 +2237,7 @@ describe("AutohandAcpAdapter", () => {
       }
     });
 
-    it("reports file changes as diffs on the completed tool update", async () => {
+    it("reports file changes as diffs before the tool completes", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
       await outputListener({
         type: "tool_start",
@@ -2262,8 +2262,14 @@ describe("AutohandAcpAdapter", () => {
       const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update)
         .filter(update => update.toolCallId === "write-1");
       expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "write-1", kind: "edit", title: "Write: src/file.ts" });
-      expect(updates).toHaveLength(2);
+      expect(updates).toHaveLength(3);
       expect(updates[1]).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "write-1",
+        locations: [{ path: "/workspace/src/file.ts" }],
+        content: [{ type: "diff", path: "/workspace/src/file.ts", oldText: "before", newText: "after" }],
+      });
+      expect(updates[2]).toMatchObject({
         sessionUpdate: "tool_call_update",
         toolCallId: "write-1",
         status: "completed",
@@ -2302,8 +2308,16 @@ describe("AutohandAcpAdapter", () => {
 
       const updates = connection.sessionUpdate.mock.calls.map(([params]: [{ update: Record<string, unknown> }]) => params.update)
         .filter(update => update.toolCallId === "write-many");
-      expect(updates).toHaveLength(2);
+      expect(updates).toHaveLength(4);
       expect(updates[1]).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        content: [{ type: "diff", path: "/workspace/src/a.ts", oldText: null, newText: "a" }],
+      });
+      expect(updates[2]).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        content: [{ type: "diff", path: "/workspace/src/b.ts", oldText: "b", newText: "updated-b" }],
+      });
+      expect(updates[3]).toMatchObject({
         status: "completed",
         locations: [{ path: "/workspace/src/a.ts" }, { path: "/workspace/src/b.ts" }],
         content: [

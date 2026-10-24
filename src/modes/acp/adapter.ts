@@ -1696,6 +1696,21 @@ export class AutohandAcpAdapter implements Agent {
                 const diffs = this.toolFileDiffs.get(toolCallId) ?? [];
                 diffs.push({ path: filePath, ...event.fileDiff });
                 this.toolFileDiffs.set(toolCallId, diffs);
+                await this.connection.sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: 'tool_call_update',
+                    toolCallId,
+                    locations: [{ path: filePath }],
+                    content: [{
+                      type: 'diff' as const,
+                      path: filePath,
+                      oldText: event.fileDiff.oldText,
+                      newText: event.fileDiff.newText,
+                    }],
+                    ...parentToolCallMeta(event.parentToolId),
+                  },
+                });
               }
             }
             this.emitHookFileModified(

@@ -219,10 +219,11 @@ function renderBlock(node: RootContent, ctx: RenderContext): string[] {
     }
     case 'code': {
       const lines: string[] = [];
-      if (node.lang) {
+      const isJsonFence = node.lang?.toLowerCase() === 'json';
+      if (node.lang && !isJsonFence) {
         lines.push(...wrap(styles.token('mdCodeBlockBorder', node.lang), ctx.width));
       }
-      const code = styles.color && node.lang ? highlight(node.value, node.lang) : node.value;
+      const code = styles.color && node.lang && !isJsonFence ? highlight(node.value, node.lang) : node.value;
       const border = styles.token('mdCodeBlockBorder', '│');
       lines.push(...wrap(code, ctx.width - 2, false).map((line) => `${border} ${line}`));
       return lines;

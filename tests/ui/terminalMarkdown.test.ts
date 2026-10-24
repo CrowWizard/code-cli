@@ -101,6 +101,13 @@ describe('renderMarkdownForTerminal', () => {
     expect(rendered).toContain('"hello world";');
   });
 
+  it('renders JSON fences as plain code blocks without a language label', () => {
+    const rendered = renderMarkdownForTerminal('```json\n{"id":"childhood"}\n```', { color: false });
+
+    expect(rendered).toBe('│ {"id":"childhood"}');
+    expect(rendered).not.toContain('json');
+  });
+
   it('drops heading markers and keeps the heading text', () => {
     expect(plain('### 1. Inline thinking extraction')).toBe('1. Inline thinking extraction');
     expect(plain('# Title\n\n## Section')).toBe('Title\n\nSection');
