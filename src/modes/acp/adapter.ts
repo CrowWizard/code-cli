@@ -556,8 +556,88 @@ export class AutohandAcpAdapter implements Agent {
     }
   }
 
-  private async replayConversation(sessionId: string, messages: SessionMessage[]): Promise<void> {
+  private async replayConversation(sessionId: string, messages: SessionMessage[], workspaceRoot: string): Promise<void> {
     for (const msg of messages) {
+      if (msg.role === 'assistant' && Array.isArray(msg.toolCalls)) {
+        for (const toolCall of msg.toolCalls) {
+          if (!toolCall || typeof toolCall !== 'object' || typeof toolCall.id !== 'string') continue;
+          const toolName = typeof toolCall.tool === 'string'
+            ? toolCall.tool
+            : typeof toolCall.function?.name === 'string' ? toolCall.function.name : 'unknown';
+          let args: Record<string, unknown> = {};
+          if (toolCall.args && typeof toolCall.args === 'object' && !Array.isArray(toolCall.args)) {
+            args = toolCall.args as Record<string, unknown>;
+          } else if (typeof toolCall.args === 'string') {
+            try {
+              const parsedArgs = JSON.parse(toolCall.args) as unknown;
+              if (parsedArgs && typeof parsedArgs === 'object' && !Array.isArray(parsedArgs)) {
+                args = parsedArgs as Record<string, unknown>;
+              }
+            } catch {
+              // Keep an empty raw input for malformed legacy tool arguments.
+            }
+          }
+          const locations: Array<{ path: string }> = [];
+          for (const key of ['path', 'file']) {
+            if (typeof args[key] === 'string') locations.push({ path: args[key] });
+          }
+          await this.connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: toolCall.id,
+              title: resolveToolDisplayName(toolName, args),
+              kind: resolveToolKind(toolName),
+              status: 'completed' as ToolCallStatus,
+              ...(locations.length > 0 ? { locations } : {}),
+              rawInput: args,
+            },
+          });
+        }
+      }
+
+      if (msg.role === 'tool' && msg.tool_call_id) {
+        const acpMeta = msg._meta?.acp;
+        const fileDiffs = acpMeta && typeof acpMeta === 'object' && Array.isArray((acpMeta as Record<string, unknown>).fileDiffs)
+          ? (acpMeta as Record<string, unknown>).fileDiffs as Array<Record<string, unknown>>
+          : [];
+        const diffs = fileDiffs.filter((diff) =>
+          typeof diff.path === 'string'
+          && typeof diff.newText === 'string'
+          && (diff.oldText === null || typeof diff.oldText === 'string'),
+        ).map((diff) => ({
+          type: 'diff' as const,
+          path: resolve(workspaceRoot, diff.path as string),
+          oldText: diff.oldText as string | null,
+          newText: diff.newText as string,
+        }));
+        if (diffs.length > 0) {
+          await this.connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: msg.tool_call_id,
+              content: diffs,
+              locations: diffs.map((diff) => ({ path: diff.path })),
+            },
+          });
+        }
+        await this.connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: msg.tool_call_id,
+            status: 'completed' as ToolCallStatus,
+            ...(diffs.length > 0 ? {
+              content: diffs,
+              locations: diffs.map((diff) => ({ path: diff.path })),
+            } : {}),
+            rawOutput: msg.content ? { output: msg.content } : undefined,
+          },
+        });
+        continue;
+      }
+
       if (!msg.content?.trim()) {
         continue;
       }
@@ -1275,7 +1355,7 @@ export class AutohandAcpAdapter implements Agent {
   ): Promise<ResponseWithLegacyModels<LoadSessionResponse>> {
     try {
       const { config, state, messages } = await this.restoreSession(params.sessionId, params.cwd, params.mcpServers);
-      await this.replayConversation(params.sessionId, messages);
+      await this.replayConversation(params.sessionId, messages, state.workspaceRoot);
 
       this.emitHookSessionStart(params.sessionId, 'resume');
       process.stderr.write(`[ACP] Loaded session ${params.sessionId} with ${messages.length} messages\n`);

@@ -58,7 +58,8 @@ export async function saveAgentToolMessage(
   host: AgentToolOutputRuntimeHost,
   name: string,
   content: string,
-  toolCallId?: string
+  toolCallId?: string,
+  meta?: Record<string, unknown>,
 ): Promise<void> {
   const session = host.sessionManager.getCurrentSession();
   if (!session) return;
@@ -71,6 +72,7 @@ export async function saveAgentToolMessage(
     name,
     timestamp: new Date().toISOString(),
     tool_call_id: toolCallId,
+    ...(meta === undefined ? {} : { _meta: meta }),
   };
   await session.append(message);
 }

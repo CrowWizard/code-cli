@@ -260,7 +260,13 @@ export interface AgentReactLoopHost {
   promptCacheToolSet?: PromptCacheToolSet;
   saveUserMessage(content: string): Promise<void>;
   saveAssistantMessage(content: string, toolCalls?: ToolCallRequest[]): Promise<void>;
-  saveToolMessage(name: AgentAction['type'], content: string, toolCallId?: string): Promise<void>;
+  saveToolMessage(
+    name: AgentAction['type'],
+    content: string,
+    toolCallId?: string,
+    meta?: Record<string, unknown>,
+  ): Promise<void>;
+  getToolFileDiffs?(toolCallId: string): Array<{ path: string; oldText: string | null; newText: string }>;
   setComposerFinalResponse(response: string): void;
   setComposerIdle(): void;
   setSpinnerStatus(status: string): void;
@@ -1622,7 +1628,13 @@ export async function runAgentReactLoop(
               toolMessage.content += `\n[Visual inspection unavailable] ${imageErrors.join(' ').slice(0, 1_000)}`;
             }
             host.conversation.addMessage(toolMessage);
-            await host.saveToolMessage(result.tool, toolMessage.content, otherCalls[i]?.id);
+            const toolCallId = otherCalls[i]?.id;
+            const fileDiffs = toolCallId ? host.getToolFileDiffs?.(toolCallId) : undefined;
+            if (fileDiffs && fileDiffs.length > 0) {
+              await host.saveToolMessage(result.tool, toolMessage.content, toolCallId, { acp: { fileDiffs } });
+            } else {
+              await host.saveToolMessage(result.tool, toolMessage.content, toolCallId);
+            }
           }
           if (results.some((result) => result.success && result.tool === 'create_meta_tool')) {
             allTools = await refreshRuntimeTools();

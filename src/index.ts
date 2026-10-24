@@ -801,7 +801,7 @@ program
       process.exit(1);
     }
 
-    // ── Authentication gate ──
+    // ── Mandatory authentication gate ──
     // Account-backed providers require a valid login. Configured BYOK and local
     // providers authenticate directly with their selected provider instead.
     {

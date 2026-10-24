@@ -40,6 +40,7 @@ export interface AgentSessionAccountingHost {
   teamManager?: { shutdown(): Promise<void> };
   teamShutdownPromise?: Promise<void> | null;
   modifiedFilePaths: Set<string>;
+  toolFileDiffs: Map<string, Array<{ path: string; oldText: string | null; newText: string }>>;
   outputListener?: (event: AgentOutputEvent) => void;
   /** The most recent final message emitted to the output listener; command mode validates it against --output-schema. */
   lastEmittedMessage?: string;
@@ -463,6 +464,12 @@ export function markAgentFilesModified(
   host.fileModCount++;
   if (filePath) {
     host.modifiedFilePaths.add(filePath);
+  }
+
+  if (filePath && toolCallId && fileDiff) {
+    const diffs = host.toolFileDiffs.get(toolCallId) ?? [];
+    diffs.push({ path: filePath, ...fileDiff });
+    host.toolFileDiffs.set(toolCallId, diffs);
   }
 
   if (filePath && host.hookManager) {

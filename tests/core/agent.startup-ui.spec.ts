@@ -2723,6 +2723,7 @@ describe('agent startup and active input UI', () => {
     agent.sessionTokensUsed = 0;
     agent.searchQueries = [];
     agent.executedActionNames = [];
+    agent.toolFileDiffs = new Map();
     agent.persistentInputActiveTurn = false;
     agent.inkRenderer = null;
     agent.outputListener = emitSpy;

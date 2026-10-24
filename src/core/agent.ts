@@ -560,6 +560,7 @@ export class AutohandAgent {
   private filesModifiedThisSession = false;
   private fileModCount = 0;
   private modifiedFilePaths = new Set<string>();
+  private toolFileDiffs = new Map<string, Array<{ path: string; oldText: string | null; newText: string }>>();
   private executedActionNames: string[] = [];
   private searchQueries: string[] = [];
   private sessionRetryCount = 0;
@@ -1344,12 +1345,18 @@ export class AutohandAgent {
     );
   }
 
-  private async saveToolMessage(name: string, content: string, toolCallId?: string): Promise<void> {
+  private async saveToolMessage(
+    name: string,
+    content: string,
+    toolCallId?: string,
+    meta?: Record<string, unknown>,
+  ): Promise<void> {
     return saveAgentToolMessage(
       this.createToolOutputRuntimeHost(),
       name,
       content,
-      toolCallId
+      toolCallId,
+      meta,
     );
   }
 
@@ -1458,7 +1465,8 @@ export class AutohandAgent {
       promptCacheToolSet: agent.promptCacheToolSet,
       saveUserMessage: content => agent.saveUserMessage(content),
       saveAssistantMessage: (content, toolCalls) => agent.saveAssistantMessage(content, toolCalls),
-      saveToolMessage: (name, content, toolCallId) => agent.saveToolMessage(name, content, toolCallId),
+      saveToolMessage: (name, content, toolCallId, meta) => agent.saveToolMessage(name, content, toolCallId, meta),
+      getToolFileDiffs: (toolCallId) => agent.getToolFileDiffs(toolCallId),
       setComposerFinalResponse: (response) => agent.setComposerFinalResponse(response),
       setComposerIdle: () => agent.setComposerIdle(),
       setSpinnerStatus: (status) => agent.setSpinnerStatus(status),
@@ -2166,6 +2174,12 @@ export class AutohandAgent {
       toolCallId,
       fileDiff,
     );
+  }
+
+  getToolFileDiffs(toolCallId: string): Array<{ path: string; oldText: string | null; newText: string }> {
+    const diffs = this.toolFileDiffs.get(toolCallId) ?? [];
+    this.toolFileDiffs.delete(toolCallId);
+    return diffs;
   }
 
   /**

@@ -1642,6 +1642,54 @@ describe("AutohandAcpAdapter", () => {
       });
     });
 
+    it("replays persisted ACP tool diffs as structured updates", async () => {
+      await adapter.initialize(makeInitRequest());
+      mockSessionManager.loadSession.mockResolvedValue({
+        metadata: { model: "your-modelcard-id-here", projectPath: "/workspace" },
+        getMessages: () => [
+          {
+            role: "assistant",
+            content: "",
+            timestamp: "2025-01-01T00:00:01Z",
+            toolCalls: [{ id: "write-history-1", tool: "write_file", args: { path: "service/anatomy_agent.go" } }],
+          },
+          {
+            role: "tool",
+            content: "Updated service/anatomy_agent.go",
+            timestamp: "2025-01-01T00:00:02Z",
+            tool_call_id: "write-history-1",
+            _meta: {
+              acp: {
+                fileDiffs: [{
+                  path: "service/anatomy_agent.go",
+                  oldText: "before",
+                  newText: "after",
+                }],
+              },
+            },
+          },
+        ],
+      });
+
+      await adapter.loadSession({ sessionId: "session-history-diff", cwd: "/workspace", mcpServers: [] } as any);
+
+      const updates = connection.sessionUpdate.mock.calls
+        .map(([params]) => params.update)
+        .filter((update) => update.toolCallId === "write-history-1");
+      expect(updates).toEqual([
+        expect.objectContaining({ sessionUpdate: "tool_call", status: "completed" }),
+        expect.objectContaining({
+          sessionUpdate: "tool_call_update",
+          content: [{ type: "diff", path: "/workspace/service/anatomy_agent.go", oldText: "before", newText: "after" }],
+        }),
+        expect.objectContaining({
+          sessionUpdate: "tool_call_update",
+          status: "completed",
+          rawOutput: { output: "Updated service/anatomy_agent.go" },
+        }),
+      ]);
+    });
+
     it("connects ACP-provided MCP servers when loading a session", async () => {
       await adapter.initialize(makeInitRequest());
 
