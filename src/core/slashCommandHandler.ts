@@ -358,11 +358,16 @@ export class SlashCommandHandler {
         }
         case '/export': {
           const { execute } = await import('../commands/export.js');
-          await execute(args.join(' '), {
-            sessionManager: this.ctx.sessionManager,
-            currentSession: this.ctx.currentSession,
-            workspaceRoot: this.ctx.workspaceRoot,
-          });
+          await this.ctx.onBeforeModal?.();
+          try {
+            await execute(args.join(' '), {
+              sessionManager: this.ctx.sessionManager,
+              currentSession: this.ctx.currentSession,
+              workspaceRoot: this.ctx.workspaceRoot,
+            });
+          } finally {
+            await this.ctx.onAfterModal?.();
+          }
           return null;
         }
         case '/share': {
@@ -509,6 +514,15 @@ export class SlashCommandHandler {
         case '/upgrade': {
           const { upgrade } = await import('../commands/upgrade.js');
           return upgrade(this.ctx);
+        }
+        case '/account': {
+          const { account } = await import('../commands/account.js');
+          await this.ctx.onBeforeModal?.();
+          try {
+            return await account({ config: this.ctx.config, args, applyAccountChange: this.ctx.applyAccountChange });
+          } finally {
+            await this.ctx.onAfterModal?.();
+          }
         }
         case '/login': {
           const { login } = await import('../commands/login.js');

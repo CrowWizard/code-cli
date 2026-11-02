@@ -34,13 +34,14 @@ export function getAutohandAICloudModelCliUnsupportedReason(
   model: string | undefined,
 ): string | undefined {
   const normalized = normalizeAutohandAICloudModelId(model);
+  if (normalized === "weka") return "Weka is available through the Autohand API, the Agent SDKs and the Console, not in the CLI. Pick another model with /model or --model.";
   const entry = getProviderModelOptions("autohandai").find(
     (candidate) => candidate.id === normalized,
   );
   if (entry?.cliSupported !== false) return undefined;
 
   const name = entry.id === "weka" ? "Weka" : (entry.displayName ?? entry.id);
-  return `${name} is available through the Autohand API and Console Playground. CLI execution is not supported yet.`;
+  return `${name} is available through the Autohand API, the Agent SDKs and the Console, not in the CLI. Pick another model with /model or --model.`;
 }
 
 export interface AutohandAICloudModelDefinition {
@@ -186,6 +187,7 @@ export class AutohandAIProvider implements LLMProvider {
     const authToken = this.resolveCloudToken(config);
     const effectiveConfig: LLMGatewaySettings = {
       apiKey: authToken,
+      ...(config.accountId ? { accountId: config.accountId } : {}),
       baseUrl: resolveAutohandAICloudBaseUrl(config.baseUrl),
       model: this.model,
       contextWindow: config.contextWindow ?? getAutohandAICloudModelContextWindow(this.model),

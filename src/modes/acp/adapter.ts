@@ -51,7 +51,7 @@ import { getProviderConfig, loadConfig } from '../../config.js';
 import { prepareBareModeConfig } from '../../runtime/bareMode.js';
 import type { AgentOutputEvent, AgentRuntime, CLIOptions, LoadedConfig, LLMToolCall } from '../../types.js';
 import type { McpServerConfig } from '../../mcp/types.js';
-import { isSessionWorktreeEnabled, prepareSessionWorktree } from '../../utils/sessionWorktree.js';
+import { cleanupSessionWorktree, isSessionWorktreeEnabled, prepareSessionWorktree, type SessionWorktreeInfo } from '../../utils/sessionWorktree.js';
 import { ApiError, classifyApiError, type ApiErrorCode } from '../../providers/errors.js';
 import type { SessionMessage } from '../../session/types.js';
 import { isGoalFeatureEnabled } from '../../goals/feature.js';
@@ -203,6 +203,7 @@ function parseAssistantReplayParts(content: string): AssistantReplayParts {
 export class AutohandAcpAdapter implements Agent {
   private outputNotificationQueues = new Map<string, Promise<void>>();
   private sessions = new Map<string, AcpSessionState>();
+  private sessionWorktrees = new Map<string, SessionWorktreeInfo>();
   private agents = new Map<string, AutohandAgent>();
   private sessionConfigs = new Map<string, LoadedConfig>();
   private permissionBridges = new Map<string, ReturnType<typeof createPermissionBridge>>();
@@ -402,6 +403,7 @@ export class AutohandAcpAdapter implements Agent {
         mode: 'acp',
       });
       workspaceRoot = sessionWorktree.worktreePath;
+      this.sessionWorktrees.set(workspaceRoot, sessionWorktree);
       process.stderr.write(
         `[ACP] Using git worktree ${sessionWorktree.worktreePath} (${sessionWorktree.branchName})\n`
       );
@@ -1109,6 +1111,13 @@ export class AutohandAcpAdapter implements Agent {
     this.sessionConfigOptions.clear();
     this.cancelledSessions.clear();
     await Promise.all(agents.map((agent) => this.shutdownAgent(agent)));
+    await this.cleanupWorktrees();
+  }
+
+  private async cleanupWorktrees(): Promise<void> {
+    const worktrees = [...this.sessionWorktrees.values()];
+    this.sessionWorktrees.clear();
+    for (const worktree of worktrees) process.stderr.write(`${await cleanupSessionWorktree(worktree)}\n`);
   }
 
   private async shutdownAgent(agent: AutohandAgent): Promise<void> {
@@ -1463,6 +1472,7 @@ export class AutohandAcpAdapter implements Agent {
     // The hooks above already ended the session; only the MCP servers, relays
     // and background processes each agent still owns need releasing.
     await Promise.all(agents.map((agent) => agent.shutdownRuntimeResources().catch(() => {})));
+    await this.cleanupWorktrees();
   }
 
   private async emitHookSafe(method: string, params: Record<string, unknown>): Promise<void> {

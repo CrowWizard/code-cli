@@ -122,6 +122,8 @@ export interface AutohandAISettings extends ProviderSettings {
   apiKey?: string;
   /** Autohand account token for CLI-authenticated Cloud usage. SDKs must use apiKey. */
   accountToken?: string;
+  /** Chosen with `autohand account`; set at provider construction, never saved here. */
+  accountId?: string;
   localModelPath?: string;
   serverCommand?: string;
 }
@@ -136,6 +138,8 @@ export interface AnthropicSettings extends ProviderSettings {
 
 export interface LLMGatewaySettings extends ProviderSettings {
   apiKey: string;
+  /** Autohand account the requests bill to; omitted, the API chooses. */
+  accountId?: string;
   /**
    * Preserve OpenAI `image_url` content parts rather than flattening them to
    * text. This is a transport capability, not a user-configurable setting.
@@ -400,7 +404,7 @@ export interface UISettings {
    */
   enterWhileWorking?: 'select' | 'steer' | 'queue';
   /**
-   * Interaction mode an interactive terminal session starts in (default: automode).
+   * Interaction mode a terminal session starts in (full-screen default: automode; classic: default).
    * Explicit flags and a restricted permission mode always take precedence.
    */
   defaultInteractionMode?: 'default' | 'plan' | 'automode' | 'yolo';
@@ -541,6 +545,10 @@ export interface PermissionRule {
 }
 
 export interface PermissionSettings {
+  /** Runtime workspace layer. Kept separate so source-rule semantics cannot shadow user denies. */
+  workspaceScopes?: PermissionSettings[];
+  /** Source semantics for rules added by the Claude permission importer. */
+  importedClaudeRules?: import('./permissions/importedClaudeRules.js').ImportedClaudeRule[];
   /** Permission mode: interactive (default), unrestricted (no prompts), restricted (deny all dangerous), external (callback) */
   mode?: PermissionMode;
   /** Commands/tools that never require approval (e.g., "run_command:npm *") */
@@ -574,6 +582,8 @@ export interface RunConfigOverlaySnapshot {
 }
 
 export interface ShellSettings {
+  executable?: string;
+  dialect?: 'posix' | 'cmd' | 'powershell';
   /** Environment inherited by commands Autohand runs; see docs/config-reference.md. */
   env?: {
     inherit?: 'all' | 'essential' | 'none';
@@ -650,6 +660,8 @@ export interface McpServerConfigEntry {
   headers?: Record<string, string>;
   /** Whether to auto-connect on startup (default: true) */
   autoConnect?: boolean;
+  /** Keep this server on this device; do not publish it to the account control plane. */
+  localOnly?: boolean;
   /** JSON-RPC framing for stdio servers (default: Content-Length with compatibility fallback) */
   stdioFraming?: 'content-length' | 'newline';
   /** Account-scoped connector ID assigned by the Autohand Console control plane. */
@@ -1146,9 +1158,9 @@ export interface LoadedConfig extends AutohandConfig {
    */
   workspaceOverlay?: WorkspaceOverlaySnapshot;
   /**
-   * Runtime-only trust state for project hooks and MCP servers declared in
-   * `<workspace>/.autohand/`. Present only when the workspace declares any.
-   * Never persisted.
+   * Runtime-only trust state for project hooks, MCP servers, and tool files
+   * declared in `<workspace>/.autohand/`. Present only when the workspace
+   * declares any. Never persisted.
    */
   workspaceTrust?: WorkspaceTrustState;
   /**
@@ -1159,11 +1171,11 @@ export interface LoadedConfig extends AutohandConfig {
   runOverlay?: RunConfigOverlaySnapshot;
 }
 
-/** Whether a workspace's project hooks and MCP servers may run. */
+/** Whether a workspace's project hooks, MCP servers, and tool files may run. */
 export interface WorkspaceTrustState {
   /** Workspace whose project files declare the entries */
   workspaceRoot: string;
-  /** Hash of the declared hooks and MCP servers; any change asks again */
+  /** Hash of the declared hooks, MCP servers, and tool files; any change asks again */
   fingerprint: string;
   /** True when the user trusted this workspace for exactly these entries */
   trusted: boolean;
@@ -1171,6 +1183,16 @@ export interface WorkspaceTrustState {
   hooks: HookDefinition[];
   /** Project MCP servers after layering */
   mcpServers: McpServerConfigEntry[];
+  /** Project tool files under `.autohand/tools/`, sorted by name, with content hashes */
+  tools: WorkspaceTrustToolEntry[];
+}
+
+/** A project tool file, identified by workspace-relative path and content hash. */
+export interface WorkspaceTrustToolEntry {
+  /** Path relative to the workspace root, e.g. `.autohand/tools/deploy.json` */
+  file: string;
+  /** Hex sha256 of the file bytes */
+  sha256: string;
 }
 
 /** Keys of plain settings objects that workspace overlays merge field by field. */
@@ -1917,7 +1939,7 @@ export type AgentAction =
   | { type: 'skill'; command: 'list' | 'info' | 'activate' | 'deactivate'; name?: string }
   | { type: 'sleep'; seconds: number; reason?: string }
   | { type: 'enter_worktree'; name?: string }
-  | { type: 'exit_worktree'; keep?: boolean }
+  | { type: 'exit_worktree'; keep?: boolean; discard_changes?: boolean }
   // Web Search Operations
   | {
       type: 'capture_test_evidence';

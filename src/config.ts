@@ -32,6 +32,7 @@ import type {
   WorkspaceTrustState,
 } from "./types.js";
 import { AUTOHAND_FILES, AUTOHAND_HOME, PROJECT_DIR_NAME } from "./constants.js";
+import { configureShellExecution } from './utils/shellExecution.js';
 import { KEYBINDING_PROFILE_IDS, isKeybindingProfileId } from "./keybindings/profiles.js";
 import { INTERACTION_MODE_SEQUENCE } from "./core/agent/InteractionModeController.js";
 import { hookIdentifier } from "./core/hookEvents.js";
@@ -42,9 +43,11 @@ import { autoInitTheme, configureThemeSources, getDefaultThemeName, themeExists 
 import { loadLocalProjectSettings, type LocalProjectSettings } from "./permissions/localProjectPermissions.js";
 import {
   canonicalJson,
+  collectProjectToolEntries,
   computeWorkspaceTrustFingerprint,
   isWorkspaceTrusted,
   type WorkspaceTrustEntries,
+  type WorkspaceTrustToolEntry,
 } from "./permissions/workspaceTrust.js";
 import { isAwsBedrockProviderEnabled } from "./features/featureRegistry.js";
 import { getCustomProviderConfig, isCustomProviderName } from "./providers/customProviders.js";
@@ -581,12 +584,15 @@ export async function loadConfig(
     workspaceSettings = await loadLocalProjectSettings(workspaceRoot);
   }
 
-  // Project hooks and MCP servers run commands, and a cloned repository can
-  // ship them. They only apply once the user trusts this exact content.
+  // Project hooks, MCP servers, and tool files run commands, and a cloned
+  // repository can ship them. They only apply once the user trusts this exact
+  // content. Tool files are part of the fingerprint so a workspace whose only
+  // executable content is .autohand/tools still gets the trust prompt.
   let workspaceTrust: WorkspaceTrustState | undefined;
   if (workspaceRoot) {
-    const entries = resolveWorkspaceTrustEntries([projectConfig, workspaceSettings]);
-    if (entries.hooks.length > 0 || entries.mcpServers.length > 0) {
+    const tools = await collectProjectToolEntries(workspaceRoot);
+    const entries = resolveWorkspaceTrustEntries([projectConfig, workspaceSettings], tools);
+    if (entries.hooks.length > 0 || entries.mcpServers.length > 0 || entries.tools.length > 0) {
       const fingerprint = computeWorkspaceTrustFingerprint(entries);
       const trusted = await isWorkspaceTrusted(workspaceRoot, fingerprint, options.workspaceTrustStorePath);
       workspaceTrust = { workspaceRoot: path.resolve(workspaceRoot), fingerprint, trusted, ...entries };
@@ -625,6 +631,7 @@ export async function loadConfig(
 
   validateConfig(withEnv, configPath);
   configureChildProcessEnvPolicy(withEnv.shell?.env);
+  configureShellExecution(withEnv.shell);
 
   if (initializeTheme) {
     // Initialize theme from config.
@@ -643,8 +650,14 @@ export async function loadConfig(
   };
 }
 
-/** Project hooks and MCP servers after layering, in the order they would apply. */
-function resolveWorkspaceTrustEntries(layers: (LocalProjectSettings | null)[]): WorkspaceTrustEntries {
+/**
+ * Project hooks and MCP servers after layering, in the order they would apply,
+ * together with the project tool files the workspace ships.
+ */
+function resolveWorkspaceTrustEntries(
+  layers: (LocalProjectSettings | null)[],
+  tools: WorkspaceTrustToolEntry[] = [],
+): WorkspaceTrustEntries {
   let hooks: HookDefinition[] = [];
   let mcpServers: McpServerConfigEntry[] = [];
   for (const layer of layers) {
@@ -656,7 +669,7 @@ function resolveWorkspaceTrustEntries(layers: (LocalProjectSettings | null)[]): 
       mcpServers = mergeMcpSettings({ servers: mcpServers }, layer.mcp).servers ?? [];
     }
   }
-  return { hooks, mcpServers };
+  return { hooks, mcpServers, tools };
 }
 
 function withoutExecutableSections(layer: LocalProjectSettings | null): LocalProjectSettings | null {
@@ -785,9 +798,14 @@ function mergeWorkspaceSettings(
 
   // Merge permissions settings
   if (workspaceSettings.permissions) {
+    // PermissionManager keeps lists in their original scopes. Flattening these
+    // arrays or their import metadata could drop user denies or narrow them.
+    const { allowList, denyList, whitelist, blacklist, importedClaudeRules, ...projectOptions } = workspaceSettings.permissions;
+    void allowList; void denyList; void whitelist; void blacklist; void importedClaudeRules;
     merged.permissions = {
       ...merged.permissions,
-      ...workspaceSettings.permissions,
+      ...projectOptions,
+      workspaceScopes: [...(merged.permissions?.workspaceScopes ?? []), workspaceSettings.permissions],
     };
   }
 
@@ -1324,6 +1342,13 @@ function normalizeConfig(
     );
   }
 
+  // Runtime permission scopes are never accepted from any saved config shape.
+  if (isPlainRecord(config.permissions)) {
+    const permissions = { ...config.permissions };
+    delete permissions.workspaceScopes;
+    config = { ...config, permissions };
+  }
+
   if (isModernConfig(config)) {
     const provider = normalizeProviderName(config.provider) ?? "openrouter";
     return {
@@ -1402,6 +1427,16 @@ function isLegacyConfig(
 function validateShellSettings(config: AutohandConfig, configPath: string): void {
   if (config.shell === undefined) return;
   if (!isPlainObject(config.shell)) throw new Error(`shell must be an object in ${configPath}`);
+  const executable: unknown = config.shell.executable;
+  if (executable !== undefined && (typeof executable !== 'string' || !executable.trim() || /[\r\n\0]/u.test(executable))) {
+    throw new Error(`shell.executable must be a non-empty string in ${configPath}`);
+  }
+  if (config.shell.dialect !== undefined && (typeof config.shell.dialect !== 'string' || !['posix', 'cmd', 'powershell'].includes(config.shell.dialect))) {
+    throw new Error(`shell.dialect must be posix, cmd, or powershell in ${configPath}`);
+  }
+  if (config.shell.dialect !== undefined && executable === undefined) {
+    throw new Error(`shell.dialect requires shell.executable in ${configPath}`);
+  }
   const env: unknown = config.shell.env;
   if (env === undefined) return;
   if (!isPlainObject(env)) throw new Error(`shell.env must be an object in ${configPath}`);
@@ -1670,6 +1705,9 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
         throw new Error(`mcp.servers must be an array in ${configPath}`);
       }
       for (const server of config.mcp.servers) {
+        if (server.localOnly !== undefined && typeof server.localOnly !== "boolean") {
+          throw new Error(`mcp.servers[].localOnly must be boolean in ${configPath}`);
+        }
         if (!server.name || typeof server.name !== "string") {
           throw new Error(
             `mcp.servers[].name must be a non-empty string in ${configPath}`,
@@ -2139,6 +2177,11 @@ export async function saveConfig(
         delete (data as Partial<AutohandConfig>).auth;
       }
     }
+  }
+
+  if (data.permissions) {
+    data.permissions = { ...data.permissions };
+    delete data.permissions.workspaceScopes;
   }
 
   await fs.ensureDir(path.dirname(configPath));

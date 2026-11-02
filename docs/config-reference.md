@@ -786,7 +786,7 @@ See [Workspace Safety](./workspace-safety.md) for full details.
 | `showTips`                   | boolean | `true`  | Rotate built-in capability tips below the working status or completion summary and above the composer |
 | `repositoryReadiness`        | boolean | `true`  | Review repository readiness in the background; show one reminder per repository after a successful interactive turn. Set false to disable background reviews |
 | `enterWhileWorking`          | string  | `select` | While a turn runs, Enter queues a draft; select a queued message with the arrow keys, press Enter to edit it, then Enter to steer or Shift+Enter to save it in the queue. `steer` and `queue` retain the earlier direct steering shortcuts for configured sessions |
-| `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"default"` | Mode an interactive terminal session starts in. The default asks before risky actions. Auto mode requires an explicit flag, mode selection, or `defaultInteractionMode` set to `"automode"`, and runs without approval prompts. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
+| `defaultInteractionMode`    | `"default"`, `"plan"`, `"automode"` or `"yolo"` | `"automode"` (full screen), `"default"` (classic) | Mode an interactive terminal session starts in. Full-screen sessions start in Auto mode, which runs without approval prompts. Set `"default"` to ask before risky actions, or select another startup mode explicitly. `--plan`, `--yolo`, `--restricted`, `--dry-run`, `--unrestricted`, `--yes` and a `restricted` or `external` `permissions.mode` take precedence, and command, RPC and ACP runs are never switched to auto mode |
 | `statusLine.showProviderModel` | boolean | `true`  | Show the active provider and model in the composer status line |
 | `statusLine.showContext`       | boolean | `true`  | Show the context percentage in the composer status line |
 | `statusLine.showCommandHint`   | boolean | `true`  | Show command, mention, skill, and terminal-entry hints in the composer status line |
@@ -1029,7 +1029,7 @@ Full-screen mode is **stable and enabled by default** in interactive terminals (
 }
 ```
 
-The full-screen layout shows Autohand Code, its runtime version, and the working directory at the top, with loading activity directly beneath the directory. Navigation and search hints appear below the composer's status line. A scrollable transcript fills the space above the composer. Page Up/Page Down browse the transcript; Ctrl+Home jumps to the first message. Ctrl+End returns to the latest output and resumes automatic following. While browsing, a line above the composer shows “Back to bottom” and marks new activity without moving your reading position. Escape returns to the bottom after closing any open menu or shortcut help; at the bottom, Escape keeps its normal interruption behavior. Ctrl+F opens transcript search, Enter finds the next match, Shift+Enter finds the previous match with wraparound, and Escape closes search without changing your draft. Ctrl+O retains the existing tool-detail toggle. Opening `/usage` or another modal preserves the parent screen, transcript position, and draft when you return. Long multiline drafts display a bounded window around the cursor.
+The full-screen layout shows Autohand Code, its runtime version, and the working directory at the top, with loading activity directly beneath the directory. The footer ends with your configured status items and the optional `? shortcuts` hint. Search and history activity appear above the composer. A scrollable transcript fills the space above the composer. Page Up/Page Down browse the transcript; Ctrl+Home jumps to the first message. Ctrl+End returns to the latest output and resumes automatic following. While browsing, a line above the composer shows “Back to bottom” and marks new activity without moving your reading position. Escape returns to the bottom after closing any open menu or shortcut help; at the bottom, Escape keeps its normal interruption behavior. Ctrl+F opens transcript search and finds matches as you type, including phrases split across wrapped rows. Search stays active while the agent works and refreshes when new output arrives. Enter finds the next match, Shift+Enter finds the previous match with wraparound, and Escape closes search without changing your draft or cancelling work. Ctrl+O retains the existing tool-detail toggle. Opening `/usage` or another modal preserves the parent screen, transcript position, and draft when you return. Long multiline drafts display a bounded window around the cursor.
 
 Full-screen mode requires interactive TTY input and output and is skipped for `TERM=dumb`. Noninteractive, piped, RPC and ACP output retains its existing format. Mouse behavior follows `ui.mouseComposerCursor` and the existing terminal defaults. When enabled, clicking positions the composer caret and the wheel scrolls the transcript. Set it to `false` to leave mouse selection to the terminal; terminal selection modifiers and hyperlinks remain terminal-dependent. The `?` shortcut opens grouped keyboard help above the composer. Full-screen suggestion menus also open above the input, keeping the composer and status bar anchored. Shell scrollback returns when Autohand exits; conversation history remains in saved Autohand sessions. There is no change to model context, token accounting, permissions, or session storage.
 
@@ -1683,7 +1683,7 @@ git add -A && git commit -m "feat: add user dashboard with charts"
 
 ## Shell Settings
 
-Control what shell commands started by Autohand can see. This covers the `run_command` tool, `!` terminal commands, and streaming or interactive shells. Hook commands and MCP server processes have their own launchers and are not affected.
+Choose the shell used by `run_command`, foreground and background `!` commands, and streaming shells, and control their environment. Hook commands and MCP server processes have their own launchers and are not affected.
 
 ```json
 {
@@ -1700,12 +1700,16 @@ Control what shell commands started by Autohand can see. This covers the `run_co
 
 | Field         | Type     | Default | Description                                                                                          |
 | ------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `executable` | string | auto | Shell executable or full path, such as `C:\\Program Files\\Git\\bin\\bash.exe`, `pwsh.exe`, or `/bin/zsh` |
+| `dialect` | string | inferred | `posix`, `cmd`, or `powershell`; requires `executable`. Controls command invocation and the syntax described to the agent |
 | `env.inherit` | string   | `all`   | `all` passes the whole parent environment; `essential` keeps PATH, HOME, USER, SHELL, TMPDIR, locale and terminal variables (plus their Windows equivalents); `none` starts empty |
 | `env.include` | string[] | `[]`    | Variable names or globs to add back on top of the inherited set                                      |
 | `env.exclude` | string[] | `[]`    | Variable names or globs removed after inheritance and includes                                        |
 | `env.set`     | object   | `{}`    | Values pinned for every command; applied last                                                         |
 
 Variables Autohand needs to run its own tooling (`AUTOHAND_*`, `AUTOHAND_CLI`, `AUTOHAND_HOME`, `CODEX_HOME`) are always present. Explicit per-command overrides supplied by a tool call still win over the policy.
+
+By default, macOS/Linux use `SHELL` or `/bin/sh`. Native Windows uses `ComSpec` or `cmd.exe`. When launched from Git Bash (`MSYSTEM` is set), Autohand resolves its Bash executable with `cygpath.exe` and uses POSIX command syntax. If that conversion fails, configure the full Windows path to `bash.exe`. Bug reports identify the selected command shell and dialect separately from the parent shell.
 
 ## Network Settings
 
@@ -2411,6 +2415,7 @@ Configure MCP (Model Context Protocol) servers to extend Autohand with external 
 | `headers`      | `Record<string, string>`            | No             | `{}`               | Custom HTTP headers for http/sse transport (e.g. auth tokens) |
 | `env`          | `Record<string, string>`            | No             | `{}`               | Environment variables passed to the server                    |
 | `autoConnect`  | `boolean`                           | No             | `true`             | Whether to auto-connect on startup                            |
+| `localOnly`    | `boolean`                           | No             | `false`            | Keep the server on this device; do not publish it to the account control plane |
 
 > Servers connect asynchronously in the background during startup without blocking the prompt. Use `/mcp` to manage servers interactively, or `/mcp add` to browse the community registry or add custom servers.
 
@@ -2563,6 +2568,18 @@ The importer reads user and current-project configurations for Claude Code, Code
 Only compatible command hooks are translated. Unsupported source HTTP, prompt/agent, async, and `failClosed` handlers are reported as skipped, along with events that require unavailable behavior such as turn continuation or pre-compaction. Legacy Codex `notify` commands are detected and reported for manual porting because they receive JSON in argv. Source-specific payloads and tool schemas are not fully reproduced.
 
 See [hook import compatibility](./hooks.md#import-hooks-from-another-coding-agent) for source file locations, event mappings, timeout defaults, supported responses, and manual-porting limits.
+
+### Import MCP Servers from Claude Code
+
+```sh
+autohand import claude --categories mcp
+```
+
+The importer reads user servers from `~/.claude.json`, current-project servers from `projects[<workspace path>].mcpServers` in that file, and project servers from `<workspace>/.mcp.json`. Use `--path <workspace>` when importing for a workspace other than the current directory.
+
+Stdio servers keep their `command`, `args`, and `env`; HTTP and SSE servers keep their `url` and `headers`. User servers are added to the selected user config. Project servers are added to `<workspace>/.autohand/settings.local.json`. Imported servers are saved with `autoConnect: false`, so review them before enabling them. Existing servers with the same name are preserved and reported as skipped (`already exists`).
+
+Environment values and headers are copied as configured. The importer does not print server values, and imported servers stay on this device instead of being published to the account control plane.
 
 ---
 
@@ -2955,6 +2972,10 @@ These flags override config file settings:
 | `--auto-commit`           | Auto-commit changes after completing tasks                                                     |
 | `--patch`                     | Generate git patch without applying changes                                                    |
 | `--output <file>`             | Output file for patch (used with --patch)                                                      |
+
+When a `--worktree` session ends, Autohand removes its worktree only when there are no uncommitted or untracked files and no commits missing from the original branch. A branch created for that session is also removed; pre-existing branches are retained. Otherwise it prints `Kept worktree <path> (branch <b>) with changes` so you can recover your work. This cleanup applies to interactive, command, patch, RPC and ACP sessions; tmux and Zit behavior is unchanged.
+
+The agent's `exit_worktree` tool follows the same preservation rule and returns to the original workspace. `keep: true` always keeps the worktree. `discard_changes: true` explicitly requests removal with changes and follows the deletion approval policy; the restricted client profile denies it. `keep` takes precedence when both options are set. Cleanup stops safely if Git cannot verify the worktree or original branch.
 
 ### Zit Sessions
 
@@ -3471,6 +3492,6 @@ Fantail ignores this setting; local sessions do not advertise it.
 
 `search.provider` accepts `autohand`, `browser-profile`, `exa`, `brave`, `parallel`, `google`, and `duckduckgo`. An explicit `--search-engine` wins over the saved setting in interactive, patch, automatic, RPC, and ACP modes.
 
-When no provider is selected, a signed-in account with server-verified paid access uses Autohand Web Search. Lite, Pro, Pro Plus, Max, Team, and Enterprise include this service through `https://dev.autohand.ai/api/native/web-search`; Free users configure an existing provider during standard or quick setup, or with `/search`. Queries are limited to 1,024 characters, 10 results, and 30 requests per account per minute. Access uses the selected Autohand account and existing account credentials; customers do not need Cloudflare credentials. A failed hosted search reports its status and does not change providers.
+When no provider is selected, a signed-in account with server-verified access uses Autohand Web Search. Verified Free accounts include 10 web searches a day, shared with Code Web for the same account and reset at 00:00 UTC. `/search` shows the remaining allowance. At the cap, the tool returns the upgrade link and reset time, and the CLI prints that notice once per session. Lite, Pro, Pro Plus, Max, Team, and Enterprise retain their included search access. Queries are limited to 1,024 characters, 10 results, and 30 native requests per account per minute. Access uses the selected Autohand account and existing account credentials; customers do not need Cloudflare credentials. A failed hosted search reports its status and does not change providers.
 
-Browser Profile is the local default. Connect Chromium through `/browser` or provide an available Chrome/Brave profile. A missing, locked, or blocked profile produces a setup error instead of silently switching to Google. Exa, Brave, and Parallel require `search.exaApiKey`, `search.braveApiKey`, or `search.parallelApiKey`, respectively, or `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or `PARALLEL_API_KEY`. Onboarding never saves a keyed provider with a blank key. Google and DuckDuckGo can be selected explicitly; automated requests may receive CAPTCHA challenges.
+Browser Profile is the local default. Connect Chromium through `/browser` or provide an available Chrome/Brave profile. Before launching the profile, Autohand checks its `SingletonLock`, including Chromium's symlink lock. With Chrome open, search uses the connected Chrome bridge first, then eligible Autohand Web Search, then one line directing you to `/search`. A locked profile with no fallback is not offered to the model. A closed profile keeps the existing browser search path. Exa, Brave, and Parallel require `search.exaApiKey`, `search.braveApiKey`, or `search.parallelApiKey`, respectively, or `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or `PARALLEL_API_KEY`. Onboarding never saves a keyed provider with a blank key. Google and DuckDuckGo can be selected explicitly; automated requests may receive CAPTCHA challenges.

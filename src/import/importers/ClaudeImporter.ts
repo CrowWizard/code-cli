@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import fse from 'fs-extra';
 import type {
   ImportSource,
@@ -13,10 +14,16 @@ import type {
   ImportError,
   ImportCategoryResult,
   ProgressCallback,
+  PermissionImportReport,
 } from '../types.js';
 import type { SessionMessage } from '../../session/types.js';
 import { AUTOHAND_PATHS } from '../../constants.js';
+import { detectConfigPath } from '../../config.js';
+import YAML from 'yaml';
+import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import { BaseImporter } from './BaseImporter.js';
+import { ClaudePermissionImport } from '../ClaudePermissionImport.js';
+import { atomicWriteFile } from '../../utils/atomicFile.js';
 
 /**
  * A single parsed Claude event from a session JSONL file.
@@ -36,6 +43,32 @@ interface ClaudeEvent {
   [k: string]: unknown;
 }
 
+type CollectedMcpServers = {
+  user: Record<string, unknown>;
+  project: Record<string, unknown>;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validMcpServers(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return {};
+
+  return Object.fromEntries(Object.entries(value).filter(([name, server]) => {
+    if (!name.trim()) return false;
+    if (!isRecord(server)) return false;
+    if (server.type === 'http' || server.type === 'sse') return typeof server.url === 'string' && server.url.length > 0;
+    return (server.type === undefined || server.type === 'stdio') && typeof server.command === 'string' && server.command.length > 0;
+  }));
+}
+
+function hasEnvPlaceholders(value: unknown): boolean {
+  if (typeof value === 'string') return /\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}/.test(value);
+  if (Array.isArray(value)) return value.some(hasEnvPlaceholders);
+  return isRecord(value) && Object.values(value).some(hasEnvPlaceholders);
+}
+
 /**
  * Importer for Claude Code CLI data (~/.claude).
  *
@@ -46,6 +79,21 @@ export class ClaudeImporter extends BaseImporter {
   readonly name: ImportSource = 'claude';
   readonly displayName = 'Claude Code';
   readonly homePath = '~/.claude';
+  private permissionReport?: PermissionImportReport;
+
+  private permissionImport(): ClaudePermissionImport {
+    return new ClaudePermissionImport(this.resolvedHomePath, this.hookImportOptions);
+  }
+
+  override async detect(): Promise<boolean> {
+    return await super.detect() || await this.permissionImport().scan() > 0
+      || await fse.pathExists(path.join(path.dirname(this.resolvedHomePath), '.claude.json'))
+      || await fse.pathExists(path.join(path.resolve(this.hookImportOptions.workspaceRoot ?? process.cwd()), '.mcp.json'));
+  }
+
+  async previewSettings(): Promise<PermissionImportReport> {
+    return this.permissionImport().preview();
+  }
 
   // ---------------------------------------------------------------
   // scan()
@@ -54,7 +102,13 @@ export class ClaudeImporter extends BaseImporter {
   async scan(): Promise<ImportScanResult> {
     const available = new Map<ImportCategory, { count: number; description: string }>();
     await this.scanHooks(available);
+    const settingsCount = await this.permissionImport().scan();
+    if (settingsCount > 0) available.set('settings', { count: settingsCount, description: 'Claude user and project permission settings' });
     const home = this.resolvedHomePath;
+    const mcp = await this.collectMcpServers();
+    if (Object.keys(mcp.user).length + Object.keys(mcp.project).length > 0) {
+      available.set('mcp', { count: Object.keys(mcp.user).length + Object.keys(mcp.project).length, description: 'Claude MCP servers' });
+    }
 
     if (!(await fse.pathExists(home))) {
       return { source: this.name, available };
@@ -93,12 +147,6 @@ export class ClaudeImporter extends BaseImporter {
       });
     }
 
-    // Check settings
-    const settingsPath = path.join(home, 'settings.json');
-    if (await fse.pathExists(settingsPath)) {
-      available.set('settings', { count: 1, description: 'Claude Code settings.json' });
-    }
-
     // Check skills
     const skillsDir = path.join(home, 'skills');
     if (await fse.pathExists(skillsDir)) {
@@ -134,6 +182,7 @@ export class ClaudeImporter extends BaseImporter {
     const start = Date.now();
     const imported = new Map<ImportCategory, ImportCategoryResult>();
     const errors: ImportError[] = [];
+    this.permissionReport = undefined;
 
     for (const category of categories) {
       switch (category) {
@@ -152,10 +201,17 @@ export class ClaudeImporter extends BaseImporter {
         case 'memory':
           await this.importMemory(imported, errors, onProgress);
           break;
+        case 'mcp':
+          await this.importMcpServers(imported, errors);
+          break;
         default:
-          // MCP import is not supported here.
           break;
       }
+    }
+
+    if (!categories.includes('settings')) {
+      this.permissionReport = await this.permissionImport().cleanup();
+      errors.push(...(this.permissionReport.errors ?? []));
     }
 
     return {
@@ -163,7 +219,165 @@ export class ClaudeImporter extends BaseImporter {
       imported,
       errors,
       duration: Date.now() - start,
+      ...(this.permissionReport ? { permissions: this.permissionReport } : {}),
     };
+  }
+
+  private async readOptionalJson(filePath: string): Promise<Record<string, unknown> | undefined> {
+    try {
+      const value: unknown = await fse.readJson(filePath);
+      return isRecord(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Collect user and current-workspace MCP servers
+  private async collectMcpServers(): Promise<CollectedMcpServers> {
+    const claudeConfigPath = path.join(path.dirname(this.resolvedHomePath), '.claude.json');
+    const workspaceRoot = path.resolve(this.hookImportOptions.workspaceRoot ?? process.cwd());
+    const projectConfigPath = path.join(workspaceRoot, '.mcp.json');
+    const collected: CollectedMcpServers = { user: {}, project: {} };
+
+    const claudeConfig = await this.readOptionalJson(claudeConfigPath);
+    if (claudeConfig && isRecord(claudeConfig.mcpServers)) {
+      Object.assign(collected.user, validMcpServers(claudeConfig.mcpServers));
+    }
+
+    const localConfig = await this.readOptionalJson(projectConfigPath);
+    if (localConfig && isRecord(localConfig.mcpServers)) {
+      Object.assign(collected.project, validMcpServers(localConfig.mcpServers));
+    }
+
+    const projects = claudeConfig?.projects;
+    if (isRecord(projects)) {
+      const projectConfig = projects[workspaceRoot];
+      if (isRecord(projectConfig) && isRecord(projectConfig.mcpServers)) {
+        Object.assign(collected.project, validMcpServers(projectConfig.mcpServers));
+      }
+    }
+
+    return collected;
+  }
+
+  // Import user and workspace MCP servers, preserving existing entries and skipping duplicates.
+  private async importMcpServers(imported: Map<ImportCategory, ImportCategoryResult>, errors: ImportError[]): Promise<void> {
+    const { user, project } = await this.collectMcpServers();
+    const workspace = path.resolve(this.hookImportOptions.workspaceRoot ?? process.cwd());
+    const destinations = [
+      { servers: user, file: await detectConfigPath(this.hookImportOptions.configPath) },
+      { servers: project, file: path.join(workspace, '.autohand', 'settings.local.json') },
+    ];
+    let success = 0;
+    let skipped = 0;
+    const skipReasons: Record<string, number> = {};
+    for (const { servers, file } of destinations) {
+      try {
+        if (!Object.keys(servers).length) continue;
+        if (servers === project) await this.assertProjectMcpDestination(workspace, file);
+        const current = await this.readConfigFile(file);
+        const mcp = isRecord(current.mcp) ? current.mcp : {};
+        const existing = Array.isArray(mcp.servers) ? mcp.servers : [];
+        const converted = Object.entries(servers).flatMap(([name, value]) => {
+          if (!isRecord(value)) return [];
+          if (hasEnvPlaceholders(value)) {
+            errors.push({ category: 'mcp', item: name, error: 'Claude MCP environment variable placeholders are not supported by this importer', retriable: false });
+            return [];
+          }
+          const server = value;
+          const transport = server.type === 'http' || server.type === 'sse' ? server.type : 'stdio';
+          return [{ ...server, name, transport, autoConnect: false, localOnly: true }];
+        });
+        const existingNames = new Set<string>();
+        for (const server of existing) {
+          if (isRecord(server) && typeof server.name === 'string') {
+            existingNames.add(server.name);
+          }
+        }
+        const additions = converted.filter(server => !existingNames.has(server.name));
+        const duplicateCount = converted.length - additions.length;
+        skipped += duplicateCount;
+        if (duplicateCount > 0) skipReasons['already exists'] = (skipReasons['already exists'] ?? 0) + duplicateCount;
+
+        if (additions.length === 0) continue;
+
+        const merged = [...existing, ...additions];
+        if (servers === project) await this.ignoreLocalSettings(workspace);
+        await fse.ensureDir(path.dirname(file));
+        if (servers === project) await this.assertProjectMcpDestination(workspace, file);
+        const output = { ...current, mcp: { ...mcp, servers: merged } };
+        await this.writeConfigFile(file, output);
+        success += additions.length;
+      } catch (error) { errors.push({ category: 'mcp', item: file, error: error instanceof Error ? error.message : String(error), retriable: false }); }
+    }
+    imported.set('mcp', {
+      success,
+      failed: errors.filter(e => e.category === 'mcp').length,
+      skipped,
+      ...(skipped > 0 ? { skipReasons } : {}),
+    });
+  }
+
+  private async assertProjectMcpDestination(workspace: string, file: string): Promise<void> {
+    const root = await fse.realpath(workspace);
+    const directory = path.dirname(file);
+    if (await fse.pathExists(directory) && await fse.realpath(directory) !== path.join(root, '.autohand')) {
+      throw new Error('Project MCP settings directory escapes its repository');
+    }
+    try {
+      if ((await fse.lstat(file)).isSymbolicLink()) throw new Error('Project MCP settings file is a symlink');
+    } catch (error) {
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error;
+    }
+  }
+
+  // Keep imported credentials out of Git without changing the shared .gitignore.
+  private async ignoreLocalSettings(workspace: string): Promise<void> {
+    let excludeFile: string;
+    try {
+      excludeFile = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-path', 'info/exclude'], {
+        cwd: workspace,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+    } catch (error) {
+      const stderr = (error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr?.toString() ?? '';
+      if (stderr.includes('not a git repository')) return;
+      throw error;
+    }
+
+    const pattern = '**/.autohand/settings.local.json';
+    const current = await fse.pathExists(excludeFile) ? await fse.readFile(excludeFile, 'utf8') : '';
+    if (current.split(/\r?\n/).includes(pattern)) return;
+    const separator = current.length > 0 && !current.endsWith('\n') ? '\n' : '';
+    await fse.writeFile(excludeFile, `${current}${separator}${pattern}\n`);
+  }
+
+  private async readConfigFile(file: string): Promise<Record<string, unknown>> {
+    if (!(await fse.pathExists(file))) return {};
+
+    const extension = path.extname(file).toLowerCase();
+    let parsed: unknown;
+    if (extension === '.toml') {
+      parsed = parseToml(await fse.readFile(file, 'utf8'));
+    } else if (/\.ya?ml$/.test(extension)) {
+      parsed = YAML.parse(await fse.readFile(file, 'utf8'));
+    } else {
+      parsed = await fse.readJson(file);
+    }
+
+    if (!isRecord(parsed)) {
+      throw new Error(`Expected a configuration object in ${file}`);
+    }
+    return parsed;
+  }
+
+  private async writeConfigFile(file: string, config: Record<string, unknown>): Promise<void> {
+    const extension = path.extname(file).toLowerCase();
+    const content = extension === '.toml' ? stringifyToml(config)
+      : /\.ya?ml$/.test(extension) ? YAML.stringify(config) : JSON.stringify(config, null, 2) + '\n';
+    await atomicWriteFile(file, content);
+    await fse.chmod(file, 0o600);
   }
 
   // ---------------------------------------------------------------
@@ -323,54 +537,33 @@ export class ClaudeImporter extends BaseImporter {
     errors: ImportError[],
     onProgress?: ProgressCallback,
   ): Promise<void> {
-    const settingsPath = path.join(this.resolvedHomePath, 'settings.json');
-
-    if (!(await fse.pathExists(settingsPath))) {
-      imported.set('settings', { success: 0, failed: 0, skipped: 1 });
-      return;
-    }
-
     onProgress?.({
       category: 'settings',
       current: 1,
       total: 1,
-      item: 'settings.json',
+      item: 'Claude permission rules',
       status: 'importing',
     });
 
     try {
-      const settings = await this.safeReadJson(settingsPath);
-
-      // Extract permissions.allow and merge into autohand config
-      const permissions = settings.permissions as { allow?: string[] } | undefined;
-      if (permissions?.allow) {
-        const configDir = AUTOHAND_PATHS.config;
-        await fse.ensureDir(configDir);
-
-        const importedSettingsPath = path.join(configDir, 'imported-claude-settings.json');
-        await fse.writeJson(importedSettingsPath, {
-          importedFrom: 'claude',
-          importedAt: new Date().toISOString(),
-          permissions: permissions.allow,
-          raw: settings,
-        }, { spaces: 2 });
-      }
-
-      imported.set('settings', { success: 1, failed: 0, skipped: 0 });
+      const result = await this.permissionImport().import();
+      this.permissionReport = result.report;
+      imported.set('settings', result.stats);
+      errors.push(...result.errors);
 
       onProgress?.({
         category: 'settings',
         current: 1,
         total: 1,
-        item: 'settings.json',
-        status: 'done',
+        item: 'Claude permission rules',
+        status: result.stats.failed ? 'failed' : 'done',
       });
-    } catch (err) {
+    } catch {
       imported.set('settings', { success: 0, failed: 1, skipped: 0 });
       errors.push({
         category: 'settings',
         item: 'settings.json',
-        error: err instanceof Error ? err.message : String(err),
+        error: 'Could not import Claude permission settings. No raw settings were copied.',
         retriable: false,
       });
     }

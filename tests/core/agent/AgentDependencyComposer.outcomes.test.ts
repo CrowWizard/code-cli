@@ -288,8 +288,14 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     }
   });
 
-  it('uses the current sign-in token for account entitlement before a stale provider-local token', async () => {
+  it.each([
+    { savedAccount: undefined, environmentAccount: undefined, expectedAccount: undefined },
+    { savedAccount: 'team-account', environmentAccount: undefined, expectedAccount: 'team-account' },
+    { savedAccount: 'team-account', environmentAccount: 'shell-account', expectedAccount: 'shell-account' },
+  ])('uses the current sign-in token and selected account $expectedAccount for entitlement', async ({ savedAccount, environmentAccount, expectedAccount }) => {
+    vi.stubEnv('AUTOHAND_ACCOUNT_ID', environmentAccount);
     const { agent, runtime } = createAgent();
+    runtime.config.api = { ...runtime.config.api, accountId: savedAccount };
     runtime.config.auth = {
       token: 'current-auth-token',
       user: { id: 'user-1', email: 'user@example.com', name: 'Test User' },
@@ -308,10 +314,13 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     const slashHandler = (agent as unknown as {
       slashHandler: { ctx: { getAccountEntitlement: () => Promise<unknown> } };
     }).slashHandler;
-    await slashHandler.ctx.getAccountEntitlement();
-
-    expect(fetchEntitlement).toHaveBeenCalledWith('current-auth-token');
-    fetchEntitlement.mockRestore();
+    try {
+      await slashHandler.ctx.getAccountEntitlement();
+      expect(fetchEntitlement).toHaveBeenCalledExactlyOnceWith('current-auth-token', expectedAccount);
+    } finally {
+      fetchEntitlement.mockRestore();
+      vi.unstubAllEnvs();
+    }
   });
 
   it('uses one typed failure for telemetry, post-tool hooks, output, and manager result', async () => {
@@ -594,18 +603,21 @@ describe('AgentDependencyComposer typed tool outcomes', () => {
     expect(result.output).toBe('Found 1 window(s).\n{"windows":[{"window_id":280,"pid":6844,"title":"Spotify Free"}]}');
   });
 
-  it('dispatches a ready native tool while an unrelated MCP server is still starting', async () => {
+  it.each([0, 150])('dispatches a ready native tool while an unrelated MCP server is still starting (hook delay %dms)', async hookDelay => {
     const { internals } = createAgent();
     const tool = 'mcp__autohand-computer-use__list_windows' as AgentAction['type'];
     internals.toolManager.register({ name: tool, description: 'List windows', parameters: { type: 'object', properties: {} } });
     let release!: () => void;
     internals.mcpReady = new Promise<void>(resolve => { release = resolve; });
     internals.mcpManager.callTool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'Spotify' }] });
-    internals.hookManager.executeHooks = vi.fn().mockResolvedValue([]);
+    internals.hookManager.executeHooks = vi.fn(async () => {
+      if (hookDelay) await new Promise<void>(resolve => setTimeout(resolve, hookDelay));
+      return [];
+    });
     internals.telemetryManager.trackToolUse = vi.fn().mockResolvedValue(undefined);
     const pending = internals.toolManager.execute([{ id: 'windows', tool, args: {} }]);
     try {
-      await vi.waitFor(() => expect(internals.mcpManager.callTool).toHaveBeenCalledOnce(), { timeout: 100 });
+      await vi.waitFor(() => expect(internals.mcpManager.callTool).toHaveBeenCalledOnce(), { timeout: 5_000 });
     } finally {
       release();
       await pending;

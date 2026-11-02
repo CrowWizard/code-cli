@@ -63,14 +63,31 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function createToolsRegistry(workspaceRoot?: string, userToolsDir = AUTOHAND_PATHS.tools): ToolsRegistry {
-  const locations: ToolsRegistryLocation[] = workspaceRoot
-    ? [
-        { scope: 'project', dir: path.join(workspaceRoot, PROJECT_DIR_NAME, 'tools') },
-        { scope: 'user', dir: userToolsDir },
-      ]
-    : [{ scope: 'user', dir: userToolsDir }];
-  return new ToolsRegistry(locations);
+export interface ToolsRegistryOptions {
+  /** Project (.autohand/tools) definitions load only when the workspace is trusted. Defaults to false. */
+  projectToolsTrusted?: boolean;
+}
+
+const UNTRUSTED_PROJECT_TOOLS_REASON = 'project tools require a trusted workspace';
+const SHADOW_REASON_PREFIX = 'project tool shadows ';
+
+/** Active-cache precedence: a user tool always wins over a project tool of the same name. */
+const META_TOOL_PRECEDENCE: readonly MetaToolScope[] = ['user', 'project'];
+
+export function createToolsRegistry(
+  workspaceRoot?: string,
+  userToolsDir = AUTOHAND_PATHS.tools,
+  options: ToolsRegistryOptions = {},
+): ToolsRegistry {
+  const registry = new ToolsRegistry([{ scope: 'user', dir: userToolsDir }]);
+  if (workspaceRoot) {
+    const projectDir = path.join(workspaceRoot, PROJECT_DIR_NAME, 'tools');
+    registry.addLocation({ scope: 'project', dir: projectDir });
+    if (!options.projectToolsTrusted) {
+      registry.noteUntrustedProjectTools(projectDir);
+    }
+  }
+  return registry;
 }
 
 export class ToolsRegistry {
@@ -78,24 +95,43 @@ export class ToolsRegistry {
   private metaToolRecords: Map<string, MetaToolRecord> = new Map();
   private diagnostics: MetaToolDiagnostic[] = [];
   private extensionToolRecords: Map<string, ExtensionMetaToolRecord> = new Map();
+  private reservedBuiltInNames: Set<string> = new Set();
+  private untrustedProjectToolsDir?: string;
 
   constructor(locations?: string | ToolsRegistryLocation[]) {
     this.locations = normalizeLocations(locations);
   }
 
-  private readonly locations: ToolsRegistryLocation[];
+  private locations: ToolsRegistryLocation[];
+
+  addLocation(location: ToolsRegistryLocation): void {
+    this.locations.push(location);
+  }
+
+  /** Remember a project tools directory that was skipped because the workspace is untrusted. */
+  noteUntrustedProjectTools(dir: string): void {
+    this.untrustedProjectToolsDir = dir;
+  }
+
+  /** Built-in tool names a project tool may never take; idempotent. */
+  reserveBuiltInNames(names: Iterable<string>): void {
+    for (const name of names) this.reservedBuiltInNames.add(name);
+    this.rebuildActiveCache();
+  }
 
   async initialize(): Promise<void> {
     this.metaToolCache.clear();
     this.metaToolRecords.clear();
     this.diagnostics = [];
     for (const location of this.locations) {
-      await fs.ensureDir(location.dir);
+      if (this.isLoadableLocation(location)) await fs.ensureDir(location.dir);
     }
     await this.loadMetaToolDefinitions();
   }
 
   async listTools(builtIns: ToolDefinition[]): Promise<ToolRegistryEntry[]> {
+    // Keeps getMetaTool consistent with what the agent advertises as built-in.
+    this.reserveBuiltInNames(builtIns.map((tool) => tool.name));
     const seen = new Set<string>();
     const entries: ToolRegistryEntry[] = [];
 
@@ -331,7 +367,11 @@ export class ToolsRegistry {
   }
 
   private async loadMetaToolDefinitions(): Promise<void> {
+    if (this.untrustedProjectToolsDir && (await fs.pathExists(this.untrustedProjectToolsDir))) {
+      this.diagnostics.push({ file: this.untrustedProjectToolsDir, reason: UNTRUSTED_PROJECT_TOOLS_REASON });
+    }
     for (const location of this.locations) {
+      if (!this.isLoadableLocation(location)) continue;
       try {
         const exists = await fs.pathExists(location.dir);
         if (!exists) {
@@ -375,6 +415,10 @@ export class ToolsRegistry {
       throw new Error(`No tools directory configured for ${scope} scope`);
     }
     return location;
+  }
+
+  private isLoadableLocation(location: ToolsRegistryLocation): boolean {
+    return location.scope !== 'project' || location.dir !== this.untrustedProjectToolsDir;
   }
 
   private async readDefinition(filePath: string): Promise<MetaToolDefinition | null> {
@@ -451,14 +495,24 @@ export class ToolsRegistry {
 
   private rebuildActiveCache(): void {
     this.metaToolCache.clear();
-    for (const location of this.locations) {
+    this.diagnostics = this.diagnostics.filter((d) => !d.reason.startsWith(SHADOW_REASON_PREFIX));
+    for (const scope of META_TOOL_PRECEDENCE) {
       for (const record of this.metaToolRecords.values()) {
-        if (record.definition.scope !== location.scope || record.definition.disabled) {
+        if (record.definition.scope !== scope || record.definition.disabled) {
           continue;
         }
-        if (!this.metaToolCache.has(record.definition.name)) {
-          this.metaToolCache.set(record.definition.name, record.definition);
+        const name = record.definition.name;
+        if (scope === 'project' && this.reservedBuiltInNames.has(name)) {
+          this.diagnostics.push({ file: record.filePath, reason: `${SHADOW_REASON_PREFIX}built-in tool "${name}"` });
+          continue;
         }
+        if (this.metaToolCache.has(name)) {
+          if (scope === 'project') {
+            this.diagnostics.push({ file: record.filePath, reason: `${SHADOW_REASON_PREFIX}user tool "${name}"` });
+          }
+          continue;
+        }
+        this.metaToolCache.set(name, record.definition);
       }
     }
     for (const [name, record] of this.extensionToolRecords) {

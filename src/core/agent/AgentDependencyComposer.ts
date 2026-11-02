@@ -119,7 +119,7 @@ import { MentionResolver } from './MentionResolver.js';
 import { AutoReportManager } from '../../reporting/AutoReportManager.js';
 import { RemoteFeatureFlagManager } from '../../features/RemoteFeatureFlagManager.js';
 import { getAnnouncementManager } from '../../announcements/AnnouncementManager.js';
-import { getAuthClient } from '../../auth/index.js';
+import { getAuthClient, selectedAccountId } from '../../auth/index.js';
 import { syncAgentAnnouncementLine } from './AgentUIRuntime.js';
 import { activityItemsFromTodos, formatSubAgentActivityLabel } from '../../ui/ink/TaskActivityPanel.js';
 import { getFeatureState } from '../../features/featureRegistry.js';
@@ -570,7 +570,9 @@ export function initializeAgentDependencies(
 
     const agentRegistry = configureAgentRegistry(runtime);
     const pluginDir = (runtime.config as typeof runtime.config & { pluginDir?: string }).pluginDir;
-    const toolsRegistry = createToolsRegistry(runtime.workspaceRoot, pluginDir ?? AUTOHAND_PATHS.tools);
+    const toolsRegistry = createToolsRegistry(runtime.workspaceRoot, pluginDir ?? AUTOHAND_PATHS.tools, {
+      projectToolsTrusted: runtime.config.workspaceTrust?.trusted === true,
+    });
     host.toolsRegistry = toolsRegistry;
     host.extensionService = new ExtensionService({
       projectRoot: join(runtime.workspaceRoot, PROJECT_DIR_NAME, 'extensions'),
@@ -924,7 +926,13 @@ export function initializeAgentDependencies(
 
     const toolAuthorization = {
       permissionManager: host.permissionManager,
-      resolvePermissionContext: (action) => host.actionExecutor.getPermissionContext(action),
+      resolvePermissionContext: (action) => {
+        const context = host.actionExecutor.getPermissionContext(action);
+        return action.type === 'exit_worktree' && action.discard_changes === true && action.keep !== true
+          && host.sessionWorktreeState
+          ? { ...context, path: host.sessionWorktreeState.worktreePath }
+          : context;
+      },
       runPreToolHooks: (context) => {
         const hookContext = {
           tool: context.tool,
@@ -1680,7 +1688,7 @@ export function initializeAgentDependencies(
           } else if (action.type === 'enter_worktree') {
             result = await host.enterSessionWorktree(action.name);
           } else if (action.type === 'exit_worktree') {
-            result = await host.exitSessionWorktree(action.keep);
+            result = await host.exitSessionWorktree(action.keep, action.discard_changes);
           } else if (action.type === 'cron_create') {
             const cron = intervalToCron(action.interval);
             const expiresInMs = action.expires_in ? shorthandToMs(action.expires_in) : undefined;
@@ -2205,7 +2213,13 @@ export function initializeAgentDependencies(
         const token = runtime.config.auth?.token
           ?? autohand?.accountToken
           ?? (autohand?.authMode === 'api-key' ? autohand.apiKey : undefined);
-        return token ? getAuthClient().fetchEntitlement(token) : Promise.resolve(null);
+        return token ? getAuthClient().fetchEntitlement(token, selectedAccountId(runtime.config)) : Promise.resolve(null);
+      },
+      applyAccountChange: async () => {
+        if (host.activeProvider === 'autohandai' && runtime.options.model) {
+          await host.providerConfigManager.applyModelChangeRemote('autohandai', runtime.options.model);
+        }
+        await host.refreshAccountPlan();
       },
       isFeatureEnabled: isRuntimeFeatureEnabled,
       trackFeatureActivation: (key: string, metadata?: Record<string, unknown>) => {

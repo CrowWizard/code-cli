@@ -43,6 +43,10 @@ describe("modelCatalog", () => {
       "gpt-5.6-luna",
       "gpt-5.4",
     ]));
+    for (const id of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-6.1-sol']) {
+      expect(getProviderModelOptions('openai')).toContainEqual(expect.objectContaining({ id, contextWindow: 272_000 }));
+    }
+    expect(getProviderDefaultModel('openai')).toBe('gpt-5.4');
     expect(getProviderDefaultModel("xai")).toBe("grok-4.5");
     expect(getProviderModelIds("xai")).toEqual(expect.arrayContaining([
       "grok-4.5",
@@ -51,17 +55,17 @@ describe("modelCatalog", () => {
       "grok-4.20-reasoning",
     ]));
     expect(getProviderDefaultModel("autohandai")).toBe("moa");
-    expect(getProviderDefaultModel("anthropic")).toBe("claude-sonnet-5");
+    expect(getProviderDefaultModel("anthropic")).toBe("claude-sonnet-5-5");
     expect(getProviderModelIds("anthropic")).toEqual(expect.arrayContaining([
-      "claude-sonnet-5",
+      "claude-sonnet-5-5",
       "claude-opus-5",
       "claude-fable-5",
       "claude-opus-4-8",
       "claude-haiku-4-5",
     ]));
-    expect(getProviderDefaultModel("openrouter")).toBe("anthropic/claude-sonnet-5");
+    expect(getProviderDefaultModel("openrouter")).toBe("anthropic/claude-sonnet-5-5");
     expect(getProviderModelIds("openrouter")).toEqual(expect.arrayContaining([
-      "anthropic/claude-sonnet-5",
+      "anthropic/claude-sonnet-5-5",
       "anthropic/claude-opus-5",
       "anthropic/claude-fable-5",
       "anthropic/claude-opus-4.8",
@@ -81,13 +85,6 @@ describe("modelCatalog", () => {
       expect.objectContaining({ id: "muse-wonder-1.0", contextWindow: 262_144, maxTokens: 16_000, toolCalls: true }),
       expect.objectContaining({ id: "qwen3.8-max", contextWindow: 262_144, maxTokens: 16_000, toolCalls: true }),
       expect.objectContaining({ id: "gemini-4-argon", contextWindow: 1_048_576, maxTokens: 16_000, toolCalls: true }),
-      expect.objectContaining({
-        id: "weka",
-        contextWindow: 32_000,
-        maxTokens: 1_024,
-        cliSupported: false,
-        description: expect.stringContaining("not runnable in the CLI"),
-      }),
     ]);
     expect(getProviderRunnableModelIds("autohandai")).toEqual(["fantail", "moa", "auto", "gpt-5.6-luna", "deepseek-v4-flash", "gpt-6-sol", "grok-4.7", "qwen3.8-27b", "muse-wonder-1.0", "qwen3.8-max", "gemini-4-argon"]);
     rmSync(dir, { recursive: true, force: true });

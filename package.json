@@ -22,6 +22,7 @@
   },
   "main": "dist/index.js",
   "files": [
+    "COMMERCIAL.md",
     "dist",
     "scripts/ensure-node-pty-helper-permissions.mjs",
     "scripts/ensure-ink-cursor-intent.mjs",
@@ -77,7 +78,15 @@
     "llm",
     "agent",
     "agentic",
-    "autohand"
+    "autohand",
+    "coding-agent",
+    "ai-coding-agent",
+    "claude-code",
+    "codex",
+    "mcp",
+    "ollama",
+    "byok",
+    "terminal"
   ],
   "engines": {
     "node": ">=22.0.0"
