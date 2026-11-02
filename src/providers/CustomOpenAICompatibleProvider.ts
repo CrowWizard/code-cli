@@ -33,7 +33,43 @@ interface ResponsesResponse {
   output_text?: string;
   output?: Array<ResponsesFunctionCall | { type?: string; content?: Array<{ type?: string; text?: string }> }>;
   usage?: unknown;
+  error?: unknown;
   incomplete_details?: { reason?: string };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function sanitizeFailureDetail(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const sanitized = value
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .replace(/\b((?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .trim()
+    .slice(0, 240);
+  return sanitized || undefined;
+}
+
+function formatResponsesFailureDetails(data: { error?: unknown; response?: ResponsesResponse }): string {
+  const responseError = asRecord(data.response?.error);
+  const failure = asRecord(data.error) ?? responseError;
+  if (!failure) {
+    const message = sanitizeFailureDetail(data.error);
+    return message ? `message=${message}` : 'details=(no structured error details)';
+  }
+
+  const fields = ['code', 'type', 'param', 'message']
+    .flatMap((key) => {
+      const value = sanitizeFailureDetail(failure[key]);
+      return value ? [`${key}=${value}`] : [];
+    });
+  return fields.length ? fields.join(' ') : 'details=(no structured error details)';
 }
 
 export class CustomOpenAICompatibleProvider implements LLMProvider {
@@ -125,6 +161,9 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
       }));
       body.tool_choice = request.toolChoice ?? 'auto';
     }
+    writeAutohandDebugLine(
+      `[RESPONSES CACHE] request cacheKey=${request.promptCache ? 'present' : 'absent'}`,
+    );
 
     let response: Response;
     try {
@@ -157,13 +196,18 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
       ? await this.parseResponsesStream(response, request.onTextDelta)
       : await response.json() as ResponsesResponse;
     const toolCalls = this.extractToolCalls(data.output);
+    const usage = normalizeLLMUsage(data.usage, 'openai-responses');
+    const rawUsage = asRecord(data.usage);
+    writeAutohandDebugLine(
+      `[RESPONSES CACHE] response inputTokens=${usage?.promptTokens ?? 'unreported'} outputTokens=${usage?.completionTokens ?? 'unreported'} cacheReadTokens=${usage?.cacheReadTokens ?? 'unreported'} cacheWriteTokens=${usage?.cacheWriteTokens ?? 'unreported'} usageFields=${rawUsage ? Object.keys(rawUsage).sort().join(',') || '(none)' : '(missing)'}`,
+    );
     return {
       id: data.id ?? `${this.providerName}-responses-${Date.now()}`,
       created: data.created_at ?? Math.floor(Date.now() / 1000),
       content: this.extractContent(data),
       toolCalls,
       finishReason: toolCalls.length ? 'tool_calls' : data.incomplete_details?.reason ? 'length' : 'stop',
-      usage: normalizeLLMUsage(data.usage, 'openai-responses'),
+      usage,
       raw: data,
     };
   }
@@ -226,7 +270,7 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
         logEvent('[DONE]', raw);
         return recoverStreamedResponse();
       }
-      let data: { type?: string; response?: ResponsesResponse; delta?: unknown };
+      let data: { type?: string; response?: ResponsesResponse; error?: unknown; delta?: unknown };
       try {
         data = JSON.parse(raw) as { type?: string; response?: ResponsesResponse; delta?: unknown };
       } catch {
@@ -244,7 +288,10 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
         writeAutohandDebugLine(`[RESPONSES SSE] terminal event=${type} ${streamSummary()}`);
         return data.response ?? data as ResponsesResponse;
       }
-      if (type === 'response.failed' || type === 'response.error') throw new ApiError(`Responses stream ended with ${type}.`, 'server_error', 0, true);
+      if (type === 'response.failed' || type === 'response.error') {
+        writeAutohandDebugLine(`[RESPONSES SSE] terminal event=${type} failure ${formatResponsesFailureDetails(data)}`);
+        throw new ApiError(`Responses stream ended with ${type}.`, 'server_error', 0, true);
+      }
       return undefined;
     };
 
@@ -300,4 +347,3 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
       .trim();
   }
 }
-

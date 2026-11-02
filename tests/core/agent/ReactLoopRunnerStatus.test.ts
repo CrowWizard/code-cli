@@ -1620,6 +1620,37 @@ describe('ReactLoopRunner prompt-cache tool stability', () => {
     expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
   });
 
+  it('preserves the cached custom Responses tool prefix when a read becomes an edit', async () => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'custom:cache-test';
+      host.runtime.config.customProviders = {
+        'cache-test': {
+          id: 'cache-test', displayName: 'Cache Test', apiFormat: 'openai-responses',
+          baseUrl: 'https://example.com/v1', model: 'test-model',
+        },
+      };
+      host.isPromptCachingEnabled = () => true;
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file', 'write_file'], ['read_file', 'write_file']]);
+  });
+
+  it.each(['disabled', 'no-session'] as const)('keeps custom Responses relevance filtering with caching %s', async (mode) => {
+    const perIteration = await advertisedToolsPerIteration((host) => {
+      host.activeProvider = 'custom:cache-test';
+      host.runtime.config.customProviders = {
+        'cache-test': {
+          id: 'cache-test', displayName: 'Cache Test', apiFormat: 'openai-responses',
+          baseUrl: 'https://example.com/v1', model: 'test-model',
+        },
+      };
+      host.isPromptCachingEnabled = () => mode !== 'disabled';
+      if (mode === 'no-session') host.sessionManager.getCurrentSession = vi.fn(() => null);
+    }, ['read the parser', 'fix the parser']);
+
+    expect(perIteration).toEqual([['read_file'], ['read_file', 'write_file']]);
+  });
+
   it('keeps relevance filtering when there is no session cache key', async () => {
     const perIteration = await advertisedToolsPerIteration((host) => {
       host.activeProvider = 'autohandai';

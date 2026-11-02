@@ -311,7 +311,12 @@ function selectCacheStableTools(
   toolSet: PromptCacheToolSet,
   messages: LLMMessage[],
 ): FunctionDefinition[] {
-  if (!usesAutohandAICloud(host.runtime.config, host.activeProvider) || host.isPromptCachingEnabled?.() !== true) {
+  const customProvider = host.activeProvider?.startsWith('custom:')
+    ? host.runtime.config.customProviders?.[host.activeProvider.slice('custom:'.length)]
+    : undefined;
+  const supportsStableCachePrefix = usesAutohandAICloud(host.runtime.config, host.activeProvider)
+    || customProvider?.apiFormat === 'openai-responses';
+  if (!supportsStableCachePrefix || host.isPromptCachingEnabled?.() !== true) {
     return relevant;
   }
   const sessionId = host.sessionManager.getCurrentSession()?.metadata.sessionId;
