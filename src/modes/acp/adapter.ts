@@ -1067,6 +1067,14 @@ export class AutohandAcpAdapter implements Agent {
         return { stopReason: 'cancelled' };
       }
       if (!success) {
+        process.stderr.write(`[ACP] Turn failed ${JSON.stringify({
+          timestamp: new Date().toISOString(),
+          sessionId: params.sessionId,
+          workspace: session.workspaceRoot,
+          durationMs: turnDuration,
+          stage: 'instruction_failed',
+          prompt: instruction.slice(0, 4000),
+        })}\n`);
         throw RequestError.internalError(undefined, 'Autohand Code could not complete this turn. Check the reported setup or tool error before retrying.');
       }
       return { stopReason: 'end_turn' };
@@ -1076,6 +1084,16 @@ export class AutohandAcpAdapter implements Agent {
       }
       if (err instanceof RequestError) throw err;
       const classified = this.classifyAndFormatError(err);
+      process.stderr.write(`[ACP] Turn failed ${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        sessionId: params.sessionId,
+        workspace: session.workspaceRoot,
+        durationMs: Date.now() - turnStart,
+        stage: 'prompt_error',
+        errorName: err instanceof Error ? err.name : typeof err,
+        error: classified.message,
+        code: classified.code,
+      })}\n`);
       process.stderr.write(`[ACP] Prompt error (${classified.code}): ${classified.message}\n`);
       this.emitHookSessionError(params.sessionId, classified.message, classified.code);
 

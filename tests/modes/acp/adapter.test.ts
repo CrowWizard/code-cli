@@ -1119,11 +1119,32 @@ describe("AutohandAcpAdapter", () => {
       expect(mockAgent.applyAcpMode).not.toHaveBeenCalledWith('yolo');
     });
 
-    it("rejects a failed instruction instead of returning a successful empty turn", async () => {
+    it("logs the prompt only when an instruction fails", async () => {
       mockAgent.runInstruction.mockResolvedValue(false);
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const promptText = "PRIVATE_PROMPT_CONTENT";
       await expect(adapter.prompt({
-        sessionId, prompt: [{ type: 'text', text: 'Update README.md' }],
+        sessionId, prompt: [{ type: 'text', text: promptText }],
       })).rejects.toMatchObject({ code: -32603 });
+
+      const stderrOutput = stderrSpy.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(stderrOutput).toContain("[ACP] Turn failed");
+      expect(stderrOutput).toContain(sessionId);
+      expect(stderrOutput).toContain("/workspace");
+      expect(stderrOutput).toContain(promptText);
+      stderrSpy.mockRestore();
+    });
+
+    it("does not log the prompt when an instruction succeeds", async () => {
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const promptText = "PRIVATE_PROMPT_CONTENT";
+
+      await adapter.prompt({ sessionId, prompt: [{ type: 'text', text: promptText }] });
+
+      const stderrOutput = stderrSpy.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(stderrOutput).not.toContain(promptText);
+      expect(stderrOutput).not.toContain("[ACP] Turn failed");
+      stderrSpy.mockRestore();
     });
 
     it("keeps adjacent ACP text blocks separated", async () => {
