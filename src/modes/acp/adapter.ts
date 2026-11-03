@@ -498,6 +498,12 @@ export class AutohandAcpAdapter implements Agent {
       }
       return activePermBridge.confirmAction(message, context);
     });
+    agent.setFollowupQuestionCallback(async (question, suggestedAnswers) => {
+      const activePermBridge = this.permissionBridges.get(state.sessionId);
+      if (!activePermBridge) return undefined;
+      return activePermBridge.askFollowupQuestion(question, suggestedAnswers);
+    });
+    agent.disableLocalFollowupQuestionFallback = true;
     agent.setDirectoryAccessCallback(async (directoryPath, reason) => {
       const activePermBridge = this.permissionBridges.get(state.sessionId);
       if (!activePermBridge) {

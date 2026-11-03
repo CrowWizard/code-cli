@@ -68,6 +68,7 @@ const {
     initializeForRPC: vi.fn().mockResolvedValue(undefined),
     setOutputListener: vi.fn(),
     setConfirmationCallback: vi.fn(),
+    setFollowupQuestionCallback: vi.fn(),
     setDirectoryAccessCallback: vi.fn<(callback: (path: string, reason?: string) => Promise<string | undefined>) => void>(),
     connectAcpMcpServers: vi.fn().mockResolvedValue(undefined),
     applyAcpMode: vi.fn(),
@@ -820,6 +821,33 @@ describe("AutohandAcpAdapter", () => {
       expect(typeof mockAgent.setConfirmationCallback.mock.calls[0][0]).toBe(
         "function",
       );
+    });
+
+    it("routes follow-up questions through ACP permission requests", async () => {
+      vi.mocked(connection.requestPermission).mockResolvedValue({
+        outcome: { outcome: "selected", optionId: "alternative", _meta: { alternative: "Keep the existing changes" } },
+      } as never);
+      const { sessionId } = await adapter.newSession(makeNewSessionRequest());
+
+      expect(mockAgent.setFollowupQuestionCallback).toHaveBeenCalledTimes(1);
+      const callback = mockAgent.setFollowupQuestionCallback.mock.calls[0][0];
+      await expect(callback("How should I proceed?", ["Continue", "Stop"])).resolves.toBe("Keep the existing changes");
+      expect(connection.requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId,
+        toolCall: expect.objectContaining({
+          title: "Question: How should I proceed?",
+          rawInput: expect.objectContaining({
+            tool: "ask_followup_question",
+            question: "How should I proceed?",
+            suggestedAnswers: ["Continue", "Stop"],
+          }),
+        }),
+        options: expect.arrayContaining([
+          expect.objectContaining({ optionId: "answer_0", name: "Continue" }),
+          expect.objectContaining({ optionId: "answer_1", name: "Stop" }),
+          expect.objectContaining({ optionId: "alternative", name: "Enter alternative..." }),
+        ]),
+      }));
     });
 
     it.each(["allow_once", "allow_session", "allow_always_project", "allow_always_user"])(

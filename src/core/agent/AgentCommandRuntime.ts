@@ -478,6 +478,10 @@ export async function executeAgentAskFollowupQuestion(host: AgentCommandRuntimeH
       } catch {
         // A mobile transport failure falls through to the existing local prompt.
       }
+
+      if (host.disableLocalFollowupQuestionFallback) {
+        return '<answer>No answer was provided. Continue using your best judgment.</answer>';
+      }
     }
 
     host.notificationService.notify(

@@ -69,6 +69,22 @@ describe('agent follow-up question routing', () => {
     });
   });
 
+  it('does not open the local modal when the ACP client provides no answer', async () => {
+    const followupQuestionCallback = vi.fn().mockResolvedValue(undefined);
+    const host = createHost({
+      followupQuestionCallback,
+      disableLocalFollowupQuestionFallback: true,
+    });
+
+    await expect(executeAgentAskFollowupQuestion(
+      host,
+      'Which environment should I deploy?',
+      ['Staging', 'Production'],
+    )).resolves.toBe('<answer>No answer was provided. Continue using your best judgment.</answer>');
+
+    expect(showQuestionModal).not.toHaveBeenCalled();
+  });
+
   it.each([
     { mode: 'yes', options: { yes: true } },
     { mode: 'unrestricted', options: { unrestricted: true } },

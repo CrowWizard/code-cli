@@ -398,6 +398,7 @@ export class AutohandAgent {
     question: string,
     suggestedAnswers?: string[],
   ) => Promise<string | undefined>;
+  disableLocalFollowupQuestionFallback = false;
   private mobileRelayController?: MobileRelayController;
   private mobileTurnFailureMessage: string | null = null;
   private conversation!: ConversationManager;
@@ -3025,6 +3026,12 @@ export class AutohandAgent {
     callback: (message: string, context?: { tool?: string; path?: string; command?: string }) => Promise<PermissionPromptResponse>
   ): void {
     this.confirmationCallback = callback;
+  }
+
+  setFollowupQuestionCallback(
+    callback: (question: string, suggestedAnswers?: string[]) => Promise<string | undefined>
+  ): void {
+    this.followupQuestionCallback = callback;
   }
 
   private getDisplayErrorMessage(error: unknown): string {

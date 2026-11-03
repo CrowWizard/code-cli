@@ -129,5 +129,53 @@ export function createPermissionBridge(options: PermissionBridgeOptions) {
     }
   };
 
-  return { confirmAction, setMode };
+  const askFollowupQuestion = async (
+    question: string,
+    suggestedAnswers: string[] = [],
+  ): Promise<string | undefined> => {
+    const toolCallId = `question_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const answerOptions = suggestedAnswers.map((answer, index) => ({
+      kind: 'allow_once' as const,
+      name: answer,
+      optionId: `answer_${index}`,
+    }));
+
+    try {
+      const response = await connection.requestPermission({
+        sessionId,
+        toolCall: {
+          toolCallId,
+          title: `Question: ${question}`,
+          kind: 'other',
+          status: 'pending',
+          locations: [],
+          rawInput: { tool: 'ask_followup_question', question, suggestedAnswers },
+        },
+        options: [
+          ...answerOptions,
+          { kind: 'reject_once', name: 'Enter alternative...', optionId: 'alternative' },
+          { kind: 'reject_once', name: 'Skip question', optionId: 'skip_question' },
+        ],
+      });
+
+      if (response.outcome.outcome !== 'selected') return undefined;
+      if (response.outcome.optionId.startsWith('answer_')) {
+        const index = Number(response.outcome.optionId.slice('answer_'.length));
+        return Number.isInteger(index) ? suggestedAnswers[index] : undefined;
+      }
+      if (response.outcome.optionId === 'alternative') {
+        const meta = (response.outcome as { _meta?: Record<string, unknown> })._meta;
+        const answer = typeof meta?.alternative === 'string' ? meta.alternative.trim() : '';
+        return answer || undefined;
+      }
+      return undefined;
+    } catch (error) {
+      process.stderr.write(
+        `[ACP] Follow-up question request failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  return { confirmAction, askFollowupQuestion, setMode };
 }

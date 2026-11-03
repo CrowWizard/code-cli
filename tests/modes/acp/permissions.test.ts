@@ -86,6 +86,29 @@ describe('createPermissionBridge', () => {
 
     expect(typeof bridge.confirmAction).toBe('function');
     expect(typeof bridge.setMode).toBe('function');
+    expect(typeof bridge.askFollowupQuestion).toBe('function');
+  });
+
+  it('routes follow-up questions through ACP and returns a selected answer', async () => {
+    vi.mocked(connection.requestPermission).mockResolvedValue(makeAllowResponse('answer_1'));
+    const bridge = createPermissionBridge({ connection, sessionId: 'sess-1', modeId: 'interactive' });
+
+    await expect(bridge.askFollowupQuestion('How should I proceed?', ['Continue', 'Pause']))
+      .resolves.toBe('Pause');
+    expect(connection.requestPermission).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'sess-1',
+      toolCall: expect.objectContaining({
+        title: 'Question: How should I proceed?',
+        rawInput: { tool: 'ask_followup_question', question: 'How should I proceed?', suggestedAnswers: ['Continue', 'Pause'] },
+      }),
+    }));
+  });
+
+  it('returns undefined when a follow-up question is cancelled', async () => {
+    vi.mocked(connection.requestPermission).mockResolvedValue(makeCancelledResponse());
+    const bridge = createPermissionBridge({ connection, sessionId: 'sess-1', modeId: 'interactive' });
+
+    await expect(bridge.askFollowupQuestion('How should I proceed?')).resolves.toBeUndefined();
   });
 
   // -------------------------------------------------------------------------
