@@ -140,6 +140,7 @@ import {
 } from './agent/ReadSessionLedger.js';
 import { buildLocalWorkMap, parseWorkMapHarnesses } from '../integrations/ahtraces/workMap.js';
 import { zitFileResource } from '../utils/sessionZit.js';
+import { writeSessionTodoActivity } from './agent/TodoActivityStore.js';
 
 interface ActivityTodo {
   id?: string;
@@ -2887,6 +2888,11 @@ export class ActionExecutor {
         // Write back. Todos are agent state, not workspace edits: never surface
         // todos.json as a modified file or the TUI renders a JSON diff.
         await this.files.writeFile(todoPath, JSON.stringify(allTodos, null, 2));
+        await writeSessionTodoActivity(
+          this.runtime.workspaceRoot,
+          this.deps.getCurrentSessionId?.() ?? this.sessionId,
+          allTodos,
+        );
         this.todoActivityForCurrentTurn = allTodos;
         const activitySurfaceHandled = this.onActivityTodosUpdated?.(allTodos) === true;
         // Display summary with progress bar

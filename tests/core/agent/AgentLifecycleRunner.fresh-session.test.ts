@@ -361,6 +361,7 @@ describe('restoreAgentSessionState', () => {
       injectProjectKnowledge: vi.fn(async () => {}),
       updateContextUsage: vi.fn(),
       restoredChatMessages: [],
+      runtime: { workspaceRoot: '/workspace' },
       inkRenderer: {
         setChatMessages: vi.fn(),
         setGoalActivity,
@@ -377,6 +378,68 @@ describe('restoreAgentSessionState', () => {
     expect(getSessionSnapshot).toHaveBeenCalledOnce();
     expect(host.goalActivitySnapshot).toBe(goalSnapshot);
     expect(setGoalActivity).toHaveBeenCalledWith(goalSnapshot);
+  });
+  it('restores the saved todo activity for the loaded session', async () => {
+    const todos = [{ id: 'task-1', content: 'Finish the unfinished task', status: 'in_progress' }];
+    const setTodoActivityItems = vi.fn();
+    const host = {
+      sessionManager: {
+        loadSession: vi.fn(async () => ({
+          metadata: { sessionId: 'todo-session' },
+          getMessages: () => [],
+        })),
+      },
+      resetConversationContext: vi.fn(async () => {}),
+      injectSessionBootstrap: vi.fn(async () => {}),
+      conversation: {
+        addSystemNote: vi.fn(),
+        addMessage: vi.fn(),
+        history: vi.fn(() => []),
+      },
+      injectProjectKnowledge: vi.fn(async () => {}),
+      updateContextUsage: vi.fn(),
+      restoredChatMessages: [],
+      inkRenderer: {
+        setChatMessages: vi.fn(),
+        setTodoActivityItems,
+      },
+      loadTodoActivity: vi.fn(async (sessionId: string) => sessionId === 'todo-session' ? todos : []),
+    };
+
+    await restoreAgentSessionState(host as unknown as AgentLifecycleHost, 'todo-session');
+
+    expect(host.loadTodoActivity).toHaveBeenCalledWith('todo-session');
+    expect(setTodoActivityItems).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ label: 'Finish the unfinished task', status: 'in_progress' }),
+    ]));
+  });
+  it('clears todo activity when the restored session has no saved task list', async () => {
+    const setTodoActivityItems = vi.fn();
+    const host = {
+      sessionManager: {
+        loadSession: vi.fn(async () => ({
+          metadata: { sessionId: 'empty-todo-session' },
+          getMessages: () => [],
+        })),
+      },
+      resetConversationContext: vi.fn(async () => {}),
+      injectSessionBootstrap: vi.fn(async () => {}),
+      conversation: {
+        addSystemNote: vi.fn(),
+        addMessage: vi.fn(),
+        history: vi.fn(() => []),
+      },
+      injectProjectKnowledge: vi.fn(async () => {}),
+      updateContextUsage: vi.fn(),
+      restoredChatMessages: [],
+      runtime: { workspaceRoot: '/workspace' },
+      inkRenderer: { setChatMessages: vi.fn(), setTodoActivityItems },
+      loadTodoActivity: vi.fn(async () => []),
+    };
+
+    await restoreAgentSessionState(host as unknown as AgentLifecycleHost, 'empty-todo-session');
+
+    expect(setTodoActivityItems).toHaveBeenCalledWith([]);
   });
 });
 

@@ -43,6 +43,8 @@ import { writeAutohandDebugLine } from '../../utils/debugLog.js';
 import { BARE_SLASH_COMMANDS_DISABLED_MESSAGE } from '../../runtime/bareMode.js';
 import type { ImageManager } from '../ImageManager.js';
 import { SessionDiffStatsTracker } from '../SessionDiffStatsTracker.js';
+import { activityItemsFromTodos } from '../../ui/ink/TaskActivityPanel.js';
+import { readSessionTodoActivity } from './TodoActivityStore.js';
 import { shouldForceAgentIdleLogout } from './AgentSessionAccounting.js';
 import {
   consumeAgentInkSubmittedInstructionEcho,
@@ -1445,6 +1447,13 @@ export async function restoreAgentSessionState(host: AgentLifecycleHost, session
     host.updateContextUsage(host.conversation.history());
     if (host.inkRenderer?.setChatMessages) {
       host.inkRenderer.setChatMessages(host.restoredChatMessages);
+    }
+    const sessionId = session.metadata?.sessionId;
+    if (sessionId && host.inkRenderer?.setTodoActivityItems) {
+      const todos = host.loadTodoActivity
+        ? await host.loadTodoActivity(sessionId)
+        : await readSessionTodoActivity(host.runtime.workspaceRoot, sessionId);
+      host.inkRenderer.setTodoActivityItems(activityItemsFromTodos(todos));
     }
     if (host.goalActivityManager?.getSessionSnapshot) {
       host.goalActivitySnapshot = await host.goalActivityManager.getSessionSnapshot();
