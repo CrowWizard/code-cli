@@ -219,7 +219,7 @@
       },
       "agent": {
         "maxIterations": "最大迭代次数",
-        "maxIterationsDesc": "每个请求的最大工具迭代次数",
+        "maxIterationsDesc": "每个请求的最大工具迭代次数；留空则不限制",
         "enableRequestQueue": "请求队列",
         "enableRequestQueueDesc": "允许代理工作时输入",
         "sessionRetryLimit": "会话重试限制",

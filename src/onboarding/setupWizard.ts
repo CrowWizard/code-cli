@@ -2447,8 +2447,9 @@ export class SetupWizard {
 
     const maxIterStr = await showInput({
       title: t('setup.agent.maxIterationsPrompt'),
-      defaultValue: '100',
+      defaultValue: '',
       validate: (val: string) => {
+        if (!val.trim()) return true;
         const n = parseInt(val, 10);
         if (isNaN(n) || n < 10 || n > 500) return 'Enter a number between 10 and 500';
         return true;
@@ -2461,7 +2462,7 @@ export class SetupWizard {
     });
 
     this.state.agentSettings = {
-      maxIterations: parseInt(maxIterStr || '100', 10),
+      ...(maxIterStr?.trim() ? { maxIterations: parseInt(maxIterStr, 10) } : {}),
       debug
     };
 

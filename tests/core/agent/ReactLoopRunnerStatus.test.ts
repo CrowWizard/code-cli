@@ -747,6 +747,40 @@ describe('ReactLoopRunner composer status', () => {
     }
   });
 
+  it('continues past 100 iterations when no limit is configured', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    let callCount = 0;
+    const llmComplete = vi.fn(async () => {
+      callCount += 1;
+      if (callCount <= 101) {
+        return {
+          id: `continue-${callCount}`,
+          created: callCount,
+          content: JSON.stringify({ toolCalls: [{ tool: 'list_tree', args: { path: `./${callCount}` } }] }),
+          raw: {},
+        };
+      }
+      return {
+        id: 'finished',
+        created: callCount,
+        content: '{"finalResponse":"Completed."}',
+        raw: {},
+      };
+    });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    host.runtime.config.agent = { debug: false };
+    host.toolManager.execute = vi.fn(async () => [{ tool: 'list_tree', success: true, output: 'src/' }]);
+
+    try {
+      const result = await runAgentReactLoop(host, new AbortController());
+
+      expect(result).toEqual({ status: 'completed' });
+      expect(llmComplete).toHaveBeenCalledTimes(102);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it('does not account for or publish a completion returned after provider abort', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const parser = new ReactionParser();

@@ -556,11 +556,8 @@ export async function runAgentReactLoop(
     const planModeManager = getPlanModeManager();
     const isExecutingPlan = planModeManager.isEnabled() && planModeManager.getPhase() === 'executing';
 
-    // For plan execution, use effectively unlimited iterations (user accepted the plan)
-    // Otherwise use configurable limit (default 100)
-    const maxIterations = isExecutingPlan
-      ? 1000
-      : (host.runtime.config.agent?.maxIterations ?? 100);
+    // Match OpenCode: only enforce an iteration limit when explicitly configured.
+    const maxIterations = isExecutingPlan ? undefined : host.runtime.config.agent?.maxIterations;
 
     // Gate plan and exit_plan_mode tools: only register when plan mode is
     // enabled and we are in the planning phase. This ensures the LLM literally
@@ -605,7 +602,7 @@ export async function runAgentReactLoop(
     // must not receive OpenAI-style tool schemas in the API request.
     let allTools = await refreshRuntimeTools();
 
-    if (debugMode) host.writeDebugLine(`[AGENT DEBUG] Loaded ${allTools.length} tools, maxIterations=${maxIterations}`);
+    if (debugMode) host.writeDebugLine(`[AGENT DEBUG] Loaded ${allTools.length} tools, maxIterations=${maxIterations ?? 'unlimited'}`);
 
     // Start status updates for the main loop
     host.startStatusUpdates();
@@ -797,7 +794,7 @@ export async function runAgentReactLoop(
       return steered.length > 0;
     };
 
-    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    for (let iteration = 0; maxIterations === undefined || iteration < maxIterations; iteration += 1) {
       // Check for abort at the start of each iteration
       if (abortController.signal.aborted) {
         if (debugMode) host.writeDebugLine('[AGENT DEBUG] Abort detected at loop start, breaking');

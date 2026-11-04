@@ -419,7 +419,7 @@ export interface UISettings {
 }
 
 export interface AgentSettings {
-  /** Maximum iterations per user request (default: 100) */
+  /** Maximum iterations per user request; unset means no iteration limit. */
   maxIterations?: number;
   /** Limits for one run, shared with in-process sub-agents; CLI flags --max-requests, --max-tokens, --max-duration win. */
   budget?: {
