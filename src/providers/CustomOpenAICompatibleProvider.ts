@@ -43,32 +43,22 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function sanitizeFailureDetail(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const sanitized = value
-    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
-    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
-    .replace(/\b((?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
-    .trim()
-    .slice(0, 240);
-  return sanitized || undefined;
-}
-
-function formatResponsesFailureDetails(data: { error?: unknown; response?: ResponsesResponse }): string {
+function formatResponsesFailureDetails(data: { error?: unknown; response?: ResponsesResponse; request_id?: unknown }, headers: Headers): string {
   const responseError = asRecord(data.response?.error);
   const failure = asRecord(data.error) ?? responseError;
-  if (!failure) {
-    const message = sanitizeFailureDetail(data.error);
-    return message ? `message=${message}` : 'details=(no structured error details)';
-  }
-
   const fields = ['code', 'type', 'param', 'message']
     .flatMap((key) => {
-      const value = sanitizeFailureDetail(failure[key]);
-      return value ? [`${key}=${value}`] : [];
+      const value = failure?.[key];
+      return typeof value === 'string' && value ? [`${key}=${value}`] : [];
     });
+  if (!failure && typeof data.error === 'string') fields.push(`message=${data.error}`);
+  const requestId = data.request_id ?? asRecord(data.response)?.request_id ?? failure?.request_id;
+  if (typeof requestId === 'string' && requestId) fields.push(`request_id=${requestId}`);
+  for (const header of ['x-request-id', 'request-id', 'x-autohand-request-id', 'x-autohand-client-request-id']) {
+    const value = headers.get(header);
+    if (value) fields.push(`${header}=${value}`);
+  }
+  if (data.response?.id) fields.push(`response_id=${data.response.id}`);
   return fields.length ? fields.join(' ') : 'details=(no structured error details)';
 }
 
@@ -289,8 +279,9 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
         return data.response ?? data as ResponsesResponse;
       }
       if (type === 'response.failed' || type === 'response.error') {
-        writeAutohandDebugLine(`[RESPONSES SSE] terminal event=${type} failure ${formatResponsesFailureDetails(data)}`);
-        throw new ApiError(`Responses stream ended with ${type}.`, 'server_error', 0, true);
+        const details = formatResponsesFailureDetails(data, response.headers);
+        writeAutohandDebugLine(`[RESPONSES SSE] terminal event=${type} failure ${details}`);
+        throw new ApiError(`Responses stream ended with ${type}. ${details}`, 'server_error', 0, true);
       }
       return undefined;
     };

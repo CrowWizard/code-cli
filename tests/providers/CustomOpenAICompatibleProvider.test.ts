@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'fs-extra';
+import path from 'node:path';
+import { ErrorLogger } from '../../src/core/errorLogger.js';
 import { CustomOpenAICompatibleProvider } from '../../src/providers/CustomOpenAICompatibleProvider.js';
 import { getSessionPromptCacheDirective, isPromptCachingEnabled, PROMPT_CACHING_KILL_SWITCH_ID } from '../../src/core/agent/PromptCache.js';
 import type { LoadedConfig } from '../../src/types.js';
@@ -286,7 +289,66 @@ describe('CustomOpenAICompatibleProvider', () => {
     });
   });
 
-  it('logs sanitized error details when a Responses stream fails', async () => {
+  it.each(['response.failed', 'response.error'])('preserves upstream details and request IDs for %s without debugging', async (type) => {
+    vi.stubEnv('AUTOHAND_DEBUG', '0');
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'ailili',
+      displayName: 'AILILI',
+      apiFormat: 'openai-responses',
+      baseUrl: 'https://ailili.chat/v1',
+      model: 'gpt-5.6-terra',
+      stream: true,
+    });
+    const message = `Upstream rejected sk-original-value\n${'detail '.repeat(60)}`;
+    globalThis.fetch = vi.fn().mockResolvedValueOnce(new Response([
+      `event: ${type}`,
+      `data: ${JSON.stringify({ type, request_id: 'req-event', response: {
+        id: 'resp-failed', error: { code: 'upstream_rejected', message },
+      } })}`,
+      '',
+    ].join('\n'), { headers: { 'Content-Type': 'text/event-stream', 'x-request-id': 'req-http' } })) as typeof globalThis.fetch;
+
+    try {
+      await expect(provider.complete({ messages: [{ role: 'user', content: 'Hello' }] }))
+        .rejects.toThrow(`Responses stream ended with ${type}. code=upstream_rejected message=${message} request_id=req-event x-request-id=req-http response_id=resp-failed`);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('persists the original failure and all available request headers in error.log without debugging', async () => {
+    vi.stubEnv('AUTOHAND_DEBUG', '0');
+    const logDir = await fs.mkdtemp(path.join(process.cwd(), '.responses-error-test-'));
+    const logger = new ErrorLogger('test', logDir);
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'fixture', displayName: 'Fixture', apiFormat: 'openai-responses',
+      baseUrl: 'https://example.com/v1', model: 'fixture', stream: true,
+    });
+    const message = `Rejected Bearer original-token\n${'original detail '.repeat(60)}`;
+    globalThis.fetch = vi.fn().mockResolvedValueOnce(new Response([
+      `data: ${JSON.stringify({ type: 'response.failed', response: {
+        id: 'resp-original', request_id: 'req-response', error: { code: 'upstream_error', message },
+      } })}`, '',
+    ].join('\n'), { headers: {
+      'x-request-id': 'req-http', 'request-id': 'req-alternate',
+      'x-autohand-request-id': 'req-autohand', 'x-autohand-client-request-id': 'req-client',
+    } })) as typeof globalThis.fetch;
+    try {
+      const error = await provider.complete({ messages: [{ role: 'user', content: 'Hello' }] })
+        .catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(Error);
+      if (!(error instanceof Error)) throw new Error('Expected provider failure');
+      await logger.log(error);
+      const entries = await logger.getRecentErrors();
+      expect(entries).toHaveLength(1);
+      expect(entries[0].error.message).toBe(`Responses stream ended with response.failed. code=upstream_error message=${message} request_id=req-response x-request-id=req-http request-id=req-alternate x-autohand-request-id=req-autohand x-autohand-client-request-id=req-client response_id=resp-original`);
+    } finally {
+      await fs.remove(logDir);
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('logs original error details when a Responses stream fails', async () => {
     const previousDebug = process.env.AUTOHAND_DEBUG;
     process.env.AUTOHAND_DEBUG = '1';
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -321,8 +383,7 @@ describe('CustomOpenAICompatibleProvider', () => {
         .rejects.toThrow('Responses stream ended with response.failed.');
 
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('code=invalid_api_key'));
-      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('message=Invalid API key [REDACTED]'));
-      expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('sk-secret-value'));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('message=Invalid API key sk-secret-value'));
       expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('Sensitive prompt'));
     } finally {
       stderr.mockRestore();

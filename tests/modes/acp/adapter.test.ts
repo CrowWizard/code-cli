@@ -2578,10 +2578,19 @@ describe("AutohandAcpAdapter", () => {
 
     it("emits sessionError hook via handleAgentOutput error event", async () => {
       const outputListener = mockAgent.setOutputListener.mock.calls[0][0];
+      const message = `Responses stream ended with response.failed. code=upstream_rejected message=Invalid key sk-original-value\n${'detail '.repeat(60)} request_id=req-event x-request-id=req-http response_id=resp-failed`;
 
       await outputListener({
         type: "error",
-        content: "Something went wrong",
+        content: message,
+      });
+
+      expect(connection.sessionUpdate).toHaveBeenCalledWith({
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Error (unknown): ${message}` },
+        },
       });
 
       // Allow fire-and-forget hook emission to settle
@@ -2594,7 +2603,7 @@ describe("AutohandAcpAdapter", () => {
       expect(errorCall).toBeDefined();
       expect(errorCall![1]).toMatchObject({
         sessionId,
-        error: "Something went wrong",
+        error: message,
       });
     });
 
