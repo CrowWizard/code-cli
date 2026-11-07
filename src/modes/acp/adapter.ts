@@ -1048,6 +1048,7 @@ export class AutohandAcpAdapter implements Agent {
               if (!config || !persistentSessionId) throw new Error('Workflow goals require a managed persistent session.');
               await withWorkflowGoalConfig(config, () => executeWorkflowGoal({
                 workspaceRoot: session.workspaceRoot,
+                goalContinuity: agent.getGoalContinuity(),
                 sessionId: persistentSessionId,
                 executionId: workflowExecution.executionId,
                 instruction,
@@ -1638,6 +1639,11 @@ export class AutohandAcpAdapter implements Agent {
         }
       }
       switch (event.type) {
+        case 'skill_attachment':
+          if (event.receipt && this.sessions.has(sessionId)) {
+            await this.connection.extNotification('_autohand/skillAttachment', { sessionId, receipt: event.receipt, timestamp: new Date().toISOString() });
+          }
+          break;
         case 'peer_update':
         case 'resource_update': {
           const update = event.type === 'peer_update' ? event.peerEvent : event.resourceEvent;

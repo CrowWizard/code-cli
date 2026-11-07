@@ -90,6 +90,7 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
         baseUrl: config.baseUrl,
         model: config.model,
         supportsImageInput: this.supportsImageInput,
+        supportsPromptCacheKey: config.supportsPromptCacheKey === true,
       },
       networkSettings,
       {
