@@ -929,11 +929,18 @@ export async function runAgentReactLoop(
             '[Tool Result Integrity] One or more prior tool results were not available in the outbound provider payload. ' +
             'Tools have been disabled for this recovery response. Do not retry the calls; explain the integrity failure ' +
             'or answer from results that remain visible.';
-          host.conversation.addSystemNote(integrityNote);
-
           const missingByAssistantId = new Map(
             integrity.missingResults.map((result) => [result.id, result]),
           );
+          const recordedResultIds = new Set(host.conversation.history()
+            .filter((message) => message.role === 'tool')
+            .map((message) => message.tool_call_id));
+          for (const missing of missingByAssistantId.values()) {
+            if (recordedResultIds.has(missing.id)) continue;
+            const content = 'Tool execution was interrupted or its result was lost; completion and side effects are unknown. The call will not be retried automatically.';
+            host.conversation.addMessage({ role: 'tool', name: missing.tool, content, tool_call_id: missing.id });
+            await host.saveToolMessage(missing.tool, content, missing.id);
+          }
           messagesWithImages = messagesWithImages.flatMap((message): MultimodalMessage[] => {
             if (message.role !== 'assistant' || !message.tool_calls?.length) {
               return [message];

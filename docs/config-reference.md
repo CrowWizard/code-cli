@@ -423,7 +423,9 @@ Sakana.AI provider configuration. The API is OpenAI-compatible and uses `https:/
 
 Autohand sign-in is required with every provider. Autohand rate limits and account quotas apply only to hosted Autohand AI inference. Third-party, custom, and local providers do not consume that allowance or inherit those limits. Your provider can still enforce its own limits; explicitly configured run budgets also remain in effect.
 
-Custom providers let users bring an OpenAI-compatible endpoint without a code change or a new bundled provider. Add the provider under `customProviders`, then select it with `provider: "custom:<id>"`. The same flow is available from `/model` with **New provider...**. During setup, Autohand verifies the base URL, authentication, and selected model through the OpenAI-compatible `/models` endpoint before saving the provider.
+Custom providers support OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages endpoints. Add the provider under `customProviders`, then select it with `provider: "custom:<id>"`. The `/model` **New provider...** flow creates OpenAI-compatible providers and verifies them through `/models`. Configure other API formats directly in the configuration file.
+
+For an Anthropic-compatible service, set `apiFormat` to `"anthropic"`, use the service root as `baseUrl` (without `/v1/messages`), and specify its `apiKey` and `model`. Requests use the Anthropic SDK, including its authentication, tool-call conversion, and prompt caching behavior. `supportsPromptCacheKey` applies to OpenAI-compatible Chat Completions, not Anthropic Messages.
 
 ```json
 {
@@ -458,7 +460,7 @@ For local OpenAI-compatible servers that do not require auth, set `apiKeyRequire
 | ----------------- | ------- | -------- | ------- | ----------- |
 | `id`              | string  | Yes      | -       | Stable provider id. It must match the object key and is selected as `custom:<id>`. |
 | `displayName`     | string  | Yes      | -       | Name shown in `/model` and provider settings. |
-| `apiFormat`       | string  | Yes      | -       | Must be `openai-compatible`. |
+| `apiFormat`       | string  | Yes      | -       | `openai-compatible` (Chat Completions), `openai-responses`, or `anthropic` (Messages API). |
 | `baseUrl`         | string  | Yes      | -       | Endpoint root such as `https://api.example.com/v1`. Autohand verifies `/models` and calls `/chat/completions`. |
 | `apiKey`          | string  | Conditional | -    | Bearer token for hosted endpoints. Required when `apiKeyRequired` is true. |
 | `apiKeyRequired`  | boolean | No       | `true`  | Set false for local or already-authenticated gateways. |

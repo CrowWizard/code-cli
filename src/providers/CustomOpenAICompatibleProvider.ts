@@ -5,6 +5,7 @@
  */
 
 import { LLMGatewayClient } from "./LLMGatewayClient.js";
+import { AnthropicProvider } from "./AnthropicProvider.js";
 import type { LLMProvider, LLMProviderCapabilities } from "./LLMProvider.js";
 import type {
   CustomProviderId,
@@ -64,7 +65,7 @@ function formatResponsesFailureDetails(data: { error?: unknown; response?: Respo
 
 export class CustomOpenAICompatibleProvider implements LLMProvider {
   private readonly providerName: CustomProviderId;
-  private readonly client: LLMGatewayClient;
+  private readonly client: LLMGatewayClient | AnthropicProvider;
   private readonly models: string[];
   private readonly apiKeyRequired: boolean;
   private readonly apiKey?: string;
@@ -84,7 +85,9 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
     this.stream = config.stream === true;
     this.supportsImageInput = config.supportsImageInput === true;
     this.baseUrl = config.baseUrl?.replace(/\/$/, '') ?? '';
-    this.client = new LLMGatewayClient(
+    this.client = config.apiFormat === 'anthropic'
+      ? new AnthropicProvider({ ...config, apiKey: config.apiKey ?? '' }, networkSettings)
+      : new LLMGatewayClient(
       {
         apiKey: config.apiKey ?? "",
         baseUrl: config.baseUrl,
@@ -111,7 +114,11 @@ export class CustomOpenAICompatibleProvider implements LLMProvider {
 
   setModel(model: string): void {
     this.model = model;
-    this.client.setDefaultModel(model);
+    if (this.client instanceof AnthropicProvider) {
+      this.client.setModel(model);
+    } else {
+      this.client.setDefaultModel(model);
+    }
   }
 
   async listModels(): Promise<string[]> {

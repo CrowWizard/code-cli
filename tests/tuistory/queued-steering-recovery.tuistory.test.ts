@@ -13,6 +13,7 @@ import {
 interface RecordedRequest {
   messages: Array<{ role: string; content: unknown; tool_call_id?: string; name?: string }>;
   stream?: boolean;
+  tools?: unknown[];
 }
 
 async function createNativeFixture(
@@ -97,7 +98,7 @@ describe('queued steering and streamed tool-call recovery in the built CLI', () 
         id: 'interrupted-call', name: 'run_command',
         args: { command: 'node -e "setInterval(() => {}, 1000)"' },
       });
-      else jsonReply(response, 'INTERRUPTED_TURN_RECOVERED');
+      else jsonReply(response, index === 2 ? 'INTERRUPTED_TURN_RECOVERED' : 'TOOLS_AVAILABLE_AGAIN');
     });
     const auth = await createMockAuthServer();
     const state = await fixtureState(server.baseUrl);
@@ -118,6 +119,13 @@ describe('queued steering and streamed tool-call recovery in the built CLI', () 
         message.role === 'tool' && message.tool_call_id === 'interrupted-call');
       expect(results).toHaveLength(1);
       expect(JSON.stringify(results)).toContain('will not be retried automatically');
+      await session.type('Continue with tools available.');
+      await session.press('enter');
+      await session.waitForText('TOOLS_AVAILABLE_AGAIN', { timeout: 25_000 });
+      expect(server.requests).toHaveLength(3);
+      expect(server.requests[2].tools?.length).toBeGreaterThan(0);
+      expect(server.requests[2].messages.filter(message => message.role === 'tool' && message.tool_call_id === 'interrupted-call')).toHaveLength(1);
+      expect(JSON.stringify(server.requests[2].messages)).not.toContain('Tools have been disabled for this recovery response');
       await exitInteractive(session);
     } finally {
       session?.close(); await session?.waitForExit(5000);

@@ -1839,8 +1839,8 @@ function validateConfig(config: AutohandConfig, configPath: string): void {
       if (typeof provider.displayName !== "string" || provider.displayName.trim() === "") {
         throw new Error(`customProviders.${key}.displayName must be a non-empty string in ${configPath}`);
       }
-      if (provider.apiFormat !== "openai-compatible" && provider.apiFormat !== "openai-responses") {
-        throw new Error(`customProviders.${key}.apiFormat must be "openai-compatible" or "openai-responses" in ${configPath}`);
+      if (provider.apiFormat !== "openai-compatible" && provider.apiFormat !== "openai-responses" && provider.apiFormat !== "anthropic") {
+        throw new Error(`customProviders.${key}.apiFormat must be "openai-compatible", "openai-responses", or "anthropic" in ${configPath}`);
       }
       if (typeof provider.baseUrl !== "string" || provider.baseUrl.trim() === "") {
         throw new Error(`customProviders.${key}.baseUrl must be a non-empty string in ${configPath}`);
@@ -1924,7 +1924,7 @@ export function getProviderConfig(
   }
   if (isCustomProviderName(chosen)) {
     const entry = getCustomProviderConfig(config, chosen);
-    if (!entry || (entry.apiFormat !== "openai-compatible" && entry.apiFormat !== "openai-responses")) {
+    if (!entry || (entry.apiFormat !== "openai-compatible" && entry.apiFormat !== "openai-responses" && entry.apiFormat !== "anthropic")) {
       return null;
     }
     const model = entry.model?.trim();

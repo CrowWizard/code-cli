@@ -22,6 +22,30 @@ describe('CustomOpenAICompatibleProvider', () => {
     globalThis.fetch = originalFetch;
   });
 
+  it('uses the Anthropic Messages protocol while preserving custom provider identity and models', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      id: 'msg-test', type: 'message', role: 'assistant', model: 'claude-other',
+      content: [{ type: 'tool_use', id: 'tool-test', name: 'read_file', input: { path: 'README.md' } }],
+      stop_reason: 'tool_use', usage: { input_tokens: 12, output_tokens: 8 },
+    }), { headers: { 'content-type': 'application/json' } }));
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const provider = new CustomOpenAICompatibleProvider({
+      id: 'claude-proxy', displayName: 'Claude Proxy', apiFormat: 'anthropic',
+      baseUrl: 'https://example.com', model: 'claude-proxy-model', apiKey: 'test-key',
+      models: [{ id: 'claude-proxy-model' }, { id: 'claude-other' }],
+    });
+    provider.setModel('claude-other');
+    const result = await provider.complete({ messages: [{ role: 'system', content: 'Policy' }, { role: 'user', content: 'Read the file' }] });
+    const [input, init] = fetchMock.mock.calls[0];
+    const request = input instanceof Request ? input : new Request(input, init);
+    expect(request.url).toBe('https://example.com/v1/messages');
+    expect(request.headers.get('x-api-key')).toBe('test-key');
+    expect(await request.json()).toMatchObject({ model: 'claude-other', messages: [{ role: 'user', content: expect.anything() }] });
+    expect(result.toolCalls).toEqual([{ id: 'tool-test', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }]);
+    expect(provider.getName()).toBe('custom:claude-proxy');
+    expect(await provider.listModels()).toEqual(['claude-proxy-model', 'claude-other']);
+  });
+
   it.each([true, false, undefined])('serializes Responses image input with supportsImageInput=%s', async (supportsImageInput) => {
     const provider = new CustomOpenAICompatibleProvider({
       id: 'vision', displayName: 'Vision', apiFormat: 'openai-responses',

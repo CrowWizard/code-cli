@@ -68,6 +68,18 @@ describe('ReactLoopRunner composer status', () => {
     expect(request.messages.filter((message: { tool_call_id?: string }) => message.tool_call_id === 'call-completed')).toHaveLength(1);
     expect(request.tools).toBeUndefined();
     expect(host.toolManager.execute).not.toHaveBeenCalled();
+    expect(host.saveToolMessage).toHaveBeenCalledWith('shell', expect.stringContaining('will not be retried automatically'), 'call-interrupted');
+    expect(host.conversation.addSystemNote).not.toHaveBeenCalledWith(expect.stringContaining('Tools have been disabled'));
+    const repairedResult = vi.mocked(host.conversation.addMessage).mock.calls
+      .map(([message]) => message)
+      .find((message) => message.role === 'tool' && message.tool_call_id === 'call-interrupted');
+    expect(repairedResult).toBeDefined();
+    const repairedMessages = [...await host.getMessagesWithImages(), repairedResult!];
+    host.getMessagesWithImages = vi.fn(async () => repairedMessages);
+    host.toolManager.toFunctionDefinitions = vi.fn(() => [{ name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: {} } }]);
+    await runAgentReactLoop(host, new AbortController());
+    expect(llmComplete.mock.calls[1][0].tools).toBeDefined();
+    expect(host.saveToolMessage).toHaveBeenCalledTimes(1);
   });
 
   it('emits streamed final response text without duplicating the terminal response', async () => {

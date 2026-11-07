@@ -80,6 +80,16 @@ describe("ProviderFactory", () => {
   });
 
   describe("create()", () => {
+    it("creates a custom Anthropic provider with its own identity", async () => {
+      const provider = ProviderFactory.create({
+        provider: "custom:claude-proxy",
+        customProviders: { "claude-proxy": { id: "claude-proxy", displayName: "Claude Proxy", apiFormat: "anthropic", baseUrl: "https://example.com", model: "claude-proxy-model", apiKey: "test-key" } },
+      });
+      expect(provider.getName()).toBe("custom:claude-proxy");
+      expect(await provider.listModels()).toEqual(["claude-proxy-model"]);
+      expect(provider.getCapabilities?.()).toEqual({ nativeToolCalling: true });
+    });
+
     it("should create OllamaProvider when ollama is configured", () => {
       const config: AutohandConfig = {
         provider: "ollama",

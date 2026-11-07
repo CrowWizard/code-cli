@@ -503,6 +503,15 @@ describe("configParser – error handling (Issue #3)", () => {
     expect(providerConfig?.baseUrl).toBe("https://api.sakana.ai/v1");
   });
 
+  it("loads a custom Anthropic provider and resolves its settings", async () => {
+    const settings = { id: "claude-proxy", displayName: "Claude Proxy", apiFormat: "anthropic", baseUrl: "https://example.com", model: "claude-proxy-model", apiKey: "test-key" };
+    const configPath = await writeTempConfig(testDir, "config.json", JSON.stringify({ provider: "custom:claude-proxy", customProviders: { "claude-proxy": settings } }));
+    const { loadConfig, getProviderConfig } = await importConfigModule();
+    const config = await loadConfig(configPath);
+    expect(config.provider).toBe("custom:claude-proxy");
+    expect(getProviderConfig(config, "custom:claude-proxy")).toMatchObject(settings);
+  });
+
   it("rejects non-boolean custom provider image capability", async () => {
     const configPath = await writeTempConfig(testDir, "config.json", JSON.stringify({
       provider: "custom:acme",

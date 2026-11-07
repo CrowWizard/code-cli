@@ -1048,7 +1048,11 @@ describe('Reflection guard integration', () => {
     await runAgentReactLoop(host, new AbortController());
 
     expect(executedCalls.map((call) => call.id)).toEqual(['call_1']);
-    expect(systemNotes.some((note) => note.startsWith('[Tool Result Integrity]'))).toBe(true);
+    expect(systemNotes.some((note) => note.startsWith('[Tool Result Integrity]'))).toBe(false);
+    expect(complete.mock.calls[1]?.[0]?.messages).toContainEqual(expect.objectContaining({
+      content: expect.stringContaining('[Tool Result Integrity]'),
+    }));
+    expect(host.conversation.history().filter((message) => message.role === 'tool' && message.tool_call_id === 'call_1')).toHaveLength(1);
     expect(complete).toHaveBeenCalledTimes(2);
     expect(complete.mock.calls[1]?.[0]?.tools).toBeUndefined();
     expect(complete.mock.calls[1]?.[0]?.messages).toContainEqual(expect.objectContaining({

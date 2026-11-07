@@ -101,7 +101,7 @@ export class ProviderFactory {
 
         if (isCustomProviderName(providerName)) {
             const customProvider = getCustomProviderConfig(config, providerName);
-            if (!customProvider || (customProvider.apiFormat !== 'openai-compatible' && customProvider.apiFormat !== 'openai-responses')) {
+            if (!customProvider || (customProvider.apiFormat !== 'openai-compatible' && customProvider.apiFormat !== 'openai-responses' && customProvider.apiFormat !== 'anthropic')) {
                 return new UnconfiguredProvider(providerName);
             }
             return new CustomOpenAICompatibleProvider(customProvider, config.network);

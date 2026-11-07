@@ -109,7 +109,7 @@ export interface ExtensionProviderSettings extends ProviderSettings {
   [key: string]: unknown;
 }
 
-export type CustomProviderApiFormat = 'openai-compatible' | 'openai-responses';
+export type CustomProviderApiFormat = 'openai-compatible' | 'openai-responses' | 'anthropic';
 
 export interface CustomProviderModel {
   id: string;
