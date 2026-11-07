@@ -91,6 +91,40 @@ async function persistedUserMessages(home: string): Promise<string[]> {
 }
 
 describe('queued steering and streamed tool-call recovery in the built CLI', () => {
+  it('continues after cancelling a tool without resending an unresolved call', async () => {
+    const server = await createNativeFixture((index, response) => {
+      if (index === 1) jsonReply(response, 'INTERRUPTED_TOOL_STARTED', {
+        id: 'interrupted-call', name: 'run_command',
+        args: { command: 'node -e "setInterval(() => {}, 1000)"' },
+      });
+      else jsonReply(response, 'INTERRUPTED_TURN_RECOVERED');
+    });
+    const auth = await createMockAuthServer();
+    const state = await fixtureState(server.baseUrl);
+    let session: Session | undefined;
+    try {
+      session = await launchBuiltAutohand(['--path', state.workspaceRoot, '--config', state.configPath, '--yes'], {
+        autohandHome: state.autohandHome, cwd: state.workspaceRoot,
+        env: { AUTOHAND_AUTH_API_URL: auth.baseUrl + '/api/auth' },
+      });
+      await requestGitStatus(session);
+      await session.waitForText('Running node -e', { timeout: 25_000 });
+      await session.press('escape');
+      await session.type('Continue');
+      await session.press('enter');
+      await session.waitForText('INTERRUPTED_TURN_RECOVERED', { timeout: 25_000 });
+      expect(server.requests).toHaveLength(2);
+      const results = server.requests[1].messages.filter(message =>
+        message.role === 'tool' && message.tool_call_id === 'interrupted-call');
+      expect(results).toHaveLength(1);
+      expect(JSON.stringify(results)).toContain('will not be retried automatically');
+      await exitInteractive(session);
+    } finally {
+      session?.close(); await session?.waitForExit(5000);
+      await server.close(); await auth.close(); await state.cleanup();
+    }
+  });
+
   it.each([
     { sequence: '\x1b[13;5u', selected: false, fullScreen: false },
     { sequence: '\x1b[27;5;13~', selected: true, fullScreen: false },

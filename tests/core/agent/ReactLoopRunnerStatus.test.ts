@@ -43,6 +43,33 @@ import { ReactionParser } from '../../../src/core/agent/ReactionParser.js';
 import { PromptCacheToolSet } from '../../../src/core/agent/PromptCache.js';
 
 describe('ReactLoopRunner composer status', () => {
+  it('repairs unresolved historical tool calls before continuing without executing them again', async () => {
+    const llmComplete = vi.fn().mockResolvedValue({
+      id: 'recovery', created: 1, raw: {}, content: '{"finalResponse":"Prior tool results are unavailable."}',
+    });
+    const host = createReactLoopTestHost(llmComplete, new ReactionParser());
+    host.llm.getCapabilities = () => ({ nativeToolCalling: true });
+    host.getMessagesWithImages = vi.fn(async () => [
+      { role: 'assistant' as const, content: '', tool_calls: [
+        { id: 'call-interrupted', type: 'function' as const, function: { name: 'shell', arguments: '{}' } },
+        { id: 'call-completed', type: 'function' as const, function: { name: 'read_file', arguments: '{}' } },
+      ] },
+      { role: 'tool' as const, content: 'Existing result', tool_call_id: 'call-completed' },
+      { role: 'user' as const, content: 'Continue' },
+    ]);
+
+    await runAgentReactLoop(host, new AbortController());
+
+    const request = llmComplete.mock.calls[0][0];
+    expect(request.messages[1]).toMatchObject({
+      role: 'tool', tool_call_id: 'call-interrupted',
+      content: expect.stringContaining('will not be retried automatically'),
+    });
+    expect(request.messages.filter((message: { tool_call_id?: string }) => message.tool_call_id === 'call-completed')).toHaveLength(1);
+    expect(request.tools).toBeUndefined();
+    expect(host.toolManager.execute).not.toHaveBeenCalled();
+  });
+
   it('emits streamed final response text without duplicating the terminal response', async () => {
     const parser = new ReactionParser();
     const llmComplete = vi.fn(async (request) => {

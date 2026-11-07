@@ -865,10 +865,14 @@ export async function runAgentReactLoop(
       // Get messages with images included for multimodal support
       let messagesWithImages = await host.getMessagesWithImages();
 
-      if (supportsNativeToolCalling && expectedOutboundToolResultIds.length > 0) {
+      if (supportsNativeToolCalling) {
         const integrity = inspectExpectedNativeToolResults(
           messagesWithImages,
-          expectedOutboundToolResultIds,
+          [
+            ...expectedOutboundToolResultIds,
+            ...messagesWithImages.flatMap((message) =>
+              message.role === 'assistant' ? (message.tool_calls ?? []).map((call) => call.id) : []),
+          ],
         );
         if (!integrity.ok) {
           tools = [];
