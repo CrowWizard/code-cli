@@ -97,6 +97,16 @@ describe('thought-only response handling', () => {
 });
 
 describe('cleanupModelResponse does not mangle thought text', () => {
+  it.each([
+    'Model inputs:\n\n```json\n{"prompt": "example", "duration": "5"}\n```\n\n## Next steps\nValidate the schema before submitting.',
+    'First example:\n\n```json\n{"model": "first"}\n```\n\nSecond example:\n\n```json\n{"model": "second"}\n```\n\nFinal recommendation: keep both examples.',
+    'Partial example:\n\n```json\n{"prompt": "example"',
+  ])('preserves JSON examples and subsequent response text: %s', (response) => {
+    const agent = createMinimalAgent();
+
+    expect(agent.cleanupModelResponse(response)).toBe(response);
+  });
+
   it('preserves a structured answer containing nested arrays and objects', () => {
     const agent = createMinimalAgent();
     const response = JSON.stringify({ schemaVersion: 1, recommendations: [{ evidence: ['package.json'], score: 70 }] });

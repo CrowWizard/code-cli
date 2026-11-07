@@ -427,6 +427,8 @@ Custom providers support OpenAI Chat Completions, OpenAI Responses, and Anthropi
 
 For an Anthropic-compatible service, set `apiFormat` to `"anthropic"`, use the service root as `baseUrl` (without `/v1/messages`), and specify its `apiKey` and `model`. Requests use the Anthropic SDK, including its authentication, tool-call conversion, and prompt caching behavior. `supportsPromptCacheKey` applies to OpenAI-compatible Chat Completions, not Anthropic Messages.
 
+ACP model selections include configured providers as `Provider / model`. Custom providers use their configured `model` and `models` entries. Select an option while the session is idle to switch the provider for the next request without restarting the ACP process. Active requests must finish or finish cancellation before switching. The selection is saved with the session, without changing the global default provider or other sessions. ACP selection IDs are opaque routing identifiers; clients should send them back unchanged rather than treating them as upstream model names.
+
 ```json
 {
   "provider": "custom:acme",

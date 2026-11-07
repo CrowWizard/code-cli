@@ -76,6 +76,7 @@ export interface SessionMetadata {
     projectPath: string;
     projectName: string;
     model: string;
+    provider?: import('../types.js').ProviderName;
     messageCount: number;
     summary?: string;
     /** Name the user gave the session with /rename; shown ahead of the summary. */

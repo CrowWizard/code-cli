@@ -216,6 +216,7 @@ import {
   applyAgentAcpConfigOption,
   applyAgentAcpMode,
   applyAgentAcpModel,
+  prepareAgentAcpProviderModel,
   confirmAgentDangerousAction,
   connectAgentAcpMcpServers,
   enterAgentSessionWorktree,
@@ -1655,7 +1656,6 @@ export class AutohandAgent {
     cleaned = cleaned.replace(/<tool_call>[\s\S]*$/g, '');
 
     // Remove broken JSON fragments at the end
-    cleaned = cleaned.replace(/```json[\s\S]*$/i, '');
     cleaned = cleaned.replace(/\{"?toolCalls"?\s*:\s*\[\][\s\S]*$/i, '');
     cleaned = cleaned.replace(/,?\s*"finalResponse"\s*:\s*"[^"]*"\s*\}?\]?\}?$/i, '');
 
@@ -2512,6 +2512,10 @@ export class AutohandAgent {
    */
   applyAcpModel(modelId: string): void {
     return applyAgentAcpModel(this, modelId);
+  }
+
+  prepareAcpProviderModel(provider: ProviderName, modelId: string): () => void {
+    return prepareAgentAcpProviderModel(this, provider, modelId);
   }
 
   /**

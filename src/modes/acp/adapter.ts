@@ -209,6 +209,7 @@ export class AutohandAcpAdapter implements Agent {
   private permissionBridges = new Map<string, ReturnType<typeof createPermissionBridge>>();
   private sessionConfigOptions = new Map<string, SessionConfigOption[]>();
   private cancelledSessions = new Set<string>();
+  private busySessions = new Set<string>();
   private hookForwarders = new Map<string, () => void>();
   private config: LoadedConfig | null = null;
   private clientCapabilities?: InitializeRequest['clientCapabilities'];
@@ -262,12 +263,42 @@ export class AutohandAcpAdapter implements Agent {
 
   private async buildSessionModels(config: LoadedConfig, modelId: string): Promise<LegacySessionModelState> {
     return {
-      availableModels: (await this.availableModelIds(config)).map((m) => ({
-        modelId: m,
-        name: m.split('/').pop() ?? m,
-      })),
+      availableModels: (await this.modelSelections(config)).map(({ id, name }) => ({ modelId: id, name })),
       currentModelId: modelId,
     };
+  }
+
+  private async modelSelections(config: LoadedConfig): Promise<Array<{ id: string; name: string; provider: NonNullable<LoadedConfig['provider']>; model: string }>> {
+    const active = config.provider ?? 'openrouter';
+    const defaultProvider = (await this.ensureConfig()).provider ?? 'openrouter';
+    const providers = new Set<NonNullable<LoadedConfig['provider']>>([active]);
+    for (const key of Object.keys(config)) {
+      if (key !== 'customProviders' && key !== 'extensionProviders' && ProviderFactory.isValidProvider(key, config)) {
+        providers.add(key as NonNullable<LoadedConfig['provider']>);
+      }
+    }
+    for (const [id, settings] of Object.entries(config.customProviders ?? {})) {
+      if (!settings.disabled) providers.add(`custom:${id}`);
+    }
+    const selections: Array<{ id: string; name: string; provider: NonNullable<LoadedConfig['provider']>; model: string }> = [];
+    for (const provider of providers) {
+      const scoped = { ...config, provider };
+      if (provider !== active && !getProviderConfig(scoped)) continue;
+      const custom = provider.startsWith('custom:') ? config.customProviders?.[provider.slice(7)] : undefined;
+      const models = custom
+        ? [...new Set([custom.model, ...(custom.models ?? []).map(entry => entry.id)])]
+        : await this.availableModelIds(scoped);
+      for (const model of models) {
+        if (!model) continue;
+        selections.push({
+          id: provider === defaultProvider ? model : `acp-provider:${encodeURIComponent(provider)}:${encodeURIComponent(model)}`,
+          name: `${custom?.displayName ?? provider} / ${model}`,
+          provider,
+          model,
+        });
+      }
+    }
+    return selections;
   }
 
   private getSessionCommands(config: LoadedConfig): AcpCommand[] {
@@ -307,14 +338,30 @@ export class AutohandAcpAdapter implements Agent {
   }
 
   private async applySessionModel(sessionId: string, modelId: string): Promise<void> {
+    if (this.busySessions.has(sessionId)) {
+      throw RequestError.invalidParams({ message: 'Session is busy. Wait for the current request to finish before switching models or providers.' });
+    }
+    this.busySessions.add(sessionId);
+    try {
+      await this.applyIdleSessionModel(sessionId, modelId);
+    } finally {
+      this.busySessions.delete(sessionId);
+    }
+  }
+
+  private async applyIdleSessionModel(sessionId: string, modelId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     const agent = this.agents.get(sessionId);
     if (!session || !agent) {
       throw RequestError.invalidParams({ message: 'Session not found' });
     }
 
-    const config = await this.ensureConfig();
-    await this.validateModel(config, modelId);
+    const config = this.sessionConfigs.get(sessionId) ?? await this.ensureConfig();
+    const selections = await this.modelSelections(config);
+    const selection = selections.find(entry => entry.id === modelId);
+    if (!selection) throw RequestError.invalidParams({ message: `Unsupported model: ${modelId}` });
+    const switchingProvider = selection.provider !== (config.provider ?? 'openrouter');
+    const commit = switchingProvider ? agent.prepareAcpProviderModel(selection.provider, selection.model) : undefined;
 
     const persistedSession = agent.getSessionManager().getCurrentSession();
     if (!persistedSession) {
@@ -322,33 +369,36 @@ export class AutohandAcpAdapter implements Agent {
     }
 
     const previousModel = persistedSession.metadata.model;
+    const previousProvider = persistedSession.metadata.provider;
     const previousLastActiveAt = persistedSession.metadata.lastActiveAt;
-    persistedSession.metadata.model = modelId;
+    persistedSession.metadata.model = selection.model;
+    persistedSession.metadata.provider = selection.provider;
     persistedSession.metadata.lastActiveAt = new Date().toISOString();
     try {
       await persistedSession.save();
     } catch (error) {
       persistedSession.metadata.model = previousModel;
+      persistedSession.metadata.provider = previousProvider;
       persistedSession.metadata.lastActiveAt = previousLastActiveAt;
       throw error;
     }
 
+    if (commit) commit();
+    else agent.applyAcpModel(selection.model);
+    config.provider = selection.provider;
     session.modelId = modelId;
+    const options = this.sessionConfigOptions.get(sessionId);
+    const modelOption = options?.find(option => option.id === 'model');
+    if (modelOption?.type === 'select') {
+      modelOption.options = selections.map(entry => ({ value: entry.id, name: entry.name }));
+    }
     this.updateModelConfigOption(sessionId, modelId);
-    agent.applyAcpModel(modelId);
     process.stderr.write(`[ACP] Session ${sessionId} model set to: ${modelId}\n`);
   }
 
   private validateMode(modeId: string): void {
     if (!DEFAULT_ACP_MODES.some((mode) => mode.id === modeId)) {
       throw RequestError.invalidParams({ message: `Unsupported mode: ${modeId}` });
-    }
-  }
-
-  private async validateModel(config: LoadedConfig, modelId: string): Promise<void> {
-    const models = await this.availableModelIds(config);
-    if (!models.includes(modelId)) {
-      throw RequestError.invalidParams({ message: `Unsupported model: ${modelId}` });
     }
   }
 
@@ -475,7 +525,12 @@ export class AutohandAcpAdapter implements Agent {
     this.agents.set(managedSessionId, agent);
     this.sessionConfigs.set(managedSessionId, config);
     this.forwardHookLifecycle(managedSessionId, agent);
-    this.sessionConfigOptions.set(managedSessionId, buildConfigOptions(config, await this.availableModelIds(config)));
+    const configOptions = buildConfigOptions(config, await this.availableModelIds(config));
+    const modelOption = configOptions.find(option => option.id === 'model');
+    if (modelOption?.type === 'select') {
+      modelOption.options = (await this.modelSelections(config)).map(entry => ({ value: entry.id, name: entry.name }));
+    }
+    this.sessionConfigOptions.set(managedSessionId, configOptions);
 
     agent.setOutputListener((event: AgentOutputEvent) => {
       const previous = this.outputNotificationQueues.get(state.sessionId) ?? Promise.resolve();
@@ -730,8 +785,22 @@ export class AutohandAcpAdapter implements Agent {
 
       if (loadedSession.metadata.model) {
         state.modelId = loadedSession.metadata.model;
+        if (loadedSession.metadata.provider && loadedSession.metadata.provider !== config.provider) {
+          const restored = (await this.modelSelections(config)).find(entry =>
+            entry.provider === loadedSession.metadata.provider && entry.model === loadedSession.metadata.model);
+          if (!restored) throw new Error(`Saved provider or model is unavailable: ${loadedSession.metadata.provider} / ${loadedSession.metadata.model}`);
+          state.modelId = restored.id;
+        }
         this.updateModelConfigOption(sessionId, state.modelId);
-        agent.applyAcpModel(state.modelId);
+        if (loadedSession.metadata.provider && loadedSession.metadata.provider !== config.provider) {
+          const restored = (await this.modelSelections(config)).find(entry => entry.id === state.modelId);
+          if (restored) {
+            agent.prepareAcpProviderModel(restored.provider, restored.model)();
+            config.provider = restored.provider;
+          }
+        } else {
+          agent.applyAcpModel(loadedSession.metadata.model);
+        }
       }
 
       this.sessions.set(sessionId, state);
@@ -843,6 +912,18 @@ export class AutohandAcpAdapter implements Agent {
   // ==========================================================================
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    if (this.busySessions.has(params.sessionId)) {
+      throw RequestError.invalidParams({ message: 'Session is busy. Wait for the current request to finish.' });
+    }
+    this.busySessions.add(params.sessionId);
+    try {
+      return await this.promptIdleSession(params);
+    } finally {
+      this.busySessions.delete(params.sessionId);
+    }
+  }
+
+  private async promptIdleSession(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions.get(params.sessionId);
     const agent = this.agents.get(params.sessionId);
 

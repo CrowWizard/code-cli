@@ -35,6 +35,9 @@ import { withProgramStatusWait } from './AgentProgramStatus.js';
 import type { AgentProgramStatus } from './AgentProgramStatus.js';
 import { isAdaptiveSkillsEnabled } from '../../skills/feature.js';
 import { isWorkflowDiscoveryShortcut } from '../../discovery/preview.js';
+import { ProviderFactory } from '../../providers/ProviderFactory.js';
+import type { LoadedConfig, ProviderName } from '../../types.js';
+import { getProviderConfig } from '../../config.js';
 
 export interface AgentCommandRuntimeHost {
   [key: string]: any;
@@ -167,9 +170,14 @@ export function applyAgentAcpModel(host: AgentCommandRuntimeHost, modelId: strin
     host.runtime.options.model = modelId;
 
     const provider = host.activeProvider ?? host.runtime.config.provider ?? 'openrouter';
-    const providerConfig = host.runtime.config[provider] as { model?: string; contextWindow?: number } | undefined;
+    const providerConfig = getProviderConfig(host.runtime.config, provider);
     if (providerConfig) {
-      providerConfig.model = modelId;
+      if (provider.startsWith('custom:')) {
+        host.runtime.config.customProviders[provider.slice(7)].model = modelId;
+      } else {
+        const settings = host.runtime.config[provider];
+        if (settings) settings.model = modelId;
+      }
     }
 
     writeAutohandDebugLine(`[DEBUG] Model changed via ACP: provider=${provider}, model=${modelId}`, host.writeDebugLine?.bind(host));
@@ -289,6 +297,23 @@ export async function handleAgentSlashCommand(
     const execute = () => handleStableAgentSlashCommand(host, command, args, surface);
     return host.extensionReloadController
       ? host.extensionReloadController.withStableExtensions(execute) : execute();
+}
+
+export function prepareAgentAcpProviderModel(host: AgentCommandRuntimeHost, provider: ProviderName, model: string): () => void {
+    const config = structuredClone(host.runtime.config as LoadedConfig);
+    config.provider = provider;
+    if (!ProviderFactory.isValidProvider(provider, config)) throw new Error(`Unknown provider: ${provider}`);
+    const client = ProviderFactory.create(config);
+    if (client.getName() === 'unconfigured') throw new Error(`Provider is not configured: ${provider}`);
+    client.setModel(model);
+    const delegator = host.delegator.withProvider(client);
+    return () => {
+      Object.assign(host.runtime.config, config);
+      host.llm = client;
+      host.delegator = delegator;
+      host.activeProvider = provider;
+      applyAgentAcpModel(host, model);
+    };
 }
 
 async function handleStableAgentSlashCommand(

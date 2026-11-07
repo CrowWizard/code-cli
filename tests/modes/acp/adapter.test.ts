@@ -74,6 +74,7 @@ const {
     connectAcpMcpServers: vi.fn().mockResolvedValue(undefined),
     applyAcpMode: vi.fn(),
     applyAcpModel: vi.fn(),
+    prepareAcpProviderModel: vi.fn().mockImplementation(() => vi.fn()),
     applyAcpConfigOption: vi.fn(),
     cancelCurrentInstruction: vi.fn(),
     getSessionManager: vi.fn().mockReturnValue(mockSessionManager),
@@ -143,6 +144,7 @@ vi.mock("../../../src/core/agent.js", () => ({
 
 vi.mock("../../../src/providers/ProviderFactory.js", () => ({
   ProviderFactory: {
+    isValidProvider: (provider: string) => ["openrouter", "anthropic", "openai", "ollama"].includes(provider) || provider.startsWith("custom:"),
     create: vi.fn().mockReturnValue({
       getName: () => "openrouter",
       streamChat: vi.fn(),
@@ -1919,6 +1921,72 @@ describe("AutohandAcpAdapter", () => {
   // -------------------------------------------------------------------------
 
   describe("unstable_setSessionModel()", () => {
+    it("selects a configured provider even when model names overlap", async () => {
+      const custom = { displayName: "First", apiFormat: "openai-compatible" as const, baseUrl: "https://example.com/v1", apiKey: "test-key", model: "shared-model" };
+      mockLoadConfig.mockResolvedValue(makeConfig({
+        provider: "custom:first",
+        customProviders: {
+          first: { ...custom, id: "first" },
+          second: { ...custom, id: "second", displayName: "Second" },
+        },
+      }));
+      await adapter.initialize(makeInitRequest());
+      const session = await adapter.newSession(makeNewSessionRequest());
+      const target = session.models.availableModels.find(model => model.name === "Second / shared-model");
+      expect(target).toBeDefined();
+      const metadata = { ...mockSessionManager.getCurrentSession().metadata };
+      const commit = vi.fn();
+      mockAgent.prepareAcpProviderModel.mockReturnValueOnce(commit);
+      mockPersistedSessionSave.mockRejectedValueOnce(new Error("disk full"));
+      await expect(adapter.unstable_setSessionModel({ sessionId: session.sessionId, modelId: target!.modelId })).rejects.toThrow("disk full");
+      expect(commit).not.toHaveBeenCalled();
+      expect(mockSessionManager.getCurrentSession().metadata).toEqual(metadata);
+      mockAgent.prepareAcpProviderModel.mockImplementationOnce(() => { throw new Error("invalid provider"); });
+      await expect(adapter.unstable_setSessionModel({ sessionId: session.sessionId, modelId: target!.modelId })).rejects.toThrow("invalid provider");
+      expect(mockSessionManager.getCurrentSession().metadata).toEqual(metadata);
+      await adapter.unstable_setSessionModel({ sessionId: session.sessionId, modelId: target!.modelId });
+      expect(mockAgent.prepareAcpProviderModel).toHaveBeenCalledWith("custom:second", "shared-model");
+      expect(mockSessionManager.getCurrentSession().metadata.provider).toBe("custom:second");
+      const result = await adapter.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: target!.modelId });
+      const option = result.configOptions.find(entry => entry.id === "model");
+      expect(option?.currentValue).toBe(target!.modelId);
+      expect(option?.type === "select" && option.options).toContainEqual({ value: target!.modelId, name: "Second / shared-model" });
+      mockSessionManager.loadSession.mockResolvedValueOnce(mockSessionManager.getCurrentSession());
+      const resumed = await adapter.loadSession({ sessionId: session.sessionId, cwd: "/workspace", mcpServers: [] });
+      expect(resumed.models.currentModelId).toBe(target!.modelId);
+      expect(mockAgent.prepareAcpProviderModel).toHaveBeenLastCalledWith("custom:second", "shared-model");
+    });
+
+    it("rejects model changes while an instruction is running and allows them afterwards", async () => {
+      await adapter.initialize(makeInitRequest());
+      const session = await adapter.newSession(makeNewSessionRequest());
+      let finish: (value: boolean) => void = () => {};
+      let started: () => void = () => {};
+      const running = new Promise<void>(resolve => { started = resolve; });
+      mockAgent.runInstruction.mockImplementationOnce(() => {
+        started();
+        return new Promise<boolean>(resolve => { finish = resolve; });
+      });
+      const prompt = adapter.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "hello" }] });
+      await running;
+      await expect(adapter.unstable_setSessionModel({ sessionId: session.sessionId, modelId: "openai/gpt-5" })).rejects.toMatchObject({ data: { message: expect.stringContaining("busy") } });
+      expect(mockPersistedSessionSave).not.toHaveBeenCalled();
+      finish(true);
+      await prompt;
+      await adapter.unstable_setSessionModel({ sessionId: session.sessionId, modelId: "openai/gpt-5" });
+      expect(mockAgent.applyAcpModel).toHaveBeenCalledWith("openai/gpt-5");
+    });
+
+    it("preserves the active model when saving the selection fails", async () => {
+      await adapter.initialize(makeInitRequest());
+      const session = await adapter.newSession(makeNewSessionRequest());
+      const metadata = { ...mockSessionManager.getCurrentSession().metadata };
+      mockPersistedSessionSave.mockRejectedValueOnce(new Error("disk full"));
+      await expect(adapter.unstable_setSessionModel({ sessionId: session.sessionId, modelId: "openai/gpt-5" })).rejects.toThrow("disk full");
+      expect(mockSessionManager.getCurrentSession().metadata).toEqual(metadata);
+      expect(mockAgent.applyAcpModel).not.toHaveBeenCalled();
+    });
+
     it("updates session model", async () => {
       await adapter.initialize(makeInitRequest());
       const session = await adapter.newSession(makeNewSessionRequest());
